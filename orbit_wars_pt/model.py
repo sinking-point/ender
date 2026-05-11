@@ -170,6 +170,9 @@ class OrbitWarsPolicy(nn.Module):
 
         self.pair_q = nn.Linear(d_model, d_model // 2, bias=False)
         self.pair_k = nn.Linear(d_model, d_model // 2, bias=False)
+        self.target_q = nn.Linear(d_model, d_model // 2, bias=False)
+        self.frac_emb = nn.Embedding(NUM_FRACTIONS, d_model)
+        self.origin_frac_head = nn.Linear(d_model, NUM_FRACTIONS)
 
         self.time_proj = nn.Linear(1, 32)
         self.frac_heads = nn.ModuleList([nn.Linear(d_model * 2 + 32, 1) for _ in range(NUM_FRACTIONS)])
@@ -275,6 +278,9 @@ class OrbitWarsPolicy(nn.Module):
         origin_ok = active_planet & owned_self & has_ships
         dest_ok = active_planet
         pair_mask = origin_ok[:, :, None] & dest_ok[:, None, :] & ~eye
+        sends = torch.floor(self._frac_const.to(features.dtype)[None, None, :] * ships[:, :, None])
+        origin_frac_mask = origin_ok[:, :, None] & (sends >= 1.0)
+        origin_frac_logits = self.origin_frac_head(planet_h)
 
         return {
             "hidden": h,
@@ -282,8 +288,26 @@ class OrbitWarsPolicy(nn.Module):
             "value": value,
             "pair_logits": pair_logits,
             "pair_mask": pair_mask,
+            "origin_frac_logits": origin_frac_logits,
+            "origin_frac_mask": origin_frac_mask,
             "planet_hidden": planet_h,
         }
+
+    def target_logits_for_origin_fraction(
+        self,
+        planet_hidden: torch.Tensor,
+        origin_idx: torch.Tensor,
+        frac_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """Target logits ``[B, MAX_PLANETS]`` conditioned on sampled origin/fraction."""
+
+        b = origin_idx.shape[0]
+        device = planet_hidden.device
+        ho = planet_hidden[torch.arange(b, device=device), origin_idx]
+        hf = ho + self.frac_emb(frac_idx)
+        q = self.target_q(hf)
+        k = self.pair_k(planet_hidden)
+        return torch.einsum("bd,bpd->bp", q, k) * (q.shape[-1] ** -0.5)
 
     def fraction_logits(
         self,

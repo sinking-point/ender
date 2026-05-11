@@ -6,12 +6,13 @@ Phases 1-5 of the JAX-exploitation rework. The whole rollout pipeline lives
 on device:
 
 * Batched ``OrbitWarsState`` lives on device throughout an episode.
-* Per-microstep observation, pair geometry, ETAs, must-halt and the
-  ``virt`` mutation all run as JIT'd vmap'd JAX kernels.
+* Per-microstep observation, must-halt, and ``virt`` mutation run as JIT'd
+  vmap'd JAX kernels; per-sampled (origin, fraction) all-target geometry is
+  ``selected_origin_fraction_targets_batched`` (shared with PPO replay).
 * Sampling stays on PyTorch, batched across all active envs (no Python loop
   over envs in the hot path).
-* Closed-form ``compute_pair_geom_and_etas`` removes the legacy 32-retry
-  pair resample and is bit-identical between rollout and PPO replay.
+* Legacy closed-form ``compute_pair_geom_and_etas`` remains for diagnostics;
+  the live policy gates targets with the sweep, not the old toward-dest ray.
 * Per-microstep transitions land in a device-resident ``TransitionBuffer``
   (``orbit_wars_pt.transition_buffer``); only tiny dispatch / scalar
   metadata cross PCIe. PPO replay gathers minibatches directly from the
@@ -55,8 +56,8 @@ from orbit_wars_pt.env_wrapper import OrbitWarsEnvConfig
 from orbit_wars_pt.gpu_mem import log_cuda_mem
 from orbit_wars_pt.micro_jax import (
     apply_micro_step_batched,
-    compute_pair_geom_and_etas,
     must_halt_no_owned_ships_batched,
+    selected_origin_fraction_targets_batched,
 )
 from orbit_wars_pt.model import OrbitWarsPolicy
 from orbit_wars_pt.observation_jax import build_observation_batched_jax
@@ -316,24 +317,20 @@ def _run_micro_phase(
 
     virt_b = state_b
     ego_jax = jnp.int32(ego)
-    fracs_t = torch.tensor(FRACTIONS, device=device, dtype=torch.float32)
 
     for k in range(max_micro_steps):
         if all(halted):
             break
 
-        # ---- JAX-side compute: obs + pair geometry + must_halt. ----
+        # ---- JAX-side compute: obs + must_halt (geometry runs per sampled origin/fraction). ----
         t0 = perf_counter()
         obs_jax = build_observation_batched_jax(virt_b, ego, ship_speed)
-        pair_geom_j, etas_j = compute_pair_geom_and_etas(virt_b, ship_speed)
         must_halt_j = must_halt_no_owned_ships_batched(virt_b, ego_jax)
         timing.obs_build_s += perf_counter() - t0
 
         # ---- Hand to PyTorch (zero-copy via dlpack). ----
         t0 = perf_counter()
         obs_torch = obs_jax_to_torch(obs_jax)
-        pair_geom_t = torch.from_dlpack(pair_geom_j)
-        etas_t = torch.from_dlpack(etas_j)
         must_halt_t = torch.from_dlpack(must_halt_j)
         timing.policy_batch_s += perf_counter() - t0
 
@@ -344,8 +341,6 @@ def _run_micro_phase(
         n_active = len(active_idx_list)
 
         active_obs = {key: v.index_select(0, active_idx_t) for key, v in obs_torch.items()}
-        pair_geom_a = pair_geom_t.index_select(0, active_idx_t)
-        etas_a = etas_t.index_select(0, active_idx_t)
         must_halt_a = must_halt_t.index_select(0, active_idx_t)
 
         # ---- Policy forward (active subset). ----
@@ -368,60 +363,78 @@ def _run_micro_phase(
         halt_action = torch.where(must_halt_a, torch.ones_like(halt_sampled), halt_sampled)
         halt_logp = halt_lp.gather(1, halt_action[:, None]).squeeze(-1)
 
-        pair_mask_combined = out["pair_mask"] & pair_geom_a
-        flat_mask = pair_mask_combined.flatten(start_dim=1)
-        any_valid_pair = flat_mask.any(dim=-1)
-        flat_logits = out["pair_logits"].flatten(start_dim=1)
-        masked_pair = flat_logits.masked_fill(~flat_mask, -1e4)
-        flat_lp = torch.log_softmax(masked_pair, dim=-1)
-        safe_pair = torch.where(any_valid_pair[:, None], masked_pair, torch.zeros_like(masked_pair))
+        origin_frac_mask = out["origin_frac_mask"]
+        flat_mask = origin_frac_mask.flatten(start_dim=1)
+        any_valid_origin_frac = flat_mask.any(dim=-1)
+        flat_logits = out["origin_frac_logits"].flatten(start_dim=1)
+        masked_origin_frac = flat_logits.masked_fill(~flat_mask, -1e4)
+        origin_frac_lp = torch.log_softmax(masked_origin_frac, dim=-1)
+        safe_origin_frac = torch.where(
+            any_valid_origin_frac[:, None],
+            masked_origin_frac,
+            torch.zeros_like(masked_origin_frac),
+        )
         if greedy:
-            pair_flat = safe_pair.argmax(dim=-1)
+            origin_frac_flat = safe_origin_frac.argmax(dim=-1)
         else:
-            pair_probs = torch.softmax(safe_pair, dim=-1)
-            pair_flat = torch.multinomial(pair_probs, 1, generator=rng).squeeze(-1)
-        pair_logp = flat_lp.gather(1, pair_flat[:, None]).squeeze(-1)
+            origin_frac_probs = torch.softmax(safe_origin_frac, dim=-1)
+            origin_frac_flat = torch.multinomial(origin_frac_probs, 1, generator=rng).squeeze(-1)
+        origin_frac_logp = origin_frac_lp.gather(1, origin_frac_flat[:, None]).squeeze(-1)
 
-        pair_used = (halt_action == 0) & any_valid_pair
         P = MAX_PLANETS
-        o_idx = pair_flat // P
-        d_idx = pair_flat % P
+        o_idx = origin_frac_flat // len(FRACTIONS)
+        frac_idx = origin_frac_flat % len(FRACTIONS)
+        origin_frac_used = (halt_action == 0) & any_valid_origin_frac
 
-        planet_ships = active_obs["features"][:, 1:1 + P, 1] * 1000.0
-        ships_avail = planet_ships.gather(1, o_idx[:, None]).squeeze(-1)
-        sends = torch.floor(fracs_t[None, :] * ships_avail[:, None])
-        frac_mask = sends >= 1.0
-        any_valid_frac = frac_mask.any(dim=-1)
+        origin_idx_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
+        frac_idx_all_geom = torch.zeros(num_envs, dtype=torch.int32, device=device)
+        origin_idx_all.index_copy_(0, active_idx_t, o_idx.to(torch.int32))
+        frac_idx_all_geom.index_copy_(0, active_idx_t, frac_idx.to(torch.int32))
+        origin_idx_j = jax.dlpack.from_dlpack(origin_idx_all.contiguous().detach())
+        frac_idx_geom_j = jax.dlpack.from_dlpack(frac_idx_all_geom.contiguous().detach())
+        target_angle_j, _target_width_j, target_valid_j, target_overflow_j = selected_origin_fraction_targets_batched(
+            virt_b,
+            origin_idx_j,
+            frac_idx_geom_j,
+            horizon=24,
+            ship_speed=ship_speed,
+            samples_per_span=17,
+        )
+        target_angle_t = torch.from_dlpack(target_angle_j).index_select(0, active_idx_t)
+        target_valid_t = torch.from_dlpack(target_valid_j).index_select(0, active_idx_t)
+        target_overflow_t = torch.from_dlpack(target_overflow_j).index_select(0, active_idx_t)
 
         n_a_idx = torch.arange(n_active, device=device)
-        eta_chosen = etas_a[n_a_idx, o_idx, d_idx]
-        times_norm = eta_chosen / 500.0
-
         ph = out["planet_hidden"]
-        frac_logits = policy.fraction_logits(ph, o_idx, d_idx, times_norm)
-        masked_frac = frac_logits.masked_fill(~frac_mask, -1e4)
-        frac_lp = torch.log_softmax(masked_frac, dim=-1)
-        safe_frac = torch.where(any_valid_frac[:, None], masked_frac, torch.zeros_like(masked_frac))
+        target_logits = policy.target_logits_for_origin_fraction(ph, o_idx, frac_idx)
+        target_mask = out["pair_mask"][n_a_idx, o_idx, :] & target_valid_t & ~target_overflow_t[:, None]
+        any_valid_target = target_mask.any(dim=-1)
+        masked_target = target_logits.masked_fill(~target_mask, -1e4)
+        target_lp = torch.log_softmax(masked_target, dim=-1)
+        safe_target = torch.where(any_valid_target[:, None], masked_target, torch.zeros_like(masked_target))
         if greedy:
-            frac_idx = safe_frac.argmax(dim=-1)
+            d_idx = safe_target.argmax(dim=-1)
         else:
-            frac_probs = torch.softmax(safe_frac, dim=-1)
-            frac_idx = torch.multinomial(frac_probs, 1, generator=rng).squeeze(-1)
-        frac_logp = frac_lp.gather(1, frac_idx[:, None]).squeeze(-1)
+            target_probs = torch.softmax(safe_target, dim=-1)
+            d_idx = torch.multinomial(target_probs, 1, generator=rng).squeeze(-1)
+        target_logp = target_lp.gather(1, d_idx[:, None]).squeeze(-1)
+        pair_flat = o_idx * P + d_idx
+        angle = target_angle_t[n_a_idx, d_idx]
 
-        frac_used = pair_used & any_valid_frac
-        total_logp = halt_logp + pair_used.float() * pair_logp + frac_used.float() * frac_logp
+        dispatch_used = origin_frac_used & any_valid_target
+        total_logp = halt_logp + origin_frac_used.float() * origin_frac_logp + dispatch_used.float() * target_logp
         # Cast the value head's output back to fp32 at the autocast boundary so
         # the per-env fp32 bookkeeping buffers (``values_all``, ``total_logp_all``)
         # stay consistent. ``log_softmax`` already promotes ``total_logp`` to fp32.
         values_active = out["value"].float()
 
-        halt_now = ~frac_used  # active env halts iff it did not dispatch
+        halt_now = ~dispatch_used  # active env halts iff it did not dispatch
 
         # ---- Build full-N tensors for buffer append + JAX apply. ----
         halt_now_all = torch.ones(num_envs, dtype=torch.bool, device=device)
         pair_flat_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
         frac_idx_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
+        angle_all = torch.zeros(num_envs, dtype=torch.float32, device=device)
         halt_action_all = torch.ones(num_envs, dtype=torch.int32, device=device)
         no_valid_pairs_all = torch.zeros(num_envs, dtype=torch.bool, device=device)
         no_valid_fracs_all = torch.zeros(num_envs, dtype=torch.bool, device=device)
@@ -431,8 +444,9 @@ def _run_micro_phase(
         pair_flat_all.index_copy_(0, active_idx_t, pair_flat.to(torch.int32))
         frac_idx_all.index_copy_(0, active_idx_t, frac_idx.to(torch.int32))
         halt_action_all.index_copy_(0, active_idx_t, halt_action.to(torch.int32))
-        no_valid_pairs_all.index_copy_(0, active_idx_t, ~any_valid_pair & (halt_action == 0))
-        no_valid_fracs_all.index_copy_(0, active_idx_t, pair_used & ~any_valid_frac)
+        angle_all.index_copy_(0, active_idx_t, angle.to(torch.float32))
+        no_valid_pairs_all.index_copy_(0, active_idx_t, origin_frac_used & ~any_valid_target)
+        no_valid_fracs_all.index_copy_(0, active_idx_t, ~any_valid_origin_frac & (halt_action == 0))
         must_halt_no_ships_all = torch.zeros(num_envs, dtype=torch.bool, device=device)
         must_halt_no_ships_all.index_copy_(0, active_idx_t, must_halt_a.to(torch.bool))
         total_logp_all.index_copy_(0, active_idx_t, total_logp)
@@ -444,13 +458,14 @@ def _run_micro_phase(
         halt_now_j = jax.dlpack.from_dlpack(halt_now_all.contiguous().detach())
         pair_flat_j = jax.dlpack.from_dlpack(pair_flat_all.contiguous().detach())
         frac_idx_j = jax.dlpack.from_dlpack(frac_idx_all.contiguous().detach())
+        angle_j = jax.dlpack.from_dlpack(angle_all.contiguous().detach())
         halt_action_j = jax.dlpack.from_dlpack(halt_action_all.contiguous().detach())
         no_valid_pairs_j = jax.dlpack.from_dlpack(no_valid_pairs_all.contiguous().detach())
         no_valid_fracs_j = jax.dlpack.from_dlpack(no_valid_fracs_all.contiguous().detach())
         must_halt_no_ships_j = jax.dlpack.from_dlpack(must_halt_no_ships_all.contiguous().detach())
 
         virt_b, oid_j, angle_j, send_j, dispatched_j, slot_j = apply_micro_step_batched(
-            virt_b, ego_jax, halt_now_j, pair_flat_j, frac_idx_j
+            virt_b, ego_jax, halt_now_j, pair_flat_j, frac_idx_j, angle_j
         )
 
         active_j = jnp.asarray(np.array([not h for h in halted], dtype=np.bool_), dtype=jnp.bool_)
@@ -460,6 +475,7 @@ def _run_micro_phase(
             buf,
             halt_now_j,
             send_j,
+            angle_j,
             slot_j,
             halt_action_j,
             pair_flat_j,

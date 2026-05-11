@@ -26,6 +26,7 @@ class TransitionBuffer(NamedTuple):
 
     micro_halt_now: jnp.ndarray
     send: jnp.ndarray
+    angle: jnp.ndarray
     slot: jnp.ndarray
     halt_action: jnp.ndarray
     pair_flat: jnp.ndarray
@@ -44,6 +45,7 @@ def init_transition_buffer(num_envs: int, H_buf: int, max_micro_steps: int) -> T
     return TransitionBuffer(
         micro_halt_now=noop_halt,
         send=jnp.zeros((H_buf, num_envs, m), dtype=jnp.float32),
+        angle=jnp.zeros((H_buf, num_envs, m), dtype=jnp.float32),
         slot=jnp.full((H_buf, num_envs, m), -1, dtype=jnp.int32),
         halt_action=jnp.zeros((H_buf, num_envs), dtype=jnp.int32),
         pair_flat=jnp.zeros((H_buf, num_envs, m), dtype=jnp.int32),
@@ -60,6 +62,7 @@ def _noop_prefix_planes(num_envs: int, max_micro_steps: int):
     return (
         jnp.ones((num_envs, m), dtype=jnp.bool_),
         jnp.zeros((num_envs, m), dtype=jnp.float32),
+        jnp.zeros((num_envs, m), dtype=jnp.float32),
         jnp.full((num_envs, m), -1, dtype=jnp.int32),
         jnp.zeros((num_envs, m), dtype=jnp.int32),
         jnp.zeros((num_envs, m), dtype=jnp.int32),
@@ -71,6 +74,7 @@ def append_to_buffer(
     buf: TransitionBuffer,
     micro_halt_now,
     send_now,
+    angle_now,
     slot_now,
     halt_action,
     pair_flat,
@@ -86,7 +90,7 @@ def append_to_buffer(
     """Write one transition per env at ``write_row[n]``, extending the in-phase prefix at slot ``micro_k[n]``."""
 
     n_idx = jnp.arange(write_row.shape[0], dtype=jnp.int32)
-    noop_h, noop_s, noop_sl, noop_pf, noop_fi = _noop_prefix_planes(write_row.shape[0], max_micro_steps)
+    noop_h, noop_s, noop_a, noop_sl, noop_pf, noop_fi = _noop_prefix_planes(write_row.shape[0], max_micro_steps)
 
     prev_row = jnp.where(micro_k > 0, write_row - 1, -1)
     safe_prev = jnp.maximum(prev_row, 0)
@@ -98,6 +102,7 @@ def append_to_buffer(
 
     new_halt = _grow(buf.micro_halt_now, micro_halt_now.astype(jnp.bool_), noop_h)
     new_send = _grow(buf.send, send_now.astype(jnp.float32), noop_s)
+    new_angle = _grow(buf.angle, angle_now.astype(jnp.float32), noop_a)
     new_slot = _grow(buf.slot, slot_now.astype(jnp.int32), noop_sl)
     new_pf = _grow(buf.pair_flat, pair_flat.astype(jnp.int32), noop_pf)
     new_fi = _grow(buf.frac_idx, frac_idx.astype(jnp.int32), noop_fi)
@@ -109,6 +114,7 @@ def append_to_buffer(
 
     out_halt = _scatter_rows(buf.micro_halt_now, new_halt)
     out_send = _scatter_rows(buf.send, new_send)
+    out_angle = _scatter_rows(buf.angle, new_angle)
     out_slot = _scatter_rows(buf.slot, new_slot)
     out_pf = _scatter_rows(buf.pair_flat, new_pf)
     out_fi = _scatter_rows(buf.frac_idx, new_fi)
@@ -125,6 +131,7 @@ def append_to_buffer(
     return TransitionBuffer(
         micro_halt_now=out_halt,
         send=out_send,
+        angle=out_angle,
         slot=out_slot,
         halt_action=out_ha,
         pair_flat=out_pf,
@@ -177,6 +184,7 @@ def gather_minibatch(
 
     halt_m = _gp(buf0.micro_halt_now, buf1.micro_halt_now)
     send_m = _gp(buf0.send, buf1.send)
+    angle_m = _gp(buf0.angle, buf1.angle)
     slot_m = _gp(buf0.slot, buf1.slot)
     pf_m = _gp(buf0.pair_flat, buf1.pair_flat)
     fi_m = _gp(buf0.frac_idx, buf1.frac_idx)
@@ -190,6 +198,7 @@ def gather_minibatch(
         slot_m,
         pf_m,
         fi_m,
+        angle_m,
         apply_mask_m,
     )
 

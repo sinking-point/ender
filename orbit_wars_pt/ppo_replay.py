@@ -28,8 +28,8 @@ import jax.numpy as jnp
 import torch
 
 from orbit_wars_pt.batched_env import obs_jax_to_torch
-from orbit_wars_pt.constants import MAX_PLANETS
-from orbit_wars_pt.micro_jax import compute_pair_geom_and_etas
+from orbit_wars_pt.constants import FRACTIONS, MAX_PLANETS
+from orbit_wars_pt.micro_jax import selected_origin_fraction_targets_batched
 from orbit_wars_pt.model import OrbitWarsPolicy
 from orbit_wars_pt.observation_jax import build_observation_batched_jax_per_ego
 
@@ -42,8 +42,8 @@ def _compute_logp_value_entropy_torch(
     rope_pos: torch.Tensor,
     entity_mask: torch.Tensor,
     planet_mask: torch.Tensor,
-    pair_geom: torch.Tensor,
-    etas: torch.Tensor,
+    target_valid: torch.Tensor,
+    target_overflow: torch.Tensor,
     halt_action: torch.Tensor,
     pair_flat: torch.Tensor,
     frac_idx: torch.Tensor,
@@ -59,7 +59,7 @@ def _compute_logp_value_entropy_torch(
     Categorical's Python ``_validate_args`` and lazy ``probs`` / ``logits``
     caching trigger graph breaks under ``torch.compile``, splitting an
     otherwise-fusable region. The math is identical: for masked variants
-    (pair, frac) the masked positions get ``logits = -1e4`` before
+    (origin/fraction, target) the masked positions get ``logits = -1e4`` before
     ``log_softmax``, so their probabilities underflow to 0 and contribute
     0 to the entropy ``-sum(p * lp)`` (no nan / -inf hazard).
     """
@@ -78,48 +78,45 @@ def _compute_logp_value_entropy_torch(
     new_halt_logp = halt_lp.gather(1, halt_action[:, None]).squeeze(-1)
     new_halt_entropy = -(halt_lp.exp() * halt_lp).sum(dim=-1)
 
-    pair_mask_combined = out["pair_mask"] & pair_geom
-    flat_mask = pair_mask_combined.flatten(start_dim=1)
-    flat_logits = out["pair_logits"].flatten(start_dim=1)
-    masked_pair = flat_logits.masked_fill(~flat_mask, -1e4)
-    flat_lp = torch.log_softmax(masked_pair, dim=-1)
-    new_pair_logp = flat_lp.gather(1, pair_flat[:, None]).squeeze(-1)
-    new_pair_entropy = -(flat_lp.exp() * flat_lp).sum(dim=-1)
-
-    pair_used = (halt_action == 0) & ~no_valid_pairs
     P = MAX_PLANETS
     o_idx = pair_flat // P
     d_idx = pair_flat % P
+    origin_frac_flat = o_idx * len(FRACTIONS) + frac_idx
 
-    planet_ships = features[:, 1 : 1 + P, 1] * 1000.0
-    ships_avail = planet_ships.gather(1, o_idx[:, None]).squeeze(-1)
-    fracs_t = policy._frac_const  # registered buffer (no per-call upload)
-    sends = torch.floor(fracs_t[None, :] * ships_avail[:, None])
-    frac_mask = sends >= 1.0
+    origin_frac_mask = out["origin_frac_mask"]
+    origin_frac_logits = out["origin_frac_logits"].flatten(start_dim=1)
+    origin_frac_mask_flat = origin_frac_mask.flatten(start_dim=1)
+    masked_origin_frac = origin_frac_logits.masked_fill(~origin_frac_mask_flat, -1e4)
+    origin_frac_lp = torch.log_softmax(masked_origin_frac, dim=-1)
+    new_origin_frac_logp = origin_frac_lp.gather(1, origin_frac_flat[:, None]).squeeze(-1)
+    new_origin_frac_entropy = -(origin_frac_lp.exp() * origin_frac_lp).sum(dim=-1)
 
     mb = halt_action.shape[0]
     n_idx = torch.arange(mb, device=halt_action.device)
-    eta_chosen = etas[n_idx, o_idx, d_idx]
-    times_norm = eta_chosen / 500.0
-
     ph = out["planet_hidden"]
-    frac_logits = policy.fraction_logits(ph, o_idx, d_idx, times_norm)
-    masked_frac = frac_logits.masked_fill(~frac_mask, -1e4)
-    frac_lp = torch.log_softmax(masked_frac, dim=-1)
-    new_frac_logp = frac_lp.gather(1, frac_idx[:, None]).squeeze(-1)
-    new_frac_entropy = -(frac_lp.exp() * frac_lp).sum(dim=-1)
+    target_logits = policy.target_logits_for_origin_fraction(ph, o_idx, frac_idx)
+    target_mask = (
+        out["pair_mask"][n_idx, o_idx, :]
+        & target_valid
+        & ~target_overflow[:, None].to(dtype=torch.bool)
+    )
+    masked_target = target_logits.masked_fill(~target_mask, -1e4)
+    target_lp = torch.log_softmax(masked_target, dim=-1)
+    new_target_logp = target_lp.gather(1, d_idx[:, None]).squeeze(-1)
+    new_target_entropy = -(target_lp.exp() * target_lp).sum(dim=-1)
 
-    frac_used = pair_used & ~no_valid_fracs
+    origin_frac_used = (halt_action == 0) & ~no_valid_fracs
+    target_used = origin_frac_used & ~no_valid_pairs
 
     new_logp = (
         new_halt_logp
-        + pair_used.float() * new_pair_logp
-        + frac_used.float() * new_frac_logp
+        + origin_frac_used.float() * new_origin_frac_logp
+        + target_used.float() * new_target_logp
     )
     new_entropy = (
         new_halt_entropy
-        + pair_used.float() * new_pair_entropy
-        + frac_used.float() * new_frac_entropy
+        + origin_frac_used.float() * new_origin_frac_entropy
+        + target_used.float() * new_target_entropy
     )
     # Cast value back to fp32 at the autocast boundary: the value-clip
     # baseline (``old_v``) and target (``returns``) are fp32, and we want
@@ -136,8 +133,8 @@ def compute_ppo_loss_torch(
     rope_pos: torch.Tensor,
     entity_mask: torch.Tensor,
     planet_mask: torch.Tensor,
-    pair_geom: torch.Tensor,
-    etas: torch.Tensor,
+    target_valid: torch.Tensor,
+    target_overflow: torch.Tensor,
     halt_action: torch.Tensor,
     pair_flat: torch.Tensor,
     frac_idx: torch.Tensor,
@@ -192,8 +189,8 @@ def compute_ppo_loss_torch(
         rope_pos,
         entity_mask,
         planet_mask,
-        pair_geom,
-        etas,
+        target_valid,
+        target_overflow,
         halt_action,
         pair_flat,
         frac_idx,
@@ -264,14 +261,22 @@ def _jax_preamble_to_torch(
 
     t0 = perf_counter()
     obs_jax = build_observation_batched_jax_per_ego(state_b, ego_b, ship_speed)
-    pair_geom_j, etas_j = compute_pair_geom_and_etas(state_b, ship_speed)
+    origin_idx = pair_flat // MAX_PLANETS
+    _angle_j, _width_j, target_valid_j, overflow_j = selected_origin_fraction_targets_batched(
+        state_b,
+        origin_idx.astype(jnp.int32),
+        frac_idx.astype(jnp.int32),
+        horizon=24,
+        ship_speed=ship_speed,
+        samples_per_span=17,
+    )
     if timing is not None:
         timing.replay_jax_s += perf_counter() - t0
 
     t0 = perf_counter()
     obs_torch = obs_jax_to_torch(obs_jax)
-    pair_geom_t = torch.from_dlpack(pair_geom_j)
-    etas_t = torch.from_dlpack(etas_j)
+    target_valid_t = torch.from_dlpack(target_valid_j)
+    target_overflow_t = torch.from_dlpack(overflow_j)
     halt_action_t = torch.from_dlpack(halt_action).to(torch.long)
     pair_flat_t = torch.from_dlpack(pair_flat).to(torch.long)
     frac_idx_t = torch.from_dlpack(frac_idx).to(torch.long)
@@ -282,8 +287,8 @@ def _jax_preamble_to_torch(
 
     return (
         obs_torch,
-        pair_geom_t,
-        etas_t,
+        target_valid_t,
+        target_overflow_t,
         halt_action_t,
         pair_flat_t,
         frac_idx_t,
@@ -315,8 +320,8 @@ def replay_logprob_value_entropy_jax(
 
     (
         obs_torch,
-        pair_geom_t,
-        etas_t,
+        target_valid_t,
+        target_overflow_t,
         halt_action_t,
         pair_flat_t,
         frac_idx_t,
@@ -342,8 +347,8 @@ def replay_logprob_value_entropy_jax(
         obs_torch["rope_pos"],
         obs_torch["entity_mask"],
         obs_torch["planet_mask"],
-        pair_geom_t,
-        etas_t,
+        target_valid_t,
+        target_overflow_t,
         halt_action_t,
         pair_flat_t,
         frac_idx_t,
@@ -394,8 +399,8 @@ def replay_ppo_loss(
 
     (
         obs_torch,
-        pair_geom_t,
-        etas_t,
+        target_valid_t,
+        target_overflow_t,
         halt_action_t,
         pair_flat_t,
         frac_idx_t,
@@ -432,8 +437,8 @@ def replay_ppo_loss(
             obs_torch["rope_pos"],
             obs_torch["entity_mask"],
             obs_torch["planet_mask"],
-            pair_geom_t,
-            etas_t,
+            target_valid_t,
+            target_overflow_t,
             halt_action_t,
             pair_flat_t,
             frac_idx_t,

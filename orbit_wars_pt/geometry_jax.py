@@ -401,9 +401,11 @@ def first_hit_intervals_jax(
     order; board and sun blockers are appended after each tick.
     """
 
-    ticks = object_active_by_tick.shape[0]
-    objects = object_active_by_tick.shape[1]
+    ticks = int(object_active_by_tick.shape[0])
+    objects = int(object_active_by_tick.shape[1])
     order = tuple(range(objects)) if object_order is None else tuple(object_order)
+    num_order = len(order)
+    order_arr = jnp.asarray(order, dtype=jnp.int32)
     target_idx_j = jnp.asarray(target_idx)
 
     block_lo, block_hi, block_valid = _empty(max_block_intervals, origin_xy.dtype)
@@ -412,17 +414,34 @@ def first_hit_intervals_jax(
     valid_count = jnp.asarray(0, dtype=jnp.int32)
     overflow = jnp.asarray(False)
 
-    for tick_i in range(ticks):
-        for obj_idx in order:
+    def outer_body(tick_i, carry):
+        block_lo, block_hi, block_valid, block_count, valid_lo, valid_hi, valid_valid, valid_count, overflow = (
+            carry
+        )
+
+        def inner_body(k, inner):
+            (
+                block_lo,
+                block_hi,
+                block_valid,
+                block_count,
+                valid_lo,
+                valid_hi,
+                valid_valid,
+                valid_count,
+                overflow,
+            ) = inner
+            obj_idx = order_arr[k]
+            tick = jnp.asarray(tick_i, dtype=jnp.int32)
             hit_lo, hit_hi, hit_valid = tick_hit_intervals_jax(
                 origin_xy,
                 origin_radius,
                 speed,
-                jnp.asarray(tick_i, dtype=jnp.int32),
-                object_p0_by_tick[tick_i, obj_idx],
-                object_p1_by_tick[tick_i, obj_idx],
+                tick,
+                object_p0_by_tick[tick, obj_idx],
+                object_p1_by_tick[tick, obj_idx],
                 object_radii[obj_idx],
-                object_active_by_tick[tick_i, obj_idx],
+                object_active_by_tick[tick, obj_idx],
                 samples_per_span=samples_per_span,
             )
             avail_lo, avail_hi, avail_valid = _set_subtract_cells(
@@ -442,9 +461,45 @@ def first_hit_intervals_jax(
                 block_lo, block_hi, block_valid, block_count, hit_lo, hit_hi, hit_valid
             )
             overflow = overflow | valid_overflow | block_overflow
+            return (
+                block_lo,
+                block_hi,
+                block_valid,
+                block_count,
+                valid_lo,
+                valid_hi,
+                valid_valid,
+                valid_count,
+                overflow,
+            )
+
+        inner_init = (
+            block_lo,
+            block_hi,
+            block_valid,
+            block_count,
+            valid_lo,
+            valid_hi,
+            valid_valid,
+            valid_count,
+            overflow,
+        )
+        (
+            block_lo,
+            block_hi,
+            block_valid,
+            block_count,
+            valid_lo,
+            valid_hi,
+            valid_valid,
+            valid_count,
+            overflow,
+        ) = jax.lax.fori_loop(0, num_order, inner_body, inner_init)
+
+        tick = jnp.asarray(tick_i, dtype=jnp.int32)
         if include_board:
             b_lo, b_hi, b_valid = _board_exit_intervals_jax(
-                origin_xy, origin_radius, speed, jnp.asarray(tick_i, dtype=jnp.int32), board_size
+                origin_xy, origin_radius, speed, tick, board_size
             )
             block_lo, block_hi, block_valid, block_count, block_overflow = _append(
                 block_lo, block_hi, block_valid, block_count, b_lo, b_hi, b_valid
@@ -456,7 +511,7 @@ def first_hit_intervals_jax(
                 origin_xy,
                 origin_radius,
                 speed,
-                jnp.asarray(tick_i, dtype=jnp.int32),
+                tick,
                 sun_xy,
                 sun_xy,
                 jnp.asarray(sun_radius - 1e-9, dtype=origin_xy.dtype),
@@ -467,7 +522,168 @@ def first_hit_intervals_jax(
                 block_lo, block_hi, block_valid, block_count, s_lo, s_hi, s_valid
             )
             overflow = overflow | block_overflow
+        return (
+            block_lo,
+            block_hi,
+            block_valid,
+            block_count,
+            valid_lo,
+            valid_hi,
+            valid_valid,
+            valid_count,
+            overflow,
+        )
+
+    init_carry = (
+        block_lo,
+        block_hi,
+        block_valid,
+        block_count,
+        valid_lo,
+        valid_hi,
+        valid_valid,
+        valid_count,
+        overflow,
+    )
+    (
+        block_lo,
+        block_hi,
+        block_valid,
+        block_count,
+        valid_lo,
+        valid_hi,
+        valid_valid,
+        valid_count,
+        overflow,
+    ) = jax.lax.fori_loop(0, ticks, outer_body, init_carry)
     return valid_lo, valid_hi, valid_valid, overflow
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "object_order",
+        "include_board",
+        "include_sun",
+        "board_size",
+        "sun_radius",
+        "samples_per_span",
+        "max_block_intervals",
+    ),
+)
+def first_hit_best_targets_jax(
+    origin_xy: jnp.ndarray,
+    origin_radius: jnp.ndarray,
+    speed: jnp.ndarray,
+    object_p0_by_tick: jnp.ndarray,
+    object_p1_by_tick: jnp.ndarray,
+    object_radii: jnp.ndarray,
+    object_active_by_tick: jnp.ndarray,
+    *,
+    object_order: Sequence[int] | None = None,
+    include_board: bool = True,
+    include_sun: bool = True,
+    board_size: float = BOARD_SIZE,
+    sun_radius: float = SUN_RADIUS,
+    samples_per_span: int = 9,
+    max_block_intervals: int = 32,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Sweep once and return the widest first-hit interval midpoint per target.
+
+    Outputs are ``(angle[P], width[P], valid[P], overflow)``. This is the
+    rollout-friendly variant: each ``available = hit - blocked`` interval set
+    is already the set of angles that hit that object first, so we record the
+    widest available cell for every object instead of recomputing the sweep per
+    target.
+    """
+
+    ticks = int(object_active_by_tick.shape[0])
+    objects = int(object_active_by_tick.shape[1])
+    order = tuple(range(objects)) if object_order is None else tuple(object_order)
+    num_order = len(order)
+    order_arr = jnp.asarray(order, dtype=jnp.int32)
+
+    block_lo, block_hi, block_valid = _empty(max_block_intervals, origin_xy.dtype)
+    block_count = jnp.asarray(0, dtype=jnp.int32)
+    best_angle = jnp.zeros((objects,), dtype=origin_xy.dtype)
+    best_width = jnp.zeros((objects,), dtype=origin_xy.dtype)
+    overflow = jnp.asarray(False)
+
+    def outer_body(tick_i, carry):
+        block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow = carry
+
+        def inner_body(k, inner):
+            block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow = inner
+            obj_idx = order_arr[k]
+            tick = jnp.asarray(tick_i, dtype=jnp.int32)
+            hit_lo, hit_hi, hit_valid = tick_hit_intervals_jax(
+                origin_xy,
+                origin_radius,
+                speed,
+                tick,
+                object_p0_by_tick[tick, obj_idx],
+                object_p1_by_tick[tick, obj_idx],
+                object_radii[obj_idx],
+                object_active_by_tick[tick, obj_idx],
+                samples_per_span=samples_per_span,
+            )
+            avail_lo, avail_hi, avail_valid = _set_subtract_cells(
+                hit_lo, hit_hi, hit_valid, block_lo, block_hi, block_valid
+            )
+            widths = jnp.where(avail_valid, avail_hi - avail_lo, -1.0)
+            idx = jnp.argmax(widths)
+            width = widths[idx]
+            update = width > best_width[obj_idx]
+            midpoint = _norm_angle(0.5 * (avail_lo[idx] + avail_hi[idx]))
+            best_angle = best_angle.at[obj_idx].set(jnp.where(update, midpoint, best_angle[obj_idx]))
+            best_width = best_width.at[obj_idx].set(jnp.where(update, width, best_width[obj_idx]))
+
+            block_lo, block_hi, block_valid, block_count, block_overflow = _append(
+                block_lo, block_hi, block_valid, block_count, hit_lo, hit_hi, hit_valid
+            )
+            overflow = overflow | block_overflow
+            return (block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow)
+
+        inner_init = (block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow)
+        block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow = jax.lax.fori_loop(
+            0, num_order, inner_body, inner_init
+        )
+
+        tick = jnp.asarray(tick_i, dtype=jnp.int32)
+        if include_board:
+            b_lo, b_hi, b_valid = _board_exit_intervals_jax(
+                origin_xy, origin_radius, speed, tick, board_size
+            )
+            block_lo, block_hi, block_valid, block_count, block_overflow = _append(
+                block_lo, block_hi, block_valid, block_count, b_lo, b_hi, b_valid
+            )
+            overflow = overflow | block_overflow
+        if include_sun:
+            sun_xy = jnp.asarray([CENTER, CENTER], dtype=origin_xy.dtype)
+            s_lo, s_hi, s_valid = tick_hit_intervals_jax(
+                origin_xy,
+                origin_radius,
+                speed,
+                tick,
+                sun_xy,
+                sun_xy,
+                jnp.asarray(sun_radius - 1e-9, dtype=origin_xy.dtype),
+                jnp.asarray(True),
+                samples_per_span=samples_per_span,
+            )
+            block_lo, block_hi, block_valid, block_count, block_overflow = _append(
+                block_lo, block_hi, block_valid, block_count, s_lo, s_hi, s_valid
+            )
+            overflow = overflow | block_overflow
+        return (block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow)
+
+    init_carry = (block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow)
+    block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow = jax.lax.fori_loop(
+        0, ticks, outer_body, init_carry
+    )
+
+    valid = best_width > GEOM_EPS
+    return best_angle, best_width, valid, overflow
 
 
 batched_first_hit_intervals_jax = jax.vmap(
