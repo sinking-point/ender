@@ -1,0 +1,21 @@
+# Install frameworks first (do not use only the PyTorch index for this file — PyPI is needed below).
+#
+# --- PyTorch (CUDA): match your driver ---
+# https://pytorch.org/get-started/locally/
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+#
+# --- JAX (CUDA): JAX 0.10+ uses plugins; `jax[cuda12_pip]` is obsolete ---
+# https://jax.readthedocs.io/en/latest/installation.html
+# Example (CUDA 12.x):
+#   pip install -U "jax[cuda12]"
+#
+# After install:
+#   python -c "import jax; print(jax.devices())"
+#   python -c "import torch; print(torch.cuda.get_device_name(0))"
+#
+# --- Rest (from PyPI) ---
+numpy>=1.24
+jax>=0.4.28
+tensorboard>=2.14
+# PyPI latest is still 1.x (there is no 2.x on PyPI); Orbit Wars lives under kaggle_environments.envs.orbit_wars
+kaggle-environments>=1.22

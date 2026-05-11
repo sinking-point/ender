@@ -1,0 +1,335 @@
+"""NumPy observation tensors for the policy (ego framed as player 0)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+from typing import Any, Dict, List, Tuple
+
+import jax
+import numpy as np
+
+from jax_orbit_wars import OrbitWarsConfig
+
+from orbit_wars_pt.constants import (
+    BOARD_SIZE,
+    CENTER,
+    ENTITY_CLS,
+    ENTITY_COMET,
+    ENTITY_FLEET,
+    ENTITY_PLANET,
+    MAX_FLEET_TOKENS,
+    MAX_PLANETS,
+    NUM_OWNER_SLOTS,
+)
+from orbit_wars_pt.geometry import (
+    first_planet_hit_along_ray,
+    fleet_speed,
+    launch_point,
+    planet_pred_velocity,
+)
+
+
+def _cls_turn_fraction(step_count: int) -> float:
+    """Fraction of the way to the env step limit (for value bootstrapping / timeouts)."""
+
+    ep = int(np.asarray(jax.device_get(OrbitWarsConfig().episode_steps)))
+    denom = max(ep - 2, 1)
+    return float(np.clip(float(step_count) / float(denom), 0.0, 1.0))
+
+
+def _remap_owner(owner: float, ego: int, num_agents: int) -> int:
+    o = int(owner)
+    if o < 0:
+        return 0  # neutral bucket
+    if o == ego:
+        return 1  # self
+    # 2p: single enemy bucket; 4p-ready: distinct opponent ids 2..num_agents
+    if num_agents <= 2:
+        return 2
+    # compress other players to slots 2..num_agents (reserve 0 neutral 1 self)
+    if o < ego:
+        return 2 + o
+    return 2 + (o - 1)
+
+
+@dataclass
+class ObservationBatch:
+    entity_type: np.ndarray  # [L] int64
+    owner_idx: np.ndarray  # [L] int64
+    features: np.ndarray  # [L, F]
+    rope_pos: np.ndarray  # [L, 3] float32 (x, y, time) scaled ~ O(1)
+    entity_mask: np.ndarray  # [L] bool — True where token is real
+    planet_mask: np.ndarray  # [L] bool — planet slots (incl. inactive padding)
+    cls_index: int
+    planet_positions: np.ndarray  # [P, 2] for masking / updates
+    planet_ids: np.ndarray  # [P] float planet id per slot
+    planet_idx_by_id: Dict[float, int]
+    ego_player: int
+    num_planets: int  # physical slots P == MAX_PLANETS
+
+
+def build_observation(
+    state: Any,
+    ego_player: int,
+    *,
+    max_fleet_tokens: int = MAX_FLEET_TOKENS,
+    ship_speed: float = 6.0,
+) -> ObservationBatch:
+    """Builds a padded entity sequence `[CLS] + planets + fleets` from a JAX `OrbitWarsState` or numpy views."""
+
+    planets = np.asarray(state.planets)
+    planet_active = np.asarray(state.planet_active)
+    initial_planets = np.asarray(state.initial_planets)
+    initial_active = np.asarray(state.initial_active)
+    fleets = np.asarray(state.fleets)
+    fleet_active = np.asarray(state.fleet_active)
+    angular_velocity = float(np.asarray(state.angular_velocity))
+    step_count = int(np.asarray(state.step_count))
+    num_agents = int(np.asarray(state.num_agents))
+
+    comet_ids = np.asarray(state.comet_planet_ids)
+    comet_set = set(float(x) for x in comet_ids.flatten() if int(x) >= 0)
+
+    cls_index = 0
+    p_slots = MAX_PLANETS
+    planet_ids = planets[:p_slots, 0].astype(np.float64)
+    planet_xy = planets[:p_slots, 2:4].astype(np.float64)
+    planet_r = planets[:p_slots, 4].astype(np.float64)
+    planet_owner = planets[:p_slots, 1].astype(np.float64)
+    planet_ships = planets[:p_slots, 5].astype(np.float64)
+    planet_prod = planets[:p_slots, 6].astype(np.float64)
+    init_xy = initial_planets[:p_slots, 2:4].astype(np.float64)
+
+    planet_idx_by_id = {}
+    for i in range(p_slots):
+        if planet_active[i]:
+            planet_idx_by_id[float(planet_ids[i])] = i
+
+    cls_turn = _cls_turn_fraction(step_count)
+    cls_feat = np.zeros((8,), dtype=np.float32)
+    cls_feat[6] = np.float32(cls_turn)
+
+    types_list: List[int] = [ENTITY_CLS]
+    owner_list: List[int] = [1]
+    feat_list: List[np.ndarray] = [cls_feat]
+    rope_list: List[np.ndarray] = [np.array([CENTER / BOARD_SIZE, CENTER / BOARD_SIZE, 0.0], dtype=np.float32)]
+    mask_list: List[bool] = [True]
+    planet_mask_list: List[bool] = [False]
+
+    # Planet tokens occupy fixed indices 1 .. P_slots
+    for i in range(p_slots):
+        active = bool(planet_active[i])
+        pid = float(planet_ids[i])
+        is_comet = pid in comet_set
+        etype = ENTITY_COMET if is_comet else ENTITY_PLANET
+        ox = _remap_owner(planet_owner[i], ego_player, num_agents)
+
+        vx, vy = planet_pred_velocity(
+            init_xy[i],
+            planet_xy[i],
+            float(planet_r[i]),
+            angular_velocity,
+            step_count,
+            bool(initial_active[i]),
+            active,
+        )
+
+        if is_comet and active:
+            group_row = np.where(comet_ids == int(pid))
+            if group_row[0].size > 0:
+                g, k = int(group_row[0][0]), int(group_row[1][0])
+                paths = np.asarray(state.comet_paths[g, k])
+                lens = int(np.asarray(state.comet_path_lengths[g, k]))
+                idx = int(np.asarray(state.comet_path_index[g]))
+                if lens > 1 and 0 <= idx < lens - 1:
+                    p0 = paths[idx]
+                    p1 = paths[idx + 1]
+                    vx = float(p1[0] - p0[0])
+                    vy = float(p1[1] - p0[1])
+
+        feat = np.array(
+            [
+                np.log1p(max(planet_prod[i], 0.0)),
+                planet_ships[i] / 1000.0,
+                vx / 5.0,
+                vy / 5.0,
+                float(active),
+                float(planet_r[i]) / 10.0,
+                0.0,
+                0.0,
+            ],
+            dtype=np.float32,
+        )
+
+        xy = planet_xy[i] if active else np.zeros((2,), dtype=np.float64)
+        rope = np.array([float(xy[0]) / BOARD_SIZE, float(xy[1]) / BOARD_SIZE, 0.0], dtype=np.float32)
+
+        types_list.append(etype)
+        owner_list.append(min(ox, NUM_OWNER_SLOTS - 1))
+        feat_list.append(feat)
+        rope_list.append(rope)
+        mask_list.append(active)
+        planet_mask_list.append(True)
+
+    base_len = len(types_list)
+    fleet_insertions = 0
+
+    fleet_indices = np.where(fleet_active)[0]
+    for fi in fleet_indices:
+        if fleet_insertions >= max_fleet_tokens:
+            break
+        frow = fleets[fi]
+        oid = float(frow[5])
+        if oid not in planet_idx_by_id:
+            continue
+        origin_idx = planet_idx_by_id[oid]
+        fx, fy = float(frow[2]), float(frow[3])
+        ang = float(frow[4])
+        ships_f = float(frow[6])
+        hit_t, hit_pi = first_planet_hit_along_ray(
+            fx,
+            fy,
+            ang,
+            planet_xy.astype(np.float64),
+            planet_r.astype(np.float64),
+            planet_active.astype(bool),
+            exclude_idx=origin_idx,
+        )
+        if hit_t is None or hit_pi is None:
+            continue
+        dx, dy = np.cos(ang), np.sin(ang)
+        dest_x = fx + dx * hit_t
+        dest_y = fy + dy * hit_t
+        dst_xy = planet_xy[hit_pi]
+        # Token anchors at destination planet center; temporal offset ~ eta steps
+        sx, sy = launch_point(fx, fy, 0.25, dst_xy[0], dst_xy[1])
+        eta = estimate_eta_to_planet(sx, sy, ang, dst_xy[0], dst_xy[1], planet_r[hit_pi], ships_f, ship_speed)
+
+        ox = _remap_owner(float(frow[1]), ego_player, num_agents)
+        feat = np.zeros((8,), dtype=np.float32)
+        feat[0] = ships_f / 1000.0
+        feat[1] = float(hit_pi) / float(MAX_PLANETS)
+        rope = np.array(
+            [float(dst_xy[0]) / BOARD_SIZE, float(dst_xy[1]) / BOARD_SIZE, float(eta) / 500.0],
+            dtype=np.float32,
+        )
+
+        types_list.append(ENTITY_FLEET)
+        owner_list.append(min(ox, NUM_OWNER_SLOTS - 1))
+        feat_list.append(feat)
+        rope_list.append(rope)
+        mask_list.append(True)
+        planet_mask_list.append(False)
+        fleet_insertions += 1
+
+    L = len(types_list)
+    entity_type = np.asarray(types_list, dtype=np.int64)
+    owner_idx = np.asarray(owner_list, dtype=np.int64)
+    features = np.stack(feat_list, axis=0).astype(np.float32)
+    rope_pos = np.stack(rope_list, axis=0).astype(np.float32)
+    entity_mask = np.asarray(mask_list, dtype=np.bool_)
+    planet_mask = np.asarray(planet_mask_list, dtype=np.bool_)
+
+    return ObservationBatch(
+        entity_type=entity_type,
+        owner_idx=owner_idx,
+        features=features,
+        rope_pos=rope_pos,
+        entity_mask=entity_mask,
+        planet_mask=planet_mask,
+        cls_index=cls_index,
+        planet_positions=planet_xy.astype(np.float32),
+        planet_ids=planet_ids.astype(np.float32),
+        planet_idx_by_id=planet_idx_by_id,
+        ego_player=ego_player,
+        num_planets=p_slots,
+    )
+
+
+def estimate_eta_to_planet(
+    sx: float,
+    sy: float,
+    angle: float,
+    dest_x: float,
+    dest_y: float,
+    dest_r: float,
+    ships: float,
+    ship_speed: float,
+    max_steps: int = 600,
+) -> float:
+    x, y = sx, sy
+    sp = fleet_speed(ships, ship_speed)
+    for t in range(max_steps):
+        if math.hypot(x - dest_x, y - dest_y) <= dest_r + 0.05:
+            return float(t)
+        x += math.cos(angle) * sp
+        y += math.sin(angle) * sp
+        sp = fleet_speed(ships, ship_speed)
+        if x < 0 or x > BOARD_SIZE or y < 0 or y > BOARD_SIZE:
+            return 500.0
+    return 500.0
+
+
+def jax_state_to_numpy(state: Any) -> Any:
+    """Convert JAX `OrbitWarsState` leaves to NumPy (CPU)."""
+
+    def _to_np(x):
+        return np.asarray(jax.device_get(x))
+
+    if hasattr(state, "_replace"):
+        return state._replace(
+            planets=_to_np(state.planets),
+            planet_active=_to_np(state.planet_active),
+            initial_planets=_to_np(state.initial_planets),
+            initial_active=_to_np(state.initial_active),
+            fleets=_to_np(state.fleets),
+            fleet_active=_to_np(state.fleet_active),
+            comet_paths=_to_np(state.comet_paths),
+            comet_path_lengths=_to_np(state.comet_path_lengths),
+            comet_ships=_to_np(state.comet_ships),
+            comet_group_active=_to_np(state.comet_group_active),
+            comet_path_index=_to_np(state.comet_path_index),
+            comet_planet_ids=_to_np(state.comet_planet_ids),
+            comet_slots=_to_np(state.comet_slots),
+            next_fleet_id=_to_np(state.next_fleet_id),
+            angular_velocity=_to_np(state.angular_velocity),
+            step_count=_to_np(state.step_count),
+            num_agents=_to_np(state.num_agents),
+            rewards=_to_np(state.rewards),
+            done=_to_np(state.done),
+            overflow=_to_np(state.overflow),
+        )
+    return state
+
+
+def total_ship_ratio_scores(state_np: Any) -> Tuple[float, float, float]:
+    """Returns (ratio_ego0, ratio_ego1, total_ships) for 2 agents (ego ids 0 and 1)."""
+
+    planets = np.asarray(state_np.planets)
+    planet_active = np.asarray(state_np.planet_active)
+    fleets = np.asarray(state_np.fleets)
+    fleet_active = np.asarray(state_np.fleet_active)
+
+    scores = np.zeros((4,), dtype=np.float64)
+    total = 1e-6
+    for i in range(planets.shape[0]):
+        if not planet_active[i]:
+            continue
+        owner = int(planets[i, 1])
+        if owner < 0:
+            continue
+        sh = float(planets[i, 5])
+        scores[owner] += sh
+        total += sh
+    for i in range(fleets.shape[0]):
+        if not fleet_active[i]:
+            continue
+        owner = int(fleets[i, 1])
+        sh = float(fleets[i, 6])
+        scores[owner] += sh
+        total += sh
+
+    r0 = float(scores[0] / total)
+    r1 = float(scores[1] / total)
+    return r0, r1, float(total)

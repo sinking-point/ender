@@ -1,0 +1,460 @@
+"""JAX micro-step geometry and apply.
+
+Phase 3 of the JAX-exploitation rework. Replaces:
+
+* Host NumPy ``path_hits_sun_or_other_planet_before_dest`` /
+  ``estimate_time_to_hit`` (Euler integration, Python loops over planets).
+* The up-to-32 pair-resample retry loop in ``micro_step_apply``.
+* Per-env Python loop in the rollout that mutates ``virt`` in-place.
+
+The new closed-form pair-validity check evaluates ray-circle intersections
+analytically and is bit-identical across rollout and PPO replay (Phase 4).
+This makes ``pair_geom_valid`` ship-count-independent: once a pair is
+geometrically valid, any fraction with ``floor(frac * ships) >= 1`` is also
+valid. The rejection loop becomes redundant.
+"""
+
+from __future__ import annotations
+
+from functools import partial
+from typing import Tuple
+
+import jax
+import jax.numpy as jnp
+
+from jax_orbit_wars import (
+    OrbitWarsState,
+    PLANET_ID,
+    PLANET_OWNER,
+    PLANET_X,
+    PLANET_Y,
+    PLANET_RADIUS,
+    PLANET_SHIPS,
+    FLEET_OWNER,
+    FLEET_X,
+    FLEET_Y,
+    FLEET_ANGLE,
+    FLEET_FROM_PLANET,
+    FLEET_SHIPS,
+)
+
+from orbit_wars_pt.constants import (
+    BOARD_SIZE,
+    CENTER,
+    FRACTIONS,
+    MAX_PLANETS,
+    SUN_RADIUS,
+)
+
+
+_FRACTIONS_JAX = jnp.asarray(FRACTIONS, dtype=jnp.float32)
+
+
+def _fleet_speed_jax(ships: jnp.ndarray, max_speed: float) -> jnp.ndarray:
+    """Mirrors host ``fleet_speed``."""
+
+    safe = jnp.maximum(ships, 1.0)
+    log_s = jnp.log(safe)
+    log_1000 = jnp.log(1000.0)
+    factor = (log_s / log_1000) ** 1.5
+    speed = jnp.minimum(1.0 + (max_speed - 1.0) * factor, max_speed)
+    return jnp.where(ships <= 1.0, 1.0, speed)
+
+
+def _ray_circle_t(
+    launch_xy: jnp.ndarray,
+    direction: jnp.ndarray,
+    center_xy: jnp.ndarray,
+    eff_r: jnp.ndarray,
+) -> jnp.ndarray:
+    """Smallest non-negative ``t`` with ``|launch + t*direction - center| = eff_r``.
+
+    Returns ``inf`` if the ray never reaches the circle. ``direction`` must be
+    a unit vector (the caller normalises). All inputs broadcast over leading
+    dims.
+    """
+
+    f = launch_xy - center_xy
+    b = 2.0 * jnp.sum(f * direction, axis=-1)
+    c = jnp.sum(f * f, axis=-1) - eff_r * eff_r
+    disc = b * b - 4.0 * c
+    sd = jnp.sqrt(jnp.maximum(disc, 0.0))
+    t0 = (-b - sd) / 2.0
+    t1 = (-b + sd) / 2.0
+    valid = disc >= 0.0
+    return jnp.where(
+        valid & (t0 >= 0.0),
+        t0,
+        jnp.where(valid & (t1 >= 0.0), t1, jnp.inf),
+    )
+
+
+def _per_env_pair_geom_and_etas(
+    state: OrbitWarsState, ship_speed: float
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Returns ``(pair_geom_valid[P, P], etas[P, P, F])`` for one env.
+
+    ``pair_geom_valid[o, d] = True`` iff a fleet launched from planet ``o``
+    along the unit direction toward planet ``d`` reaches ``d``'s rim before
+    crossing the sun, another active planet, or the board boundary. The check
+    is closed-form (single ray-circle intersection per planet) and does not
+    depend on ship counts.
+
+    ``etas[o, d, k] = t_dest / fleet_speed(floor(FRACTIONS[k] * ships[o]))``,
+    clipped to ``[0, 500]`` for the policy's fraction-time input.
+    """
+
+    P = state.planets.shape[0]
+    xy = state.planets[:, PLANET_X:PLANET_Y + 1]
+    radius = state.planets[:, PLANET_RADIUS]
+    planet_active = state.planet_active
+    ships = state.planets[:, PLANET_SHIPS]
+
+    o_xy = xy[:, None, :]
+    d_xy = xy[None, :, :]
+    o_r = radius[:, None]
+    d_r = radius[None, :]
+
+    diff = d_xy - o_xy
+    dist2 = jnp.sum(diff * diff, axis=-1)
+    safe_dist = jnp.sqrt(jnp.maximum(dist2, 1e-12))
+    direction = diff / safe_dist[..., None]
+
+    launch = o_xy + (o_r[..., None] + 0.1) * direction
+
+    t_dest = _ray_circle_t(launch, direction, d_xy, d_r + 0.05)
+
+    sun_center = jnp.array([CENTER, CENTER], dtype=xy.dtype)
+    t_sun = _ray_circle_t(
+        launch, direction, sun_center[None, None, :], jnp.float32(SUN_RADIUS)
+    )
+
+    # Other-planet hits: [P_origin, P_dest, P_obstacle]. Mask out o, d, and inactive planets.
+    launch_e = launch[:, :, None, :]
+    direction_e = direction[:, :, None, :]
+    other_xy = xy[None, None, :, :]
+    other_r_eff = radius[None, None, :] + 0.02
+    f_o = launch_e - other_xy
+    b_o = 2.0 * jnp.sum(f_o * direction_e, axis=-1)
+    c_o = jnp.sum(f_o * f_o, axis=-1) - other_r_eff * other_r_eff
+    disc_o = b_o * b_o - 4.0 * c_o
+    sd_o = jnp.sqrt(jnp.maximum(disc_o, 0.0))
+    t0_o = (-b_o - sd_o) / 2.0
+    t1_o = (-b_o + sd_o) / 2.0
+    valid_o = disc_o >= 0.0
+    t_other_each = jnp.where(
+        valid_o & (t0_o >= 0.0),
+        t0_o,
+        jnp.where(valid_o & (t1_o >= 0.0), t1_o, jnp.inf),
+    )
+
+    P_idx = jnp.arange(P)
+    is_o = P_idx[:, None, None] == P_idx[None, None, :]
+    is_d = P_idx[None, :, None] == P_idx[None, None, :]
+    inactive = ~planet_active[None, None, :]
+    skip = is_o | is_d | inactive
+    t_other_each = jnp.where(skip, jnp.inf, t_other_each)
+    t_other = jnp.min(t_other_each, axis=-1)
+
+    # Board exit: smallest t at which x or y leaves [0, BOARD_SIZE].
+    eps = 1e-6
+    dx = direction[..., 0]
+    dy = direction[..., 1]
+    lx = launch[..., 0]
+    ly = launch[..., 1]
+    safe_dx = jnp.where(jnp.abs(dx) < eps, eps, dx)
+    safe_dy = jnp.where(jnp.abs(dy) < eps, eps, dy)
+    tx_pos = (BOARD_SIZE - lx) / safe_dx
+    tx_neg = -lx / safe_dx
+    ty_pos = (BOARD_SIZE - ly) / safe_dy
+    ty_neg = -ly / safe_dy
+    tx = jnp.where(dx > 0, tx_pos, jnp.where(dx < 0, tx_neg, jnp.inf))
+    ty = jnp.where(dy > 0, ty_pos, jnp.where(dy < 0, ty_neg, jnp.inf))
+    t_board = jnp.minimum(tx, ty)
+
+    pair_geom_valid = (
+        jnp.isfinite(t_dest)
+        & (t_dest <= t_sun)
+        & (t_dest <= t_other)
+        & (t_dest <= t_board)
+    )
+    eye = jnp.eye(P, dtype=bool)
+    pair_geom_valid = pair_geom_valid & ~eye
+
+    sends = jnp.floor(_FRACTIONS_JAX[None, :] * ships[:, None])  # [P, F]
+    speeds = _fleet_speed_jax(sends, ship_speed)
+    safe_t = jnp.where(jnp.isfinite(t_dest), t_dest, 500.0)
+    safe_speeds = jnp.maximum(speeds, 1e-6)
+    etas = safe_t[:, :, None] / safe_speeds[:, None, :]
+    etas = jnp.clip(etas, 0.0, 500.0)
+
+    return pair_geom_valid, etas
+
+
+@partial(jax.jit, static_argnames=("ship_speed",))
+def compute_pair_geom_and_etas(
+    state: OrbitWarsState, ship_speed: float = 6.0
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Vmap'd over ``num_envs``. Returns ``(pair_geom_valid[N, P, P], etas[N, P, P, F])``."""
+
+    return jax.vmap(lambda s: _per_env_pair_geom_and_etas(s, ship_speed))(state)
+
+
+@jax.jit
+def must_halt_no_owned_ships_batched(state: OrbitWarsState, ego: jnp.ndarray) -> jnp.ndarray:
+    """``[N]`` bool. ``ego`` is a JAX scalar (int32) shared across envs."""
+
+    owners = state.planets[..., PLANET_OWNER].astype(jnp.int32)
+    ships = state.planets[..., PLANET_SHIPS]
+    active = state.planet_active
+    matches = active & (owners == ego) & (ships > 0.0)
+    summed = jnp.sum(jnp.where(matches, ships, 0.0), axis=-1)
+    return summed < 1.0 - 1e-6
+
+
+@jax.jit
+def must_halt_no_owned_ships_per_ego(
+    state: OrbitWarsState, ego_b: jnp.ndarray
+) -> jnp.ndarray:
+    """``[N]`` bool. ``ego_b`` is ``[N] int32`` — per-env ego (used at PPO replay)."""
+
+    owners = state.planets[..., PLANET_OWNER].astype(jnp.int32)
+    ships = state.planets[..., PLANET_SHIPS]
+    active = state.planet_active
+    matches = active & (owners == ego_b[:, None]) & (ships > 0.0)
+    summed = jnp.sum(jnp.where(matches, ships, 0.0), axis=-1)
+    return summed < 1.0 - 1e-6
+
+
+def _per_env_apply_one(
+    state: OrbitWarsState,
+    ego: jnp.ndarray,
+    halt_now: jnp.ndarray,
+    pair_flat: jnp.ndarray,
+    frac_idx: jnp.ndarray,
+):
+    """Single env update; vmap'd over the leading axis.
+
+    Returns ``(new_state, oid, angle, send, dispatched, slot_out)``. When ``halt_now`` is
+    True the state is unchanged and ``dispatched`` is False; ``oid``/``angle``/
+    ``send`` are still finite (they fall through gated arithmetic) but should
+    not be appended to the action buffer by the caller. ``slot_out`` is ``-1``
+    when no fleet row is written.
+    """
+
+    P = MAX_PLANETS
+    o_idx = pair_flat // P
+    d_idx = pair_flat % P
+
+    ships_avail = state.planets[o_idx, PLANET_SHIPS]
+    frac_chosen = _FRACTIONS_JAX[frac_idx]
+    send = jnp.floor(frac_chosen * ships_avail)
+    send = jnp.maximum(send, 1.0)
+    send = jnp.minimum(send, ships_avail)
+
+    o_xy = state.planets[o_idx, PLANET_X:PLANET_Y + 1]
+    d_xy = state.planets[d_idx, PLANET_X:PLANET_Y + 1]
+    o_r = state.planets[o_idx, PLANET_RADIUS]
+    oid = state.planets[o_idx, PLANET_ID]
+
+    diff = d_xy - o_xy
+    dist = jnp.sqrt(jnp.maximum(jnp.sum(diff * diff), 1e-12))
+    direction = diff / dist
+    angle = jnp.arctan2(direction[1], direction[0])
+    sx = o_xy[0] + direction[0] * (o_r + 0.1)
+    sy = o_xy[1] + direction[1] * (o_r + 0.1)
+
+    not_active = ~state.fleet_active
+    has_slot = jnp.any(not_active)
+    slot = jnp.argmax(not_active.astype(jnp.int32))
+
+    update_state = ~halt_now
+    write_fleet = update_state & has_slot
+
+    ship_col = state.planets[:, PLANET_SHIPS]
+    ship_col_after = ship_col.at[o_idx].add(-jnp.where(update_state, send, 0.0))
+    new_planets = state.planets.at[:, PLANET_SHIPS].set(ship_col_after)
+
+    new_row = jnp.array(
+        [
+            0.0,
+            ego.astype(state.fleets.dtype),
+            sx,
+            sy,
+            angle,
+            oid,
+            send,
+        ],
+        dtype=state.fleets.dtype,
+    )
+
+    new_fleets = jnp.where(
+        write_fleet,
+        state.fleets.at[slot].set(new_row),
+        state.fleets,
+    )
+    new_fleet_active = jnp.where(
+        write_fleet,
+        state.fleet_active.at[slot].set(True),
+        state.fleet_active,
+    )
+
+    new_state = state._replace(
+        planets=new_planets,
+        fleets=new_fleets,
+        fleet_active=new_fleet_active,
+    )
+
+    slot_out = jnp.where(
+        write_fleet, slot.astype(jnp.int32), jnp.full((), -1, dtype=jnp.int32)
+    )
+    return new_state, oid, angle, send, write_fleet, slot_out
+
+
+@jax.jit
+def apply_micro_step_batched(
+    state: OrbitWarsState,
+    ego: jnp.ndarray,
+    halt_now: jnp.ndarray,
+    pair_flat: jnp.ndarray,
+    frac_idx: jnp.ndarray,
+):
+    """Vmap'd over ``num_envs``.
+
+    Returns ``(new_state, oid[N], angle[N], send[N], dispatched[N], slot[N])``. ``ego``
+    is a scalar broadcast across envs. ``slot`` is the fleet row written, or ``-1``.
+    """
+
+    return jax.vmap(_per_env_apply_one, in_axes=(0, None, 0, 0, 0))(
+        state, ego, halt_now, pair_flat, frac_idx
+    )
+
+
+@jax.jit
+def apply_micro_step_batched_masked(
+    state: OrbitWarsState,
+    ego_b: jnp.ndarray,
+    halt_now: jnp.ndarray,
+    pair_flat: jnp.ndarray,
+    frac_idx: jnp.ndarray,
+    apply: jnp.ndarray,
+):
+    """Like ``apply_micro_step_batched`` but per-batch ``ego_b`` and optional ``apply`` mask.
+
+    Leaves have leading batch axis ``B`` (one env-state per sample). ``apply[b]`` selects
+    whether micro-step ``b`` runs; otherwise that slice is unchanged.
+    """
+
+    new_state, _, _, _, _, _ = jax.vmap(_per_env_apply_one, in_axes=(0, 0, 0, 0, 0))(
+        state, ego_b, halt_now, pair_flat, frac_idx
+    )
+
+    def _blend(new_leaf, old_leaf):
+        a = apply.astype(jnp.bool_)
+        for _ in range(old_leaf.ndim - 1):
+            a = a[..., None]
+        return jnp.where(a, new_leaf, old_leaf)
+
+    return jax.tree.map(_blend, new_state, state)
+
+
+def _fleet_rows_from_pair_batched(
+    planets_bp: jnp.ndarray,
+    ego_b: jnp.ndarray,
+    pair_flat_b: jnp.ndarray,
+    send_b: jnp.ndarray,
+    dispatch_b: jnp.ndarray,
+    dtype: jnp.dtype,
+) -> jnp.ndarray:
+    """Build fleet row tensors matching ``_per_env_apply_one`` (launch geometry from planets)."""
+
+    bsz = planets_bp.shape[0]
+    p = MAX_PLANETS
+    o_idx = pair_flat_b // p
+    d_idx = pair_flat_b % p
+    b_lin = jnp.arange(bsz, dtype=jnp.int32)
+    o_xy = planets_bp[b_lin, o_idx, PLANET_X : PLANET_Y + 1]
+    d_xy = planets_bp[b_lin, d_idx, PLANET_X : PLANET_Y + 1]
+    o_r = planets_bp[b_lin, o_idx, PLANET_RADIUS]
+    oid = planets_bp[b_lin, o_idx, PLANET_ID]
+    diff = d_xy - o_xy
+    dist = jnp.sqrt(jnp.maximum(jnp.sum(diff * diff, axis=-1), 1e-12))
+    direction = diff / dist[..., None]
+    angle = jnp.arctan2(direction[:, 1], direction[:, 0])
+    sx = o_xy[:, 0] + direction[:, 0] * (o_r + 0.1)
+    sy = o_xy[:, 1] + direction[:, 1] * (o_r + 0.1)
+    send_eff = jnp.where(dispatch_b, send_b, jnp.zeros_like(send_b))
+    return jnp.stack(
+        [
+            jnp.zeros(bsz, dtype=dtype),
+            ego_b.astype(dtype),
+            sx,
+            sy,
+            angle,
+            oid,
+            send_eff,
+        ],
+        axis=-1,
+    )
+
+
+@partial(jax.jit, static_argnames=("max_micro_steps",))
+def apply_prefix_micro_deltas_batched(
+    state: OrbitWarsState,
+    ego_b: jnp.ndarray,
+    max_micro_steps: int,
+    micro_halt: jnp.ndarray,
+    send_m: jnp.ndarray,
+    slot_m: jnp.ndarray,
+    pair_flat_m: jnp.ndarray,
+    frac_idx_m: jnp.ndarray,
+    apply_mask_m: jnp.ndarray,
+) -> OrbitWarsState:
+    """Apply up to ``max_micro_steps`` closed micro deltas in one pass (planet scatter + fleet writes).
+
+    Shapes: ``ego_b`` ``[B]``; ``micro_halt``, ``send_m``, ``slot_m``, ``pair_flat_m``,
+    ``frac_idx_m``, ``apply_mask_m`` are ``[B, M]``.  ``frac_idx_m`` is carried for parity
+    with rollout storage; ship deductions use stored ``send_m``.  ``apply_mask_m`` marks
+    which prefix slots run (typically ``k < phase_micro_idx`` for pre-action replay).
+    """
+
+    del frac_idx_m  # stored for replay parity; send_m is authoritative
+    p = MAX_PLANETS
+    dispatch_bm = apply_mask_m.astype(jnp.bool_) & (~micro_halt.astype(jnp.bool_))
+    send_eff = jnp.where(dispatch_bm, send_m, jnp.zeros_like(send_m))
+    o_idx_m = pair_flat_m // p
+    one_hot = jax.nn.one_hot(o_idx_m, p, axis=-1)
+    deduct = jnp.einsum("bmp,bm->bp", one_hot, send_eff)
+    ship_col = state.planets[..., PLANET_SHIPS]
+    new_ships = ship_col - deduct
+    new_planets = state.planets.at[..., PLANET_SHIPS].set(new_ships)
+
+    dtype = state.fleets.dtype
+
+    def body(k, carry):
+        fleets, active = carry
+        dispatch = dispatch_bm[:, k]
+        sl = slot_m[:, k]
+        rows = _fleet_rows_from_pair_batched(
+            new_planets,
+            ego_b,
+            pair_flat_m[:, k],
+            send_m[:, k],
+            dispatch,
+            dtype,
+        )
+
+        def write_f(f, _a, d, s, r):
+            return jnp.where(d & (s >= 0), f.at[s].set(r), f)
+
+        new_f = jax.vmap(write_f)(fleets, active, dispatch, sl, rows)
+
+        def write_a(a, d, s):
+            return jnp.where(d & (s >= 0), a.at[s].set(True), a)
+
+        new_a = jax.vmap(write_a)(active, dispatch, sl)
+        return new_f, new_a
+
+    fleets0, active0 = state.fleets, state.fleet_active
+    fleets1, active1 = jax.lax.fori_loop(0, max_micro_steps, body, (fleets0, active0))
+    return state._replace(planets=new_planets, fleets=fleets1, fleet_active=active1)
