@@ -13,10 +13,9 @@ on device:
   over envs in the hot path).
 * Legacy closed-form ``compute_pair_geom_and_etas`` remains for diagnostics;
   the live policy gates targets with the sweep, not the old toward-dest ray.
-* Per-microstep transitions land in a device-resident ``TransitionBuffer``
-  (``orbit_wars_pt.transition_buffer``); only tiny dispatch / scalar
-  metadata cross PCIe. PPO replay gathers minibatches directly from the
-  buffer via JIT'd advanced indexing.
+* Per-microstep transitions land in PyTorch-backed ``TorchTransitionBuffer``
+  records; only selected minibatch rows are handed back to JAX for prefix
+  replay during PPO.
 """
 
 from __future__ import annotations
@@ -62,10 +61,9 @@ from orbit_wars_pt.micro_jax import (
 from orbit_wars_pt.model import OrbitWarsPolicy
 from orbit_wars_pt.observation_jax import build_observation_batched_jax
 from orbit_wars_pt.transition_buffer import (
-    TransitionBuffer,
-    append_to_buffer,
-    init_transition_buffer,
-    scatter_turn_tags,
+    TorchTransitionBuffer,
+    append_to_torch_buffer,
+    init_torch_transition_buffer,
 )
 
 _MAX_FLEET_EXPAND_RETRIES = 48
@@ -123,6 +121,16 @@ def _copy_state_slices(
     return jax.tree.map(lambda dst, src: dst.at[idx].set(src[idx]), dst_b, src_b)
 
 
+def _jax_state_to_torch_cache(state_b: OrbitWarsState, rows: int, device: torch.device) -> OrbitWarsState:
+    """Allocate a PyTorch turn-state cache with leading ``[rows]`` axis."""
+
+    def one(leaf: jnp.ndarray) -> torch.Tensor:
+        src = torch.from_dlpack(leaf)
+        return torch.zeros((rows,) + tuple(src.shape), dtype=src.dtype, device=device)
+
+    return jax.tree.map(one, state_b)
+
+
 def _expand_turn_state_cache_if_needed(
     turn_state_cache: OrbitWarsState,
     required_turn_index: int,
@@ -138,11 +146,9 @@ def _expand_turn_state_cache_if_needed(
         print(f"[orbit_wars_pt] turn state cache doubled rows {cur} -> {new_rows}", flush=True)
     pad_rows = new_rows - cur
 
-    def _pad_leaf(leaf: jnp.ndarray) -> jnp.ndarray:
-        return jnp.concatenate(
-            [leaf, jnp.zeros((pad_rows,) + leaf.shape[1:], dtype=leaf.dtype)],
-            axis=0,
-        )
+    def _pad_leaf(leaf: torch.Tensor) -> torch.Tensor:
+        pad = torch.zeros((pad_rows,) + tuple(leaf.shape[1:]), dtype=leaf.dtype, device=leaf.device)
+        return torch.cat([leaf, pad], dim=0)
 
     return jax.tree.map(_pad_leaf, turn_state_cache)
 
@@ -159,8 +165,8 @@ def _expand_turn_state_cache_fleets(turn_state_cache: OrbitWarsState, new_F: int
     if cur_F >= new_F:
         return turn_state_cache
     pad = new_F - cur_F
-    fleets = jnp.pad(turn_state_cache.fleets, ((0, 0), (0, 0), (0, pad), (0, 0)))
-    fleet_active = jnp.pad(turn_state_cache.fleet_active, ((0, 0), (0, 0), (0, pad)))
+    fleets = torch.nn.functional.pad(turn_state_cache.fleets, (0, 0, 0, pad, 0, 0, 0, 0))
+    fleet_active = torch.nn.functional.pad(turn_state_cache.fleet_active, (0, pad, 0, 0, 0, 0))
     return turn_state_cache._replace(fleets=fleets, fleet_active=fleet_active)
 
 
@@ -233,18 +239,20 @@ def _carry_action_fleet_metadata_after_step(
     return jax.vmap(one_env)(state_before_b, next_state_b, actions_b, action_meta_b)
 
 
-@jax.jit
 def _scatter_turn_start_state(
     turn_state_cache: OrbitWarsState,
     state_b: OrbitWarsState,
-    turn_slot_per_env: jnp.ndarray,
+    turn_slot_per_env: np.ndarray,
 ) -> OrbitWarsState:
     """Write full ``state_b[n]`` into ``turn_state_cache[turn_slot_per_env[n], n]``."""
 
-    n_idx = jnp.arange(turn_slot_per_env.shape[0], dtype=jnp.int32)
+    device = turn_state_cache.planets.device
+    slots = torch.as_tensor(turn_slot_per_env, dtype=torch.long, device=device)
+    n_idx = torch.arange(slots.shape[0], dtype=torch.long, device=device)
 
-    def _scatter_leaf(cache_leaf: jnp.ndarray, live_leaf: jnp.ndarray) -> jnp.ndarray:
-        return cache_leaf.at[turn_slot_per_env, n_idx].set(live_leaf)
+    def _scatter_leaf(cache_leaf: torch.Tensor, live_leaf: jnp.ndarray) -> torch.Tensor:
+        cache_leaf[slots, n_idx] = torch.from_dlpack(live_leaf).to(device=cache_leaf.device, dtype=cache_leaf.dtype)
+        return cache_leaf
 
     return jax.tree.map(_scatter_leaf, turn_state_cache, state_b)
 
@@ -317,11 +325,11 @@ class RolloutSegment:
     ``t < write_idx_pX[n]`` and ``False`` elsewhere.
     """
 
-    buf0: TransitionBuffer
-    buf1: TransitionBuffer
+    buf0: TorchTransitionBuffer
+    buf1: TorchTransitionBuffer
     turn_state_cache: OrbitWarsState
-    turn_tag_p0: jnp.ndarray
-    turn_tag_p1: jnp.ndarray
+    turn_tag_p0: torch.Tensor
+    turn_tag_p1: torch.Tensor
     write_idx_p0: np.ndarray
     write_idx_p1: np.ndarray
     valid_p0: np.ndarray
@@ -532,7 +540,7 @@ def _run_micro_phase(
     *,
     ego: int,
     state_b: OrbitWarsState,
-    buf: TransitionBuffer,
+    buf: TorchTransitionBuffer,
     write_idx_per_env: np.ndarray,
     valid: np.ndarray,
     old_logprob: np.ndarray,
@@ -544,17 +552,17 @@ def _run_micro_phase(
     ship_speed: float,
     max_micro_steps: int,
     timing: RolloutTiming,
-    turn_tag_j: jnp.ndarray,
+    turn_tag_j: torch.Tensor,
     turn_slot_np: np.ndarray,
     first_hit_n_rays: int = 2048,
     first_hit_ray_chunk_size: int = 0,
 ) -> Tuple[
-    TransitionBuffer,
+    TorchTransitionBuffer,
     np.ndarray,
     List[List[Tuple[float, float, float]]],
     List[List[Tuple[float, float]]],
     List[int],
-    jnp.ndarray,
+    torch.Tensor,
 ]:
     """Run one player's micro-loop in lockstep across all envs (Phase 5).
 
@@ -751,34 +759,41 @@ def _run_micro_phase(
         virt_b, oid_j, angle_j, send_j, dispatched_j, slot_j = apply_micro_step_batched(
             virt_b, ego_jax, halt_now_j, pair_flat_j, frac_idx_j, angle_j, fleet_eta_j
         )
+        oid_t = torch.from_dlpack(oid_j)
+        angle_applied_t = torch.from_dlpack(angle_j)
+        send_t = torch.from_dlpack(send_j)
+        dispatched_t = torch.from_dlpack(dispatched_j)
+        slot_t = torch.from_dlpack(slot_j)
 
-        active_j = jnp.asarray(np.array([not h for h in halted], dtype=np.bool_), dtype=jnp.bool_)
-        micro_k_vec = jnp.full((num_envs,), k, dtype=jnp.int32)
-        write_idx_j = jnp.asarray(write_idx, dtype=jnp.int32)
-        buf = append_to_buffer(
+        active_t = torch.as_tensor(np.array([not h for h in halted], dtype=np.bool_), device=device)
+        micro_k_t = torch.full((num_envs,), k, dtype=torch.int32, device=device)
+        write_idx_t = torch.as_tensor(write_idx, dtype=torch.int32, device=device)
+        buf = append_to_torch_buffer(
             buf,
-            halt_now_j,
-            send_j,
-            angle_j,
-            fleet_eta_j,
-            slot_j,
-            halt_action_j,
-            pair_flat_j,
-            frac_idx_j,
-            no_valid_pairs_j,
-            no_valid_fracs_j,
-            must_halt_no_ships_j,
-            target_planet_reachable_j,
-            write_idx_j,
-            micro_k_vec,
-            active_j,
+            halt_now_all,
+            send_t,
+            angle_applied_t,
+            fleet_eta_all,
+            slot_t,
+            halt_action_all,
+            pair_flat_all,
+            frac_idx_all,
+            no_valid_pairs_all,
+            no_valid_fracs_all,
+            must_halt_no_ships_all,
+            target_pr_all,
+            write_idx_t,
+            micro_k_t,
+            active_t,
             max_micro_steps,
         )
-        turn_slot_j = jnp.asarray(turn_slot_np, dtype=jnp.int32)
-        turn_tag_j = scatter_turn_tags(turn_tag_j, write_idx_j, turn_slot_j)
-        oid_np, angle_np, send_np, dispatched_np = jax.device_get(
-            (oid_j, angle_j, send_j, dispatched_j)
-        )
+        rows_t = torch.as_tensor(write_idx, dtype=torch.long, device=device)
+        env_t = torch.arange(num_envs, dtype=torch.long, device=device)
+        turn_tag_j[rows_t, env_t] = torch.as_tensor(turn_slot_np, dtype=torch.int32, device=device)
+        oid_np = oid_t.detach().cpu().numpy()
+        angle_np = angle_applied_t.detach().cpu().numpy()
+        send_np = send_t.detach().cpu().numpy()
+        dispatched_np = dispatched_t.detach().cpu().numpy()
         timing.micro_apply_s += perf_counter() - t0
 
         # ---- Pull tiny scalar metadata for GAE / action_lists. ----
@@ -816,7 +831,7 @@ def _run_async_micro_step(
     ego: int,
     active_envs: np.ndarray,
     virt_b: OrbitWarsState,
-    buf: TransitionBuffer,
+    buf: TorchTransitionBuffer,
     write_idx: np.ndarray,
     micro_k: np.ndarray,
     valid: np.ndarray,
@@ -834,11 +849,11 @@ def _run_async_micro_step(
     ship_speed: float,
     max_micro_steps: int,
     timing: RolloutTiming,
-    turn_tag_j: jnp.ndarray,
+    turn_tag_j: torch.Tensor,
     turn_slot_np: np.ndarray,
     first_hit_n_rays: int,
     first_hit_ray_chunk_size: int = 0,
-) -> tuple[OrbitWarsState, TransitionBuffer, jnp.ndarray]:
+) -> tuple[OrbitWarsState, TorchTransitionBuffer, torch.Tensor]:
     """Run one micro decision for ``ego`` on a masked subset of envs."""
 
     num_envs = int(virt_b.planets.shape[0])
@@ -981,32 +996,42 @@ def _run_async_micro_step(
     virt_b, oid_j, angle_j, send_j, dispatched_j, slot_j = apply_micro_step_batched(
         virt_b, ego_jax, halt_now_j, pair_flat_j, frac_idx_j, angle_j, fleet_eta_j
     )
+    oid_t = torch.from_dlpack(oid_j)
+    angle_applied_t = torch.from_dlpack(angle_j)
+    send_t = torch.from_dlpack(send_j)
+    dispatched_t = torch.from_dlpack(dispatched_j)
+    slot_t = torch.from_dlpack(slot_j)
     active_mask = np.zeros((num_envs,), dtype=np.bool_)
     active_mask[active_envs] = True
-    active_j = jnp.asarray(active_mask, dtype=jnp.bool_)
-    micro_k_vec = jnp.asarray(micro_k, dtype=jnp.int32)
-    write_idx_j = jnp.asarray(write_idx, dtype=jnp.int32)
-    buf = append_to_buffer(
+    active_t = torch.as_tensor(active_mask, dtype=torch.bool, device=device)
+    micro_k_t = torch.as_tensor(micro_k, dtype=torch.int32, device=device)
+    write_idx_t = torch.as_tensor(write_idx, dtype=torch.int32, device=device)
+    buf = append_to_torch_buffer(
         buf,
-        halt_now_j,
-        send_j,
-        angle_j,
-        fleet_eta_j,
-        slot_j,
-        halt_action_j,
-        pair_flat_j,
-        frac_idx_j,
-        no_valid_pairs_j,
-        no_valid_fracs_j,
-        must_halt_no_ships_j,
-        target_planet_reachable_j,
-        write_idx_j,
-        micro_k_vec,
-        active_j,
+        halt_now_all,
+        send_t,
+        angle_applied_t,
+        fleet_eta_all,
+        slot_t,
+        halt_action_all,
+        pair_flat_all,
+        frac_idx_all,
+        no_valid_pairs_all,
+        no_valid_fracs_all,
+        must_halt_no_ships_all,
+        target_pr_all,
+        write_idx_t,
+        micro_k_t,
+        active_t,
         max_micro_steps,
     )
-    turn_tag_j = scatter_turn_tags(turn_tag_j, write_idx_j, jnp.asarray(turn_slot_np, dtype=jnp.int32))
-    oid_np, angle_np, send_np, dispatched_np = jax.device_get((oid_j, angle_j, send_j, dispatched_j))
+    rows_t = torch.as_tensor(write_idx, dtype=torch.long, device=device)
+    env_t = torch.arange(num_envs, dtype=torch.long, device=device)
+    turn_tag_j[rows_t, env_t] = torch.as_tensor(turn_slot_np, dtype=torch.int32, device=device)
+    oid_np = oid_t.detach().cpu().numpy()
+    angle_np = angle_applied_t.detach().cpu().numpy()
+    send_np = send_t.detach().cpu().numpy()
+    dispatched_np = dispatched_t.detach().cpu().numpy()
     timing.micro_apply_s += perf_counter() - t0
 
     total_logp_np = total_logp_all.detach().cpu().numpy()
@@ -1132,22 +1157,17 @@ def collect_parallel_micro_rollouts(
     # boundary. In the worst phase mix, either player's buffer may still need
     # one full local turn of micro rows before that boundary.
     H_buf = rollout_micro_horizon + max_micro_steps_per_player + 2
-    buf0 = init_transition_buffer(num_envs, H_buf, max_micro_steps_per_player)
-    buf1 = init_transition_buffer(num_envs, H_buf, max_micro_steps_per_player)
+    buf0 = init_torch_transition_buffer(num_envs, H_buf, max_micro_steps_per_player, device=device)
+    buf1 = init_torch_transition_buffer(num_envs, H_buf, max_micro_steps_per_player, device=device)
 
     turn_slot_np = np.zeros((num_envs,), dtype=np.int32)
     # Start near the usual per-segment turn count so early rollout does not
     # recompile through 1/2/4/8/16/32 cache shapes, while keeping memory modest.
-    turn_state_cache = jax.tree.map(
-        lambda leaf: jnp.zeros((_INITIAL_TURN_CACHE_ROWS,) + leaf.shape, dtype=leaf.dtype),
-        state_b,
-    )
-    turn_state_cache = _scatter_turn_start_state(
-        turn_state_cache, state_b, jnp.asarray(turn_slot_np, dtype=jnp.int32)
-    )
+    turn_state_cache = _jax_state_to_torch_cache(state_b, _INITIAL_TURN_CACHE_ROWS, device)
+    turn_state_cache = _scatter_turn_start_state(turn_state_cache, state_b, turn_slot_np)
 
-    turn_tag_p0 = jnp.full((H_buf, num_envs), -1, dtype=jnp.int32)
-    turn_tag_p1 = jnp.full((H_buf, num_envs), -1, dtype=jnp.int32)
+    turn_tag_p0 = torch.full((H_buf, num_envs), -1, dtype=torch.int32, device=device)
+    turn_tag_p1 = torch.full((H_buf, num_envs), -1, dtype=torch.int32, device=device)
 
     valid_p0 = np.zeros((H_buf, num_envs), dtype=np.bool_)
     valid_p1 = np.zeros((H_buf, num_envs), dtype=np.bool_)
@@ -1334,9 +1354,7 @@ def collect_parallel_micro_rollouts(
                 _reset_prefetch_resync(reset_prefetch, seed_base, seeds_consumed, cfg)
                 max_turn = int(np.max(turn_slot_np))
                 turn_state_cache = _expand_turn_state_cache_if_needed(turn_state_cache, max_turn)
-                turn_state_cache = _scatter_turn_start_state(
-                    turn_state_cache, state_b, jnp.asarray(turn_slot_np, dtype=jnp.int32)
-                )
+                turn_state_cache = _scatter_turn_start_state(turn_state_cache, state_b, turn_slot_np)
                 actual_idx_j = jnp.asarray(step_envs, dtype=jnp.int32)
                 virt0_b = _copy_state_slices(virt0_b, state_b, actual_idx_j)
                 virt1_b = _copy_state_slices(virt1_b, state_b, actual_idx_j)

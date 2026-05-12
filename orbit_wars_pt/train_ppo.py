@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
@@ -47,12 +48,9 @@ from orbit_wars_pt.parallel_rollout import (
     collect_parallel_micro_rollouts,
 )
 from orbit_wars_pt.reset_prefetch import RolloutResetPrefetch
-from orbit_wars_pt.ppo_replay import compute_ppo_loss_torch, replay_ppo_loss
-from orbit_wars_pt.transition_buffer import (
-    TransitionBuffer,
-    gather_minibatch,
-    gather_minibatch_selected,
-)
+from orbit_wars_pt.ppo_replay import compute_ppo_loss_torch
+from orbit_wars_pt.transition_buffer import TorchTransitionBuffer
+from orbit_wars_pt.torch_replay import build_observation_torch, select_and_replay_minibatch_torch
 
 from jax_orbit_wars import OrbitWarsState
 
@@ -348,6 +346,8 @@ class PPOTiming:
     """
 
     gather_s: float = 0.0
+    gather_select_s: float = 0.0
+    prefix_replay_s: float = 0.0
     replay_jax_s: float = 0.0
     replay_dlpack_s: float = 0.0
     compiled_loss_s: float = 0.0
@@ -360,6 +360,8 @@ class PPOTiming:
     def accounted_s(self) -> float:
         return (
             self.gather_s
+            + self.gather_select_s
+            + self.prefix_replay_s
             + self.replay_jax_s
             + self.replay_dlpack_s
             + self.compiled_loss_s
@@ -496,8 +498,14 @@ def normalize_advantages(samples: dict) -> None:
     samples["advantages"] = ((a - a.mean()) / (a.std() + 1e-8)).astype(np.float32)
 
 
-def _tree_to_host(x: Any) -> Any:
-    return jax.tree.map(lambda leaf: np.asarray(jax.device_get(leaf)), x)
+def _torch_buffer_to_host(buf: TorchTransitionBuffer) -> TorchTransitionBuffer:
+    return TorchTransitionBuffer(
+        **{field: getattr(buf, field).detach().cpu().contiguous() for field in buf._fields}
+    )
+
+
+def _torch_state_cache_to_host(state_cache: OrbitWarsState) -> OrbitWarsState:
+    return jax.tree.map(lambda leaf: leaf.detach().cpu().contiguous(), state_cache)
 
 
 def _rollout_segment_to_host(segment: RolloutSegment) -> RolloutSegment:
@@ -509,11 +517,11 @@ def _rollout_segment_to_host(segment: RolloutSegment) -> RolloutSegment:
     """
 
     return RolloutSegment(
-        buf0=_tree_to_host(segment.buf0),
-        buf1=_tree_to_host(segment.buf1),
-        turn_state_cache=_tree_to_host(segment.turn_state_cache),
-        turn_tag_p0=np.asarray(jax.device_get(segment.turn_tag_p0)),
-        turn_tag_p1=np.asarray(jax.device_get(segment.turn_tag_p1)),
+        buf0=_torch_buffer_to_host(segment.buf0),
+        buf1=_torch_buffer_to_host(segment.buf1),
+        turn_state_cache=_torch_state_cache_to_host(segment.turn_state_cache),
+        turn_tag_p0=segment.turn_tag_p0.detach().cpu().contiguous(),
+        turn_tag_p1=segment.turn_tag_p1.detach().cpu().contiguous(),
         write_idx_p0=np.asarray(segment.write_idx_p0),
         write_idx_p1=np.asarray(segment.write_idx_p1),
         valid_p0=np.asarray(segment.valid_p0),
@@ -746,7 +754,8 @@ def _ppo_timing_str(pt: PPOTiming) -> str:
     unacc = max(0.0, pt.total_s - pt.accounted_s())
     return (
         f"ppo_wall {pt.total_s:.3f}s mb {pt.n_minibatches} "
-        f"gather {pt.gather_s:.3f}s replay_jax {pt.replay_jax_s:.3f}s "
+        f"gather {pt.gather_s:.3f}s gather_sel {pt.gather_select_s:.3f}s "
+        f"prefix {pt.prefix_replay_s:.3f}s replay_jax {pt.replay_jax_s:.3f}s "
         f"replay_dlpack {pt.replay_dlpack_s:.3f}s compiled_loss {pt.compiled_loss_s:.3f}s "
         f"backward {pt.backward_s:.3f}s optim {pt.optim_s:.3f}s sync {pt.sync_s:.3f}s "
         f"unaccounted {unacc:.3f}s"
@@ -810,6 +819,58 @@ def _print_rollout_pre_ppo(
     )
 
 
+def _torch_ppo_loss_from_replay(
+    *,
+    state_b: OrbitWarsState,
+    actions: dict[str, torch.Tensor],
+    adv: torch.Tensor,
+    returns: torch.Tensor,
+    old_logp: torch.Tensor,
+    old_v: torch.Tensor,
+    policy: OrbitWarsPolicy,
+    ship_speed: float,
+    clip_eps: float,
+    vf_coef: float,
+    entropy_coef: float,
+    loss_fn: Optional[Any],
+    amp_dtype: Optional[torch.dtype],
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    obs = build_observation_torch(state_b, actions["ego"].to(state_b.planets.device), ship_speed)
+    fn = loss_fn if loss_fn is not None else compute_ppo_loss_torch
+    target_valid = actions["target_planet_reachable"].to(device=adv.device, dtype=torch.bool)
+    target_overflow = torch.zeros((target_valid.shape[0],), dtype=torch.bool, device=adv.device)
+    amp_ctx = (
+        torch.autocast(device_type="cuda", dtype=amp_dtype)
+        if amp_dtype is not None
+        else nullcontext()
+    )
+    with amp_ctx:
+        return fn(
+            policy,
+            obs["entity_type"].to(device=adv.device, dtype=torch.long),
+            obs["owner_idx"].to(device=adv.device, dtype=torch.long),
+            obs["features"].to(device=adv.device, dtype=torch.float32),
+            obs["rope_pos"].to(device=adv.device, dtype=torch.float32),
+            obs["entity_mask"].to(device=adv.device, dtype=torch.bool),
+            obs["planet_mask"].to(device=adv.device, dtype=torch.bool),
+            target_valid,
+            target_overflow,
+            actions["halt_action"].to(device=adv.device, dtype=torch.long),
+            actions["pair_flat"].to(device=adv.device, dtype=torch.long),
+            actions["frac_idx"].to(device=adv.device, dtype=torch.long),
+            actions["no_valid_pairs"].to(device=adv.device, dtype=torch.bool),
+            actions["no_valid_fracs"].to(device=adv.device, dtype=torch.bool),
+            actions["must_halt_no_ships"].to(device=adv.device, dtype=torch.bool),
+            adv,
+            returns,
+            old_logp,
+            old_v,
+            clip_eps,
+            vf_coef,
+            entropy_coef,
+        )
+
+
 def ppo_iteration(
     policy: OrbitWarsPolicy,
     opt: torch.optim.Optimizer,
@@ -832,8 +893,8 @@ def ppo_iteration(
 ) -> Tuple[float, PPOTiming, PPOStats]:
     """Multiple epochs of clipped PPO surrogate with minibatches.
 
-    Minibatches are gathered directly from device-resident
-    ``TransitionBuffer`` via ``gather_minibatch`` — no host stacking.
+    Minibatches are selected/replayed from PyTorch-backed rollout buffers;
+    PPO replay is Torch-only.
     Returns ``(mean_total_loss, ppo_timing, ppo_stats)``.
     """
 
@@ -852,6 +913,11 @@ def ppo_iteration(
     timing = PPOTiming()
     stats = PPOStats()
     t_total0 = perf_counter()
+    state_device = segment.turn_state_cache.planets.device
+    turn_tag_cache = (
+        segment.turn_tag_p0.to(device=state_device, dtype=torch.long),
+        segment.turn_tag_p1.to(device=state_device, dtype=torch.long),
+    )
 
     for _ in range(ppo_epochs):
         rnd.shuffle(idx)
@@ -863,33 +929,9 @@ def ppo_iteration(
             mb_t = t_idx[mb_idx]
             mb_n = n_idx[mb_idx]
 
-            mb_player_j = jnp.asarray(mb_player, dtype=jnp.int32)
-            mb_t_j = jnp.asarray(mb_t, dtype=jnp.int32)
-            mb_n_j = jnp.asarray(mb_n, dtype=jnp.int32)
-
-            max_m = int(segment.buf0.micro_halt_now.shape[2])
-            (
-                state_b,
-                halt_action_j,
-                pair_flat_j,
-                frac_idx_j,
-                no_valid_pairs_j,
-                no_valid_fracs_j,
-                must_halt_no_ships_j,
-                target_planet_reachable_j,
-            ) = gather_minibatch(
-                segment.buf0,
-                segment.buf1,
-                mb_player_j,
-                mb_t_j,
-                mb_n_j,
-                segment.turn_state_cache,
-                segment.turn_tag_p0,
-                segment.turn_tag_p1,
-                max_m,
+            state_b, actions = select_and_replay_minibatch_torch(
+                segment, mb_player, mb_t, mb_n, turn_tag_cache, replay_device=device, timing=timing
             )
-
-            ego_b_j = mb_player_j
 
             adv = torch.as_tensor(advantages[mb_idx], device=device, dtype=torch.float32)
             ret_t = torch.as_tensor(returns[mb_idx], device=device, dtype=torch.float32)
@@ -897,31 +939,23 @@ def ppo_iteration(
             old_v = torch.as_tensor(old_value[mb_idx], device=device, dtype=torch.float32)
             timing.gather_s += perf_counter() - t0
 
-            loss, mb_stats = replay_ppo_loss(
+            t0 = perf_counter()
+            loss, mb_stats = _torch_ppo_loss_from_replay(
                 state_b=state_b,
-                halt_action=halt_action_j,
-                pair_flat=pair_flat_j,
-                frac_idx=frac_idx_j,
-                no_valid_pairs=no_valid_pairs_j,
-                no_valid_fracs=no_valid_fracs_j,
-                must_halt_no_ships=must_halt_no_ships_j,
-                ego_b=ego_b_j,
+                actions=actions,
                 adv=adv,
                 returns=ret_t,
                 old_logp=old_logp,
                 old_v=old_v,
                 policy=policy,
                 ship_speed=ship_speed,
-                first_hit_n_rays=first_hit_n_rays,
-                first_hit_ray_chunk_size=first_hit_ray_chunk_size,
                 clip_eps=clip_eps,
                 vf_coef=vf_coef,
                 entropy_coef=entropy_coef,
                 loss_fn=loss_fn,
-                timing=timing,
                 amp_dtype=amp_dtype,
-                target_planet_reachable=target_planet_reachable_j,
             )
+            timing.compiled_loss_s += perf_counter() - t0
 
             t0 = perf_counter()
             opt.zero_grad()
@@ -946,56 +980,6 @@ def ppo_iteration(
     timing.n_minibatches = n_mb
     timing.total_s = perf_counter() - t_total0
     return total_loss_sum / max(1, n_mb), timing, stats
-
-
-def _host_selected_minibatch(segment: RolloutSegment, mb_player: np.ndarray, mb_t: np.ndarray, mb_n: np.ndarray):
-    """Select minibatch rows from a CPU-resident rollout chunk and place them on device."""
-
-    is_p0 = mb_player == 0
-    turn_idx = np.where(is_p0, segment.turn_tag_p0[mb_t, mb_n], segment.turn_tag_p1[mb_t, mb_n])
-    state_host = jax.tree.map(lambda leaf: leaf[turn_idx, mb_n], segment.turn_state_cache)
-
-    buf0: TransitionBuffer = segment.buf0
-    buf1: TransitionBuffer = segment.buf1
-
-    def _sel_plane(field0: np.ndarray, field1: np.ndarray) -> np.ndarray:
-        a = field0[mb_t, mb_n, :]
-        b = field1[mb_t, mb_n, :]
-        return np.where(is_p0[:, None], a, b)
-
-    def _sel_scalar(field0: np.ndarray, field1: np.ndarray) -> np.ndarray:
-        a = field0[mb_t, mb_n]
-        b = field1[mb_t, mb_n]
-        return np.where(is_p0, a, b)
-
-    phase_micro_idx = _sel_scalar(buf0.phase_micro_idx, buf1.phase_micro_idx).astype(np.int32)
-    max_m = int(buf0.micro_halt_now.shape[2])
-
-    return gather_minibatch_selected(
-        jax.tree.map(jnp.asarray, state_host),
-        jnp.asarray(mb_player, dtype=jnp.int32),
-        max_m,
-        jnp.asarray(_sel_plane(buf0.micro_halt_now, buf1.micro_halt_now), dtype=jnp.bool_),
-        jnp.asarray(_sel_plane(buf0.send, buf1.send), dtype=jnp.float32),
-        jnp.asarray(_sel_plane(buf0.angle, buf1.angle), dtype=jnp.float32),
-        jnp.asarray(_sel_plane(buf0.fleet_eta, buf1.fleet_eta), dtype=jnp.float32),
-        jnp.asarray(_sel_plane(buf0.slot, buf1.slot), dtype=jnp.int32),
-        jnp.asarray(_sel_scalar(buf0.halt_action, buf1.halt_action), dtype=jnp.int32),
-        jnp.asarray(_sel_plane(buf0.pair_flat, buf1.pair_flat), dtype=jnp.int32),
-        jnp.asarray(_sel_plane(buf0.frac_idx, buf1.frac_idx), dtype=jnp.int32),
-        jnp.asarray(_sel_scalar(buf0.no_valid_pairs, buf1.no_valid_pairs), dtype=jnp.bool_),
-        jnp.asarray(_sel_scalar(buf0.no_valid_fracs, buf1.no_valid_fracs), dtype=jnp.bool_),
-        jnp.asarray(_sel_scalar(buf0.must_halt_no_ships, buf1.must_halt_no_ships), dtype=jnp.bool_),
-        jnp.asarray(
-            np.where(
-                is_p0[:, None],
-                buf0.target_planet_reachable[mb_t, mb_n, :],
-                buf1.target_planet_reachable[mb_t, mb_n, :],
-            ),
-            dtype=jnp.bool_,
-        ),
-        jnp.asarray(phase_micro_idx, dtype=jnp.int32),
-    )
 
 
 def ppo_iteration_host_staged(
@@ -1024,12 +1008,22 @@ def ppo_iteration_host_staged(
     timing = PPOTiming()
     stats = PPOStats()
     t_total0 = perf_counter()
+    turn_tag_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for chunk in chunks:
+        state_device = chunk.segment.turn_state_cache.planets.device
+        turn_tag_caches.append(
+            (
+                chunk.segment.turn_tag_p0.to(device=state_device, dtype=torch.long),
+                chunk.segment.turn_tag_p1.to(device=state_device, dtype=torch.long),
+            )
+        )
 
     for _ in range(ppo_epochs):
         chunk_order = np.arange(len(chunks))
         rnd.shuffle(chunk_order)
         for chunk_i in chunk_order:
-            chunk = chunks[int(chunk_i)]
+            chunk_idx = int(chunk_i)
+            chunk = chunks[chunk_idx]
             samples = chunk.samples
             n = int(samples["advantages"].shape[0])
             idx = np.arange(n)
@@ -1041,49 +1035,38 @@ def ppo_iteration_host_staged(
                 mb_player = samples["players"][mb_idx]
                 mb_t = samples["t_idx"][mb_idx]
                 mb_n = samples["n_idx"][mb_idx]
-                (
-                    state_b,
-                    halt_action_j,
-                    pair_flat_j,
-                    frac_idx_j,
-                    no_valid_pairs_j,
-                    no_valid_fracs_j,
-                    must_halt_no_ships_j,
-                    target_planet_reachable_j,
-                ) = _host_selected_minibatch(chunk.segment, mb_player, mb_t, mb_n)
-
-                ego_b_j = jnp.asarray(mb_player, dtype=jnp.int32)
+                state_b, actions = select_and_replay_minibatch_torch(
+                    chunk.segment,
+                    mb_player,
+                    mb_t,
+                    mb_n,
+                    turn_tag_caches[chunk_idx],
+                    replay_device=device,
+                    timing=timing,
+                )
                 adv = torch.as_tensor(samples["advantages"][mb_idx], device=device, dtype=torch.float32)
                 ret_t = torch.as_tensor(samples["returns"][mb_idx], device=device, dtype=torch.float32)
                 old_logp = torch.as_tensor(samples["old_logprob"][mb_idx], device=device, dtype=torch.float32)
                 old_v = torch.as_tensor(samples["old_value"][mb_idx], device=device, dtype=torch.float32)
                 timing.gather_s += perf_counter() - t0
 
-                loss, mb_stats = replay_ppo_loss(
+                t0 = perf_counter()
+                loss, mb_stats = _torch_ppo_loss_from_replay(
                     state_b=state_b,
-                    halt_action=halt_action_j,
-                    pair_flat=pair_flat_j,
-                    frac_idx=frac_idx_j,
-                    no_valid_pairs=no_valid_pairs_j,
-                    no_valid_fracs=no_valid_fracs_j,
-                    must_halt_no_ships=must_halt_no_ships_j,
-                    ego_b=ego_b_j,
+                    actions=actions,
                     adv=adv,
                     returns=ret_t,
                     old_logp=old_logp,
                     old_v=old_v,
                     policy=policy,
                     ship_speed=ship_speed,
-                    first_hit_n_rays=first_hit_n_rays,
-                    first_hit_ray_chunk_size=first_hit_ray_chunk_size,
                     clip_eps=clip_eps,
                     vf_coef=vf_coef,
                     entropy_coef=entropy_coef,
                     loss_fn=loss_fn,
-                    timing=timing,
                     amp_dtype=amp_dtype,
-                    target_planet_reachable=target_planet_reachable_j,
                 )
+                timing.compiled_loss_s += perf_counter() - t0
 
                 t0 = perf_counter()
                 opt.zero_grad()

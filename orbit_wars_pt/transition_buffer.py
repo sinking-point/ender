@@ -16,6 +16,7 @@ from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import torch
 
 from jax_orbit_wars import OrbitWarsState
 
@@ -46,6 +47,29 @@ class TransitionBuffer(NamedTuple):
     phase_micro_idx: jnp.ndarray
 
 
+class TorchTransitionBuffer(NamedTuple):
+    """One player's transitions stored in PyTorch tensors.
+
+    This mirrors ``TransitionBuffer`` field-for-field, but keeps persistent
+    rollout records out of XLA's allocator. PPO replay selects minibatch rows
+    from these tensors and passes only those rows to ``gather_minibatch_selected``.
+    """
+
+    micro_halt_now: torch.Tensor
+    send: torch.Tensor
+    angle: torch.Tensor
+    fleet_eta: torch.Tensor
+    slot: torch.Tensor
+    halt_action: torch.Tensor
+    pair_flat: torch.Tensor
+    frac_idx: torch.Tensor
+    no_valid_pairs: torch.Tensor
+    no_valid_fracs: torch.Tensor
+    must_halt_no_ships: torch.Tensor
+    target_planet_reachable: torch.Tensor
+    phase_micro_idx: torch.Tensor
+
+
 def init_transition_buffer(num_envs: int, H_buf: int, max_micro_steps: int) -> TransitionBuffer:
     """Allocate prefix tensors ``(H_buf, num_envs, max_micro_steps)`` and scalars ``(H_buf, num_envs)``."""
 
@@ -66,6 +90,98 @@ def init_transition_buffer(num_envs: int, H_buf: int, max_micro_steps: int) -> T
         target_planet_reachable=jnp.zeros((H_buf, num_envs, MAX_PLANETS), dtype=jnp.bool_),
         phase_micro_idx=jnp.zeros((H_buf, num_envs), dtype=jnp.int32),
     )
+
+
+def init_torch_transition_buffer(
+    num_envs: int,
+    H_buf: int,
+    max_micro_steps: int,
+    *,
+    device: torch.device,
+) -> TorchTransitionBuffer:
+    """Allocate a PyTorch-backed transition buffer with the same layout as ``TransitionBuffer``."""
+
+    m = int(max_micro_steps)
+    return TorchTransitionBuffer(
+        micro_halt_now=torch.ones((H_buf, num_envs, m), dtype=torch.bool, device=device),
+        send=torch.zeros((H_buf, num_envs, m), dtype=torch.float32, device=device),
+        angle=torch.zeros((H_buf, num_envs, m), dtype=torch.float32, device=device),
+        fleet_eta=torch.zeros((H_buf, num_envs, m), dtype=torch.float32, device=device),
+        slot=torch.full((H_buf, num_envs, m), -1, dtype=torch.int32, device=device),
+        halt_action=torch.zeros((H_buf, num_envs), dtype=torch.int32, device=device),
+        pair_flat=torch.zeros((H_buf, num_envs, m), dtype=torch.int32, device=device),
+        frac_idx=torch.zeros((H_buf, num_envs, m), dtype=torch.int32, device=device),
+        no_valid_pairs=torch.zeros((H_buf, num_envs), dtype=torch.bool, device=device),
+        no_valid_fracs=torch.zeros((H_buf, num_envs), dtype=torch.bool, device=device),
+        must_halt_no_ships=torch.zeros((H_buf, num_envs), dtype=torch.bool, device=device),
+        target_planet_reachable=torch.zeros((H_buf, num_envs, MAX_PLANETS), dtype=torch.bool, device=device),
+        phase_micro_idx=torch.zeros((H_buf, num_envs), dtype=torch.int32, device=device),
+    )
+
+
+@torch.no_grad()
+def append_to_torch_buffer(
+    buf: TorchTransitionBuffer,
+    micro_halt_now: torch.Tensor,
+    send_now: torch.Tensor,
+    angle_now: torch.Tensor,
+    fleet_eta_now: torch.Tensor,
+    slot_now: torch.Tensor,
+    halt_action: torch.Tensor,
+    pair_flat: torch.Tensor,
+    frac_idx: torch.Tensor,
+    no_valid_pairs: torch.Tensor,
+    no_valid_fracs: torch.Tensor,
+    must_halt_no_ships: torch.Tensor,
+    target_planet_reachable_now: torch.Tensor,
+    write_row: torch.Tensor,
+    micro_k: torch.Tensor,
+    active: torch.Tensor,
+    max_micro_steps: int,
+) -> TorchTransitionBuffer:
+    """Write one transition per active env into a PyTorch-backed buffer."""
+
+    del max_micro_steps
+    device = buf.micro_halt_now.device
+    n = int(write_row.shape[0])
+    n_idx = torch.arange(n, device=device, dtype=torch.long)
+    wr = write_row.to(device=device, dtype=torch.long)
+    mk = micro_k.to(device=device, dtype=torch.long)
+    active_b = active.to(device=device, dtype=torch.bool)
+    prev_row = torch.where(mk > 0, wr - 1, torch.full_like(wr, -1))
+    safe_prev = torch.clamp(prev_row, min=0)
+    has_prev = prev_row >= 0
+
+    def _grow(field: torch.Tensor, new_value: torch.Tensor, fill_value: int | float | bool) -> torch.Tensor:
+        base = field[safe_prev, n_idx, :].clone()
+        base[~has_prev] = fill_value
+        base[n_idx, mk] = new_value.to(device=device, dtype=field.dtype)
+        return base
+
+    new_halt = _grow(buf.micro_halt_now, micro_halt_now, True)
+    new_send = _grow(buf.send, send_now, 0.0)
+    new_angle = _grow(buf.angle, angle_now, 0.0)
+    new_fleet_eta = _grow(buf.fleet_eta, fleet_eta_now, 0.0)
+    new_slot = _grow(buf.slot, slot_now, -1)
+    new_pf = _grow(buf.pair_flat, pair_flat, 0)
+    new_fi = _grow(buf.frac_idx, frac_idx, 0)
+
+    env = n_idx[active_b]
+    row = wr[active_b]
+    buf.micro_halt_now[row, env, :] = new_halt[active_b]
+    buf.send[row, env, :] = new_send[active_b]
+    buf.angle[row, env, :] = new_angle[active_b]
+    buf.fleet_eta[row, env, :] = new_fleet_eta[active_b]
+    buf.slot[row, env, :] = new_slot[active_b]
+    buf.pair_flat[row, env, :] = new_pf[active_b]
+    buf.frac_idx[row, env, :] = new_fi[active_b]
+    buf.halt_action[row, env] = halt_action.to(device=device, dtype=torch.int32)[active_b]
+    buf.no_valid_pairs[row, env] = no_valid_pairs.to(device=device, dtype=torch.bool)[active_b]
+    buf.no_valid_fracs[row, env] = no_valid_fracs.to(device=device, dtype=torch.bool)[active_b]
+    buf.must_halt_no_ships[row, env] = must_halt_no_ships.to(device=device, dtype=torch.bool)[active_b]
+    buf.target_planet_reachable[row, env, :] = target_planet_reachable_now.to(device=device, dtype=torch.bool)[active_b]
+    buf.phase_micro_idx[row, env] = micro_k.to(device=device, dtype=torch.int32)[active_b]
+    return buf
 
 
 def _noop_prefix_planes(num_envs: int, max_micro_steps: int):
