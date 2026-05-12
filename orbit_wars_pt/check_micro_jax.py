@@ -95,10 +95,11 @@ def main() -> None:
     diff = planets0[d_idx, PLANET_X:PLANET_Y + 1] - planets0[o_idx, PLANET_X:PLANET_Y + 1]
     launch_angle0 = float(np.arctan2(diff[1], diff[0]))
     launch_angle = jnp.zeros((4,), dtype=jnp.float32).at[0].set(launch_angle0)
+    fleet_eta = jnp.zeros((4,), dtype=jnp.float32)
 
     pre_planets = np.asarray(jax.device_get(state_b.planets))
     new_state, oid_j, angle_j, send_j, dispatched_j, _slot_j = apply_micro_step_batched(
-        state_b, jnp.int32(0), halt_now, pair_flat, frac_idx, launch_angle
+        state_b, jnp.int32(0), halt_now, pair_flat, frac_idx, launch_angle, fleet_eta
     )
     post_planets = np.asarray(jax.device_get(new_state.planets))
     oid_np, angle_np, send_np, dispatched_np = jax.device_get(
@@ -129,13 +130,20 @@ def main() -> None:
     # Single-env slice: two p0 micro rows (dispatch then halt) and one p1 row.
     state_1 = jax.tree.map(lambda x: x[:1], state_b)
     new_state_1, _, _, send_1, _, slot_1 = apply_micro_step_batched(
-        state_1, jnp.int32(0), jnp.array([False]), pair_flat[:1], frac_idx[:1], launch_angle[:1]
+        state_1,
+        jnp.int32(0),
+        jnp.array([False]),
+        pair_flat[:1],
+        frac_idx[:1],
+        launch_angle[:1],
+        fleet_eta[:1],
     )
     pair_flat_1 = pair_flat[:1]
     frac_idx_1 = frac_idx[:1]
     no_valid_pairs_1 = jnp.zeros((1,), dtype=jnp.bool_)
     no_valid_fracs_1 = jnp.zeros((1,), dtype=jnp.bool_)
     must_halt_ns_1 = jnp.zeros((1,), dtype=jnp.bool_)
+    tpr_1 = jnp.zeros((1, MAX_PLANETS), dtype=jnp.bool_).at[0, d_idx].set(True)
 
     H_buf = 8
     M = 8
@@ -150,6 +158,7 @@ def main() -> None:
     micro_halt_halt = jnp.array([True], dtype=jnp.bool_)
     active_1 = jnp.array([True], dtype=jnp.bool_)
     send_zero = jnp.array([0.0], dtype=jnp.float32)
+    eta_zero = jnp.array([0.0], dtype=jnp.float32)
     slot_neg = jnp.array([-1], dtype=jnp.int32)
 
     buf0 = append_to_buffer(
@@ -157,6 +166,7 @@ def main() -> None:
         halt_now[:1],
         send_1,
         launch_angle[:1],
+        fleet_eta[:1],
         slot_1,
         halt_action_r0,
         pair_flat_1,
@@ -164,6 +174,7 @@ def main() -> None:
         no_valid_pairs_1,
         no_valid_fracs_1,
         must_halt_ns_1,
+        tpr_1,
         jnp.array([0], dtype=jnp.int32),
         jnp.array([0], dtype=jnp.int32),
         active_1,
@@ -174,6 +185,7 @@ def main() -> None:
         micro_halt_halt,
         send_zero,
         jnp.zeros((1,), dtype=jnp.float32),
+        eta_zero,
         slot_neg,
         halt_action_r1,
         pair_flat_1,
@@ -181,6 +193,7 @@ def main() -> None:
         no_valid_pairs_1,
         no_valid_fracs_1,
         must_halt_ns_1,
+        tpr_1,
         jnp.array([1], dtype=jnp.int32),
         jnp.array([1], dtype=jnp.int32),
         active_1,
@@ -193,6 +206,7 @@ def main() -> None:
         micro_halt_halt,
         send_zero,
         jnp.zeros((1,), dtype=jnp.float32),
+        eta_zero,
         slot_neg,
         halt_action_p1_r0,
         pair_flat_1,
@@ -200,6 +214,7 @@ def main() -> None:
         no_valid_pairs_1,
         no_valid_fracs_1,
         must_halt_ns_1,
+        tpr_1,
         jnp.array([0], dtype=jnp.int32),
         jnp.array([0], dtype=jnp.int32),
         active_1,
@@ -228,7 +243,7 @@ def main() -> None:
     mb_t = jnp.array([1, 0], dtype=jnp.int32)
     mb_n = jnp.array([0, 0], dtype=jnp.int32)
 
-    state_mb, halt_action_mb, pair_flat_mb, frac_idx_mb, nvp_mb, nvf_mb, _mh_mb = gather_minibatch(
+    state_mb, halt_action_mb, pair_flat_mb, frac_idx_mb, nvp_mb, nvf_mb, _mh_mb, tpr_mb = gather_minibatch(
         buf0,
         buf1,
         mb_player,
@@ -269,6 +284,7 @@ def main() -> None:
             policy=policy,
             device=device,
             ship_speed=6.0,
+            target_planet_reachable=tpr_mb,
         )
     print(
         f"replay_jax: logp shape {tuple(new_logp.shape)}, "

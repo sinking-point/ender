@@ -167,7 +167,7 @@ def expand_fleet_buffers_batched(state: OrbitWarsState, new_max_fleets: int) -> 
     pad = new_max_fleets - old_max
     num_envs = int(state.fleets.shape[0])
     fleets = jnp.concatenate(
-        [state.fleets, jnp.zeros((num_envs, pad, 7), dtype=state.fleets.dtype)],
+        [state.fleets, jnp.zeros((num_envs, pad, state.fleets.shape[-1]), dtype=state.fleets.dtype)],
         axis=1,
     )
     fleet_active = jnp.concatenate(

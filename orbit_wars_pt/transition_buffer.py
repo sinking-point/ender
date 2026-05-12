@@ -2,8 +2,9 @@
 
 Each buffer row stores a length-``M`` prefix of in-phase micro deltas (halt, stored
 ``send``, ``slot``, ``pair_flat``, ``frac_idx``), padded with no-ops, plus the
-scalar policy bookkeeping fields for that transition.  Canonical
-``planets`` / ``fleets`` / ``fleet_active`` live in ``turn_state_cache`` per
+scalar policy bookkeeping fields and ``target_planet_reachable`` (snapshot of
+which planets are valid first-hit targets for the sampled origin/fraction).
+Canonical ``planets`` / ``fleets`` / ``fleet_active`` live in ``turn_state_cache`` per
 turn.  PPO gather replays a prefix with :func:`apply_prefix_micro_deltas_batched`
 (no scan over ``H_buf``).
 """
@@ -18,15 +19,22 @@ import jax.numpy as jnp
 
 from jax_orbit_wars import OrbitWarsState
 
+from orbit_wars_pt.constants import MAX_PLANETS
 from orbit_wars_pt.micro_jax import apply_prefix_micro_deltas_batched
 
 
 class TransitionBuffer(NamedTuple):
-    """One player's transitions for one segment, all on device."""
+    """One player's transitions for one segment, all on device.
+
+    ``target_planet_reachable`` stores rollout-time ``target_valid & ~overflow``
+    per planet for the sampled origin/fraction (used at PPO replay instead of
+    recomputing first-hit rays).
+    """
 
     micro_halt_now: jnp.ndarray
     send: jnp.ndarray
     angle: jnp.ndarray
+    fleet_eta: jnp.ndarray
     slot: jnp.ndarray
     halt_action: jnp.ndarray
     pair_flat: jnp.ndarray
@@ -34,6 +42,7 @@ class TransitionBuffer(NamedTuple):
     no_valid_pairs: jnp.ndarray
     no_valid_fracs: jnp.ndarray
     must_halt_no_ships: jnp.ndarray
+    target_planet_reachable: jnp.ndarray
     phase_micro_idx: jnp.ndarray
 
 
@@ -46,6 +55,7 @@ def init_transition_buffer(num_envs: int, H_buf: int, max_micro_steps: int) -> T
         micro_halt_now=noop_halt,
         send=jnp.zeros((H_buf, num_envs, m), dtype=jnp.float32),
         angle=jnp.zeros((H_buf, num_envs, m), dtype=jnp.float32),
+        fleet_eta=jnp.zeros((H_buf, num_envs, m), dtype=jnp.float32),
         slot=jnp.full((H_buf, num_envs, m), -1, dtype=jnp.int32),
         halt_action=jnp.zeros((H_buf, num_envs), dtype=jnp.int32),
         pair_flat=jnp.zeros((H_buf, num_envs, m), dtype=jnp.int32),
@@ -53,6 +63,7 @@ def init_transition_buffer(num_envs: int, H_buf: int, max_micro_steps: int) -> T
         no_valid_pairs=jnp.zeros((H_buf, num_envs), dtype=jnp.bool_),
         no_valid_fracs=jnp.zeros((H_buf, num_envs), dtype=jnp.bool_),
         must_halt_no_ships=jnp.zeros((H_buf, num_envs), dtype=jnp.bool_),
+        target_planet_reachable=jnp.zeros((H_buf, num_envs, MAX_PLANETS), dtype=jnp.bool_),
         phase_micro_idx=jnp.zeros((H_buf, num_envs), dtype=jnp.int32),
     )
 
@@ -75,6 +86,7 @@ def append_to_buffer(
     micro_halt_now,
     send_now,
     angle_now,
+    fleet_eta_now,
     slot_now,
     halt_action,
     pair_flat,
@@ -82,6 +94,7 @@ def append_to_buffer(
     no_valid_pairs,
     no_valid_fracs,
     must_halt_no_ships,
+    target_planet_reachable_now,
     write_row: jnp.ndarray,
     micro_k: jnp.ndarray,
     active: jnp.ndarray,
@@ -103,6 +116,7 @@ def append_to_buffer(
     new_halt = _grow(buf.micro_halt_now, micro_halt_now.astype(jnp.bool_), noop_h)
     new_send = _grow(buf.send, send_now.astype(jnp.float32), noop_s)
     new_angle = _grow(buf.angle, angle_now.astype(jnp.float32), noop_a)
+    new_fleet_eta = _grow(buf.fleet_eta, fleet_eta_now.astype(jnp.float32), noop_a)
     new_slot = _grow(buf.slot, slot_now.astype(jnp.int32), noop_sl)
     new_pf = _grow(buf.pair_flat, pair_flat.astype(jnp.int32), noop_pf)
     new_fi = _grow(buf.frac_idx, frac_idx.astype(jnp.int32), noop_fi)
@@ -115,6 +129,7 @@ def append_to_buffer(
     out_halt = _scatter_rows(buf.micro_halt_now, new_halt)
     out_send = _scatter_rows(buf.send, new_send)
     out_angle = _scatter_rows(buf.angle, new_angle)
+    out_fleet_eta = _scatter_rows(buf.fleet_eta, new_fleet_eta)
     out_slot = _scatter_rows(buf.slot, new_slot)
     out_pf = _scatter_rows(buf.pair_flat, new_pf)
     out_fi = _scatter_rows(buf.frac_idx, new_fi)
@@ -123,6 +138,9 @@ def append_to_buffer(
     out_nvp = buf.no_valid_pairs.at[write_row, n_idx].set(no_valid_pairs.astype(jnp.bool_))
     out_nvf = buf.no_valid_fracs.at[write_row, n_idx].set(no_valid_fracs.astype(jnp.bool_))
     out_mh = buf.must_halt_no_ships.at[write_row, n_idx].set(must_halt_no_ships.astype(jnp.bool_))
+    out_tpr = buf.target_planet_reachable.at[write_row, n_idx, :].set(
+        target_planet_reachable_now.astype(jnp.bool_)
+    )
 
     old_pm = buf.phase_micro_idx[write_row, n_idx]
     new_pm = jnp.where(active, micro_k.astype(jnp.int32), old_pm)
@@ -132,6 +150,7 @@ def append_to_buffer(
         micro_halt_now=out_halt,
         send=out_send,
         angle=out_angle,
+        fleet_eta=out_fleet_eta,
         slot=out_slot,
         halt_action=out_ha,
         pair_flat=out_pf,
@@ -139,6 +158,7 @@ def append_to_buffer(
         no_valid_pairs=out_nvp,
         no_valid_fracs=out_nvf,
         must_halt_no_ships=out_mh,
+        target_planet_reachable=out_tpr,
         phase_micro_idx=out_pm,
     )
 
@@ -185,6 +205,7 @@ def gather_minibatch(
     halt_m = _gp(buf0.micro_halt_now, buf1.micro_halt_now)
     send_m = _gp(buf0.send, buf1.send)
     angle_m = _gp(buf0.angle, buf1.angle)
+    fleet_eta_m = _gp(buf0.fleet_eta, buf1.fleet_eta)
     slot_m = _gp(buf0.slot, buf1.slot)
     pf_m = _gp(buf0.pair_flat, buf1.pair_flat)
     fi_m = _gp(buf0.frac_idx, buf1.frac_idx)
@@ -199,6 +220,7 @@ def gather_minibatch(
         pf_m,
         fi_m,
         angle_m,
+        fleet_eta_m,
         apply_mask_m,
     )
 
@@ -219,6 +241,9 @@ def gather_minibatch(
     no_valid_pairs = _sel(buf0.no_valid_pairs, buf1.no_valid_pairs)
     no_valid_fracs = _sel(buf0.no_valid_fracs, buf1.no_valid_fracs)
     must_halt_no_ships = _sel(buf0.must_halt_no_ships, buf1.must_halt_no_ships)
+    tpr0 = buf0.target_planet_reachable[t_b, n_b, :]
+    tpr1 = buf1.target_planet_reachable[t_b, n_b, :]
+    target_planet_reachable = jnp.where(is_p0[:, None], tpr0, tpr1)
 
     return (
         state_mb,
@@ -228,4 +253,5 @@ def gather_minibatch(
         no_valid_pairs,
         no_valid_fracs,
         must_halt_no_ships,
+        target_planet_reachable,
     )

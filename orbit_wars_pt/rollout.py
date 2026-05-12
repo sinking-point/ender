@@ -19,18 +19,17 @@ from jax_orbit_wars import (
     PLANET_Y,
     FLEET_ANGLE,
     FLEET_FROM_PLANET,
+    FLEET_ETA,
     FLEET_OWNER,
     FLEET_SHIPS,
+    FLEET_TARGET_PLANET,
     FLEET_X,
     FLEET_Y,
 )
 
 from orbit_wars_pt.constants import FRACTIONS, MAX_PLANETS, NUM_FRACTIONS
-from orbit_wars_pt.geometry import (
-    estimate_time_to_hit,
-    launch_point,
-    path_hits_sun_or_other_planet_before_dest,
-)
+from orbit_wars_pt.geometry import estimate_time_to_hit, launch_point
+from orbit_wars_pt.micro_jax import path_hits_brute_host
 from orbit_wars_pt.model import OrbitWarsPolicy
 from orbit_wars_pt.observation import ObservationBatch, build_observation, jax_state_to_numpy
 
@@ -255,20 +254,13 @@ def replay_micro_step_logprob_entropy(
         if send < 1:
             masks[fi] = False
             continue
-        bad = path_hits_sun_or_other_planet_before_dest(
-            ox,
-            oy,
-            float(planet_r[o_idx]),
-            dx,
-            dy,
-            float(planet_r[d_idx]),
-            float(send),
-            planet_xy,
-            planet_r,
-            planet_active,
+        bad = path_hits_brute_host(
+            virt,
             o_idx,
             d_idx,
-            max_speed=ship_speed,
+            float(send),
+            ship_speed=ship_speed,
+            horizon=24,
         )
         masks[fi] = not bad
         eta = estimate_time_to_hit(
@@ -427,20 +419,13 @@ def micro_step_apply(
         if send < 1:
             masks[fi] = False
             continue
-        bad = path_hits_sun_or_other_planet_before_dest(
-            ox,
-            oy,
-            float(planet_r[o_idx]),
-            dx,
-            dy,
-            float(planet_r[d_idx]),
-            float(send),
-            planet_xy,
-            planet_r,
-            planet_active,
+        bad = path_hits_brute_host(
+            virt,
             o_idx,
             d_idx,
-            max_speed=ship_speed,
+            float(send),
+            ship_speed=ship_speed,
+            horizon=24,
         )
         masks[fi] = not bad
         eta = estimate_time_to_hit(
@@ -479,20 +464,13 @@ def micro_step_apply(
             send = math.floor(frac * ships_avail)
             if send < 1:
                 continue
-            bad = path_hits_sun_or_other_planet_before_dest(
-                ox,
-                oy,
-                float(planet_r[o_idx]),
-                dx,
-                dy,
-                float(planet_r[d_idx]),
-                float(send),
-                planet_xy,
-                planet_r,
-                planet_active,
+            bad = path_hits_brute_host(
+                virt,
                 o_idx,
                 d_idx,
-                max_speed=ship_speed,
+                float(send),
+                ship_speed=ship_speed,
+                horizon=24,
             )
             masks[fi] = not bad
             eta = estimate_time_to_hit(
@@ -559,13 +537,16 @@ def micro_step_apply(
         fl = np.asarray(virt.fleets)
         fa = np.asarray(virt.fleet_active)
         sx, sy = launch_point(ox, oy, float(planet_r[o_idx]), dx, dy)
-        row = np.zeros((7,), dtype=np.float32)
+        row = np.zeros((fl.shape[1],), dtype=np.float32)
         row[FLEET_OWNER] = float(ego_player)
         row[FLEET_X] = sx
         row[FLEET_Y] = sy
         row[FLEET_ANGLE] = float(angle)
         row[FLEET_FROM_PLANET] = oid
         row[FLEET_SHIPS] = float(send)
+        if row.shape[0] > FLEET_ETA:
+            row[FLEET_TARGET_PLANET] = float(d_idx)
+            row[FLEET_ETA] = float(etas[fi])
         fl[slot] = row
         fa[slot] = True
         virt = virt._replace(fleets=fl, fleet_active=fa)
@@ -674,4 +655,3 @@ def build_turn_actions(
         ),
     }
     return arr, info
-

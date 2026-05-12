@@ -271,7 +271,7 @@ def _circle_disk_interval_at_tau(
     target_radius: jnp.ndarray,
     tau: jnp.ndarray,
     eps: float = GEOM_EPS,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     p = target_xy - origin_xy
     d = jnp.linalg.norm(p)
     rho = launch_offset + (tick.astype(origin_xy.dtype) + tau) * speed
@@ -337,6 +337,40 @@ def tick_hit_intervals_jax(
     out_hi = jnp.where(any_valid, jnp.where(any_full, TAU, _norm_angle(hull_hi + ANGLE_PAD)), 0.0)
     out_valid = any_valid
     return split_wrapped_intervals(out_lo, out_hi, out_valid)
+
+
+def _all_planet_tick_hits(
+    origin_xy: jnp.ndarray,
+    origin_radius: jnp.ndarray,
+    speed: jnp.ndarray,
+    tick: jnp.ndarray,
+    object_p0_row: jnp.ndarray,
+    object_p1_row: jnp.ndarray,
+    object_radii: jnp.ndarray,
+    object_active_row: jnp.ndarray,
+    *,
+    samples_per_span: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Batched ``tick_hit_intervals_jax`` for every object in one tick row.
+
+    One radial-disk solve per planet, fused as a single ``vmap`` instead of
+    ``P`` sequential calls inside the occlusion loop.
+    """
+
+    def one(p0j: jnp.ndarray, p1j: jnp.ndarray, rj: jnp.ndarray, aj: jnp.ndarray):
+        return tick_hit_intervals_jax(
+            origin_xy,
+            origin_radius,
+            speed,
+            tick,
+            p0j,
+            p1j,
+            rj,
+            aj,
+            samples_per_span=samples_per_span,
+        )
+
+    return jax.vmap(one)(object_p0_row, object_p1_row, object_radii, object_active_row)
 
 
 def _board_exit_intervals_jax(
@@ -408,6 +442,23 @@ def first_hit_intervals_jax(
     order_arr = jnp.asarray(order, dtype=jnp.int32)
     target_idx_j = jnp.asarray(target_idx)
 
+    ti_vec = jnp.arange(ticks, dtype=jnp.int32)
+
+    def hits_one_tick(ti: jnp.ndarray):
+        return _all_planet_tick_hits(
+            origin_xy,
+            origin_radius,
+            speed,
+            ti,
+            object_p0_by_tick[ti],
+            object_p1_by_tick[ti],
+            object_radii,
+            object_active_by_tick[ti],
+            samples_per_span=samples_per_span,
+        )
+
+    all_hits_lo, all_hits_hi, all_hits_valid = jax.vmap(hits_one_tick)(ti_vec)
+
     block_lo, block_hi, block_valid = _empty(max_block_intervals, origin_xy.dtype)
     valid_lo, valid_hi, valid_valid = _empty(max_valid_intervals, origin_xy.dtype)
     block_count = jnp.asarray(0, dtype=jnp.int32)
@@ -418,6 +469,11 @@ def first_hit_intervals_jax(
         block_lo, block_hi, block_valid, block_count, valid_lo, valid_hi, valid_valid, valid_count, overflow = (
             carry
         )
+
+        tick = jnp.asarray(tick_i, dtype=jnp.int32)
+        all_lo = all_hits_lo[tick_i]
+        all_hi = all_hits_hi[tick_i]
+        all_valid = all_hits_valid[tick_i]
 
         def inner_body(k, inner):
             (
@@ -432,18 +488,9 @@ def first_hit_intervals_jax(
                 overflow,
             ) = inner
             obj_idx = order_arr[k]
-            tick = jnp.asarray(tick_i, dtype=jnp.int32)
-            hit_lo, hit_hi, hit_valid = tick_hit_intervals_jax(
-                origin_xy,
-                origin_radius,
-                speed,
-                tick,
-                object_p0_by_tick[tick, obj_idx],
-                object_p1_by_tick[tick, obj_idx],
-                object_radii[obj_idx],
-                object_active_by_tick[tick, obj_idx],
-                samples_per_span=samples_per_span,
-            )
+            hit_lo = all_lo[obj_idx]
+            hit_hi = all_hi[obj_idx]
+            hit_valid = all_valid[obj_idx]
             avail_lo, avail_hi, avail_valid = _set_subtract_cells(
                 hit_lo, hit_hi, hit_valid, block_lo, block_hi, block_valid
             )
@@ -496,7 +543,6 @@ def first_hit_intervals_jax(
             overflow,
         ) = jax.lax.fori_loop(0, num_order, inner_body, inner_init)
 
-        tick = jnp.asarray(tick_i, dtype=jnp.int32)
         if include_board:
             b_lo, b_hi, b_valid = _board_exit_intervals_jax(
                 origin_xy, origin_radius, speed, tick, board_size
@@ -559,19 +605,125 @@ def first_hit_intervals_jax(
     return valid_lo, valid_hi, valid_valid, overflow
 
 
-@partial(
-    jax.jit,
-    static_argnames=(
-        "object_order",
-        "include_board",
-        "include_sun",
-        "board_size",
-        "sun_radius",
-        "samples_per_span",
-        "max_block_intervals",
-    ),
-)
-def first_hit_best_targets_jax(
+def _precompute_all_tick_planet_hits_for_best_targets_jax(
+    origin_xy: jnp.ndarray,
+    origin_radius: jnp.ndarray,
+    speed: jnp.ndarray,
+    object_p0_by_tick: jnp.ndarray,
+    object_p1_by_tick: jnp.ndarray,
+    object_radii: jnp.ndarray,
+    object_active_by_tick: jnp.ndarray,
+    samples_per_span: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """``[T, P, S]`` hit interval tensors for every tick and planet (no occlusion)."""
+
+    ticks = int(object_active_by_tick.shape[0])
+    ti_vec = jnp.arange(ticks, dtype=jnp.int32)
+
+    def hits_one_tick(ti: jnp.ndarray):
+        return _all_planet_tick_hits(
+            origin_xy,
+            origin_radius,
+            speed,
+            ti,
+            object_p0_by_tick[ti],
+            object_p1_by_tick[ti],
+            object_radii,
+            object_active_by_tick[ti],
+            samples_per_span=samples_per_span,
+        )
+
+    return jax.vmap(hits_one_tick)(ti_vec)
+
+
+def _precompute_all_tick_planet_and_sun_hits_jax(
+    origin_xy: jnp.ndarray,
+    origin_radius: jnp.ndarray,
+    speed: jnp.ndarray,
+    object_p0_by_tick: jnp.ndarray,
+    object_p1_by_tick: jnp.ndarray,
+    object_radii: jnp.ndarray,
+    object_active_by_tick: jnp.ndarray,
+    samples_per_span: int,
+    sun_radius: float,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """``[T, P+1, S]`` planet rows plus one sun row per tick (no occlusion)."""
+
+    p_lo, p_hi, p_val = _precompute_all_tick_planet_hits_for_best_targets_jax(
+        origin_xy,
+        origin_radius,
+        speed,
+        object_p0_by_tick,
+        object_p1_by_tick,
+        object_radii,
+        object_active_by_tick,
+        samples_per_span,
+    )
+    ticks = int(object_active_by_tick.shape[0])
+    dtype = origin_xy.dtype
+    sun_xy = jnp.asarray([CENTER, CENTER], dtype=dtype)
+    sr = jnp.asarray(sun_radius - 1e-9, dtype=dtype)
+
+    def sun_for_tick(ti: jnp.ndarray):
+        return tick_hit_intervals_jax(
+            origin_xy,
+            origin_radius,
+            speed,
+            ti,
+            sun_xy,
+            sun_xy,
+            sr,
+            jnp.asarray(True),
+            samples_per_span=samples_per_span,
+        )
+
+    ti_vec = jnp.arange(ticks, dtype=jnp.int32)
+    s_lo, s_hi, s_val = jax.vmap(sun_for_tick)(ti_vec)
+    s_lo = s_lo[:, None, :]
+    s_hi = s_hi[:, None, :]
+    s_val = s_val[:, None, :]
+    return (
+        jnp.concatenate([p_lo, s_lo], axis=1),
+        jnp.concatenate([p_hi, s_hi], axis=1),
+        jnp.concatenate([p_val, s_val], axis=1),
+    )
+
+
+def _hit_intervals_to_bin_mask(
+    lo: jnp.ndarray,
+    hi: jnp.ndarray,
+    valid: jnp.ndarray,
+    *,
+    n_bins: int,
+) -> jnp.ndarray:
+    """``[n_bins]`` bool: any bin center lies in a valid ``[lo, hi]`` elementary cell."""
+
+    dtype = lo.dtype
+    centers = (jnp.arange(n_bins, dtype=dtype) + 0.5) * (TAU / jnp.asarray(float(n_bins), dtype=dtype))
+    inside = valid[:, None] & (centers[None, :] >= lo[:, None]) & (centers[None, :] <= hi[:, None])
+    return jnp.any(inside, axis=0)
+
+
+def _max_circular_true_run_length_and_start(mask: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Longest consecutive True on a ring of length ``n``; returns ``(length, start)``."""
+
+    n = int(mask.shape[0])
+    m2 = jnp.concatenate([mask, mask], axis=0)
+    idx = jnp.arange(n, dtype=jnp.int32)
+
+    def length_from_start(s):
+        window = jax.lax.dynamic_slice(m2, (s,), (n,))
+        all_true = jnp.all(window)
+        first_false = jnp.argmax(~window)
+        return jnp.where(all_true, jnp.asarray(n, dtype=jnp.int32), first_false)
+
+    lengths = jax.vmap(length_from_start)(idx)
+    max_len = jnp.max(lengths)
+    best_start = jnp.argmax(lengths)
+    return max_len, best_start
+
+
+def first_hit_union_scan_bins_apply_jax(
     origin_xy: jnp.ndarray,
     origin_radius: jnp.ndarray,
     speed: jnp.ndarray,
@@ -580,6 +732,290 @@ def first_hit_best_targets_jax(
     object_radii: jnp.ndarray,
     object_active_by_tick: jnp.ndarray,
     *,
+    samples_per_span: int,
+    n_block_bins: int,
+    sun_radius: float = SUN_RADIUS,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Experimental first-hit style angles via **binned** prefix-OR over ticks (no board).
+
+    Pipeline:
+
+    1. Precompute planet + sun hit intervals ``[T, P+1, S]``.
+    2. Map each object's intervals to a fixed ``n_block_bins`` angular bitmask.
+    3. Per tick, ``E_t = OR_j mask[t,j]``; ``associative_scan(bitwise_or)`` yields cumulative
+       blocked union through tick ``t`` inclusive; **blocked before tick** ``t`` is the
+       prior prefix (empty at ``t=0``).
+    4. For each ``(t, planet)``, available bins = planet mask minus blocked-before;
+       widest True run on the **discretized** circle; best over ``t`` is the reported width.
+
+    This ignores board edges, moves sun into precompute, and approximates interval geometry
+    on a uniform bin grid — **not** bit-identical with ``first_hit_best_targets_apply_jax``.
+    Intended for benchmarking scan-shaped parallelism.
+
+    Returns ``(angle[P], width[P], valid[P], overflow)`` with ``overflow`` always false.
+    """
+
+    planets = int(object_radii.shape[0])
+    dtype = origin_xy.dtype
+    dtheta = TAU / jnp.asarray(float(n_block_bins), dtype=dtype)
+
+    all_lo, all_hi, all_va = _precompute_all_tick_planet_and_sun_hits_jax(
+        origin_xy,
+        origin_radius,
+        speed,
+        object_p0_by_tick,
+        object_p1_by_tick,
+        object_radii,
+        object_active_by_tick,
+        samples_per_span,
+        sun_radius,
+    )
+    ticks = int(all_lo.shape[0])
+
+    def hit_to_mask(row_lo: jnp.ndarray, row_hi: jnp.ndarray, row_va: jnp.ndarray) -> jnp.ndarray:
+        return _hit_intervals_to_bin_mask(row_lo, row_hi, row_va, n_bins=n_block_bins)
+
+    hit_mask_obj = jax.vmap(jax.vmap(hit_to_mask))(all_lo, all_hi, all_va)
+    E_t = jnp.any(hit_mask_obj, axis=1)
+    cum_or = jax.lax.associative_scan(jnp.bitwise_or, E_t, axis=0)
+    zeros = jnp.zeros((n_block_bins,), dtype=jnp.bool_)
+    blocked_before = jnp.concatenate([zeros[None, :], cum_or[:-1]], axis=0)
+
+    jp = jnp.arange(planets, dtype=jnp.int32)
+    jt = jnp.arange(ticks, dtype=jnp.int32)
+
+    def one_tj(t: jnp.ndarray, j: jnp.ndarray):
+        mobs = hit_mask_obj[t, j]
+        bb = blocked_before[t]
+        avail = mobs & (~bb)
+        mlen, mstart = _max_circular_true_run_length_and_start(avail)
+        width = mlen.astype(dtype) * dtheta
+        angle = _norm_angle((mstart.astype(dtype) + 0.5 * mlen.astype(dtype)) * dtheta)
+        ok = mlen > 0
+        return width, angle, ok
+
+    def row_t(t: jnp.ndarray):
+        return jax.vmap(lambda j: one_tj(t, j))(jp)
+
+    w_tab, ang_tab, val_tab = jax.vmap(row_t)(jt)
+    best_w = jnp.max(w_tab, axis=0)
+    rr = jnp.arange(planets, dtype=jnp.int32)
+    best_t = jnp.argmax(w_tab, axis=0)
+    best_angle = ang_tab[best_t, rr]
+    best_valid = (best_w > GEOM_EPS) & val_tab[best_t, rr]
+    overflow = jnp.asarray(False)
+    return best_angle, best_w, best_valid, overflow
+
+
+def _game_point_to_segment_distance(point: jnp.ndarray, start: jnp.ndarray, end: jnp.ndarray) -> jnp.ndarray:
+    """Closest distance from ``point`` to segment ``start→end`` (same as ``jax_orbit_wars``)."""
+
+    delta = end - start
+    l2 = jnp.sum(delta * delta, axis=-1, keepdims=True)
+    t = jnp.where(l2 == 0.0, 0.0, jnp.sum((point - start) * delta, axis=-1, keepdims=True) / l2)
+    t = jnp.clip(t, 0.0, 1.0)
+    projection = start + t * delta
+    return jnp.linalg.norm(point - projection, axis=-1)
+
+
+def first_hit_brute_rays_baseline_apply_jax(
+    origin_xy: jnp.ndarray,
+    origin_radius: jnp.ndarray,
+    speed: jnp.ndarray,
+    object_p0_by_tick: jnp.ndarray,
+    object_p1_by_tick: jnp.ndarray,
+    object_radii: jnp.ndarray,
+    object_active_by_tick: jnp.ndarray,
+    *,
+    n_rays: int = 2048,
+    n_substeps_per_tick: int = 8,
+    ray_angles: jnp.ndarray | None = None,
+    include_sun: bool = True,
+    include_board: bool = True,
+    sun_radius: float = SUN_RADIUS,
+    board_size: float = BOARD_SIZE,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Brute forward check: ``n_rays`` **virtual fleets**, one per launch heading, in parallel.
+
+    Each ray angle ``θ_k = 2π k / n_rays`` is a separate fleet with heading ``u(θ_k)``, same
+    speed and rim offset as the real game. The fleets **do not block each other** (no
+    fleet–fleet geometry); only planets, sun, and board affect each path independently.
+
+    Per virtual fleet, motion matches ``jax_orbit_wars._move_fleets_and_collect_combats``:
+
+    * Launch from ``origin + (origin_radius + 0.1) u(θ)`` (same rim offset as the env).
+    * Each tick: fleet segment ``a0 → a1`` with ``a1 = a0 + speed * u`` (straight motion).
+    * Planet hit: ``_swept_pair_hit`` on ``(a0,a1)`` vs ``(p0[t,j], p1[t,j])`` with planet
+      radius, masked by ``object_active_by_tick``. Among planet hits, the lowest index
+      ``j`` wins (``jnp.argmax`` on the hit mask), matching ``_first_true``.
+    * Sun: distance from board center to the **fleet segment** is ``< sun_radius`` (not a
+      moving disk in the planet list).
+    * Out of bounds: endpoint ``a1`` outside ``[0, board_size]^2`` (same as the env).
+    * Within one tick, precedence if multiple apply: **planet** (lowest ``j``) else
+      **sun** else **board**, matching combat attribution when a planet is also hit.
+
+    ``n_substeps_per_tick`` is ignored (kept for benchmark CLI compatibility).
+
+    If ``ray_angles`` is provided (shape ``[n_rays]``), those headings are used instead of
+    the uniform grid ``2π k / n_rays``.
+
+    Returns ``(first_event_lex[n_rays], hit_any[n_rays])``. Lex packs
+    ``tick * stride + code`` with ``code ∈ [0, P)`` planet index, ``code = P`` for sun
+    (if ``include_sun``), ``code = P+1`` for board when both sun and board are on, etc.;
+    ``stride = P + int(include_sun) + int(include_board)``. No hit on the horizon is
+    ``2**31 - 1``.
+    """
+
+    _ = n_substeps_per_tick
+    dtype = origin_xy.dtype
+    ticks = int(object_active_by_tick.shape[0])
+    planets = int(object_radii.shape[0])
+    launch_off = origin_radius + jnp.asarray(0.1, dtype=dtype)
+
+    if ray_angles is None:
+        kvec = jnp.arange(n_rays, dtype=dtype)
+        theta = kvec * (TAU / jnp.asarray(float(n_rays), dtype=dtype))
+    else:
+        theta = ray_angles
+    u = jnp.stack([jnp.cos(theta), jnp.sin(theta)], axis=-1)
+
+    tvec = jnp.arange(ticks, dtype=dtype)
+    t3 = tvec[:, None, None]
+    factor = launch_off + speed * t3
+    a0 = origin_xy[None, None, :] + u[None, :, :] * factor
+    a1 = a0 + speed * u[None, :, :]
+
+    p0 = object_p0_by_tick
+    p1 = object_p1_by_tick
+    d0 = a0[:, :, None, :] - p0[:, None, :, :]
+    dv = (a1[:, :, None, :] - a0[:, :, None, :]) - (p1[:, None, :, :] - p0[:, None, :, :])
+    qa = jnp.sum(dv * dv, axis=-1)
+    qb = 2.0 * jnp.sum(d0 * dv, axis=-1)
+    qc = jnp.sum(d0 * d0, axis=-1) - object_radii[None, None, :] ** 2
+    disc = qb * qb - 4.0 * qa * qc
+    static_hit = qc <= 0.0
+    sqrt_disc = jnp.sqrt(jnp.maximum(disc, 0.0))
+    qa_safe = jnp.where(qa < jnp.asarray(1e-12, dtype=dtype), 1.0, qa)
+    t1 = (-qb - sqrt_disc) / (2.0 * qa_safe)
+    t2 = (-qb + sqrt_disc) / (2.0 * qa_safe)
+    moving_hit = (disc >= 0.0) & (t2 >= 0.0) & (t1 <= 1.0)
+    qa_small = jnp.asarray(1e-12, dtype=dtype)
+    hit_planet_raw = jnp.where(qa < qa_small, static_hit, moving_hit)
+    act = object_active_by_tick[:, None, :]
+    hit_planet = hit_planet_raw & act
+    any_planet = jnp.any(hit_planet, axis=-1)
+    planet_idx = jnp.argmax(hit_planet.astype(jnp.int32), axis=-1)
+
+    sun_xy = jnp.asarray([CENTER, CENTER], dtype=dtype)
+    sun_dist = _game_point_to_segment_distance(sun_xy, a0, a1)
+    sun_hit = sun_dist < jnp.asarray(sun_radius, dtype=dtype)
+    sun_hit_eff = sun_hit & jnp.asarray(include_sun, dtype=jnp.bool_)
+
+    in_bounds = (
+        (a1[..., 0] >= 0.0)
+        & (a1[..., 0] <= jnp.asarray(board_size, dtype=dtype))
+        & (a1[..., 1] >= 0.0)
+        & (a1[..., 1] <= jnp.asarray(board_size, dtype=dtype))
+    )
+    oob = ~in_bounds & jnp.asarray(include_board, dtype=jnp.bool_)
+
+    sun_code = planets
+    board_code = planets + int(include_sun)
+    stride = planets + int(include_sun) + int(include_board)
+    event_code = jnp.where(
+        any_planet,
+        planet_idx.astype(jnp.int32),
+        jnp.where(
+            sun_hit_eff,
+            jnp.asarray(sun_code, dtype=jnp.int32),
+            jnp.where(oob, jnp.asarray(board_code, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32)),
+        ),
+    )
+    had_event = any_planet | sun_hit_eff | oob
+
+    t_col = jnp.arange(ticks, dtype=jnp.int32)[:, None]
+    tick_lex = t_col * jnp.asarray(stride, dtype=jnp.int32) + event_code
+    big = jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32)
+    masked = jnp.where(had_event, tick_lex, big)
+    first_lex = jnp.min(masked, axis=0).astype(jnp.int32)
+    hit_any = first_lex < big
+    return first_lex, hit_any
+
+
+def first_hit_brute_best_targets_from_rays_apply_jax(
+    origin_xy: jnp.ndarray,
+    origin_radius: jnp.ndarray,
+    speed: jnp.ndarray,
+    object_p0_by_tick: jnp.ndarray,
+    object_p1_by_tick: jnp.ndarray,
+    object_radii: jnp.ndarray,
+    object_active_by_tick: jnp.ndarray,
+    *,
+    n_rays: int = 2048,
+    include_sun: bool = True,
+    include_board: bool = True,
+    board_size: float = BOARD_SIZE,
+    sun_radius: float = SUN_RADIUS,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Per-planet launch heading from discrete rays (same sweep as ``first_hit_brute_rays_baseline_apply_jax``).
+
+    For each planet ``j``, keep only rays whose **first** terminal event is hitting ``j`` (same
+    precedence as the baseline: planet index, then sun, then board within a tick; earliest
+    tick wins). Among those rays, pick the one with the **smallest hit tick** (earliest time);
+    ties use the **smallest ray index**. The reported angle is that ray's heading; width is
+    one bin ``2π / n_rays``. If no ray hits ``j`` first, ``valid[j]`` is false.
+
+    Returns ``(angle[P], width[P], valid[P], overflow, hit_tick[P])`` with
+    ``overflow`` always false. ``hit_tick`` is the first terminal-event tick for
+    the selected ray.
+    """
+
+    dtype = origin_xy.dtype
+    planets = int(object_radii.shape[0])
+    first_lex, hit_any = first_hit_brute_rays_baseline_apply_jax(
+        origin_xy,
+        origin_radius,
+        speed,
+        object_p0_by_tick,
+        object_p1_by_tick,
+        object_radii,
+        object_active_by_tick,
+        n_rays=n_rays,
+        include_sun=include_sun,
+        include_board=include_board,
+        board_size=board_size,
+        sun_radius=sun_radius,
+    )
+    stride = planets + int(include_sun) + int(include_board)
+    stride_j = jnp.asarray(stride, dtype=jnp.int32)
+    iinf = jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32)
+    codes = jnp.where(hit_any, first_lex % stride_j, jnp.asarray(-1, dtype=jnp.int32))
+    hit_ticks = jnp.where(hit_any, first_lex // stride_j, iinf)
+
+    kvec = jnp.arange(n_rays, dtype=dtype)
+    theta = kvec * (TAU / jnp.asarray(float(n_rays), dtype=dtype))
+    dtheta = TAU / jnp.asarray(float(n_rays), dtype=dtype)
+    jp = jnp.arange(planets, dtype=jnp.int32)
+    # One (R,P) mat over rays×planets — fuses better than vmap(one_planet) on small P.
+    mask = hit_any[:, None] & (codes[:, None] == jp[None, :])
+    scores_rp = jnp.where(mask, hit_ticks[:, None], iinf)
+    br = jnp.argmin(scores_rp, axis=0).astype(jnp.int32)
+    ok = jnp.any(mask, axis=0)
+    ang = jnp.where(ok, _norm_angle(theta[br]), jnp.asarray(0.0, dtype=dtype))
+    wid = jnp.where(ok, dtheta, jnp.asarray(0.0, dtype=dtype))
+    tick = jnp.where(ok, hit_ticks[br].astype(dtype), jnp.asarray(0.0, dtype=dtype))
+    overflow = jnp.asarray(False)
+    return ang, wid, ok, overflow, tick
+
+
+def _sweep_best_targets_from_precomputed_hits_jax(
+    origin_xy: jnp.ndarray,
+    origin_radius: jnp.ndarray,
+    speed: jnp.ndarray,
+    all_hits_lo: jnp.ndarray,
+    all_hits_hi: jnp.ndarray,
+    all_hits_valid: jnp.ndarray,
+    *,
     object_order: Sequence[int] | None = None,
     include_board: bool = True,
     include_sun: bool = True,
@@ -587,18 +1023,24 @@ def first_hit_best_targets_jax(
     sun_radius: float = SUN_RADIUS,
     samples_per_span: int = 9,
     max_block_intervals: int = 32,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Sweep once and return the widest first-hit interval midpoint per target.
+    same_tick_planets_parallel: bool = False,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Occlusion sweep + best-angle recording given precomputed per-tick planet hits.
 
-    Outputs are ``(angle[P], width[P], valid[P], overflow)``. This is the
-    rollout-friendly variant: each ``available = hit - blocked`` interval set
-    is already the set of angles that hit that object first, so we record the
-    widest available cell for every object instead of recomputing the sweep per
-    target.
+    When ``same_tick_planets_parallel`` is False (default), planets in ``object_order``
+    are processed sequentially within each tick: each planet subtracts the blocker
+    union that already includes all earlier planets that tick — same-tick ties match
+    ``geometry.first_hit_angle_intervals`` / the Kaggle interpreter.
+
+    When True, every planet in a tick subtracts only the blocker union carried in from
+    **previous** ticks; widest cells and bests are computed in parallel with ``vmap``,
+    then all planets' hit intervals are appended in ``object_order`` before board/sun.
+    That changes angular tie semantics within a tick but removes the sequential
+    ``P`` dependence for the subtract / argmax portion.
     """
 
-    ticks = int(object_active_by_tick.shape[0])
-    objects = int(object_active_by_tick.shape[1])
+    ticks = int(all_hits_lo.shape[0])
+    objects = int(all_hits_lo.shape[1])
     order = tuple(range(objects)) if object_order is None else tuple(object_order)
     num_order = len(order)
     order_arr = jnp.asarray(order, dtype=jnp.int32)
@@ -612,44 +1054,73 @@ def first_hit_best_targets_jax(
     def outer_body(tick_i, carry):
         block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow = carry
 
-        def inner_body(k, inner):
-            block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow = inner
-            obj_idx = order_arr[k]
-            tick = jnp.asarray(tick_i, dtype=jnp.int32)
-            hit_lo, hit_hi, hit_valid = tick_hit_intervals_jax(
-                origin_xy,
-                origin_radius,
-                speed,
-                tick,
-                object_p0_by_tick[tick, obj_idx],
-                object_p1_by_tick[tick, obj_idx],
-                object_radii[obj_idx],
-                object_active_by_tick[tick, obj_idx],
-                samples_per_span=samples_per_span,
-            )
-            avail_lo, avail_hi, avail_valid = _set_subtract_cells(
-                hit_lo, hit_hi, hit_valid, block_lo, block_hi, block_valid
-            )
-            widths = jnp.where(avail_valid, avail_hi - avail_lo, -1.0)
-            idx = jnp.argmax(widths)
-            width = widths[idx]
-            update = width > best_width[obj_idx]
-            midpoint = _norm_angle(0.5 * (avail_lo[idx] + avail_hi[idx]))
-            best_angle = best_angle.at[obj_idx].set(jnp.where(update, midpoint, best_angle[obj_idx]))
-            best_width = best_width.at[obj_idx].set(jnp.where(update, width, best_width[obj_idx]))
-
-            block_lo, block_hi, block_valid, block_count, block_overflow = _append(
-                block_lo, block_hi, block_valid, block_count, hit_lo, hit_hi, hit_valid
-            )
-            overflow = overflow | block_overflow
-            return (block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow)
-
-        inner_init = (block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow)
-        block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow = jax.lax.fori_loop(
-            0, num_order, inner_body, inner_init
-        )
-
         tick = jnp.asarray(tick_i, dtype=jnp.int32)
+        all_lo = all_hits_lo[tick_i]
+        all_hi = all_hits_hi[tick_i]
+        all_valid = all_hits_valid[tick_i]
+
+        if same_tick_planets_parallel:
+            bl0, bh0, bv0, bc0 = block_lo, block_hi, block_valid, block_count
+            hit_lo_o = all_lo[order_arr]
+            hit_hi_o = all_hi[order_arr]
+            hit_va_o = all_valid[order_arr]
+
+            def subtract_one(hl, hh, hv):
+                return _set_subtract_cells(hl, hh, hv, bl0, bh0, bv0)
+
+            avail_lo, avail_hi, avail_valid = jax.vmap(subtract_one)(hit_lo_o, hit_hi_o, hit_va_o)
+            widths = jnp.where(avail_valid, avail_hi - avail_lo, -1.0)
+            idx = jnp.argmax(widths, axis=-1)
+            width = jnp.max(widths, axis=-1)
+            row = jnp.arange(num_order, dtype=jnp.int32)
+            midpoint = _norm_angle(0.5 * (avail_lo[row, idx] + avail_hi[row, idx]))
+            prev_w = best_width[order_arr]
+            upd = width > prev_w
+            new_w = jnp.where(upd, width, prev_w)
+            new_a = jnp.where(upd, midpoint, best_angle[order_arr])
+            best_width = best_width.at[order_arr].set(new_w)
+            best_angle = best_angle.at[order_arr].set(new_a)
+
+            def append_slot(k, inner):
+                bl, bh, bv, bc, ov = inner
+                oi = order_arr[k]
+                hl, hh, hv = all_lo[oi], all_hi[oi], all_valid[oi]
+                bl, bh, bv, bc, bo = _append(bl, bh, bv, bc, hl, hh, hv)
+                return (bl, bh, bv, bc, ov | bo)
+
+            block_lo, block_hi, block_valid, block_count, overflow = jax.lax.fori_loop(
+                0, num_order, append_slot, (bl0, bh0, bv0, bc0, overflow)
+            )
+        else:
+
+            def inner_body(k, inner):
+                block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow = inner
+                obj_idx = order_arr[k]
+                hit_lo = all_lo[obj_idx]
+                hit_hi = all_hi[obj_idx]
+                hit_valid = all_valid[obj_idx]
+                avail_lo, avail_hi, avail_valid = _set_subtract_cells(
+                    hit_lo, hit_hi, hit_valid, block_lo, block_hi, block_valid
+                )
+                widths = jnp.where(avail_valid, avail_hi - avail_lo, -1.0)
+                idx = jnp.argmax(widths)
+                width = widths[idx]
+                update = width > best_width[obj_idx]
+                midpoint = _norm_angle(0.5 * (avail_lo[idx] + avail_hi[idx]))
+                best_angle = best_angle.at[obj_idx].set(jnp.where(update, midpoint, best_angle[obj_idx]))
+                best_width = best_width.at[obj_idx].set(jnp.where(update, width, best_width[obj_idx]))
+
+                block_lo, block_hi, block_valid, block_count, block_overflow = _append(
+                    block_lo, block_hi, block_valid, block_count, hit_lo, hit_hi, hit_valid
+                )
+                overflow = overflow | block_overflow
+                return (block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow)
+
+            inner_init = (block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow)
+            block_lo, block_hi, block_valid, block_count, best_angle, best_width, overflow = jax.lax.fori_loop(
+                0, num_order, inner_body, inner_init
+            )
+
         if include_board:
             b_lo, b_hi, b_valid = _board_exit_intervals_jax(
                 origin_xy, origin_radius, speed, tick, board_size
@@ -684,6 +1155,162 @@ def first_hit_best_targets_jax(
 
     valid = best_width > GEOM_EPS
     return best_angle, best_width, valid, overflow
+
+
+def first_hit_interval_best_targets_apply_jax(
+    origin_xy: jnp.ndarray,
+    origin_radius: jnp.ndarray,
+    speed: jnp.ndarray,
+    object_p0_by_tick: jnp.ndarray,
+    object_p1_by_tick: jnp.ndarray,
+    object_radii: jnp.ndarray,
+    object_active_by_tick: jnp.ndarray,
+    *,
+    object_order: Sequence[int] | None = None,
+    include_board: bool = True,
+    include_sun: bool = True,
+    board_size: float = BOARD_SIZE,
+    sun_radius: float = SUN_RADIUS,
+    samples_per_span: int = 9,
+    max_block_intervals: int = 32,
+    same_tick_planets_parallel: bool = False,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Angular-interval sweep + occlusion (legacy training geometry; for benchmarks / audits)."""
+
+    all_hits_lo, all_hits_hi, all_hits_valid = _precompute_all_tick_planet_hits_for_best_targets_jax(
+        origin_xy,
+        origin_radius,
+        speed,
+        object_p0_by_tick,
+        object_p1_by_tick,
+        object_radii,
+        object_active_by_tick,
+        samples_per_span,
+    )
+    return _sweep_best_targets_from_precomputed_hits_jax(
+        origin_xy,
+        origin_radius,
+        speed,
+        all_hits_lo,
+        all_hits_hi,
+        all_hits_valid,
+        object_order=object_order,
+        include_board=include_board,
+        include_sun=include_sun,
+        board_size=board_size,
+        sun_radius=sun_radius,
+        samples_per_span=samples_per_span,
+        max_block_intervals=max_block_intervals,
+        same_tick_planets_parallel=same_tick_planets_parallel,
+    )
+
+
+def first_hit_best_targets_apply_jax(
+    origin_xy: jnp.ndarray,
+    origin_radius: jnp.ndarray,
+    speed: jnp.ndarray,
+    object_p0_by_tick: jnp.ndarray,
+    object_p1_by_tick: jnp.ndarray,
+    object_radii: jnp.ndarray,
+    object_active_by_tick: jnp.ndarray,
+    *,
+    object_order: Sequence[int] | None = None,
+    include_board: bool = True,
+    include_sun: bool = True,
+    board_size: float = BOARD_SIZE,
+    sun_radius: float = SUN_RADIUS,
+    samples_per_span: int = 9,
+    max_block_intervals: int = 32,
+    same_tick_planets_parallel: bool = False,
+    n_rays: int = 2048,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Discrete-ray first-hit targets (``first_hit_brute_best_targets_from_rays_apply_jax``).
+
+    Per planet: among rays whose first event is that planet, use the ray with the **earliest
+    hit tick** (ties: smallest ray index); angle = that ray; width = one bin ``2π / n_rays``.
+    The final return value is that selected first-hit tick.
+
+    Prefer this inside a single outer ``jit(vmap(...))``. Interval-sweep kwargs
+    ``object_order``, ``samples_per_span``, ``max_block_intervals``, and
+    ``same_tick_planets_parallel`` are accepted for API compatibility but ignored.
+    ``n_rays`` controls angular resolution and GPU memory (fewer rays = cheaper).
+    """
+
+    del object_order, samples_per_span, max_block_intervals, same_tick_planets_parallel
+    return first_hit_brute_best_targets_from_rays_apply_jax(
+        origin_xy,
+        origin_radius,
+        speed,
+        object_p0_by_tick,
+        object_p1_by_tick,
+        object_radii,
+        object_active_by_tick,
+        n_rays=n_rays,
+        include_sun=include_sun,
+        include_board=include_board,
+        board_size=board_size,
+        sun_radius=sun_radius,
+    )
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "object_order",
+        "include_board",
+        "include_sun",
+        "board_size",
+        "sun_radius",
+        "samples_per_span",
+        "max_block_intervals",
+        "same_tick_planets_parallel",
+        "n_rays",
+    ),
+)
+def first_hit_best_targets_jax(
+    origin_xy: jnp.ndarray,
+    origin_radius: jnp.ndarray,
+    speed: jnp.ndarray,
+    object_p0_by_tick: jnp.ndarray,
+    object_p1_by_tick: jnp.ndarray,
+    object_radii: jnp.ndarray,
+    object_active_by_tick: jnp.ndarray,
+    *,
+    object_order: Sequence[int] | None = None,
+    include_board: bool = True,
+    include_sun: bool = True,
+    board_size: float = BOARD_SIZE,
+    sun_radius: float = SUN_RADIUS,
+    samples_per_span: int = 9,
+    max_block_intervals: int = 32,
+    same_tick_planets_parallel: bool = False,
+    n_rays: int = 2048,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Discrete-ray first-hit targets (delegates to ``first_hit_best_targets_apply_jax``).
+
+    Returns ``(angle[P], width[P], valid[P], overflow, hit_tick[P])`` — per planet, ray with earliest
+    first-hit tick among headings that hit that planet first (game swept segments).
+    Interval-sweep kwargs are ignored but kept so this ``@jit`` entry point stays drop-in compatible.
+    """
+
+    return first_hit_best_targets_apply_jax(
+        origin_xy,
+        origin_radius,
+        speed,
+        object_p0_by_tick,
+        object_p1_by_tick,
+        object_radii,
+        object_active_by_tick,
+        object_order=object_order,
+        include_board=include_board,
+        include_sun=include_sun,
+        board_size=board_size,
+        sun_radius=sun_radius,
+        samples_per_span=samples_per_span,
+        max_block_intervals=max_block_intervals,
+        same_tick_planets_parallel=same_tick_planets_parallel,
+        n_rays=n_rays,
+    )
 
 
 batched_first_hit_intervals_jax = jax.vmap(

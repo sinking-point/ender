@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 from typing import Any, Dict, List, Tuple
 
 import jax
 import numpy as np
 
-from jax_orbit_wars import OrbitWarsConfig
+from jax_orbit_wars import FLEET_ETA, FLEET_TARGET_PLANET, OrbitWarsConfig
 
 from orbit_wars_pt.constants import (
     BOARD_SIZE,
@@ -22,12 +21,7 @@ from orbit_wars_pt.constants import (
     MAX_PLANETS,
     NUM_OWNER_SLOTS,
 )
-from orbit_wars_pt.geometry import (
-    first_planet_hit_along_ray,
-    fleet_speed,
-    launch_point,
-    planet_pred_velocity,
-)
+from orbit_wars_pt.geometry import planet_pred_velocity
 
 
 def _cls_turn_fraction(step_count: int) -> float:
@@ -184,27 +178,14 @@ def build_observation(
         if oid not in planet_idx_by_id:
             continue
         origin_idx = planet_idx_by_id[oid]
-        fx, fy = float(frow[2]), float(frow[3])
-        ang = float(frow[4])
         ships_f = float(frow[6])
-        hit_t, hit_pi = first_planet_hit_along_ray(
-            fx,
-            fy,
-            ang,
-            planet_xy.astype(np.float64),
-            planet_r.astype(np.float64),
-            planet_active.astype(bool),
-            exclude_idx=origin_idx,
-        )
-        if hit_t is None or hit_pi is None:
+        if frow.shape[0] <= FLEET_ETA:
             continue
-        dx, dy = np.cos(ang), np.sin(ang)
-        dest_x = fx + dx * hit_t
-        dest_y = fy + dy * hit_t
+        hit_pi = int(frow[FLEET_TARGET_PLANET])
+        if hit_pi < 0 or hit_pi >= MAX_PLANETS or not bool(planet_active[hit_pi]):
+            continue
         dst_xy = planet_xy[hit_pi]
-        # Token anchors at destination planet center; temporal offset ~ eta steps
-        sx, sy = launch_point(fx, fy, 0.25, dst_xy[0], dst_xy[1])
-        eta = estimate_eta_to_planet(sx, sy, ang, dst_xy[0], dst_xy[1], planet_r[hit_pi], ships_f, ship_speed)
+        eta = float(np.clip(frow[FLEET_ETA], 0.0, 500.0))
 
         ox = _remap_owner(float(frow[1]), ego_player, num_agents)
         feat = np.zeros((8,), dtype=np.float32)
@@ -245,30 +226,6 @@ def build_observation(
         ego_player=ego_player,
         num_planets=p_slots,
     )
-
-
-def estimate_eta_to_planet(
-    sx: float,
-    sy: float,
-    angle: float,
-    dest_x: float,
-    dest_y: float,
-    dest_r: float,
-    ships: float,
-    ship_speed: float,
-    max_steps: int = 600,
-) -> float:
-    x, y = sx, sy
-    sp = fleet_speed(ships, ship_speed)
-    for t in range(max_steps):
-        if math.hypot(x - dest_x, y - dest_y) <= dest_r + 0.05:
-            return float(t)
-        x += math.cos(angle) * sp
-        y += math.sin(angle) * sp
-        sp = fleet_speed(ships, ship_speed)
-        if x < 0 or x > BOARD_SIZE or y < 0 or y > BOARD_SIZE:
-            return 500.0
-    return 500.0
 
 
 def jax_state_to_numpy(state: Any) -> Any:

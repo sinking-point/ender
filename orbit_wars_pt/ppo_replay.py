@@ -252,24 +252,31 @@ def _jax_preamble_to_torch(
     ego_b: jnp.ndarray,
     ship_speed: float,
     timing: Optional[Any],
+    first_hit_n_rays: int = 2048,
+    target_planet_reachable: Optional[jnp.ndarray] = None,
 ):
-    """Run the JAX side (obs builder + pair geom) and dlpack-import results.
+    """Run the JAX side (obs builder + optional first-hit) and dlpack-import results.
 
-    Returns a dict of torch tensors plus the converted action / mask tensors.
-    Any per-phase wall times accumulate into ``timing`` if supplied.
+    When ``target_planet_reachable`` is set (shape ``[B, MAX_PLANETS]``, rollout snapshot
+    of ``target_valid & ~overflow``), skips ``selected_origin_fraction_targets_batched``.
     """
 
     t0 = perf_counter()
     obs_jax = build_observation_batched_jax_per_ego(state_b, ego_b, ship_speed)
-    origin_idx = pair_flat // MAX_PLANETS
-    _angle_j, _width_j, target_valid_j, overflow_j = selected_origin_fraction_targets_batched(
-        state_b,
-        origin_idx.astype(jnp.int32),
-        frac_idx.astype(jnp.int32),
-        horizon=24,
-        ship_speed=ship_speed,
-        samples_per_span=17,
-    )
+    if target_planet_reachable is not None:
+        target_valid_j = target_planet_reachable.astype(jnp.bool_)
+        overflow_j = jnp.zeros((target_planet_reachable.shape[0],), dtype=jnp.bool_)
+    else:
+        origin_idx = pair_flat // MAX_PLANETS
+        _angle_j, _width_j, target_valid_j, overflow_j, _hit_tick_j = selected_origin_fraction_targets_batched(
+            state_b,
+            origin_idx.astype(jnp.int32),
+            frac_idx.astype(jnp.int32),
+            horizon=24,
+            ship_speed=ship_speed,
+            samples_per_span=17,
+            n_rays=first_hit_n_rays,
+        )
     if timing is not None:
         timing.replay_jax_s += perf_counter() - t0
 
@@ -310,6 +317,8 @@ def replay_logprob_value_entropy_jax(
     device: torch.device,
     ship_speed: float = 6.0,
     timing: Optional[Any] = None,
+    first_hit_n_rays: int = 2048,
+    target_planet_reachable: Optional[jnp.ndarray] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Diagnostic entry: returns ``(new_logp, new_value, new_entropy)``.
 
@@ -337,6 +346,8 @@ def replay_logprob_value_entropy_jax(
         ego_b=ego_b,
         ship_speed=ship_speed,
         timing=timing,
+        first_hit_n_rays=first_hit_n_rays,
+        target_planet_reachable=target_planet_reachable,
     )
 
     return _compute_logp_value_entropy_torch(
@@ -379,6 +390,8 @@ def replay_ppo_loss(
     loss_fn: Optional[Callable] = None,
     timing: Optional[Any] = None,
     amp_dtype: Optional[torch.dtype] = None,
+    target_planet_reachable: Optional[jnp.ndarray] = None,
+    first_hit_n_rays: int = 2048,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """JAX preamble + dlpack + (optionally compiled) PPO loss.
 
@@ -416,6 +429,8 @@ def replay_ppo_loss(
         ego_b=ego_b,
         ship_speed=ship_speed,
         timing=timing,
+        first_hit_n_rays=first_hit_n_rays,
+        target_planet_reachable=target_planet_reachable,
     )
     must_halt_no_ships_t = torch.from_dlpack(must_halt_no_ships).to(
         device=adv.device, dtype=torch.bool

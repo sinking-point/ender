@@ -526,6 +526,7 @@ def ppo_iteration(
     entropy_coef: float,
     max_grad_norm: float,
     ship_speed: float,
+    first_hit_n_rays: int,
     *,
     rnd: np.random.Generator,
     loss_fn: Optional[Any] = None,
@@ -577,6 +578,7 @@ def ppo_iteration(
                 no_valid_pairs_j,
                 no_valid_fracs_j,
                 must_halt_no_ships_j,
+                target_planet_reachable_j,
             ) = gather_minibatch(
                 segment.buf0,
                 segment.buf1,
@@ -612,12 +614,14 @@ def ppo_iteration(
                 old_v=old_v,
                 policy=policy,
                 ship_speed=ship_speed,
+                first_hit_n_rays=first_hit_n_rays,
                 clip_eps=clip_eps,
                 vf_coef=vf_coef,
                 entropy_coef=entropy_coef,
                 loss_fn=loss_fn,
                 timing=timing,
                 amp_dtype=amp_dtype,
+                target_planet_reachable=target_planet_reachable_j,
             )
 
             t0 = perf_counter()
@@ -942,6 +946,7 @@ def _train_loop(
             amp_dtype=amp_dtype,
             min_max_fleets=args.max_fleets,
             reset_prefetch=reset_prefetch,
+            first_hit_n_rays=max(8, int(args.first_hit_n_rays)),
         )
         rollout_env_seed += seeds_used
         cfg.max_fleets = rollout_carry.cfg.max_fleets
@@ -1000,6 +1005,7 @@ def _train_loop(
                 args.entropy_coef,
                 args.max_grad_norm,
                 args.ship_speed,
+                max(8, int(args.first_hit_n_rays)),
                 rnd=rnd,
                 loss_fn=compiled_loss_fn,
                 amp_dtype=amp_dtype,
@@ -1122,6 +1128,13 @@ def parse_args() -> argparse.Namespace:
         help="Transitions per minibatch (capped automatically if buffer smaller).",
     )
     p.add_argument("--ship-speed", type=float, default=6.0)
+    p.add_argument(
+        "--first-hit-n-rays",
+        type=int,
+        default=2048,
+        help="Virtual launch directions for discrete first-hit target geometry (rollout + PPO replay). "
+        "Lower values reduce JAX GPU memory (e.g. 512); minimum 8.",
+    )
     p.add_argument("--max-grad-norm", type=float, default=0.5)
     p.add_argument("--d-model", type=int, default=384)
     p.add_argument("--n-heads", type=int, default=8)

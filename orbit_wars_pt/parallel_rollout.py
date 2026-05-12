@@ -34,7 +34,7 @@ import jax.numpy as jnp
 
 import jax_orbit_wars as jow
 
-from jax_orbit_wars import DEFAULT_MAX_ACTIONS, OrbitWarsState
+from jax_orbit_wars import DEFAULT_MAX_ACTIONS, FLEET_ETA, FLEET_TARGET_PLANET, OrbitWarsState
 
 from orbit_wars_pt.reset_prefetch import RolloutResetPrefetch
 
@@ -70,7 +70,7 @@ from orbit_wars_pt.transition_buffer import (
 
 _MAX_FLEET_EXPAND_RETRIES = 48
 
-_INITIAL_TURN_CACHE_ROWS = 1
+_INITIAL_TURN_CACHE_ROWS = 32
 
 
 def _expand_turn_state_cache_if_needed(
@@ -101,7 +101,7 @@ def _expand_turn_state_cache_fleets(turn_state_cache: OrbitWarsState, new_F: int
     """Pad cached turn-start fleet leaves along the F axis.
 
     ``turn_state_cache`` is ``state_b`` with a leading turn-row axis, so
-    ``fleets`` is ``[T, N, F, 7]`` and ``fleet_active`` is ``[T, N, F]`` (see
+    ``fleets`` is ``[T, N, F, W]`` and ``fleet_active`` is ``[T, N, F]`` (see
     ``expand_fleet_buffers_batched`` for the live ``[N, F, ...]`` layout).
     """
 
@@ -112,6 +112,75 @@ def _expand_turn_state_cache_fleets(turn_state_cache: OrbitWarsState, new_F: int
     fleets = jnp.pad(turn_state_cache.fleets, ((0, 0), (0, 0), (0, pad), (0, 0)))
     fleet_active = jnp.pad(turn_state_cache.fleet_active, ((0, 0), (0, 0), (0, pad)))
     return turn_state_cache._replace(fleets=fleets, fleet_active=fleet_active)
+
+
+@jax.jit
+def _carry_action_fleet_metadata_after_step(
+    state_before_b: OrbitWarsState,
+    next_state_b: OrbitWarsState,
+    actions_b: jnp.ndarray,
+    action_meta_b: jnp.ndarray,
+) -> OrbitWarsState:
+    """Preserve dispatch-time destination metadata across the real env step.
+
+    The env launches fleets from action triples, so destination/ETA travel in a
+    side tensor aligned to ``actions_b[..., (target_planet, hit_tick)]``. This
+    replays only the slot allocation and validity logic from ``_launch_fleets``
+    to recover which post-step fleet slot should receive each metadata row.
+    """
+
+    def one_env(state: OrbitWarsState, next_state: OrbitWarsState, actions: jnp.ndarray, meta: jnp.ndarray):
+        def launch_one(carry, flat_idx):
+            planets, fleet_active, target_meta, eta_meta = carry
+            max_actions = actions.shape[1]
+            player = flat_idx // max_actions
+            action_idx = flat_idx % max_actions
+            from_id, _angle, ships_raw = actions[player, action_idx]
+            ships = jnp.floor(ships_raw)
+            planet_id_match = planets[:, jow.PLANET_ID] == from_id
+            valid_planet_mask = state.planet_active & planet_id_match
+            has_planet, planet_idx = jow._first_true(valid_planet_mask)
+            planet = planets[planet_idx]
+            valid = (
+                (player < state.num_agents)
+                & has_planet
+                & (planet[jow.PLANET_OWNER] == player.astype(jnp.float32))
+                & (planet[jow.PLANET_SHIPS] >= ships)
+                & (ships > 0)
+            )
+            has_fleet_slot, fleet_idx = jow._first_true(~fleet_active)
+            write = valid & has_fleet_slot
+            safe_fleet_idx = jnp.where(has_fleet_slot, fleet_idx, 0)
+            planets = planets.at[planet_idx, jow.PLANET_SHIPS].add(jnp.where(valid, -ships, 0.0))
+            fleet_active = fleet_active.at[safe_fleet_idx].set(write | fleet_active[safe_fleet_idx])
+            target_meta = target_meta.at[safe_fleet_idx].set(
+                jnp.where(write, meta[player, action_idx, 0], target_meta[safe_fleet_idx])
+            )
+            eta_meta = eta_meta.at[safe_fleet_idx].set(
+                jnp.where(write, meta[player, action_idx, 1], eta_meta[safe_fleet_idx])
+            )
+            return (planets, fleet_active, target_meta, eta_meta), None
+
+        target_meta = state.fleets[:, FLEET_TARGET_PLANET]
+        eta_meta = state.fleets[:, FLEET_ETA]
+        total_actions = actions.shape[0] * actions.shape[1]
+        (planets, fleet_active, target_meta, eta_meta), _ = jax.lax.scan(
+            launch_one,
+            (state.planets, state.fleet_active, target_meta, eta_meta),
+            jnp.arange(total_actions, dtype=jnp.int32),
+        )
+        del planets, fleet_active
+        active = next_state.fleet_active
+        fleets = next_state.fleets
+        fleets = fleets.at[:, FLEET_TARGET_PLANET].set(
+            jnp.where(active, target_meta, fleets[:, FLEET_TARGET_PLANET])
+        )
+        fleets = fleets.at[:, FLEET_ETA].set(
+            jnp.where(active, jnp.maximum(eta_meta - 1.0, 0.0), fleets[:, FLEET_ETA])
+        )
+        return next_state._replace(fleets=fleets)
+
+    return jax.vmap(one_env)(state_before_b, next_state_b, actions_b, action_meta_b)
 
 
 @jax.jit
@@ -184,8 +253,9 @@ class RolloutSegment:
 
     ``buf0`` / ``buf1`` store per-row prefix stacks of in-phase micro deltas
     (halt, stored ``send`` / ``slot``, ``pair_flat``, ``frac_idx``) with length
-    ``max_micro_steps_per_player``, plus scalar policy fields.  Full canonical
-    ``OrbitWarsState`` at each env-turn start lives in ``turn_state_cache``.
+    ``max_micro_steps_per_player``, plus scalar policy fields and
+    ``target_planet_reachable`` (rollout-time reachable-destination mask per planet).
+    Full canonical ``OrbitWarsState`` at each env-turn start lives in ``turn_state_cache``.
     Per-row ``turn_tag_p0`` / ``turn_tag_p1`` tie buffer rows to a turn slot;
     PPO gather applies a prefix with ``apply_prefix_micro_deltas_batched``.
 
@@ -270,6 +340,27 @@ def _build_batched_actions(
     return arr
 
 
+def _build_batched_action_metadata(
+    meta0: List[List[Tuple[float, float]]],
+    meta1: List[List[Tuple[float, float]]],
+    max_actions: int = DEFAULT_MAX_ACTIONS,
+) -> np.ndarray:
+    """Pack per-action ``(target_planet, hit_tick)`` metadata beside actions."""
+
+    num_envs = len(meta0)
+    arr = np.zeros((num_envs, 2, max_actions, 2), dtype=np.float32)
+    arr[..., 0] = -1.0
+    arr[..., 1] = 500.0
+    for i in range(num_envs):
+        for j, tup in enumerate(meta0[i][:max_actions]):
+            arr[i, 0, j, 0] = tup[0]
+            arr[i, 0, j, 1] = tup[1]
+        for j, tup in enumerate(meta1[i][:max_actions]):
+            arr[i, 1, j, 0] = tup[0]
+            arr[i, 1, j, 1] = tup[1]
+    return arr
+
+
 def _run_micro_phase(
     *,
     ego: int,
@@ -288,7 +379,15 @@ def _run_micro_phase(
     timing: RolloutTiming,
     turn_tag_j: jnp.ndarray,
     turn_slot_np: np.ndarray,
-) -> Tuple[TransitionBuffer, np.ndarray, List[List[Tuple[float, float, float]]], List[int], jnp.ndarray]:
+    first_hit_n_rays: int = 2048,
+) -> Tuple[
+    TransitionBuffer,
+    np.ndarray,
+    List[List[Tuple[float, float, float]]],
+    List[List[Tuple[float, float]]],
+    List[int],
+    jnp.ndarray,
+]:
     """Run one player's micro-loop in lockstep across all envs (Phase 5).
 
     All transitions are written into the device-resident ``buf`` with
@@ -303,7 +402,8 @@ def _run_micro_phase(
     append writes that index into ``turn_tag_j`` at ``(row, n)`` so replay
     can reconstruct full state from turn starts.
 
-    Returns ``(buf, new_write_idx_per_env, action_lists, reward_idx, turn_tag_j)``.
+    Returns ``(buf, new_write_idx_per_env, action_lists, action_meta_lists,
+    reward_idx, turn_tag_j)``.
     ``reward_idx[n]`` is the row index of env ``n``'s last valid write in
     this phase (``-1`` if env ``n`` produced no rows).
     """
@@ -311,6 +411,7 @@ def _run_micro_phase(
     num_envs = int(state_b.planets.shape[0])
     halted: List[bool] = [False] * num_envs
     action_lists: List[List[Tuple[float, float, float]]] = [[] for _ in range(num_envs)]
+    action_meta_lists: List[List[Tuple[float, float]]] = [[] for _ in range(num_envs)]
     reward_idx: List[int] = [-1] * num_envs
     write_idx = write_idx_per_env.copy()
     n_idx_full = np.arange(num_envs)
@@ -386,23 +487,28 @@ def _run_micro_phase(
         frac_idx = origin_frac_flat % len(FRACTIONS)
         origin_frac_used = (halt_action == 0) & any_valid_origin_frac
 
-        origin_idx_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
-        frac_idx_all_geom = torch.zeros(num_envs, dtype=torch.int32, device=device)
-        origin_idx_all.index_copy_(0, active_idx_t, o_idx.to(torch.int32))
-        frac_idx_all_geom.index_copy_(0, active_idx_t, frac_idx.to(torch.int32))
-        origin_idx_j = jax.dlpack.from_dlpack(origin_idx_all.contiguous().detach())
-        frac_idx_geom_j = jax.dlpack.from_dlpack(frac_idx_all_geom.contiguous().detach())
-        target_angle_j, _target_width_j, target_valid_j, target_overflow_j = selected_origin_fraction_targets_batched(
+        # Keep the JAX geometry batch at fixed ``num_envs`` shape. Gathering
+        # ``virt_b[active_idx]`` with a changing active count forces a new XLA
+        # compile for each count/capacity during rollout.
+        o_idx_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
+        frac_idx_geom_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
+        o_idx_all.index_copy_(0, active_idx_t, o_idx.to(torch.int32))
+        frac_idx_geom_all.index_copy_(0, active_idx_t, frac_idx.to(torch.int32))
+        origin_idx_j = jax.dlpack.from_dlpack(o_idx_all.contiguous().detach())
+        frac_idx_geom_j = jax.dlpack.from_dlpack(frac_idx_geom_all.contiguous().detach())
+        target_angle_j, _target_width_j, target_valid_j, target_overflow_j, target_hit_tick_j = selected_origin_fraction_targets_batched(
             virt_b,
             origin_idx_j,
             frac_idx_geom_j,
             horizon=24,
             ship_speed=ship_speed,
             samples_per_span=17,
+            n_rays=first_hit_n_rays,
         )
         target_angle_t = torch.from_dlpack(target_angle_j).index_select(0, active_idx_t)
         target_valid_t = torch.from_dlpack(target_valid_j).index_select(0, active_idx_t)
         target_overflow_t = torch.from_dlpack(target_overflow_j).index_select(0, active_idx_t)
+        target_hit_tick_t = torch.from_dlpack(target_hit_tick_j).index_select(0, active_idx_t)
 
         n_a_idx = torch.arange(n_active, device=device)
         ph = out["planet_hidden"]
@@ -420,6 +526,7 @@ def _run_micro_phase(
         target_logp = target_lp.gather(1, d_idx[:, None]).squeeze(-1)
         pair_flat = o_idx * P + d_idx
         angle = target_angle_t[n_a_idx, d_idx]
+        fleet_eta = target_hit_tick_t[n_a_idx, d_idx]
 
         dispatch_used = origin_frac_used & any_valid_target
         total_logp = halt_logp + origin_frac_used.float() * origin_frac_logp + dispatch_used.float() * target_logp
@@ -435,6 +542,7 @@ def _run_micro_phase(
         pair_flat_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
         frac_idx_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
         angle_all = torch.zeros(num_envs, dtype=torch.float32, device=device)
+        fleet_eta_all = torch.zeros(num_envs, dtype=torch.float32, device=device)
         halt_action_all = torch.ones(num_envs, dtype=torch.int32, device=device)
         no_valid_pairs_all = torch.zeros(num_envs, dtype=torch.bool, device=device)
         no_valid_fracs_all = torch.zeros(num_envs, dtype=torch.bool, device=device)
@@ -445,6 +553,7 @@ def _run_micro_phase(
         frac_idx_all.index_copy_(0, active_idx_t, frac_idx.to(torch.int32))
         halt_action_all.index_copy_(0, active_idx_t, halt_action.to(torch.int32))
         angle_all.index_copy_(0, active_idx_t, angle.to(torch.float32))
+        fleet_eta_all.index_copy_(0, active_idx_t, fleet_eta.to(torch.float32))
         no_valid_pairs_all.index_copy_(0, active_idx_t, origin_frac_used & ~any_valid_target)
         no_valid_fracs_all.index_copy_(0, active_idx_t, ~any_valid_origin_frac & (halt_action == 0))
         must_halt_no_ships_all = torch.zeros(num_envs, dtype=torch.bool, device=device)
@@ -459,13 +568,19 @@ def _run_micro_phase(
         pair_flat_j = jax.dlpack.from_dlpack(pair_flat_all.contiguous().detach())
         frac_idx_j = jax.dlpack.from_dlpack(frac_idx_all.contiguous().detach())
         angle_j = jax.dlpack.from_dlpack(angle_all.contiguous().detach())
+        fleet_eta_j = jax.dlpack.from_dlpack(fleet_eta_all.contiguous().detach())
         halt_action_j = jax.dlpack.from_dlpack(halt_action_all.contiguous().detach())
         no_valid_pairs_j = jax.dlpack.from_dlpack(no_valid_pairs_all.contiguous().detach())
         no_valid_fracs_j = jax.dlpack.from_dlpack(no_valid_fracs_all.contiguous().detach())
         must_halt_no_ships_j = jax.dlpack.from_dlpack(must_halt_no_ships_all.contiguous().detach())
+        target_pr_all = torch.zeros((num_envs, P), dtype=torch.bool, device=device)
+        target_pr_all.index_copy_(
+            0, active_idx_t, (target_valid_t & ~target_overflow_t[:, None]).to(torch.bool)
+        )
+        target_planet_reachable_j = jax.dlpack.from_dlpack(target_pr_all.contiguous().detach())
 
         virt_b, oid_j, angle_j, send_j, dispatched_j, slot_j = apply_micro_step_batched(
-            virt_b, ego_jax, halt_now_j, pair_flat_j, frac_idx_j, angle_j
+            virt_b, ego_jax, halt_now_j, pair_flat_j, frac_idx_j, angle_j, fleet_eta_j
         )
 
         active_j = jnp.asarray(np.array([not h for h in halted], dtype=np.bool_), dtype=jnp.bool_)
@@ -476,6 +591,7 @@ def _run_micro_phase(
             halt_now_j,
             send_j,
             angle_j,
+            fleet_eta_j,
             slot_j,
             halt_action_j,
             pair_flat_j,
@@ -483,6 +599,7 @@ def _run_micro_phase(
             no_valid_pairs_j,
             no_valid_fracs_j,
             must_halt_no_ships_j,
+            target_planet_reachable_j,
             write_idx_j,
             micro_k_vec,
             active_j,
@@ -499,6 +616,8 @@ def _run_micro_phase(
         total_logp_np = total_logp_all.detach().cpu().numpy()
         values_np = values_all.detach().cpu().numpy()
         halt_now_np = halt_now_all.detach().cpu().numpy()
+        d_idx_np = d_idx.detach().cpu().numpy()
+        fleet_eta_np = fleet_eta.detach().cpu().numpy()
 
         active_mask = ~np.array(halted, dtype=np.bool_)
         active_envs = np.where(active_mask)[0]
@@ -513,11 +632,14 @@ def _run_micro_phase(
                     action_lists[int(i)].append(
                         (float(oid_np[i]), float(angle_np[i]), float(send_np[i]))
                     )
+                    action_meta_lists[int(i)].append(
+                        (float(d_idx_np[j_arr]), float(fleet_eta_np[j_arr]))
+                    )
                 if bool(halt_now_np[i]):
                     halted[int(i)] = True
             write_idx[active_envs] += 1
 
-    return buf, write_idx, action_lists, reward_idx, turn_tag_j
+    return buf, write_idx, action_lists, action_meta_lists, reward_idx, turn_tag_j
 
 
 def _reset_prefetch_resync(
@@ -553,6 +675,7 @@ def collect_parallel_micro_rollouts(
     amp_dtype: Optional[torch.dtype] = None,
     min_max_fleets: int = 1,
     reset_prefetch: Optional[RolloutResetPrefetch] = None,
+    first_hit_n_rays: int = 2048,
 ) -> Tuple[RolloutSegment, RolloutTiming, RolloutCarry, int, RolloutGameStats]:
     """Collect one rollout segment using device-resident transition buffers.
 
@@ -612,6 +735,8 @@ def collect_parallel_micro_rollouts(
     buf1 = init_transition_buffer(num_envs, H_buf, max_micro_steps_per_player)
 
     turn_slot_np = np.zeros((num_envs,), dtype=np.int32)
+    # Start near the usual per-segment turn count so early rollout does not
+    # recompile through 1/2/4/8/16/32 cache shapes, while keeping memory modest.
     turn_state_cache = jax.tree.map(
         lambda leaf: jnp.zeros((_INITIAL_TURN_CACHE_ROWS,) + leaf.shape, dtype=leaf.dtype),
         state_b,
@@ -656,7 +781,7 @@ def collect_parallel_micro_rollouts(
             outer += 1
 
             # ===== Phase A: ego=0 micro-loop =====
-            buf0, write_idx_p0, actions0_per_env, p0_reward_idx, turn_tag_p0 = _run_micro_phase(
+            buf0, write_idx_p0, actions0_per_env, meta0_per_env, p0_reward_idx, turn_tag_p0 = _run_micro_phase(
                 ego=0,
                 state_b=state_b,
                 buf=buf0,
@@ -673,13 +798,14 @@ def collect_parallel_micro_rollouts(
                 timing=timing,
                 turn_tag_j=turn_tag_p0,
                 turn_slot_np=turn_slot_np,
+                first_hit_n_rays=first_hit_n_rays,
             )
             if profile_rollout and device.type == "cuda" and not logged_first_policy_fwd:
                 log_cuda_mem("rollout after first batched policy forward", device)
                 logged_first_policy_fwd = True
 
             # ===== Phase B: ego=1 micro-loop =====
-            buf1, write_idx_p1, actions1_per_env, p1_reward_idx, turn_tag_p1 = _run_micro_phase(
+            buf1, write_idx_p1, actions1_per_env, meta1_per_env, p1_reward_idx, turn_tag_p1 = _run_micro_phase(
                 ego=1,
                 state_b=state_b,
                 buf=buf1,
@@ -696,11 +822,13 @@ def collect_parallel_micro_rollouts(
                 timing=timing,
                 turn_tag_j=turn_tag_p1,
                 turn_slot_np=turn_slot_np,
+                first_hit_n_rays=first_hit_n_rays,
             )
 
             # ===== Phase C: batched env step (vmap) =====
             t0 = perf_counter()
             actions_np = _build_batched_actions(actions0_per_env, actions1_per_env)
+            action_meta_np = _build_batched_action_metadata(meta0_per_env, meta1_per_env)
 
             need_host = upper_bound_fleet_writes_per_env(actions_np)
             inactive_host = np.asarray(jax.device_get(inactive_fleet_count_batched(state_b)))
@@ -751,6 +879,13 @@ def collect_parallel_micro_rollouts(
                 next_state_b = vmap_step_env(state_b, actions_np)
                 overflow_any = bool(np.asarray(jax.device_get(jnp.any(next_state_b.overflow))))
                 _reset_prefetch_resync(reset_prefetch, seed_base, seeds_consumed, cfg)
+
+            next_state_b = _carry_action_fleet_metadata_after_step(
+                state_b,
+                next_state_b,
+                jnp.asarray(actions_np, dtype=jnp.float32),
+                jnp.asarray(action_meta_np, dtype=jnp.float32),
+            )
 
             peak_max_active = max(
                 peak_max_active,

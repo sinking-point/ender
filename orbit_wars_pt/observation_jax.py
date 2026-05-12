@@ -12,15 +12,9 @@ Output layout matches the original ``ObservationBatch`` semantics:
   ``[..., 1:1+MAX_PLANETS]`` are planet/comet tokens (fixed slots);
   ``[..., 1+MAX_PLANETS:]`` are compacted active-fleet tokens.
 
-Approximations vs the host builder (numerically tiny; behaviorally equivalent):
-
-* ``estimate_eta_to_planet`` is replaced by a closed-form
-  ``(distance_from_launch_point - dest_radius) / fleet_speed(ships)``. The
-  original integrated 1-step Euler with the same speed and the same straight
-  path; the closed-form differs by at most one step.
-* Fleet tokens are emitted in slot order for active fleets that have *both*
-  an existing origin planet and a finite first-planet hit — same filter as
-  the host builder.
+* Fleet tokens are emitted in slot order for active fleets that have persistent
+  destination metadata from dispatch. Fleets launched outside that path have
+  target ``-1`` and are omitted.
 """
 
 from __future__ import annotations
@@ -32,7 +26,7 @@ import jax
 import jax.numpy as jnp
 
 import jax_orbit_wars as jow
-from jax_orbit_wars import OrbitWarsState
+from jax_orbit_wars import FLEET_ETA, FLEET_TARGET_PLANET, OrbitWarsState
 
 from orbit_wars_pt.constants import (
     BOARD_SIZE,
@@ -67,70 +61,6 @@ def _remap_owner_2p(owner: jnp.ndarray, ego: int) -> jnp.ndarray:
     is_self = o == ego
     out = jnp.where(is_neutral, 0, jnp.where(is_self, 1, 2))
     return jnp.minimum(out, NUM_OWNER_SLOTS - 1).astype(jnp.int32)
-
-
-# ---- Geometry helpers (JAX). ----
-
-
-def _fleet_speed(ships: jnp.ndarray, max_speed: float) -> jnp.ndarray:
-    """Matches host ``fleet_speed``. ``ships <= 1`` clamps to 1.0."""
-
-    safe = jnp.maximum(ships, 1.0)
-    log_s = jnp.log(safe)
-    log_1000 = jnp.log(1000.0)
-    factor = (log_s / log_1000) ** 1.5
-    speed = jnp.minimum(1.0 + (max_speed - 1.0) * factor, max_speed)
-    return jnp.where(ships <= 1.0, 1.0, speed)
-
-
-def _launch_point(ox: jnp.ndarray, oy: jnp.ndarray, radius: jnp.ndarray, dx: jnp.ndarray, dy: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Slightly offset the origin along the direction toward the destination."""
-
-    vx = dx - ox
-    vy = dy - oy
-    d = jnp.hypot(vx, vy)
-    safe_d = jnp.maximum(d, 1e-6)
-    ux = vx / safe_d
-    uy = vy / safe_d
-    sx = ox + ux * (radius + 0.1)
-    sy = oy + uy * (radius + 0.1)
-    # Degenerate fallback if origin and destination coincide.
-    sx = jnp.where(d < 1e-6, ox + radius + 0.1, sx)
-    sy = jnp.where(d < 1e-6, oy, sy)
-    return sx, sy
-
-
-def _ray_planet_t(
-    fx: jnp.ndarray,
-    fy: jnp.ndarray,
-    cos_a: jnp.ndarray,
-    sin_a: jnp.ndarray,
-    cx: jnp.ndarray,
-    cy: jnp.ndarray,
-    r: jnp.ndarray,
-) -> jnp.ndarray:
-    """Smallest non-negative ray-circle intersection ``t`` (or ``inf``).
-
-    Mirrors host ``ray_circle_intersections``: roots of
-    ``|(fx,fy) + t*(cos_a, sin_a) - (cx, cy)|^2 = r^2``.
-    """
-
-    fxc = fx - cx
-    fyc = fy - cy
-    b = 2.0 * (fxc * cos_a + fyc * sin_a)
-    c = fxc * fxc + fyc * fyc - r * r
-    disc = b * b - 4.0 * c
-    sd = jnp.sqrt(jnp.maximum(disc, 0.0))
-    t0 = (-b - sd) / 2.0
-    t1 = (-b + sd) / 2.0
-    valid_disc = disc >= 0.0
-    t_min = jnp.where(
-        valid_disc & (t0 >= 0.0),
-        t0,
-        jnp.where(valid_disc & (t1 >= 0.0), t1, jnp.inf),
-    )
-    return t_min
-
 
 # ---- Per-env observation builder (called via vmap over num_envs). ----
 
@@ -268,42 +198,19 @@ def _build_observation_one_env(state: OrbitWarsState, ego: int, ship_speed: floa
     # ---- Fleet tokens. ----
     F = fleets.shape[0]
     f_owner = fleets[:, 1]
-    f_x = fleets[:, 2]
-    f_y = fleets[:, 3]
-    f_ang = fleets[:, 4]
     f_origin_pid = fleets[:, 5].astype(jnp.int32)
     f_ships = fleets[:, 6]
-
-    cos_a = jnp.cos(f_ang)
-    sin_a = jnp.sin(f_ang)
+    f_target = fleets[:, FLEET_TARGET_PLANET].astype(jnp.int32)
+    f_eta = fleets[:, FLEET_ETA]
 
     # Origin slot per fleet: argmax of (planet_id == origin_pid). 0 if no match;
     # mask via has_origin separately.
     origin_match = pid[None, :] == f_origin_pid[:, None]  # [F, P]
     has_origin = jnp.any(origin_match, axis=1)  # [F]
-    origin_slot = jnp.argmax(origin_match.astype(jnp.int32), axis=1)  # [F]
 
-    # Per-(fleet, planet) ray hit time, masking out the origin and inactive planets.
-    # Shapes: fleets are F, planets are P; broadcast.
-    t_each = _ray_planet_t(
-        f_x[:, None],
-        f_y[:, None],
-        cos_a[:, None],
-        sin_a[:, None],
-        planet_xy[None, :, 0],
-        planet_xy[None, :, 1],
-        planet_r[None, :],
-    )  # [F, P]
-
-    planet_idx_grid = jnp.arange(MAX_PLANETS)[None, :]  # [1, P]
-    is_origin = planet_idx_grid == origin_slot[:, None]  # [F, P]
-    planet_mask_2d = planet_active[None, :] & ~is_origin  # [F, P]
-    t_eff = jnp.where(planet_mask_2d, t_each, jnp.inf)
-    hit_pi = jnp.argmin(t_eff, axis=1)  # [F]
-    hit_t = jnp.take_along_axis(t_eff, hit_pi[:, None], axis=1).squeeze(-1)  # [F]
-    has_hit = jnp.isfinite(hit_t)
-
-    valid_fleet = fleet_active & has_origin & has_hit  # [F]
+    safe_target = jnp.clip(f_target, 0, MAX_PLANETS - 1)
+    has_target = (f_target >= 0) & (f_target < MAX_PLANETS) & planet_active[safe_target]
+    valid_fleet = fleet_active & has_origin & has_target  # [F]
 
     # Compact valid fleet slots into the first MAX_FLEET_TOKENS positions, slot-order preserving.
     F_idx = jnp.arange(F, dtype=jnp.int32)
@@ -331,21 +238,11 @@ def _build_observation_one_env(state: OrbitWarsState, ego: int, ship_speed: floa
     # Gather fleet attributes at compact indices.
     g_owner = f_owner[take_idx]
     g_ships = f_ships[take_idx]
-    g_hit_pi = hit_pi[take_idx]
+    g_hit_pi = safe_target[take_idx]
+    eta = jnp.clip(f_eta[take_idx], 0.0, 500.0)
 
     # Destination XY = planet center of the hit planet.
     dst_xy = planet_xy[g_hit_pi]  # [MAX_FLEET_TOKENS, 2]
-    dst_r = planet_r[g_hit_pi]
-    g_fx = f_x[take_idx]
-    g_fy = f_y[take_idx]
-
-    # Closed-form ETA approximation matching the host straight-line stepping
-    # from the launch point at radius=0.25 toward the dest planet rim.
-    sx, sy = _launch_point(g_fx, g_fy, jnp.float32(0.25), dst_xy[:, 0], dst_xy[:, 1])
-    dist = jnp.hypot(dst_xy[:, 0] - sx, dst_xy[:, 1] - sy) - dst_r - 0.05
-    sp = _fleet_speed(g_ships, ship_speed)
-    eta = jnp.clip(dist / jnp.maximum(sp, 1e-6), 0.0, 500.0)
-
     fleet_etype = jnp.where(fleet_token_active, ENTITY_FLEET, 0).astype(jnp.int32)
     fleet_owner_idx = _remap_owner_2p(g_owner, ego)  # uses 2p remap; matches host
     fleet_owner_idx = jnp.where(fleet_token_active, fleet_owner_idx, jnp.int32(0))

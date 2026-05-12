@@ -48,6 +48,9 @@ FLEET_Y = 3
 FLEET_ANGLE = 4
 FLEET_FROM_PLANET = 5
 FLEET_SHIPS = 6
+FLEET_TARGET_PLANET = 7
+FLEET_ETA = 8
+FLEET_ROW_WIDTH = 9
 
 
 class OrbitWarsConfig(NamedTuple):
@@ -62,7 +65,7 @@ class OrbitWarsState(NamedTuple):
     planet_active: jnp.ndarray  # [MAX_PLANETS], bool
     initial_planets: jnp.ndarray  # [MAX_PLANETS, 7], float32
     initial_active: jnp.ndarray  # [MAX_PLANETS], bool
-    fleets: jnp.ndarray  # [max_fleets, 7], float32
+    fleets: jnp.ndarray  # [max_fleets, FLEET_ROW_WIDTH], float32
     fleet_active: jnp.ndarray  # [max_fleets], bool
     comet_paths: jnp.ndarray  # [5, 4, 40, 2], float32
     comet_path_lengths: jnp.ndarray  # [5, 4], int32
@@ -176,7 +179,7 @@ def reset_from_reference(
         planet_active=planet_active,
         initial_planets=initial_planets,
         initial_active=initial_active,
-        fleets=jnp.zeros((max_fleets, 7), dtype=jnp.float32),
+        fleets=jnp.zeros((max_fleets, FLEET_ROW_WIDTH), dtype=jnp.float32),
         fleet_active=jnp.zeros((max_fleets,), dtype=bool),
         comet_paths=comet_paths,
         comet_path_lengths=comet_path_lengths,
@@ -352,7 +355,7 @@ def _launch_fleets(state: OrbitWarsState, actions: jnp.ndarray) -> OrbitWarsStat
         write = valid & has_fleet_slot
         start_x = planet[PLANET_X] + jnp.cos(angle) * (planet[PLANET_RADIUS] + 0.1)
         start_y = planet[PLANET_Y] + jnp.sin(angle) * (planet[PLANET_RADIUS] + 0.1)
-        fleet = jnp.asarray([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=jnp.float32)
+        fleet = jnp.zeros((FLEET_ROW_WIDTH,), dtype=jnp.float32)
         fleet = fleet.at[FLEET_ID].set(next_fleet_id.astype(jnp.float32))
         fleet = fleet.at[FLEET_OWNER].set(player.astype(jnp.float32))
         fleet = fleet.at[FLEET_X].set(start_x)
@@ -360,6 +363,8 @@ def _launch_fleets(state: OrbitWarsState, actions: jnp.ndarray) -> OrbitWarsStat
         fleet = fleet.at[FLEET_ANGLE].set(angle)
         fleet = fleet.at[FLEET_FROM_PLANET].set(from_id)
         fleet = fleet.at[FLEET_SHIPS].set(ships)
+        fleet = fleet.at[FLEET_TARGET_PLANET].set(-1.0)
+        fleet = fleet.at[FLEET_ETA].set(500.0)
 
         safe_fleet_idx = jnp.where(has_fleet_slot, fleet_idx, 0)
         planets = planets.at[planet_idx, PLANET_SHIPS].add(jnp.where(valid, -ships, 0.0))
@@ -493,11 +498,40 @@ def _move_fleets_and_collect_combats(
         )
         sun_hit = _point_to_segment_distance(jnp.asarray([CENTER, CENTER]), old_pos, new_pos) < config.sun_radius
         remove = active & (hit_planet | (~in_bounds) | sun_hit)
+        unexpected_terminal = active & (~hit_planet) & ((~in_bounds) | sun_hit)
+
+        def _warn_unexpected_fleet_terminal(_):
+            jax.debug.print(
+                "[orbit_wars_pt] WARNING fleet disappeared without planet hit: "
+                "fleet_id={} owner={} target={} eta={} sun_hit={} oob={} "
+                "old=({:.3f}, {:.3f}) new=({:.3f}, {:.3f})",
+                fleet[FLEET_ID],
+                fleet[FLEET_OWNER],
+                fleet[FLEET_TARGET_PLANET],
+                fleet[FLEET_ETA],
+                sun_hit,
+                ~in_bounds,
+                old_pos[0],
+                old_pos[1],
+                new_pos[0],
+                new_pos[1],
+            )
+            return jnp.int32(0)
+
+        _ = jax.lax.cond(
+            unexpected_terminal,
+            _warn_unexpected_fleet_terminal,
+            lambda _: jnp.int32(0),
+            operand=None,
+        )
         owner = fleet[FLEET_OWNER].astype(jnp.int32)
         combat_ships = combat_ships.at[planet_idx, owner].add(
             jnp.where(hit_planet, ships, 0.0)
         )
         fleet = fleet.at[FLEET_X : FLEET_Y + 1].set(jnp.where(active, new_pos, old_pos))
+        fleet = fleet.at[FLEET_ETA].set(
+            jnp.where(active, jnp.maximum(fleet[FLEET_ETA] - 1.0, 0.0), fleet[FLEET_ETA])
+        )
         fleets = fleets.at[fleet_idx].set(fleet)
         fleet_active = fleet_active.at[fleet_idx].set(active & ~remove)
         return (fleets, fleet_active, combat_ships), None
@@ -638,7 +672,7 @@ def step(
 
 
 def expand_fleet_buffers(state: OrbitWarsState, new_max_fleets: int) -> OrbitWarsState:
-    """Copies fleet rows into a larger `[new_max_fleets, 7]` buffer.
+    """Copies fleet rows into a larger `[new_max_fleets, FLEET_ROW_WIDTH]` buffer.
 
     Call when `_launch_fleets` cannot place a fleet because `fleet_active` is
     full (`overflow=True`). Preserves existing fleet slots and flags.
@@ -647,7 +681,7 @@ def expand_fleet_buffers(state: OrbitWarsState, new_max_fleets: int) -> OrbitWar
     old_max = int(state.fleets.shape[0])
     if new_max_fleets <= old_max:
         return state
-    fleets = jnp.zeros((new_max_fleets, 7), dtype=jnp.float32)
+    fleets = jnp.zeros((new_max_fleets, state.fleets.shape[-1]), dtype=jnp.float32)
     fleet_active = jnp.zeros((new_max_fleets,), dtype=bool)
     fleets = fleets.at[:old_max].set(state.fleets)
     fleet_active = fleet_active.at[:old_max].set(state.fleet_active)

@@ -5,9 +5,7 @@ Run with::
     python -m orbit_wars_pt.check_observation_jax
 
 Reports max abs diff per field for a fresh 2-agent reset and a state with a
-few queued fleets. Treats ``eta`` (rope_pos[..., 2]) loosely — the JAX builder
-uses a closed-form approximation while the host builder uses a 600-step Euler
-integration, so small differences are expected (and benign for the policy).
+few queued fleets.
 """
 
 from __future__ import annotations
@@ -25,7 +23,7 @@ if ROOT not in sys.path:
 import jax
 import jax.numpy as jnp
 
-import jax_orbit_wars as jow
+from jax_orbit_wars import FLEET_ETA, FLEET_TARGET_PLANET
 from orbit_wars_pt.batched_env import stack_initial_states
 from orbit_wars_pt.env_wrapper import OrbitWarsEnvConfig
 from orbit_wars_pt.observation import build_observation, jax_state_to_numpy
@@ -96,13 +94,11 @@ def _diff_report(host: Dict[str, np.ndarray], jax_: Dict[str, np.ndarray], tag: 
             mean_diff = float(diff.mean()) if diff.size else 0.0
             note = ""
             if k == "rope_pos":
-                # eta lives in column 2 — closed-form vs Euler is loose by design.
                 eta_diff = float(np.abs(h[..., 2].astype(np.float64) - j[..., 2].astype(np.float64)).max())
                 xy_diff = float(np.abs(h[..., :2].astype(np.float64) - j[..., :2].astype(np.float64)).max())
-                note = f"  (xy max {xy_diff:.6g}, eta max {eta_diff:.6g}; eta intentionally approximate)"
+                note = f"  (xy max {xy_diff:.6g}, eta max {eta_diff:.6g})"
             print(f"  {k}: max abs diff = {max_diff:.6g}, mean = {mean_diff:.6g}{note}")
-            tolerance = 1.0 if k == "rope_pos" else 1e-5
-            if max_diff > tolerance:
+            if max_diff > 1e-5:
                 ok = False
     print(f"  -> {'PASS' if ok else 'FAIL (see above)'}")
     return ok
@@ -139,7 +135,11 @@ def main() -> int:
         ang = float(np.arctan2(ey - oy, ex - ox))
         oid = float(planets_np[owned_idx, 0])
         for slot, ships in enumerate((5.0, 12.0, 30.0)):
-            fleets_np[slot] = [float(slot), 0.0, ox, oy, ang, oid, ships]
+            row = np.zeros((fleets_np.shape[1],), dtype=np.float32)
+            row[:7] = [float(slot), 0.0, ox, oy, ang, oid, ships]
+            row[FLEET_TARGET_PLANET] = float(enemy_idx)
+            row[FLEET_ETA] = 10.0 + float(slot)
+            fleets_np[slot] = row
             fa_np[slot] = True
         state_one = state_one._replace(
             fleets=jnp.asarray(fleets_np), fleet_active=jnp.asarray(fa_np),
