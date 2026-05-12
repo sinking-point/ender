@@ -323,6 +323,7 @@ def _jax_preamble_to_torch(
     ship_speed: float,
     timing: Optional[Any],
     first_hit_n_rays: int = 2048,
+    first_hit_ray_chunk_size: int = 0,
     target_planet_reachable: Optional[jnp.ndarray] = None,
 ):
     """Run the JAX side (obs builder + optional first-hit) and dlpack-import results.
@@ -346,6 +347,7 @@ def _jax_preamble_to_torch(
             ship_speed=ship_speed,
             samples_per_span=17,
             n_rays=first_hit_n_rays,
+            ray_chunk_size=first_hit_ray_chunk_size,
         )
     if timing is not None:
         timing.replay_jax_s += perf_counter() - t0
@@ -388,6 +390,7 @@ def replay_logprob_value_entropy_jax(
     ship_speed: float = 6.0,
     timing: Optional[Any] = None,
     first_hit_n_rays: int = 2048,
+    first_hit_ray_chunk_size: int = 0,
     target_planet_reachable: Optional[jnp.ndarray] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Diagnostic entry: returns ``(new_logp, new_value, new_entropy)``.
@@ -417,6 +420,7 @@ def replay_logprob_value_entropy_jax(
         ship_speed=ship_speed,
         timing=timing,
         first_hit_n_rays=first_hit_n_rays,
+        first_hit_ray_chunk_size=first_hit_ray_chunk_size,
         target_planet_reachable=target_planet_reachable,
     )
 
@@ -463,6 +467,7 @@ def replay_ppo_loss(
     amp_dtype: Optional[torch.dtype] = None,
     target_planet_reachable: Optional[jnp.ndarray] = None,
     first_hit_n_rays: int = 2048,
+    first_hit_ray_chunk_size: int = 0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """JAX preamble + dlpack + (optionally compiled) PPO loss.
 
@@ -501,6 +506,7 @@ def replay_ppo_loss(
         ship_speed=ship_speed,
         timing=timing,
         first_hit_n_rays=first_hit_n_rays,
+        first_hit_ray_chunk_size=first_hit_ray_chunk_size,
         target_planet_reachable=target_planet_reachable,
     )
     must_halt_no_ships_t = torch.from_dlpack(must_halt_no_ships).to(

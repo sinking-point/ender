@@ -1008,6 +1008,93 @@ def first_hit_brute_best_targets_from_rays_apply_jax(
     return ang, wid, ok, overflow, tick
 
 
+def first_hit_brute_best_targets_from_rays_chunked_apply_jax(
+    origin_xy: jnp.ndarray,
+    origin_radius: jnp.ndarray,
+    speed: jnp.ndarray,
+    object_p0_by_tick: jnp.ndarray,
+    object_p1_by_tick: jnp.ndarray,
+    object_radii: jnp.ndarray,
+    object_active_by_tick: jnp.ndarray,
+    *,
+    n_rays: int = 2048,
+    ray_chunk_size: int = 256,
+    include_sun: bool = True,
+    include_board: bool = True,
+    board_size: float = BOARD_SIZE,
+    sun_radius: float = SUN_RADIUS,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Chunked version of ``first_hit_brute_best_targets_from_rays_apply_jax``.
+
+    The result matches the full ray grid semantics, but the largest temporary
+    raycasting tensors use ``ray_chunk_size`` rays rather than ``n_rays``.
+    """
+
+    dtype = origin_xy.dtype
+    planets = int(object_radii.shape[0])
+    chunk = max(1, int(ray_chunk_size))
+    chunks = (int(n_rays) + chunk - 1) // chunk
+    stride = planets + int(include_sun) + int(include_board)
+    stride_j = jnp.asarray(stride, dtype=jnp.int32)
+    iinf = jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32)
+    # Score sorts by earliest hit tick, then by global ray index for ties.
+    score_inf = jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32)
+    best_score0 = jnp.full((planets,), score_inf, dtype=jnp.int32)
+    best_ray0 = jnp.zeros((planets,), dtype=jnp.int32)
+    best_tick0 = jnp.full((planets,), iinf, dtype=jnp.int32)
+    jp = jnp.arange(planets, dtype=jnp.int32)
+    dtheta = TAU / jnp.asarray(float(n_rays), dtype=dtype)
+
+    def body(ci, carry):
+        best_score, best_ray, best_tick = carry
+        start = ci * chunk
+        ray_i = start + jnp.arange(chunk, dtype=jnp.int32)
+        ray_valid = ray_i < jnp.asarray(n_rays, dtype=jnp.int32)
+        theta = ray_i.astype(dtype) * dtheta
+        first_lex, hit_any = first_hit_brute_rays_baseline_apply_jax(
+            origin_xy,
+            origin_radius,
+            speed,
+            object_p0_by_tick,
+            object_p1_by_tick,
+            object_radii,
+            object_active_by_tick,
+            n_rays=chunk,
+            ray_angles=theta,
+            include_sun=include_sun,
+            include_board=include_board,
+            board_size=board_size,
+            sun_radius=sun_radius,
+        )
+        hit_any = hit_any & ray_valid
+        codes = jnp.where(hit_any, first_lex % stride_j, jnp.asarray(-1, dtype=jnp.int32))
+        hit_ticks = jnp.where(hit_any, first_lex // stride_j, iinf)
+        mask = hit_any[:, None] & (codes[:, None] == jp[None, :])
+        # ``n_rays + 1`` is plenty for the tie-break index and keeps the score int32.
+        ray_score = hit_ticks[:, None] * jnp.asarray(n_rays + 1, dtype=jnp.int32) + ray_i[:, None]
+        scores_rp = jnp.where(mask, ray_score, score_inf)
+        local_score = jnp.min(scores_rp, axis=0)
+        local_ray_idx = jnp.argmin(scores_rp, axis=0).astype(jnp.int32)
+        local_ray = ray_i[local_ray_idx]
+        local_tick = hit_ticks[local_ray_idx]
+        update = local_score < best_score
+        return (
+            jnp.where(update, local_score, best_score),
+            jnp.where(update, local_ray, best_ray),
+            jnp.where(update, local_tick, best_tick),
+        )
+
+    best_score, best_ray, best_tick = jax.lax.fori_loop(
+        0, chunks, body, (best_score0, best_ray0, best_tick0)
+    )
+    ok = best_score < score_inf
+    ang = jnp.where(ok, _norm_angle(best_ray.astype(dtype) * dtheta), jnp.asarray(0.0, dtype=dtype))
+    wid = jnp.where(ok, dtheta, jnp.asarray(0.0, dtype=dtype))
+    tick = jnp.where(ok, best_tick.astype(dtype), jnp.asarray(0.0, dtype=dtype))
+    overflow = jnp.asarray(False)
+    return ang, wid, ok, overflow, tick
+
+
 def _sweep_best_targets_from_precomputed_hits_jax(
     origin_xy: jnp.ndarray,
     origin_radius: jnp.ndarray,
@@ -1223,6 +1310,7 @@ def first_hit_best_targets_apply_jax(
     max_block_intervals: int = 32,
     same_tick_planets_parallel: bool = False,
     n_rays: int = 2048,
+    ray_chunk_size: int = 0,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Discrete-ray first-hit targets (``first_hit_brute_best_targets_from_rays_apply_jax``).
 
@@ -1237,6 +1325,22 @@ def first_hit_best_targets_apply_jax(
     """
 
     del object_order, samples_per_span, max_block_intervals, same_tick_planets_parallel
+    if int(ray_chunk_size) > 0 and int(ray_chunk_size) < int(n_rays):
+        return first_hit_brute_best_targets_from_rays_chunked_apply_jax(
+            origin_xy,
+            origin_radius,
+            speed,
+            object_p0_by_tick,
+            object_p1_by_tick,
+            object_radii,
+            object_active_by_tick,
+            n_rays=n_rays,
+            ray_chunk_size=ray_chunk_size,
+            include_sun=include_sun,
+            include_board=include_board,
+            board_size=board_size,
+            sun_radius=sun_radius,
+        )
     return first_hit_brute_best_targets_from_rays_apply_jax(
         origin_xy,
         origin_radius,
@@ -1265,6 +1369,7 @@ def first_hit_best_targets_apply_jax(
         "max_block_intervals",
         "same_tick_planets_parallel",
         "n_rays",
+        "ray_chunk_size",
     ),
 )
 def first_hit_best_targets_jax(
@@ -1285,6 +1390,7 @@ def first_hit_best_targets_jax(
     max_block_intervals: int = 32,
     same_tick_planets_parallel: bool = False,
     n_rays: int = 2048,
+    ray_chunk_size: int = 0,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Discrete-ray first-hit targets (delegates to ``first_hit_best_targets_apply_jax``).
 
@@ -1310,6 +1416,7 @@ def first_hit_best_targets_jax(
         max_block_intervals=max_block_intervals,
         same_tick_planets_parallel=same_tick_planets_parallel,
         n_rays=n_rays,
+        ray_chunk_size=ray_chunk_size,
     )
 
 

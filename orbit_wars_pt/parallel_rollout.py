@@ -547,6 +547,7 @@ def _run_micro_phase(
     turn_tag_j: jnp.ndarray,
     turn_slot_np: np.ndarray,
     first_hit_n_rays: int = 2048,
+    first_hit_ray_chunk_size: int = 0,
 ) -> Tuple[
     TransitionBuffer,
     np.ndarray,
@@ -671,6 +672,7 @@ def _run_micro_phase(
             ship_speed=ship_speed,
             samples_per_span=17,
             n_rays=first_hit_n_rays,
+            ray_chunk_size=first_hit_ray_chunk_size,
         )
         target_angle_t = torch.from_dlpack(target_angle_j).index_select(0, active_idx_t)
         target_valid_t = torch.from_dlpack(target_valid_j).index_select(0, active_idx_t)
@@ -835,6 +837,7 @@ def _run_async_micro_step(
     turn_tag_j: jnp.ndarray,
     turn_slot_np: np.ndarray,
     first_hit_n_rays: int,
+    first_hit_ray_chunk_size: int = 0,
 ) -> tuple[OrbitWarsState, TransitionBuffer, jnp.ndarray]:
     """Run one micro decision for ``ego`` on a masked subset of envs."""
 
@@ -908,6 +911,7 @@ def _run_async_micro_step(
         ship_speed=ship_speed,
         samples_per_span=17,
         n_rays=first_hit_n_rays,
+        ray_chunk_size=first_hit_ray_chunk_size,
     )
     target_angle_t = torch.from_dlpack(target_angle_j).index_select(0, active_idx_t)
     target_valid_t = torch.from_dlpack(target_valid_j).index_select(0, active_idx_t)
@@ -1072,6 +1076,7 @@ def collect_parallel_micro_rollouts(
     min_max_fleets: int = 1,
     reset_prefetch: Optional[RolloutResetPrefetch] = None,
     first_hit_n_rays: int = 2048,
+    first_hit_ray_chunk_size: int = 0,
 ) -> Tuple[RolloutSegment, RolloutTiming, RolloutCarry, int, RolloutGameStats]:
     """Collect one rollout segment using device-resident transition buffers.
 
@@ -1369,6 +1374,7 @@ def collect_parallel_micro_rollouts(
                     turn_tag_j=turn_tag_p0,
                     turn_slot_np=turn_slot_np,
                     first_hit_n_rays=first_hit_n_rays,
+                    first_hit_ray_chunk_size=first_hit_ray_chunk_size,
                 )
                 if profile_rollout and device.type == "cuda" and not logged_first_policy_fwd:
                     log_cuda_mem("rollout after first batched policy forward", device)
@@ -1399,6 +1405,7 @@ def collect_parallel_micro_rollouts(
                     turn_tag_j=turn_tag_p1,
                     turn_slot_np=turn_slot_np,
                     first_hit_n_rays=first_hit_n_rays,
+                    first_hit_ray_chunk_size=first_hit_ray_chunk_size,
                 )
 
             if np.any(write_idx_p0 >= rollout_micro_horizon) or np.any(write_idx_p1 >= rollout_micro_horizon):

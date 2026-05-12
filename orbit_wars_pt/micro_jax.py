@@ -100,7 +100,7 @@ def _forecast_planet_paths_one_tick(s: OrbitWarsState):
     return jax.lax.cond(s.done, no_tick, do_tick, s)
 
 
-@partial(jax.jit, static_argnames=("horizon", "ship_speed", "samples_per_span", "n_rays"))
+@partial(jax.jit, static_argnames=("horizon", "ship_speed", "samples_per_span", "n_rays", "ray_chunk_size"))
 def selected_origin_fraction_targets_batched(
     state: OrbitWarsState,
     origin_idx: jnp.ndarray,
@@ -110,6 +110,7 @@ def selected_origin_fraction_targets_batched(
     ship_speed: float = 6.0,
     samples_per_span: int = 17,
     n_rays: int = 2048,
+    ray_chunk_size: int = 0,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """For each env's sampled origin/fraction, return best first-hit target angles.
 
@@ -137,6 +138,7 @@ def selected_origin_fraction_targets_batched(
             active,
             samples_per_span=samples_per_span,
             n_rays=n_rays,
+            ray_chunk_size=ray_chunk_size,
         )
         not_self = jnp.arange(s.planets.shape[0], dtype=jnp.int32) != oi
         valid = valid & not_self & s.planet_active

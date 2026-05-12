@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import re
 import sys
@@ -47,11 +48,23 @@ from orbit_wars_pt.parallel_rollout import (
 )
 from orbit_wars_pt.reset_prefetch import RolloutResetPrefetch
 from orbit_wars_pt.ppo_replay import compute_ppo_loss_torch, replay_ppo_loss
-from orbit_wars_pt.transition_buffer import gather_minibatch
+from orbit_wars_pt.transition_buffer import (
+    TransitionBuffer,
+    gather_minibatch,
+    gather_minibatch_selected,
+)
 
 from jax_orbit_wars import OrbitWarsState
 
 CHECKPOINT_VERSION = 1
+
+
+@dataclass
+class HostRolloutChunk:
+    """A rollout segment spilled to host RAM for minibatch-sized replay transfers."""
+
+    segment: RolloutSegment
+    samples: dict
 
 
 def _sanitize_experiment_name(name: str) -> str:
@@ -136,6 +149,8 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "num_envs",
         "max_micro_steps",
         "rollout_micro_horizon",
+        "rollout_storage",
+        "rollout_host_chunks",
         "lr",
         "gamma",
         "lam",
@@ -145,6 +160,8 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "ppo_epochs",
         "minibatch_size",
         "ship_speed",
+        "first_hit_n_rays",
+        "first_hit_ray_chunk_size",
         "max_grad_norm",
         "d_model",
         "n_heads",
@@ -479,6 +496,242 @@ def normalize_advantages(samples: dict) -> None:
     samples["advantages"] = ((a - a.mean()) / (a.std() + 1e-8)).astype(np.float32)
 
 
+def _tree_to_host(x: Any) -> Any:
+    return jax.tree.map(lambda leaf: np.asarray(jax.device_get(leaf)), x)
+
+
+def _rollout_segment_to_host(segment: RolloutSegment) -> RolloutSegment:
+    """Move device-resident rollout payload to CPU RAM.
+
+    Host metadata arrays are already NumPy arrays; ``np.asarray`` keeps them as
+    views.  The heavyweight JAX buffers and turn cache become CPU arrays so
+    the accelerator only sees minibatch-sized slices during PPO.
+    """
+
+    return RolloutSegment(
+        buf0=_tree_to_host(segment.buf0),
+        buf1=_tree_to_host(segment.buf1),
+        turn_state_cache=_tree_to_host(segment.turn_state_cache),
+        turn_tag_p0=np.asarray(jax.device_get(segment.turn_tag_p0)),
+        turn_tag_p1=np.asarray(jax.device_get(segment.turn_tag_p1)),
+        write_idx_p0=np.asarray(segment.write_idx_p0),
+        write_idx_p1=np.asarray(segment.write_idx_p1),
+        valid_p0=np.asarray(segment.valid_p0),
+        valid_p1=np.asarray(segment.valid_p1),
+        old_logprob_p0=np.asarray(segment.old_logprob_p0),
+        old_logprob_p1=np.asarray(segment.old_logprob_p1),
+        old_value_p0=np.asarray(segment.old_value_p0),
+        old_value_p1=np.asarray(segment.old_value_p1),
+        reward_p0=np.asarray(segment.reward_p0),
+        reward_p1=np.asarray(segment.reward_p1),
+        done_p0=np.asarray(segment.done_p0),
+        done_p1=np.asarray(segment.done_p1),
+        bootstrap_p0=np.asarray(segment.bootstrap_p0),
+        bootstrap_p1=np.asarray(segment.bootstrap_p1),
+        bootstrap_valid_p0=np.asarray(segment.bootstrap_valid_p0),
+        bootstrap_valid_p1=np.asarray(segment.bootstrap_valid_p1),
+        env_steps_per_env=np.asarray(segment.env_steps_per_env),
+    )
+
+
+def _release_rollout_device_refs(device: torch.device) -> None:
+    """Drop Python-held accelerator refs before learner-side allocations.
+
+    JAX/XLA may keep its allocator pool reserved, so this is not guaranteed to
+    reduce process-level ``nvidia-smi`` usage.  It does make dead arrays
+    collectable/reusable before PPO builds its backward graph.
+    """
+
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def _concat_sample_dicts(sample_dicts: list[dict]) -> dict:
+    keys = sample_dicts[0].keys()
+    return {k: np.concatenate([s[k] for s in sample_dicts]).astype(sample_dicts[0][k].dtype) for k in keys}
+
+
+def _normalize_chunk_advantages(chunks: list[HostRolloutChunk]) -> None:
+    adv = np.concatenate([c.samples["advantages"] for c in chunks])
+    mean = float(adv.mean())
+    std = float(adv.std()) + 1e-8
+    for chunk in chunks:
+        chunk.samples["advantages"] = ((chunk.samples["advantages"] - mean) / std).astype(np.float32)
+
+
+def _build_host_chunk_samples(
+    segments: list[RolloutSegment],
+    gamma: float,
+    lam: float,
+) -> Optional[list[dict]]:
+    """Compute GAE across all host-staged chunks, then shard samples by chunk.
+
+    Chunk boundaries are storage boundaries only.  For each player/env stream,
+    rewards/values/dones are concatenated across every collected chunk and GAE
+    uses only the final available bootstrap.
+    """
+
+    if not segments:
+        return None
+
+    keys = ("advantages", "returns", "players", "t_idx", "n_idx", "old_logprob", "old_value")
+    per_chunk = [{k: [] for k in keys} for _ in segments]
+    num_envs = int(segments[0].valid_p0.shape[1])
+
+    for player in (0, 1):
+        for n in range(num_envs):
+            values_parts, rewards_parts, dones_parts, old_lp_parts = [], [], [], []
+            t_parts: list[np.ndarray] = []
+            lengths: list[int] = []
+            last_nonempty_i: Optional[int] = None
+
+            for ci, segment in enumerate(segments):
+                if player == 0:
+                    old_value = segment.old_value_p0
+                    old_logprob = segment.old_logprob_p0
+                    rewards = segment.reward_p0
+                    dones = segment.done_p0
+                    write_idx = segment.write_idx_p0
+                else:
+                    old_value = segment.old_value_p1
+                    old_logprob = segment.old_logprob_p1
+                    rewards = segment.reward_p1
+                    dones = segment.done_p1
+                    write_idx = segment.write_idx_p1
+
+                T = int(write_idx[n])
+                lengths.append(T)
+                if T == 0:
+                    continue
+                last_nonempty_i = ci
+                values_parts.append(old_value[:T, n])
+                rewards_parts.append(rewards[:T, n])
+                dones_parts.append(dones[:T, n])
+                old_lp_parts.append(old_logprob[:T, n])
+                t_parts.append(np.arange(T, dtype=np.int32))
+
+            if last_nonempty_i is None:
+                continue
+
+            values = np.concatenate(values_parts).astype(np.float32)
+            rewards = np.concatenate(rewards_parts).astype(np.float32)
+            dones = np.concatenate(dones_parts).astype(np.bool_)
+            last_segment = segments[last_nonempty_i]
+            if player == 0:
+                bootstrap = (
+                    float(last_segment.bootstrap_p0[n])
+                    if bool(last_segment.bootstrap_valid_p0[n])
+                    else None
+                )
+            else:
+                bootstrap = (
+                    float(last_segment.bootstrap_p1[n])
+                    if bool(last_segment.bootstrap_valid_p1[n])
+                    else None
+                )
+            adv, ret = compute_gae(rewards, values, dones, gamma, lam, bootstrap=bootstrap)
+
+            offset = 0
+            part_i = 0
+            for ci, T in enumerate(lengths):
+                if T == 0:
+                    continue
+                old_lp = old_lp_parts[part_i]
+                t_local = t_parts[part_i]
+                dst = per_chunk[ci]
+                dst["advantages"].append(adv[offset : offset + T])
+                dst["returns"].append(ret[offset : offset + T])
+                dst["players"].append(np.full((T,), player, dtype=np.int32))
+                dst["t_idx"].append(t_local)
+                dst["n_idx"].append(np.full((T,), n, dtype=np.int32))
+                dst["old_logprob"].append(old_lp)
+                dst["old_value"].append(values[offset : offset + T])
+                offset += T
+                part_i += 1
+
+    out: list[dict] = []
+    any_samples = False
+    dtypes = {
+        "advantages": np.float32,
+        "returns": np.float32,
+        "players": np.int32,
+        "t_idx": np.int32,
+        "n_idx": np.int32,
+        "old_logprob": np.float32,
+        "old_value": np.float32,
+    }
+    for chunk in per_chunk:
+        if not chunk["advantages"]:
+            out.append({})
+            continue
+        any_samples = True
+        out.append({k: np.concatenate(chunk[k]).astype(dtypes[k]) for k in keys})
+
+    return out if any_samples else None
+
+
+def _combine_rollout_timing(items: list[RolloutTiming]) -> RolloutTiming:
+    out = RolloutTiming()
+    for rt in items:
+        out.init_s += rt.init_s
+        out.env_step_s += rt.env_step_s
+        out.micro_cap_s += rt.micro_cap_s
+        out.obs_build_s += rt.obs_build_s
+        out.policy_batch_s += rt.policy_batch_s
+        out.policy_forward_s += rt.policy_forward_s
+        out.micro_apply_s += rt.micro_apply_s
+        out.state_unstack_s += rt.state_unstack_s
+        out.loop_s += rt.loop_s
+        out.wall_s += rt.wall_s
+        out.outer_iters += rt.outer_iters
+    return out
+
+
+def _combine_game_stats(items: list[RolloutGameStats]) -> RolloutGameStats:
+    out = RolloutGameStats()
+    for gs in items:
+        out.n_completed += gs.n_completed
+        out.n_step_limit += gs.n_step_limit
+        out.n_decisive += gs.n_decisive
+        out.n_p0_positive_reward += gs.n_p0_positive_reward
+        out.n_p1_positive_reward += gs.n_p1_positive_reward
+        out.sum_final_ships_p0 += gs.sum_final_ships_p0
+        out.sum_final_ships_p1 += gs.sum_final_ships_p1
+        out.sum_episode_turns += gs.sum_episode_turns
+    return out
+
+
+def _combine_segments_for_stats(segments: list[RolloutSegment]) -> RolloutSegment:
+    """Small synthetic segment for logging aggregate rollout counts."""
+
+    first = segments[0]
+    return RolloutSegment(
+        buf0=first.buf0,
+        buf1=first.buf1,
+        turn_state_cache=first.turn_state_cache,
+        turn_tag_p0=first.turn_tag_p0,
+        turn_tag_p1=first.turn_tag_p1,
+        write_idx_p0=sum((s.write_idx_p0 for s in segments), np.zeros_like(first.write_idx_p0)),
+        write_idx_p1=sum((s.write_idx_p1 for s in segments), np.zeros_like(first.write_idx_p1)),
+        valid_p0=first.valid_p0,
+        valid_p1=first.valid_p1,
+        old_logprob_p0=first.old_logprob_p0,
+        old_logprob_p1=first.old_logprob_p1,
+        old_value_p0=first.old_value_p0,
+        old_value_p1=first.old_value_p1,
+        reward_p0=np.concatenate([s.reward_p0 for s in segments], axis=0),
+        reward_p1=np.concatenate([s.reward_p1 for s in segments], axis=0),
+        done_p0=first.done_p0,
+        done_p1=first.done_p1,
+        bootstrap_p0=first.bootstrap_p0,
+        bootstrap_p1=first.bootstrap_p1,
+        bootstrap_valid_p0=first.bootstrap_valid_p0,
+        bootstrap_valid_p1=first.bootstrap_valid_p1,
+        env_steps_per_env=sum((s.env_steps_per_env for s in segments), np.zeros_like(first.env_steps_per_env)),
+    )
+
+
 def _rollout_timing_str(rt: RolloutTiming) -> str:
     unacc_loop = max(0.0, rt.loop_s - rt.accounted_loop_s())
     return (
@@ -571,6 +824,7 @@ def ppo_iteration(
     max_grad_norm: float,
     ship_speed: float,
     first_hit_n_rays: int,
+    first_hit_ray_chunk_size: int,
     *,
     rnd: np.random.Generator,
     loss_fn: Optional[Any] = None,
@@ -659,6 +913,7 @@ def ppo_iteration(
                 policy=policy,
                 ship_speed=ship_speed,
                 first_hit_n_rays=first_hit_n_rays,
+                first_hit_ray_chunk_size=first_hit_ray_chunk_size,
                 clip_eps=clip_eps,
                 vf_coef=vf_coef,
                 entropy_coef=entropy_coef,
@@ -687,6 +942,164 @@ def ppo_iteration(
             stats.update(mb_stats, grad_norm)
             timing.sync_s += perf_counter() - t0
             n_mb += 1
+
+    timing.n_minibatches = n_mb
+    timing.total_s = perf_counter() - t_total0
+    return total_loss_sum / max(1, n_mb), timing, stats
+
+
+def _host_selected_minibatch(segment: RolloutSegment, mb_player: np.ndarray, mb_t: np.ndarray, mb_n: np.ndarray):
+    """Select minibatch rows from a CPU-resident rollout chunk and place them on device."""
+
+    is_p0 = mb_player == 0
+    turn_idx = np.where(is_p0, segment.turn_tag_p0[mb_t, mb_n], segment.turn_tag_p1[mb_t, mb_n])
+    state_host = jax.tree.map(lambda leaf: leaf[turn_idx, mb_n], segment.turn_state_cache)
+
+    buf0: TransitionBuffer = segment.buf0
+    buf1: TransitionBuffer = segment.buf1
+
+    def _sel_plane(field0: np.ndarray, field1: np.ndarray) -> np.ndarray:
+        a = field0[mb_t, mb_n, :]
+        b = field1[mb_t, mb_n, :]
+        return np.where(is_p0[:, None], a, b)
+
+    def _sel_scalar(field0: np.ndarray, field1: np.ndarray) -> np.ndarray:
+        a = field0[mb_t, mb_n]
+        b = field1[mb_t, mb_n]
+        return np.where(is_p0, a, b)
+
+    phase_micro_idx = _sel_scalar(buf0.phase_micro_idx, buf1.phase_micro_idx).astype(np.int32)
+    max_m = int(buf0.micro_halt_now.shape[2])
+
+    return gather_minibatch_selected(
+        jax.tree.map(jnp.asarray, state_host),
+        jnp.asarray(mb_player, dtype=jnp.int32),
+        max_m,
+        jnp.asarray(_sel_plane(buf0.micro_halt_now, buf1.micro_halt_now), dtype=jnp.bool_),
+        jnp.asarray(_sel_plane(buf0.send, buf1.send), dtype=jnp.float32),
+        jnp.asarray(_sel_plane(buf0.angle, buf1.angle), dtype=jnp.float32),
+        jnp.asarray(_sel_plane(buf0.fleet_eta, buf1.fleet_eta), dtype=jnp.float32),
+        jnp.asarray(_sel_plane(buf0.slot, buf1.slot), dtype=jnp.int32),
+        jnp.asarray(_sel_scalar(buf0.halt_action, buf1.halt_action), dtype=jnp.int32),
+        jnp.asarray(_sel_plane(buf0.pair_flat, buf1.pair_flat), dtype=jnp.int32),
+        jnp.asarray(_sel_plane(buf0.frac_idx, buf1.frac_idx), dtype=jnp.int32),
+        jnp.asarray(_sel_scalar(buf0.no_valid_pairs, buf1.no_valid_pairs), dtype=jnp.bool_),
+        jnp.asarray(_sel_scalar(buf0.no_valid_fracs, buf1.no_valid_fracs), dtype=jnp.bool_),
+        jnp.asarray(_sel_scalar(buf0.must_halt_no_ships, buf1.must_halt_no_ships), dtype=jnp.bool_),
+        jnp.asarray(
+            np.where(
+                is_p0[:, None],
+                buf0.target_planet_reachable[mb_t, mb_n, :],
+                buf1.target_planet_reachable[mb_t, mb_n, :],
+            ),
+            dtype=jnp.bool_,
+        ),
+        jnp.asarray(phase_micro_idx, dtype=jnp.int32),
+    )
+
+
+def ppo_iteration_host_staged(
+    policy: OrbitWarsPolicy,
+    opt: torch.optim.Optimizer,
+    chunks: list[HostRolloutChunk],
+    device: torch.device,
+    minibatch_size: int,
+    ppo_epochs: int,
+    clip_eps: float,
+    vf_coef: float,
+    entropy_coef: float,
+    max_grad_norm: float,
+    ship_speed: float,
+    first_hit_n_rays: int,
+    first_hit_ray_chunk_size: int,
+    *,
+    rnd: np.random.Generator,
+    loss_fn: Optional[Any] = None,
+    amp_dtype: Optional[torch.dtype] = None,
+) -> Tuple[float, PPOTiming, PPOStats]:
+    """PPO over CPU-resident rollout chunks, staging only minibatches to device."""
+
+    total_loss_sum = 0.0
+    n_mb = 0
+    timing = PPOTiming()
+    stats = PPOStats()
+    t_total0 = perf_counter()
+
+    for _ in range(ppo_epochs):
+        chunk_order = np.arange(len(chunks))
+        rnd.shuffle(chunk_order)
+        for chunk_i in chunk_order:
+            chunk = chunks[int(chunk_i)]
+            samples = chunk.samples
+            n = int(samples["advantages"].shape[0])
+            idx = np.arange(n)
+            rnd.shuffle(idx)
+            for start in range(0, n, minibatch_size):
+                mb_idx = idx[start : start + minibatch_size]
+
+                t0 = perf_counter()
+                mb_player = samples["players"][mb_idx]
+                mb_t = samples["t_idx"][mb_idx]
+                mb_n = samples["n_idx"][mb_idx]
+                (
+                    state_b,
+                    halt_action_j,
+                    pair_flat_j,
+                    frac_idx_j,
+                    no_valid_pairs_j,
+                    no_valid_fracs_j,
+                    must_halt_no_ships_j,
+                    target_planet_reachable_j,
+                ) = _host_selected_minibatch(chunk.segment, mb_player, mb_t, mb_n)
+
+                ego_b_j = jnp.asarray(mb_player, dtype=jnp.int32)
+                adv = torch.as_tensor(samples["advantages"][mb_idx], device=device, dtype=torch.float32)
+                ret_t = torch.as_tensor(samples["returns"][mb_idx], device=device, dtype=torch.float32)
+                old_logp = torch.as_tensor(samples["old_logprob"][mb_idx], device=device, dtype=torch.float32)
+                old_v = torch.as_tensor(samples["old_value"][mb_idx], device=device, dtype=torch.float32)
+                timing.gather_s += perf_counter() - t0
+
+                loss, mb_stats = replay_ppo_loss(
+                    state_b=state_b,
+                    halt_action=halt_action_j,
+                    pair_flat=pair_flat_j,
+                    frac_idx=frac_idx_j,
+                    no_valid_pairs=no_valid_pairs_j,
+                    no_valid_fracs=no_valid_fracs_j,
+                    must_halt_no_ships=must_halt_no_ships_j,
+                    ego_b=ego_b_j,
+                    adv=adv,
+                    returns=ret_t,
+                    old_logp=old_logp,
+                    old_v=old_v,
+                    policy=policy,
+                    ship_speed=ship_speed,
+                    first_hit_n_rays=first_hit_n_rays,
+                    first_hit_ray_chunk_size=first_hit_ray_chunk_size,
+                    clip_eps=clip_eps,
+                    vf_coef=vf_coef,
+                    entropy_coef=entropy_coef,
+                    loss_fn=loss_fn,
+                    timing=timing,
+                    amp_dtype=amp_dtype,
+                    target_planet_reachable=target_planet_reachable_j,
+                )
+
+                t0 = perf_counter()
+                opt.zero_grad()
+                loss.backward()
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm))
+                timing.backward_s += perf_counter() - t0
+
+                t0 = perf_counter()
+                opt.step()
+                timing.optim_s += perf_counter() - t0
+
+                t0 = perf_counter()
+                total_loss_sum += float(loss.item())
+                stats.update(mb_stats, grad_norm)
+                timing.sync_s += perf_counter() - t0
+                n_mb += 1
 
     timing.n_minibatches = n_mb
     timing.total_s = perf_counter() - t_total0
@@ -763,6 +1176,8 @@ def train(args: argparse.Namespace) -> None:
 
     if args.checkpoint_every < 1:
         raise SystemExit("--checkpoint-every must be >= 1")
+    if args.rollout_host_chunks < 1:
+        raise SystemExit("--rollout-host-chunks must be >= 1")
 
     exp_dir, tb_dir, ckpt_dir = experiment_dirs(args)
     exp_dir.mkdir(parents=True, exist_ok=True)
@@ -972,27 +1387,102 @@ def _train_loop(
             reset_peak_stats(device)
             log_cuda_mem(f"iter {it} start (peak reset)", device)
 
-        seed_base = rollout_env_seed
-        segment, rt, rollout_carry, seeds_used, game_stats = collect_parallel_micro_rollouts(
-            policy,
-            cfg,
-            args.num_envs,
-            device,
-            seed_base=seed_base,
-            rng=rng,
-            greedy=False,
-            ship_speed=args.ship_speed,
-            max_micro_steps_per_player=args.max_micro_steps,
-            rollout_micro_horizon=args.rollout_micro_horizon,
-            carry_in=rollout_carry,
-            mem_debug=mem_dbg,
-            train_iter=it,
-            amp_dtype=amp_dtype,
-            min_max_fleets=args.max_fleets,
-            reset_prefetch=reset_prefetch,
-            first_hit_n_rays=max(8, int(args.first_hit_n_rays)),
-        )
-        rollout_env_seed += seeds_used
+        host_chunks: Optional[list[HostRolloutChunk]] = None
+        if args.rollout_storage == "host":
+            chunk_segments: list[RolloutSegment] = []
+            chunk_timings: list[RolloutTiming] = []
+            chunk_stats: list[RolloutGameStats] = []
+            host_chunks = []
+            samples_t0 = time.perf_counter()
+            samples_s = 0.0
+            for chunk_i in range(int(args.rollout_host_chunks)):
+                segment_i, rt_i, rollout_carry, seeds_used, game_stats_i = collect_parallel_micro_rollouts(
+                    policy,
+                    cfg,
+                    args.num_envs,
+                    device,
+                    seed_base=rollout_env_seed,
+                    rng=rng,
+                    greedy=False,
+                    ship_speed=args.ship_speed,
+                    max_micro_steps_per_player=args.max_micro_steps,
+                    rollout_micro_horizon=args.rollout_micro_horizon,
+                    carry_in=rollout_carry,
+                    mem_debug=mem_dbg if chunk_i == 0 else 0,
+                    train_iter=it,
+                    amp_dtype=amp_dtype,
+                    min_max_fleets=args.max_fleets,
+                    reset_prefetch=reset_prefetch,
+                    first_hit_n_rays=max(8, int(args.first_hit_n_rays)),
+                    first_hit_ray_chunk_size=max(0, int(args.first_hit_ray_chunk_size)),
+                )
+                rollout_env_seed += seeds_used
+                cfg.max_fleets = rollout_carry.cfg.max_fleets
+                chunk_sample_count = int(segment_i.write_idx_p0.sum() + segment_i.write_idx_p1.sum())
+                t_host0 = time.perf_counter()
+                host_segment_i = _rollout_segment_to_host(segment_i)
+                host_transfer_s = time.perf_counter() - t_host0
+                del segment_i
+                _release_rollout_device_refs(device)
+                chunk_segments.append(host_segment_i)
+                chunk_timings.append(rt_i)
+                chunk_stats.append(game_stats_i)
+                print(
+                    f"iter {it:4d} host rollout chunk {chunk_i + 1}/{args.rollout_host_chunks} "
+                    f"raw_samples {chunk_sample_count} host_transfer {host_transfer_s:.3f}s "
+                    f"| {_rollout_timing_str(rt_i)}",
+                    flush=True,
+                )
+            chunk_sample_dicts = _build_host_chunk_samples(chunk_segments, args.gamma, args.lam)
+            if chunk_sample_dicts is not None:
+                host_chunks = [
+                    HostRolloutChunk(segment=segment_i, samples=samples_i)
+                    for segment_i, samples_i in zip(chunk_segments, chunk_sample_dicts)
+                    if samples_i
+                ]
+                _normalize_chunk_advantages(host_chunks)
+                segment = _combine_segments_for_stats(chunk_segments)
+                rt = _combine_rollout_timing(chunk_timings)
+                game_stats = _combine_game_stats(chunk_stats)
+                samples = _concat_sample_dicts([c.samples for c in host_chunks])
+                samples_s = time.perf_counter() - samples_t0
+                _release_rollout_device_refs(device)
+            else:
+                # Keep a tiny empty segment around for the existing skipped-iteration logging.
+                segment = _combine_segments_for_stats(chunk_segments)
+                rt = _combine_rollout_timing(chunk_timings)
+                game_stats = _combine_game_stats(chunk_stats)
+                samples = None
+                samples_s = time.perf_counter() - samples_t0
+                _release_rollout_device_refs(device)
+        else:
+            seed_base = rollout_env_seed
+            segment, rt, rollout_carry, seeds_used, game_stats = collect_parallel_micro_rollouts(
+                policy,
+                cfg,
+                args.num_envs,
+                device,
+                seed_base=seed_base,
+                rng=rng,
+                greedy=False,
+                ship_speed=args.ship_speed,
+                max_micro_steps_per_player=args.max_micro_steps,
+                rollout_micro_horizon=args.rollout_micro_horizon,
+                carry_in=rollout_carry,
+                mem_debug=mem_dbg,
+                train_iter=it,
+                amp_dtype=amp_dtype,
+                min_max_fleets=args.max_fleets,
+                reset_prefetch=reset_prefetch,
+                first_hit_n_rays=max(8, int(args.first_hit_n_rays)),
+                first_hit_ray_chunk_size=max(0, int(args.first_hit_ray_chunk_size)),
+            )
+            rollout_env_seed += seeds_used
+            t_samples0 = time.perf_counter()
+            samples = build_ppo_samples(segment, args.gamma, args.lam)
+            if samples is not None:
+                normalize_advantages(samples)
+            samples_s = time.perf_counter() - t_samples0
         cfg.max_fleets = rollout_carry.cfg.max_fleets
         num_fleets, mean_fleets_per_env = _fleet_counts_from_state(rollout_carry.state_b)
 
@@ -1000,12 +1490,6 @@ def _train_loop(
             log_cuda_mem(f"iter {it} after rollouts", device)
 
         _print_rollout_pre_ppo(it, args.num_envs, cfg.max_fleets, segment, rt, game_stats)
-
-        t_samples0 = time.perf_counter()
-        samples = build_ppo_samples(segment, args.gamma, args.lam)
-        if samples is not None:
-            normalize_advantages(samples)
-        samples_s = time.perf_counter() - t_samples0
 
         if samples is None:
             iter_dt = max(1e-9, time.perf_counter() - iter_start)
@@ -1036,24 +1520,45 @@ def _train_loop(
                 )
 
             t_ppo0 = time.perf_counter()
-            loss_mb, ppo_t, ppo_stats = ppo_iteration(
-                policy,
-                opt,
-                segment,
-                samples,
-                device,
-                args.minibatch_size,
-                args.ppo_epochs,
-                args.clip_eps,
-                args.vf_coef,
-                args.entropy_coef,
-                args.max_grad_norm,
-                args.ship_speed,
-                max(8, int(args.first_hit_n_rays)),
-                rnd=rnd,
-                loss_fn=compiled_loss_fn,
-                amp_dtype=amp_dtype,
-            )
+            if host_chunks is not None:
+                loss_mb, ppo_t, ppo_stats = ppo_iteration_host_staged(
+                    policy,
+                    opt,
+                    host_chunks,
+                    device,
+                    args.minibatch_size,
+                    args.ppo_epochs,
+                    args.clip_eps,
+                    args.vf_coef,
+                    args.entropy_coef,
+                    args.max_grad_norm,
+                    args.ship_speed,
+                    max(8, int(args.first_hit_n_rays)),
+                    max(0, int(args.first_hit_ray_chunk_size)),
+                    rnd=rnd,
+                    loss_fn=compiled_loss_fn,
+                    amp_dtype=amp_dtype,
+                )
+            else:
+                loss_mb, ppo_t, ppo_stats = ppo_iteration(
+                    policy,
+                    opt,
+                    segment,
+                    samples,
+                    device,
+                    args.minibatch_size,
+                    args.ppo_epochs,
+                    args.clip_eps,
+                    args.vf_coef,
+                    args.entropy_coef,
+                    args.max_grad_norm,
+                    args.ship_speed,
+                    max(8, int(args.first_hit_n_rays)),
+                    max(0, int(args.first_hit_ray_chunk_size)),
+                    rnd=rnd,
+                    loss_fn=compiled_loss_fn,
+                    amp_dtype=amp_dtype,
+                )
             ppo_s = time.perf_counter() - t_ppo0
 
             if mem_dbg and device.type == "cuda":
@@ -1158,6 +1663,27 @@ def parse_args() -> argparse.Namespace:
             "State carries to the next iteration; GAE bootstraps truncated trajectories."
         ),
     )
+    p.add_argument(
+        "--rollout-storage",
+        type=str,
+        default="device",
+        choices=("device", "host"),
+        help=(
+            "Where completed rollout chunks live during PPO. 'device' is the existing fastest "
+            "path. 'host' spills each rollout chunk to CPU RAM and stages only PPO minibatches "
+            "back to the accelerator, allowing longer effective rollouts at higher transfer cost."
+        ),
+    )
+    p.add_argument(
+        "--rollout-host-chunks",
+        type=int,
+        default=1,
+        help=(
+            "Number of device-sized rollout chunks to collect per PPO iteration when "
+            "--rollout-storage=host. Effective rollout length is roughly "
+            "rollout_micro_horizon * rollout_host_chunks."
+        ),
+    )
     p.add_argument("--lr", type=float, default=3e-5)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--lam", type=float, default=0.95)
@@ -1178,6 +1704,16 @@ def parse_args() -> argparse.Namespace:
         default=256,
         help="Virtual launch directions for discrete first-hit target geometry (rollout + PPO replay). "
         "Lower values reduce JAX GPU memory (e.g. 512); minimum 8.",
+    )
+    p.add_argument(
+        "--first-hit-ray-chunk-size",
+        type=int,
+        default=64,
+        help=(
+            "If >0 and smaller than --first-hit-n-rays, process discrete first-hit geometry "
+            "in JAX ray chunks of this size to lower peak XLA temporary memory. 0 keeps "
+            "the current full-ray implementation."
+        ),
     )
     p.add_argument("--max-grad-norm", type=float, default=0.5)
     p.add_argument("--d-model", type=int, default=384)

@@ -255,3 +255,62 @@ def gather_minibatch(
         must_halt_no_ships,
         target_planet_reachable,
     )
+
+
+@partial(jax.jit, static_argnames=("max_micro_steps",))
+def gather_minibatch_selected(
+    state_mb: Any,
+    player_b: jnp.ndarray,
+    max_micro_steps: int,
+    micro_halt_now_m: jnp.ndarray,
+    send_m: jnp.ndarray,
+    angle_m: jnp.ndarray,
+    fleet_eta_m: jnp.ndarray,
+    slot_m: jnp.ndarray,
+    halt_action: jnp.ndarray,
+    pair_flat_m: jnp.ndarray,
+    frac_idx_m: jnp.ndarray,
+    no_valid_pairs: jnp.ndarray,
+    no_valid_fracs: jnp.ndarray,
+    must_halt_no_ships: jnp.ndarray,
+    target_planet_reachable: jnp.ndarray,
+    phase_micro_idx: jnp.ndarray,
+):
+    """Reconstruct a minibatch from rows already selected on the host.
+
+    This is the host-staging counterpart to :func:`gather_minibatch`.  The
+    caller does NumPy advanced indexing into CPU-resident rollout chunks and
+    transfers only the selected minibatch rows to the accelerator.
+    """
+
+    k_ar = jnp.arange(max_micro_steps, dtype=jnp.int32)
+    apply_mask_m = k_ar[None, :] < phase_micro_idx[:, None]
+
+    state_mb = apply_prefix_micro_deltas_batched(
+        state_mb,
+        player_b.astype(jnp.int32),
+        max_micro_steps,
+        micro_halt_now_m,
+        send_m,
+        slot_m,
+        pair_flat_m,
+        frac_idx_m,
+        angle_m,
+        fleet_eta_m,
+        apply_mask_m,
+    )
+
+    bb = jnp.arange(player_b.shape[0], dtype=jnp.int32)
+    pair_flat = pair_flat_m[bb, phase_micro_idx]
+    frac_idx = frac_idx_m[bb, phase_micro_idx]
+
+    return (
+        state_mb,
+        halt_action,
+        pair_flat,
+        frac_idx,
+        no_valid_pairs,
+        no_valid_fracs,
+        must_halt_no_ships,
+        target_planet_reachable,
+    )
