@@ -51,7 +51,7 @@ from orbit_wars_pt.batched_env import (
     upper_bound_fleet_writes_per_env,
     vmap_step_env,
 )
-from orbit_wars_pt.constants import FRACTIONS, MAX_PLANETS
+from orbit_wars_pt.constants import BOARD_SIZE, CENTER, FRACTIONS, MAX_PLANETS, SUN_RADIUS
 from orbit_wars_pt.env_wrapper import OrbitWarsEnvConfig
 from orbit_wars_pt.gpu_mem import log_cuda_mem
 from orbit_wars_pt.micro_jax import (
@@ -71,6 +71,56 @@ from orbit_wars_pt.transition_buffer import (
 _MAX_FLEET_EXPAND_RETRIES = 48
 
 _INITIAL_TURN_CACHE_ROWS = 32
+
+
+def _bucket_size(count: int, capacity: int) -> int:
+    count = max(1, int(count))
+    b = 1
+    while b < count:
+        b *= 2
+    return min(b, int(capacity))
+
+
+def _unique_padded_indices(active_idx: np.ndarray, capacity: int) -> tuple[np.ndarray, np.ndarray]:
+    active_idx = np.asarray(active_idx, dtype=np.int32)
+    bucket = _bucket_size(int(active_idx.size), capacity)
+    if active_idx.size == bucket:
+        return active_idx, np.ones((bucket,), dtype=np.bool_)
+    used = np.zeros((capacity,), dtype=np.bool_)
+    used[active_idx] = True
+    pad = np.flatnonzero(~used).astype(np.int32)
+    need = bucket - int(active_idx.size)
+    idx = np.concatenate([active_idx, pad[:need]]).astype(np.int32)
+    mask = np.zeros((bucket,), dtype=np.bool_)
+    mask[: active_idx.size] = True
+    return idx, mask
+
+
+@jax.jit
+def _scatter_state_bucket(
+    state_b: OrbitWarsState,
+    idx: jnp.ndarray,
+    new_bucket: OrbitWarsState,
+    apply_mask: jnp.ndarray,
+) -> OrbitWarsState:
+    def one(old_leaf: jnp.ndarray, new_leaf: jnp.ndarray) -> jnp.ndarray:
+        old_sel = old_leaf[idx]
+        m = apply_mask
+        for _ in range(old_sel.ndim - 1):
+            m = m[..., None]
+        merged = jnp.where(m, new_leaf, old_sel)
+        return old_leaf.at[idx].set(merged)
+
+    return jax.tree.map(one, state_b, new_bucket)
+
+
+@jax.jit
+def _copy_state_slices(
+    dst_b: OrbitWarsState,
+    src_b: OrbitWarsState,
+    idx: jnp.ndarray,
+) -> OrbitWarsState:
+    return jax.tree.map(lambda dst, src: dst.at[idx].set(src[idx]), dst_b, src_b)
 
 
 def _expand_turn_state_cache_if_needed(
@@ -361,6 +411,123 @@ def _build_batched_action_metadata(
     return arr
 
 
+def _point_to_segment_distance_np(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+    delta = end - start
+    l2 = float(np.dot(delta, delta))
+    if l2 <= 0.0:
+        return float(np.linalg.norm(point - start))
+    t = float(np.clip(np.dot(point - start, delta) / l2, 0.0, 1.0))
+    return float(np.linalg.norm(point - (start + t * delta)))
+
+
+def _swept_pair_hit_np(a0: np.ndarray, a1: np.ndarray, b0: np.ndarray, b1: np.ndarray, radius: float) -> bool:
+    d0 = a0 - b0
+    dv = (a1 - a0) - (b1 - b0)
+    qa = float(np.dot(dv, dv))
+    qb = 2.0 * float(np.dot(d0, dv))
+    qc = float(np.dot(d0, d0)) - float(radius) * float(radius)
+    if qa < 1e-12:
+        return qc <= 0.0
+    disc = qb * qb - 4.0 * qa * qc
+    if disc < 0.0:
+        return False
+    sqrt_disc = float(np.sqrt(disc))
+    t1 = (-qb - sqrt_disc) / (2.0 * qa)
+    t2 = (-qb + sqrt_disc) / (2.0 * qa)
+    return (t2 >= 0.0) and (t1 <= 1.0)
+
+
+def _warn_lost_fleets_if_any(
+    state_before_b: OrbitWarsState,
+    next_state_b: OrbitWarsState,
+    *,
+    max_examples: int = 8,
+) -> None:
+    """Warn when a previously active fleet vanishes by sun/board rather than planet hit."""
+
+    before_fleets, before_active, before_planets, before_planet_active = jax.device_get(
+        (
+            state_before_b.fleets,
+            state_before_b.fleet_active,
+            state_before_b.planets,
+            state_before_b.planet_active,
+        )
+    )
+    after_fleets, after_active, after_planets = jax.device_get(
+        (next_state_b.fleets, next_state_b.fleet_active, next_state_b.planets)
+    )
+    before_fleets = np.asarray(before_fleets)
+    after_fleets = np.asarray(after_fleets)
+    before_active = np.asarray(before_active, dtype=np.bool_)
+    after_active = np.asarray(after_active, dtype=np.bool_)
+    before_planets = np.asarray(before_planets)
+    after_planets = np.asarray(after_planets)
+    before_planet_active = np.asarray(before_planet_active, dtype=np.bool_)
+
+    sun_xy = np.asarray([CENTER, CENTER], dtype=np.float64)
+    examples: list[str] = []
+    lost_count = 0
+    candidate_count = 0
+
+    for env_i in range(before_active.shape[0]):
+        vanished = np.where(before_active[env_i] & ~after_active[env_i])[0]
+        for fleet_i in vanished:
+            old_pos = before_fleets[env_i, fleet_i, jow.FLEET_X : jow.FLEET_Y + 1].astype(np.float64)
+            new_pos = after_fleets[env_i, fleet_i, jow.FLEET_X : jow.FLEET_Y + 1].astype(np.float64)
+            oob = (
+                (new_pos[0] < 0.0)
+                or (new_pos[0] > BOARD_SIZE)
+                or (new_pos[1] < 0.0)
+                or (new_pos[1] > BOARD_SIZE)
+            )
+            sun_hit = _point_to_segment_distance_np(sun_xy, old_pos, new_pos) < SUN_RADIUS
+            if not (oob or sun_hit):
+                continue
+            candidate_count += 1
+            planet_hit = False
+            for planet_i in np.where(before_planet_active[env_i])[0]:
+                planet_hit = _swept_pair_hit_np(
+                    old_pos,
+                    new_pos,
+                    before_planets[env_i, planet_i, jow.PLANET_X : jow.PLANET_Y + 1].astype(np.float64),
+                    after_planets[env_i, planet_i, jow.PLANET_X : jow.PLANET_Y + 1].astype(np.float64),
+                    float(before_planets[env_i, planet_i, jow.PLANET_RADIUS]),
+                )
+                if planet_hit:
+                    break
+            if planet_hit:
+                continue
+            lost_count += 1
+            if len(examples) < max_examples:
+                row = before_fleets[env_i, fleet_i]
+                examples.append(
+                    "env={} slot={} fleet_id={:.0f} owner={:.0f} target={:.0f} eta={:.1f} "
+                    "sun_hit={} oob={} old=({:.3f},{:.3f}) new=({:.3f},{:.3f})".format(
+                        env_i,
+                        fleet_i,
+                        float(row[jow.FLEET_ID]),
+                        float(row[jow.FLEET_OWNER]),
+                        float(row[FLEET_TARGET_PLANET]),
+                        float(row[FLEET_ETA]),
+                        bool(sun_hit),
+                        bool(oob),
+                        old_pos[0],
+                        old_pos[1],
+                        new_pos[0],
+                        new_pos[1],
+                    )
+                )
+
+    if lost_count:
+        print(
+            f"[orbit_wars_pt] WARNING {lost_count} fleet(s) disappeared via sun/board "
+            f"without a swept planet hit ({candidate_count} sun/board candidate removals).",
+            flush=True,
+        )
+        for ex in examples:
+            print(f"[orbit_wars_pt]   lost fleet: {ex}", flush=True)
+
+
 def _run_micro_phase(
     *,
     ego: int,
@@ -642,6 +809,235 @@ def _run_micro_phase(
     return buf, write_idx, action_lists, action_meta_lists, reward_idx, turn_tag_j
 
 
+def _run_async_micro_step(
+    *,
+    ego: int,
+    active_envs: np.ndarray,
+    virt_b: OrbitWarsState,
+    buf: TransitionBuffer,
+    write_idx: np.ndarray,
+    micro_k: np.ndarray,
+    valid: np.ndarray,
+    old_logprob: np.ndarray,
+    old_value: np.ndarray,
+    pending_actions: np.ndarray,
+    pending_meta: np.ndarray,
+    pending_action_count: np.ndarray,
+    reward_idx: np.ndarray,
+    halted: np.ndarray,
+    policy: OrbitWarsPolicy,
+    device: torch.device,
+    rng: Optional[torch.Generator],
+    greedy: bool,
+    ship_speed: float,
+    max_micro_steps: int,
+    timing: RolloutTiming,
+    turn_tag_j: jnp.ndarray,
+    turn_slot_np: np.ndarray,
+    first_hit_n_rays: int,
+) -> tuple[OrbitWarsState, TransitionBuffer, jnp.ndarray]:
+    """Run one micro decision for ``ego`` on a masked subset of envs."""
+
+    num_envs = int(virt_b.planets.shape[0])
+    if active_envs.size == 0:
+        return virt_b, buf, turn_tag_j
+
+    active_idx_t = torch.as_tensor(active_envs, device=device, dtype=torch.long)
+    n_active = int(active_envs.size)
+    ego_jax = jnp.int32(ego)
+
+    t0 = perf_counter()
+    obs_jax = build_observation_batched_jax(virt_b, ego, ship_speed)
+    must_halt_j = must_halt_no_owned_ships_batched(virt_b, ego_jax)
+    timing.obs_build_s += perf_counter() - t0
+
+    t0 = perf_counter()
+    obs_torch = obs_jax_to_torch(obs_jax)
+    must_halt_t = torch.from_dlpack(must_halt_j)
+    active_obs = {key: v.index_select(0, active_idx_t) for key, v in obs_torch.items()}
+    must_halt_a = must_halt_t.index_select(0, active_idx_t)
+    timing.policy_batch_s += perf_counter() - t0
+
+    t0 = perf_counter()
+    out = policy(**active_obs)
+    timing.policy_forward_s += perf_counter() - t0
+
+    t0 = perf_counter()
+    halt_logits = out["halt_logits"]
+    halt_lp = torch.log_softmax(halt_logits, dim=-1)
+    if greedy:
+        halt_sampled = halt_logits.argmax(dim=-1)
+    else:
+        halt_sampled = torch.multinomial(halt_lp.exp(), 1, generator=rng).squeeze(-1)
+    halt_action = torch.where(must_halt_a, torch.ones_like(halt_sampled), halt_sampled)
+    halt_logp = halt_lp.gather(1, halt_action[:, None]).squeeze(-1)
+
+    origin_frac_mask = out["origin_frac_mask"]
+    flat_mask = origin_frac_mask.flatten(start_dim=1)
+    any_valid_origin_frac = flat_mask.any(dim=-1)
+    flat_logits = out["origin_frac_logits"].flatten(start_dim=1)
+    masked_origin_frac = flat_logits.masked_fill(~flat_mask, -1e4)
+    origin_frac_lp = torch.log_softmax(masked_origin_frac, dim=-1)
+    safe_origin_frac = torch.where(
+        any_valid_origin_frac[:, None],
+        masked_origin_frac,
+        torch.zeros_like(masked_origin_frac),
+    )
+    if greedy:
+        origin_frac_flat = safe_origin_frac.argmax(dim=-1)
+    else:
+        origin_frac_flat = torch.multinomial(torch.softmax(safe_origin_frac, dim=-1), 1, generator=rng).squeeze(-1)
+    origin_frac_logp = origin_frac_lp.gather(1, origin_frac_flat[:, None]).squeeze(-1)
+
+    P = MAX_PLANETS
+    o_idx = origin_frac_flat // len(FRACTIONS)
+    frac_idx = origin_frac_flat % len(FRACTIONS)
+    origin_frac_used = (halt_action == 0) & any_valid_origin_frac
+
+    o_idx_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
+    frac_idx_geom_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
+    o_idx_all.index_copy_(0, active_idx_t, o_idx.to(torch.int32))
+    frac_idx_geom_all.index_copy_(0, active_idx_t, frac_idx.to(torch.int32))
+    origin_idx_j = jax.dlpack.from_dlpack(o_idx_all.contiguous().detach())
+    frac_idx_geom_j = jax.dlpack.from_dlpack(frac_idx_geom_all.contiguous().detach())
+    target_angle_j, _target_width_j, target_valid_j, target_overflow_j, target_hit_tick_j = selected_origin_fraction_targets_batched(
+        virt_b,
+        origin_idx_j,
+        frac_idx_geom_j,
+        horizon=24,
+        ship_speed=ship_speed,
+        samples_per_span=17,
+        n_rays=first_hit_n_rays,
+    )
+    target_angle_t = torch.from_dlpack(target_angle_j).index_select(0, active_idx_t)
+    target_valid_t = torch.from_dlpack(target_valid_j).index_select(0, active_idx_t)
+    target_overflow_t = torch.from_dlpack(target_overflow_j).index_select(0, active_idx_t)
+    target_hit_tick_t = torch.from_dlpack(target_hit_tick_j).index_select(0, active_idx_t)
+
+    n_a_idx = torch.arange(n_active, device=device)
+    target_logits = policy.target_logits_for_origin_fraction(out["planet_hidden"], o_idx, frac_idx)
+    target_mask = out["pair_mask"][n_a_idx, o_idx, :] & target_valid_t & ~target_overflow_t[:, None]
+    any_valid_target = target_mask.any(dim=-1)
+    masked_target = target_logits.masked_fill(~target_mask, -1e4)
+    target_lp = torch.log_softmax(masked_target, dim=-1)
+    safe_target = torch.where(any_valid_target[:, None], masked_target, torch.zeros_like(masked_target))
+    if greedy:
+        d_idx = safe_target.argmax(dim=-1)
+    else:
+        d_idx = torch.multinomial(torch.softmax(safe_target, dim=-1), 1, generator=rng).squeeze(-1)
+    target_logp = target_lp.gather(1, d_idx[:, None]).squeeze(-1)
+    pair_flat = o_idx * P + d_idx
+    angle = target_angle_t[n_a_idx, d_idx]
+    fleet_eta = target_hit_tick_t[n_a_idx, d_idx]
+
+    dispatch_used = origin_frac_used & any_valid_target
+    total_logp = halt_logp + origin_frac_used.float() * origin_frac_logp + dispatch_used.float() * target_logp
+    values_active = out["value"].float()
+    halt_now = ~dispatch_used
+
+    halt_now_all = torch.ones(num_envs, dtype=torch.bool, device=device)
+    pair_flat_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
+    frac_idx_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
+    angle_all = torch.zeros(num_envs, dtype=torch.float32, device=device)
+    fleet_eta_all = torch.zeros(num_envs, dtype=torch.float32, device=device)
+    halt_action_all = torch.ones(num_envs, dtype=torch.int32, device=device)
+    no_valid_pairs_all = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    no_valid_fracs_all = torch.zeros(num_envs, dtype=torch.bool, device=device)
+    total_logp_all = torch.zeros(num_envs, dtype=torch.float32, device=device)
+    values_all = torch.zeros(num_envs, dtype=torch.float32, device=device)
+    must_halt_no_ships_all = torch.zeros(num_envs, dtype=torch.bool, device=device)
+
+    halt_now_all.index_copy_(0, active_idx_t, halt_now)
+    pair_flat_all.index_copy_(0, active_idx_t, pair_flat.to(torch.int32))
+    frac_idx_all.index_copy_(0, active_idx_t, frac_idx.to(torch.int32))
+    halt_action_all.index_copy_(0, active_idx_t, halt_action.to(torch.int32))
+    angle_all.index_copy_(0, active_idx_t, angle.to(torch.float32))
+    fleet_eta_all.index_copy_(0, active_idx_t, fleet_eta.to(torch.float32))
+    no_valid_pairs_all.index_copy_(0, active_idx_t, origin_frac_used & ~any_valid_target)
+    no_valid_fracs_all.index_copy_(0, active_idx_t, ~any_valid_origin_frac & (halt_action == 0))
+    must_halt_no_ships_all.index_copy_(0, active_idx_t, must_halt_a.to(torch.bool))
+    total_logp_all.index_copy_(0, active_idx_t, total_logp)
+    values_all.index_copy_(0, active_idx_t, values_active)
+    timing.policy_forward_s += perf_counter() - t0
+
+    t0 = perf_counter()
+    halt_now_j = jax.dlpack.from_dlpack(halt_now_all.contiguous().detach())
+    pair_flat_j = jax.dlpack.from_dlpack(pair_flat_all.contiguous().detach())
+    frac_idx_j = jax.dlpack.from_dlpack(frac_idx_all.contiguous().detach())
+    angle_j = jax.dlpack.from_dlpack(angle_all.contiguous().detach())
+    fleet_eta_j = jax.dlpack.from_dlpack(fleet_eta_all.contiguous().detach())
+    halt_action_j = jax.dlpack.from_dlpack(halt_action_all.contiguous().detach())
+    no_valid_pairs_j = jax.dlpack.from_dlpack(no_valid_pairs_all.contiguous().detach())
+    no_valid_fracs_j = jax.dlpack.from_dlpack(no_valid_fracs_all.contiguous().detach())
+    must_halt_no_ships_j = jax.dlpack.from_dlpack(must_halt_no_ships_all.contiguous().detach())
+    target_pr_all = torch.zeros((num_envs, P), dtype=torch.bool, device=device)
+    target_pr_all.index_copy_(0, active_idx_t, (target_valid_t & ~target_overflow_t[:, None]).to(torch.bool))
+    target_planet_reachable_j = jax.dlpack.from_dlpack(target_pr_all.contiguous().detach())
+
+    virt_b, oid_j, angle_j, send_j, dispatched_j, slot_j = apply_micro_step_batched(
+        virt_b, ego_jax, halt_now_j, pair_flat_j, frac_idx_j, angle_j, fleet_eta_j
+    )
+    active_mask = np.zeros((num_envs,), dtype=np.bool_)
+    active_mask[active_envs] = True
+    active_j = jnp.asarray(active_mask, dtype=jnp.bool_)
+    micro_k_vec = jnp.asarray(micro_k, dtype=jnp.int32)
+    write_idx_j = jnp.asarray(write_idx, dtype=jnp.int32)
+    buf = append_to_buffer(
+        buf,
+        halt_now_j,
+        send_j,
+        angle_j,
+        fleet_eta_j,
+        slot_j,
+        halt_action_j,
+        pair_flat_j,
+        frac_idx_j,
+        no_valid_pairs_j,
+        no_valid_fracs_j,
+        must_halt_no_ships_j,
+        target_planet_reachable_j,
+        write_idx_j,
+        micro_k_vec,
+        active_j,
+        max_micro_steps,
+    )
+    turn_tag_j = scatter_turn_tags(turn_tag_j, write_idx_j, jnp.asarray(turn_slot_np, dtype=jnp.int32))
+    oid_np, angle_np, send_np, dispatched_np = jax.device_get((oid_j, angle_j, send_j, dispatched_j))
+    timing.micro_apply_s += perf_counter() - t0
+
+    total_logp_np = total_logp_all.detach().cpu().numpy()
+    values_np = values_all.detach().cpu().numpy()
+    halt_now_np = halt_now_all.detach().cpu().numpy()
+    d_idx_np = d_idx.detach().cpu().numpy()
+    fleet_eta_np = fleet_eta.detach().cpu().numpy()
+
+    rows = write_idx[active_envs]
+    valid[rows, active_envs] = True
+    old_logprob[rows, active_envs] = total_logp_np[active_envs]
+    old_value[rows, active_envs] = values_np[active_envs]
+
+    for j_arr, env_i in enumerate(active_envs):
+        env_i = int(env_i)
+        reward_idx[env_i] = int(write_idx[env_i])
+        if bool(dispatched_np[env_i]):
+            ac = int(pending_action_count[ego, env_i])
+            if ac < pending_actions.shape[2]:
+                pending_actions[env_i, ego, ac, 0] = float(oid_np[env_i])
+                pending_actions[env_i, ego, ac, 1] = float(angle_np[env_i])
+                pending_actions[env_i, ego, ac, 2] = float(send_np[env_i])
+                pending_meta[env_i, ego, ac, 0] = float(d_idx_np[j_arr])
+                pending_meta[env_i, ego, ac, 1] = float(fleet_eta_np[j_arr])
+            pending_action_count[ego, env_i] = ac + 1
+        if bool(halt_now_np[env_i]):
+            halted[ego, env_i] = True
+        write_idx[env_i] += 1
+        micro_k[env_i] += 1
+        if micro_k[env_i] >= max_micro_steps:
+            halted[ego, env_i] = True
+
+    return virt_b, buf, turn_tag_j
+
+
 def _reset_prefetch_resync(
     reset_prefetch: Optional[RolloutResetPrefetch],
     seed_base: int,
@@ -726,11 +1122,11 @@ def collect_parallel_micro_rollouts(
     episode_timeout_step_count = episode_lim - 1
     game_stats = RolloutGameStats()
 
-    # Allocate per-segment device buffers. ``H_buf`` covers the worst case
-    # where the horizon trigger fires at the start of a turn but the final
-    # turn still adds up to ``max_micro_steps_per_player`` more steps before
-    # the segment cuts.
-    H_buf = rollout_micro_horizon + max_micro_steps_per_player + 1
+    # Allocate per-segment device buffers. Once any player's write index hits
+    # the horizon, async collection drains every env to its next real env-step
+    # boundary. In the worst phase mix, either player's buffer may still need
+    # one full local turn of micro rows before that boundary.
+    H_buf = rollout_micro_horizon + max_micro_steps_per_player + 2
     buf0 = init_transition_buffer(num_envs, H_buf, max_micro_steps_per_player)
     buf1 = init_transition_buffer(num_envs, H_buf, max_micro_steps_per_player)
 
@@ -776,210 +1172,237 @@ def collect_parallel_micro_rollouts(
         else nullcontext()
     )
 
+    virt0_b = state_b
+    virt1_b = state_b
+    halted = np.zeros((2, num_envs), dtype=np.bool_)
+    micro_k = np.zeros((2, num_envs), dtype=np.int32)
+    pending_actions = np.zeros((num_envs, 2, DEFAULT_MAX_ACTIONS, 3), dtype=np.float32)
+    pending_meta = np.zeros((num_envs, 2, DEFAULT_MAX_ACTIONS, 2), dtype=np.float32)
+    pending_meta[..., 0] = -1.0
+    pending_meta[..., 1] = 500.0
+    pending_action_count = np.zeros((2, num_envs), dtype=np.int32)
+    reward_idx = np.full((2, num_envs), -1, dtype=np.int32)
+    segment_done = np.zeros((num_envs,), dtype=np.bool_)
+
     with torch.inference_mode(), amp_ctx:
         while outer < max_outer_iters:
             outer += 1
 
-            # ===== Phase A: ego=0 micro-loop =====
-            buf0, write_idx_p0, actions0_per_env, meta0_per_env, p0_reward_idx, turn_tag_p0 = _run_micro_phase(
-                ego=0,
-                state_b=state_b,
-                buf=buf0,
-                write_idx_per_env=write_idx_p0,
-                valid=valid_p0,
-                old_logprob=old_logprob_p0,
-                old_value=old_value_p0,
-                policy=policy,
-                device=device,
-                rng=rng,
-                greedy=greedy,
-                ship_speed=ship_speed,
-                max_micro_steps=max_micro_steps_per_player,
-                timing=timing,
-                turn_tag_j=turn_tag_p0,
-                turn_slot_np=turn_slot_np,
-                first_hit_n_rays=first_hit_n_rays,
-            )
-            if profile_rollout and device.type == "cuda" and not logged_first_policy_fwd:
-                log_cuda_mem("rollout after first batched policy forward", device)
-                logged_first_policy_fwd = True
-
-            # ===== Phase B: ego=1 micro-loop =====
-            buf1, write_idx_p1, actions1_per_env, meta1_per_env, p1_reward_idx, turn_tag_p1 = _run_micro_phase(
-                ego=1,
-                state_b=state_b,
-                buf=buf1,
-                write_idx_per_env=write_idx_p1,
-                valid=valid_p1,
-                old_logprob=old_logprob_p1,
-                old_value=old_value_p1,
-                policy=policy,
-                device=device,
-                rng=rng,
-                greedy=greedy,
-                ship_speed=ship_speed,
-                max_micro_steps=max_micro_steps_per_player,
-                timing=timing,
-                turn_tag_j=turn_tag_p1,
-                turn_slot_np=turn_slot_np,
-                first_hit_n_rays=first_hit_n_rays,
-            )
-
-            # ===== Phase C: batched env step (vmap) =====
-            t0 = perf_counter()
-            actions_np = _build_batched_actions(actions0_per_env, actions1_per_env)
-            action_meta_np = _build_batched_action_metadata(meta0_per_env, meta1_per_env)
-
-            need_host = upper_bound_fleet_writes_per_env(actions_np)
-            inactive_host = np.asarray(jax.device_get(inactive_fleet_count_batched(state_b)))
-            expansions = 0
-            while np.any(need_host > inactive_host):
-                expansions += 1
-                if expansions > _MAX_FLEET_EXPAND_RETRIES:
-                    raise RuntimeError(
-                        "Orbit Wars fleet buffer expansions exhausted during pre-expand; "
-                        "check action tensor shape or raise _MAX_FLEET_EXPAND_RETRIES."
-                    )
-                old_cap = int(state_b.fleets.shape[1])
-                new_cap = old_cap * 2
-                cfg.max_fleets = new_cap
-                worst_env = int(np.argmax(need_host - inactive_host))
-                print(
-                    f"[orbit_wars_pt] max_fleets pre-expand {old_cap} -> {new_cap} "
-                    f"(worst env {worst_env}: inactive {inactive_host[worst_env]} "
-                    f"< launch upper bound {need_host[worst_env]}, expansion {expansions})",
-                    flush=True,
-                )
-                state_b = expand_fleet_buffers_batched(state_b, new_cap)
-                turn_state_cache = _expand_turn_state_cache_fleets(turn_state_cache, new_cap)
-                inactive_host = np.asarray(jax.device_get(inactive_fleet_count_batched(state_b)))
-                _reset_prefetch_resync(reset_prefetch, seed_base, seeds_consumed, cfg)
-
-            r0_pre, r1_pre = ship_ratio_scores_batched(state_b)
-            next_state_b = vmap_step_env(state_b, actions_np)
-
-            overflow_any = bool(np.asarray(jax.device_get(jnp.any(next_state_b.overflow))))
-            while overflow_any:
-                expansions += 1
-                if expansions > _MAX_FLEET_EXPAND_RETRIES:
-                    raise RuntimeError(
-                        "Orbit Wars overflow after expanding fleet buffers; "
-                        "this may indicate planet-slot overflow rather than fleets."
-                    )
-                old_cap = int(state_b.fleets.shape[1])
-                new_cap = old_cap * 2
-                cfg.max_fleets = new_cap
-                print(
-                    f"[orbit_wars_pt] max_fleets replay (non-fleet overflow?): "
-                    f"{old_cap} -> {new_cap} (expansion {expansions})",
-                    flush=True,
-                )
-                state_b = expand_fleet_buffers_batched(state_b, new_cap)
-                turn_state_cache = _expand_turn_state_cache_fleets(turn_state_cache, new_cap)
-                next_state_b = vmap_step_env(state_b, actions_np)
-                overflow_any = bool(np.asarray(jax.device_get(jnp.any(next_state_b.overflow))))
-                _reset_prefetch_resync(reset_prefetch, seed_base, seeds_consumed, cfg)
-
-            next_state_b = _carry_action_fleet_metadata_after_step(
-                state_b,
-                next_state_b,
-                jnp.asarray(actions_np, dtype=jnp.float32),
-                jnp.asarray(action_meta_np, dtype=jnp.float32),
-            )
-
-            peak_max_active = max(
-                peak_max_active,
-                int(jax.device_get(max_concurrent_fleets_any_env(next_state_b))),
-            )
-
-            r0_post, r1_post = ship_ratio_scores_batched(next_state_b)
-            s0_post, s1_post = ship_totals_batched(next_state_b)
-            dr0_jax = r0_post - r0_pre
-            dr1_jax = r1_post - r1_pre
-            done_jax = next_state_b.done
-
-            (
-                dr0_np,
-                dr1_np,
-                done_np,
-                step_count_np,
-                rewards_np,
-                s0_fin_np,
-                s1_fin_np,
-            ) = jax.device_get(
-                (
-                    dr0_jax,
-                    dr1_jax,
-                    done_jax,
-                    next_state_b.step_count,
-                    next_state_b.rewards,
-                    s0_post,
-                    s1_post,
-                )
-            )
-            dr0_np = np.asarray(dr0_np)
-            dr1_np = np.asarray(dr1_np)
-            done_np = np.asarray(done_np)
-            step_count_np = np.asarray(step_count_np)
-            rewards_np = np.asarray(rewards_np)
-            s0_fin_np = np.asarray(s0_fin_np)
-            s1_fin_np = np.asarray(s1_fin_np)
-
-            for i in range(num_envs):
-                env_steps_per_env[i] += 1
-                episode_turns[i] += 1
-                if p0_reward_idx[i] >= 0:
-                    reward_p0[p0_reward_idx[i], i] += float(dr0_np[i])
-                    done_p0[p0_reward_idx[i], i] = bool(done_np[i]) or bool(done_p0[p0_reward_idx[i], i])
-                if p1_reward_idx[i] >= 0:
-                    reward_p1[p1_reward_idx[i], i] += float(dr1_np[i])
-                    done_p1[p1_reward_idx[i], i] = bool(done_np[i]) or bool(done_p1[p1_reward_idx[i], i])
-                if bool(done_np[i]):
-                    sc_i = int(step_count_np[i])
-                    step_limit_end = sc_i >= episode_timeout_step_count
-                    rwi = rewards_np[i]
-                    rw0 = float(rwi[0])
-                    rw1 = float(rwi[1])
-                    game_stats.record_completion(
-                        step_limit=step_limit_end,
-                        ships_p0=float(s0_fin_np[i]),
-                        ships_p1=float(s1_fin_np[i]),
-                        episode_turns=int(episode_turns[i]),
-                        reward0=rw0,
-                        reward1=rw1,
-                    )
-                    episode_turns[i] = 0
-
-            state_b = next_state_b
-            for i in range(num_envs):
-                if not bool(done_np[i]):
-                    continue
-                sid = int(seed_base + seeds_consumed)
-                if reset_prefetch is not None:
-                    fresh_np = reset_prefetch.pop_state(
-                        sid, int(cfg.num_agents), int(cfg.max_fleets)
-                    )
-                    state_b = reset_env_at_index(state_b, i, sid, cfg, fresh_np=fresh_np)
-                else:
-                    state_b = reset_env_at_index(state_b, i, sid, cfg)
-                seeds_consumed += 1
-            _reset_prefetch_resync(reset_prefetch, seed_base, seeds_consumed, cfg)
-            turn_slot_np += 1
-            max_turn = int(np.max(turn_slot_np))
-            turn_state_cache = _expand_turn_state_cache_if_needed(turn_state_cache, max_turn)
-            turn_state_cache = _scatter_turn_start_state(
-                turn_state_cache, state_b, jnp.asarray(turn_slot_np, dtype=jnp.int32)
-            )
-            timing.env_step_s += perf_counter() - t0
-
-            # Horizon triggers when any env's player-0 or player-1 count
-            # crosses ``rollout_micro_horizon``. ``write_idx_p{0,1}`` is the
-            # per-env transition count (number of valid rows written).
-            if np.any(write_idx_p0 >= rollout_micro_horizon) or np.any(
-                write_idx_p1 >= rollout_micro_horizon
-            ):
-                horizon_fired = True
+            if horizon_fired and np.all(segment_done):
                 break
+
+            ready_mask = (~segment_done) & halted[0] & halted[1]
+            pending0 = (~segment_done) & (~halted[0])
+            pending1 = (~segment_done) & (~halted[1])
+            ready_count = int(np.sum(ready_mask))
+            pending0_count = int(np.sum(pending0))
+            pending1_count = int(np.sum(pending1))
+            pending_total = pending0_count + pending1_count
+
+            # Env stepping is cheap relative to policy/geometry work, but
+            # tiny step buckets still pay host/JAX dispatch overhead. Step
+            # once roughly a quarter-batch is ready, or force the step when
+            # every remaining player is already halted.
+            ready_step_threshold = max(2, num_envs // 4)
+            should_step = ready_count >= ready_step_threshold or (ready_count > 0 and pending_total == 0)
+            if should_step:
+                t0 = perf_counter()
+                step_envs = np.flatnonzero(ready_mask).astype(np.int32)
+                bucket_idx, bucket_mask = _unique_padded_indices(step_envs, num_envs)
+                idx_j = jnp.asarray(bucket_idx, dtype=jnp.int32)
+                mask_j = jnp.asarray(bucket_mask, dtype=jnp.bool_)
+                actions_bucket = pending_actions[bucket_idx].copy()
+                meta_bucket = pending_meta[bucket_idx].copy()
+                actions_bucket[~bucket_mask] = 0.0
+                meta_bucket[~bucket_mask, :, :, 0] = -1.0
+                meta_bucket[~bucket_mask, :, :, 1] = 500.0
+
+                need_host = upper_bound_fleet_writes_per_env(actions_bucket)
+                inactive_host = np.asarray(jax.device_get(inactive_fleet_count_batched(state_b)))[bucket_idx]
+                expansions = 0
+                while np.any(need_host[bucket_mask] > inactive_host[bucket_mask]):
+                    expansions += 1
+                    if expansions > _MAX_FLEET_EXPAND_RETRIES:
+                        raise RuntimeError("Orbit Wars fleet buffer expansions exhausted during async pre-expand.")
+                    old_cap = int(state_b.fleets.shape[1])
+                    new_cap = old_cap * 2
+                    cfg.max_fleets = new_cap
+                    print(f"[orbit_wars_pt] max_fleets async pre-expand {old_cap} -> {new_cap}", flush=True)
+                    state_b = expand_fleet_buffers_batched(state_b, new_cap)
+                    virt0_b = expand_fleet_buffers_batched(virt0_b, new_cap)
+                    virt1_b = expand_fleet_buffers_batched(virt1_b, new_cap)
+                    turn_state_cache = _expand_turn_state_cache_fleets(turn_state_cache, new_cap)
+                    inactive_host = np.asarray(jax.device_get(inactive_fleet_count_batched(state_b)))[bucket_idx]
+                    _reset_prefetch_resync(reset_prefetch, seed_base, seeds_consumed, cfg)
+
+                state_bucket = jax.tree.map(lambda leaf: leaf[idx_j], state_b)
+                r0_pre, r1_pre = ship_ratio_scores_batched(state_bucket)
+                next_bucket = vmap_step_env(state_bucket, actions_bucket)
+                overflow_any = bool(np.asarray(jax.device_get(jnp.any(next_bucket.overflow & mask_j))))
+                while overflow_any:
+                    expansions += 1
+                    if expansions > _MAX_FLEET_EXPAND_RETRIES:
+                        raise RuntimeError("Orbit Wars overflow after async fleet expansion.")
+                    old_cap = int(state_b.fleets.shape[1])
+                    new_cap = old_cap * 2
+                    cfg.max_fleets = new_cap
+                    print(f"[orbit_wars_pt] max_fleets async replay {old_cap} -> {new_cap}", flush=True)
+                    state_b = expand_fleet_buffers_batched(state_b, new_cap)
+                    virt0_b = expand_fleet_buffers_batched(virt0_b, new_cap)
+                    virt1_b = expand_fleet_buffers_batched(virt1_b, new_cap)
+                    turn_state_cache = _expand_turn_state_cache_fleets(turn_state_cache, new_cap)
+                    state_bucket = jax.tree.map(lambda leaf: leaf[idx_j], state_b)
+                    next_bucket = vmap_step_env(state_bucket, actions_bucket)
+                    overflow_any = bool(np.asarray(jax.device_get(jnp.any(next_bucket.overflow & mask_j))))
+                    _reset_prefetch_resync(reset_prefetch, seed_base, seeds_consumed, cfg)
+
+                next_bucket = _carry_action_fleet_metadata_after_step(
+                    state_bucket,
+                    next_bucket,
+                    jnp.asarray(actions_bucket, dtype=jnp.float32),
+                    jnp.asarray(meta_bucket, dtype=jnp.float32),
+                )
+                actual_count = int(step_envs.size)
+                _warn_lost_fleets_if_any(
+                    jax.tree.map(lambda leaf: leaf[:actual_count], state_bucket),
+                    jax.tree.map(lambda leaf: leaf[:actual_count], next_bucket),
+                )
+
+                r0_post, r1_post = ship_ratio_scores_batched(next_bucket)
+                s0_post, s1_post = ship_totals_batched(next_bucket)
+                dr0_jax = r0_post - r0_pre
+                dr1_jax = r1_post - r1_pre
+                dr0_np, dr1_np, done_np, step_count_np, rewards_np, s0_fin_np, s1_fin_np = jax.device_get(
+                    (dr0_jax, dr1_jax, next_bucket.done, next_bucket.step_count, next_bucket.rewards, s0_post, s1_post)
+                )
+                dr0_np = np.asarray(dr0_np)
+                dr1_np = np.asarray(dr1_np)
+                done_np = np.asarray(done_np)
+                step_count_np = np.asarray(step_count_np)
+                rewards_np = np.asarray(rewards_np)
+                s0_fin_np = np.asarray(s0_fin_np)
+                s1_fin_np = np.asarray(s1_fin_np)
+
+                state_b = _scatter_state_bucket(state_b, idx_j, next_bucket, mask_j)
+                peak_max_active = max(peak_max_active, int(jax.device_get(max_concurrent_fleets_any_env(state_b))))
+
+                for local_i, env_i in enumerate(step_envs):
+                    env_i = int(env_i)
+                    env_steps_per_env[env_i] += 1
+                    episode_turns[env_i] += 1
+                    if reward_idx[0, env_i] >= 0:
+                        reward_p0[reward_idx[0, env_i], env_i] += float(dr0_np[local_i])
+                        done_p0[reward_idx[0, env_i], env_i] = bool(done_np[local_i]) or bool(done_p0[reward_idx[0, env_i], env_i])
+                    if reward_idx[1, env_i] >= 0:
+                        reward_p1[reward_idx[1, env_i], env_i] += float(dr1_np[local_i])
+                        done_p1[reward_idx[1, env_i], env_i] = bool(done_np[local_i]) or bool(done_p1[reward_idx[1, env_i], env_i])
+                    if bool(done_np[local_i]):
+                        sc_i = int(step_count_np[local_i])
+                        game_stats.record_completion(
+                            step_limit=sc_i >= episode_timeout_step_count,
+                            ships_p0=float(s0_fin_np[local_i]),
+                            ships_p1=float(s1_fin_np[local_i]),
+                            episode_turns=int(episode_turns[env_i]),
+                            reward0=float(rewards_np[local_i, 0]),
+                            reward1=float(rewards_np[local_i, 1]),
+                        )
+                        episode_turns[env_i] = 0
+                        sid = int(seed_base + seeds_consumed)
+                        if reset_prefetch is not None:
+                            fresh_np = reset_prefetch.pop_state(sid, int(cfg.num_agents), int(cfg.max_fleets))
+                            state_b = reset_env_at_index(state_b, env_i, sid, cfg, fresh_np=fresh_np)
+                        else:
+                            state_b = reset_env_at_index(state_b, env_i, sid, cfg)
+                        seeds_consumed += 1
+
+                    halted[:, env_i] = False
+                    micro_k[:, env_i] = 0
+                    pending_actions[env_i] = 0.0
+                    pending_meta[env_i, :, :, 0] = -1.0
+                    pending_meta[env_i, :, :, 1] = 500.0
+                    pending_action_count[:, env_i] = 0
+                    reward_idx[:, env_i] = -1
+                    if horizon_fired:
+                        segment_done[env_i] = True
+                    turn_slot_np[env_i] += 1
+
+                _reset_prefetch_resync(reset_prefetch, seed_base, seeds_consumed, cfg)
+                max_turn = int(np.max(turn_slot_np))
+                turn_state_cache = _expand_turn_state_cache_if_needed(turn_state_cache, max_turn)
+                turn_state_cache = _scatter_turn_start_state(
+                    turn_state_cache, state_b, jnp.asarray(turn_slot_np, dtype=jnp.int32)
+                )
+                actual_idx_j = jnp.asarray(step_envs, dtype=jnp.int32)
+                virt0_b = _copy_state_slices(virt0_b, state_b, actual_idx_j)
+                virt1_b = _copy_state_slices(virt1_b, state_b, actual_idx_j)
+                timing.env_step_s += perf_counter() - t0
+                continue
+
+            if pending_total == 0:
+                break
+
+            ego = 0 if pending0_count >= pending1_count else 1
+            active_envs = np.flatnonzero(pending0 if ego == 0 else pending1).astype(np.int32)
+            if ego == 0:
+                virt0_b, buf0, turn_tag_p0 = _run_async_micro_step(
+                    ego=0,
+                    active_envs=active_envs,
+                    virt_b=virt0_b,
+                    buf=buf0,
+                    write_idx=write_idx_p0,
+                    micro_k=micro_k[0],
+                    valid=valid_p0,
+                    old_logprob=old_logprob_p0,
+                    old_value=old_value_p0,
+                    pending_actions=pending_actions,
+                    pending_meta=pending_meta,
+                    pending_action_count=pending_action_count,
+                    reward_idx=reward_idx[0],
+                    halted=halted,
+                    policy=policy,
+                    device=device,
+                    rng=rng,
+                    greedy=greedy,
+                    ship_speed=ship_speed,
+                    max_micro_steps=max_micro_steps_per_player,
+                    timing=timing,
+                    turn_tag_j=turn_tag_p0,
+                    turn_slot_np=turn_slot_np,
+                    first_hit_n_rays=first_hit_n_rays,
+                )
+                if profile_rollout and device.type == "cuda" and not logged_first_policy_fwd:
+                    log_cuda_mem("rollout after first batched policy forward", device)
+                    logged_first_policy_fwd = True
+            else:
+                virt1_b, buf1, turn_tag_p1 = _run_async_micro_step(
+                    ego=1,
+                    active_envs=active_envs,
+                    virt_b=virt1_b,
+                    buf=buf1,
+                    write_idx=write_idx_p1,
+                    micro_k=micro_k[1],
+                    valid=valid_p1,
+                    old_logprob=old_logprob_p1,
+                    old_value=old_value_p1,
+                    pending_actions=pending_actions,
+                    pending_meta=pending_meta,
+                    pending_action_count=pending_action_count,
+                    reward_idx=reward_idx[1],
+                    halted=halted,
+                    policy=policy,
+                    device=device,
+                    rng=rng,
+                    greedy=greedy,
+                    ship_speed=ship_speed,
+                    max_micro_steps=max_micro_steps_per_player,
+                    timing=timing,
+                    turn_tag_j=turn_tag_p1,
+                    turn_slot_np=turn_slot_np,
+                    first_hit_n_rays=first_hit_n_rays,
+                )
+
+            if np.any(write_idx_p0 >= rollout_micro_horizon) or np.any(write_idx_p1 >= rollout_micro_horizon):
+                horizon_fired = True
 
     timing.loop_s = perf_counter() - t_loop0
     timing.outer_iters = outer

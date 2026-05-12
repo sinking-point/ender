@@ -49,7 +49,11 @@ def _compute_logp_value_entropy_torch(
     frac_idx: torch.Tensor,
     no_valid_pairs: torch.Tensor,
     no_valid_fracs: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor,
+]:
     """Forward + masking + log-prob/entropy/value (pure torch).
 
     Used both as a diagnostic entry (``replay_logprob_value_entropy_jax``)
@@ -62,6 +66,14 @@ def _compute_logp_value_entropy_torch(
     (origin/fraction, target) the masked positions get ``logits = -1e4`` before
     ``log_softmax``, so their probabilities underflow to 0 and contribute
     0 to the entropy ``-sum(p * lp)`` (no nan / -inf hazard).
+
+    Returns
+    -------
+    ``(new_logp, new_value, new_entropy, halt_entropy, origin_frac_entropy,
+    target_entropy, origin_frac_used, target_used)``. The first three are the
+    quantities the diagnostic / loss path consumes; the latter five are kept
+    so the loss path can report a per-head entropy breakdown (halt / origin+
+    fraction / target) conditioned on the rows where each head is sampled.
     """
 
     out = policy(
@@ -122,7 +134,16 @@ def _compute_logp_value_entropy_torch(
     # baseline (``old_v``) and target (``returns``) are fp32, and we want
     # the squared-error / clip math to run in fp32 to avoid bf16 rounding
     # in the loss scalar.
-    return new_logp, out["value"].float(), new_entropy
+    return (
+        new_logp,
+        out["value"].float(),
+        new_entropy,
+        new_halt_entropy,
+        new_origin_frac_entropy,
+        new_target_entropy,
+        origin_frac_used,
+        target_used,
+    )
 
 
 def compute_ppo_loss_torch(
@@ -166,6 +187,14 @@ def compute_ppo_loss_torch(
     * ``loss_vf`` — clipped value MSE (mean, x0.5 not applied — matches
       what the optimizer sees).
     * ``entropy`` — mean policy entropy over the same non-forced subset.
+    * ``entropy_halt`` / ``entropy_origin_frac`` / ``entropy_target`` —
+      conditional mean entropy of each head over the (non-forced) rows
+      where that head was actually sampled. The halt head is always
+      sampled when not forced; origin+fraction is sampled when
+      ``halt_action == 0`` and at least one fraction is valid; target is
+      sampled when origin+fraction sampled and at least one pair is valid.
+      Each is set to ``nan`` when its conditioning set is empty for the
+      minibatch (rare but possible early in training).
     * ``approx_kl`` — ``((old_logp - new_logp) * w_pi).sum() / w_sum`` over
       non-forced rows.
     * ``approx_kl_k3`` — masked mean of ``ratio - 1 - log_ratio``.
@@ -181,7 +210,16 @@ def compute_ppo_loss_torch(
     just extra return values in the same trace.
     """
 
-    new_logp, new_value, new_entropy = _compute_logp_value_entropy_torch(
+    (
+        new_logp,
+        new_value,
+        new_entropy,
+        new_halt_entropy,
+        new_origin_frac_entropy,
+        new_target_entropy,
+        origin_frac_used,
+        target_used,
+    ) = _compute_logp_value_entropy_torch(
         policy,
         entity_type,
         owner_idx,
@@ -225,10 +263,42 @@ def compute_ppo_loss_torch(
         ret_sq_sum = returns.pow(2).sum()
         count = torch.full((), float(returns.numel()), device=returns.device, dtype=torch.float32)
 
+        # Per-head conditional entropies. Each head's denominator is the
+        # number of non-forced rows in which that head is actually
+        # sampled, so the reported value is the *average entropy of that
+        # head when it is used* — directly comparable across heads even
+        # though their action spaces have different sizes.
+        w_pi_bool = ~must_halt_no_ships
+        w_halt = w_pi  # halt is always sampled when not forced.
+        w_origin_frac = (w_pi_bool & origin_frac_used).float()
+        w_target = (w_pi_bool & target_used).float()
+        w_halt_sum = w_halt.sum()
+        w_origin_frac_sum = w_origin_frac.sum()
+        w_target_sum = w_target.sum()
+        nan = torch.full((), float("nan"), device=returns.device, dtype=torch.float32)
+        entropy_halt = torch.where(
+            w_halt_sum > 0,
+            (new_halt_entropy * w_halt).sum() / w_halt_sum.clamp(min=1.0),
+            nan,
+        )
+        entropy_origin_frac = torch.where(
+            w_origin_frac_sum > 0,
+            (new_origin_frac_entropy * w_origin_frac).sum() / w_origin_frac_sum.clamp(min=1.0),
+            nan,
+        )
+        entropy_target = torch.where(
+            w_target_sum > 0,
+            (new_target_entropy * w_target).sum() / w_target_sum.clamp(min=1.0),
+            nan,
+        )
+
     stats: Dict[str, torch.Tensor] = {
         "loss_pi": loss_pi.detach(),
         "loss_vf": loss_vf.detach(),
         "entropy": entropy.detach(),
+        "entropy_halt": entropy_halt,
+        "entropy_origin_frac": entropy_origin_frac,
+        "entropy_target": entropy_target,
         "approx_kl": approx_kl,
         "approx_kl_k3": approx_kl_k3,
         "clip_frac": clip_frac,
@@ -350,7 +420,7 @@ def replay_logprob_value_entropy_jax(
         target_planet_reachable=target_planet_reachable,
     )
 
-    return _compute_logp_value_entropy_torch(
+    new_logp, new_value, new_entropy, *_ = _compute_logp_value_entropy_torch(
         policy,
         obs_torch["entity_type"],
         obs_torch["owner_idx"],
@@ -366,6 +436,7 @@ def replay_logprob_value_entropy_jax(
         no_valid_pairs_t,
         no_valid_fracs_t,
     )
+    return new_logp, new_value, new_entropy
 
 
 def replay_ppo_loss(

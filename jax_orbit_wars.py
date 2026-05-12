@@ -498,32 +498,6 @@ def _move_fleets_and_collect_combats(
         )
         sun_hit = _point_to_segment_distance(jnp.asarray([CENTER, CENTER]), old_pos, new_pos) < config.sun_radius
         remove = active & (hit_planet | (~in_bounds) | sun_hit)
-        unexpected_terminal = active & (~hit_planet) & ((~in_bounds) | sun_hit)
-
-        def _warn_unexpected_fleet_terminal(_):
-            jax.debug.print(
-                "[orbit_wars_pt] WARNING fleet disappeared without planet hit: "
-                "fleet_id={} owner={} target={} eta={} sun_hit={} oob={} "
-                "old=({:.3f}, {:.3f}) new=({:.3f}, {:.3f})",
-                fleet[FLEET_ID],
-                fleet[FLEET_OWNER],
-                fleet[FLEET_TARGET_PLANET],
-                fleet[FLEET_ETA],
-                sun_hit,
-                ~in_bounds,
-                old_pos[0],
-                old_pos[1],
-                new_pos[0],
-                new_pos[1],
-            )
-            return jnp.int32(0)
-
-        _ = jax.lax.cond(
-            unexpected_terminal,
-            _warn_unexpected_fleet_terminal,
-            lambda _: jnp.int32(0),
-            operand=None,
-        )
         owner = fleet[FLEET_OWNER].astype(jnp.int32)
         combat_ships = combat_ships.at[planet_idx, owner].add(
             jnp.where(hit_planet, ships, 0.0)

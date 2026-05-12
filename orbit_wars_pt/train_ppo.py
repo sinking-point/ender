@@ -367,6 +367,12 @@ class PPOStats:
     loss_pi_sum: float = 0.0
     loss_vf_sum: float = 0.0
     entropy_sum: float = 0.0
+    entropy_halt_sum: float = 0.0
+    entropy_halt_n: int = 0
+    entropy_origin_frac_sum: float = 0.0
+    entropy_origin_frac_n: int = 0
+    entropy_target_sum: float = 0.0
+    entropy_target_n: int = 0
     approx_kl_sum: float = 0.0
     approx_kl_k3_sum: float = 0.0
     clip_frac_sum: float = 0.0
@@ -382,6 +388,23 @@ class PPOStats:
         self.loss_pi_sum += float(stats["loss_pi"].item())
         self.loss_vf_sum += float(stats["loss_vf"].item())
         self.entropy_sum += float(stats["entropy"].item())
+        # Per-head conditional entropies may be NaN when a head's
+        # conditioning set is empty in a given minibatch (e.g. every
+        # row triggered ``no_valid_fracs``). Skip those minibatches
+        # in the per-head running mean instead of contaminating the
+        # iter summary with NaN.
+        ent_h = float(stats["entropy_halt"].item())
+        if ent_h == ent_h:
+            self.entropy_halt_sum += ent_h
+            self.entropy_halt_n += 1
+        ent_of = float(stats["entropy_origin_frac"].item())
+        if ent_of == ent_of:
+            self.entropy_origin_frac_sum += ent_of
+            self.entropy_origin_frac_n += 1
+        ent_t = float(stats["entropy_target"].item())
+        if ent_t == ent_t:
+            self.entropy_target_sum += ent_t
+            self.entropy_target_n += 1
         self.approx_kl_sum += float(stats["approx_kl"].item())
         self.approx_kl_k3_sum += float(stats["approx_kl_k3"].item())
         self.clip_frac_sum += float(stats["clip_frac"].item())
@@ -406,10 +429,28 @@ class PPOStats:
 
     def summary(self) -> dict:
         n = max(1, self.n_mb)
+        ent_h = (
+            self.entropy_halt_sum / self.entropy_halt_n
+            if self.entropy_halt_n > 0
+            else float("nan")
+        )
+        ent_of = (
+            self.entropy_origin_frac_sum / self.entropy_origin_frac_n
+            if self.entropy_origin_frac_n > 0
+            else float("nan")
+        )
+        ent_t = (
+            self.entropy_target_sum / self.entropy_target_n
+            if self.entropy_target_n > 0
+            else float("nan")
+        )
         return {
             "loss_pi": self.loss_pi_sum / n,
             "loss_vf": self.loss_vf_sum / n,
             "entropy": self.entropy_sum / n,
+            "entropy_halt": ent_h,
+            "entropy_origin_frac": ent_of,
+            "entropy_target": ent_t,
             "approx_kl": self.approx_kl_sum / n,
             "approx_kl_k3": self.approx_kl_k3_sum / n,
             "clip_frac": self.clip_frac_sum / n,
@@ -422,7 +463,10 @@ class PPOStats:
 def _ppo_stats_str(s: dict) -> str:
     return (
         f"loss_pi {s['loss_pi']:+.4f} loss_vf {s['loss_vf']:.4f} "
-        f"ent {s['entropy']:.3f} kl {s['approx_kl']:+.4f} kl_k3 {s['approx_kl_k3']:.4f} "
+        f"ent {s['entropy']:.3f} "
+        f"ent_h {s['entropy_halt']:.3f} ent_of {s['entropy_origin_frac']:.3f} "
+        f"ent_t {s['entropy_target']:.3f} "
+        f"kl {s['approx_kl']:+.4f} kl_k3 {s['approx_kl_k3']:.4f} "
         f"clip {s['clip_frac']:.3f} ev {s['explained_var']:+.3f} "
         f"v_mean {s['value_mean']:+.4f} g_norm {s['grad_norm']:.3f}"
     )
@@ -1097,7 +1141,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--iterations", type=int, default=100000)
-    p.add_argument("--num-envs", type=int, default=128, help="Parallel env rollouts per iteration.")
+    p.add_argument("--num-envs", type=int, default=256, help="Parallel env rollouts per iteration.")
     p.add_argument(
         "--max-micro-steps",
         type=int,
@@ -1107,7 +1151,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--rollout-micro-horizon",
         type=int,
-        default=64,
+        default=128,
         help=(
             "Stop a rollout segment after a full env-step when any env's player-0 or player-1 "
             "micro-step count in this segment reaches this value (end-of-turn cut). "
@@ -1124,14 +1168,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--minibatch-size",
         type=int,
-        default=256,
+        default=512,
         help="Transitions per minibatch (capped automatically if buffer smaller).",
     )
     p.add_argument("--ship-speed", type=float, default=6.0)
     p.add_argument(
         "--first-hit-n-rays",
         type=int,
-        default=2048,
+        default=256,
         help="Virtual launch directions for discrete first-hit target geometry (rollout + PPO replay). "
         "Lower values reduce JAX GPU memory (e.g. 512); minimum 8.",
     )
@@ -1142,7 +1186,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--activation-checkpointing",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Recompute transformer block activations during backward to reduce GPU memory usage.",
     )
     p.add_argument("--max-fleets", type=int, default=128)
@@ -1193,7 +1237,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--reset-prefetch-depth",
         type=int,
-        default=0,
+        default=256,
         help="If >0, spawn CPU worker processes to run Kaggle-backed resets ahead of the "
         "rollout (overlaps with policy/env work). 0 disables (default).",
     )
