@@ -123,8 +123,9 @@ def main() -> None:
         assert np.allclose(pre_planets[i], post_planets[i]), f"env {i} should be unchanged"
         assert not bool(dispatched_np[i])
 
-    new_fleet_active = np.asarray(jax.device_get(new_state.fleet_active))
-    assert new_fleet_active[0, 0], "env 0 fleet slot 0 should be active"
+    incoming_np = np.asarray(jax.device_get(new_state.incoming_fleets))
+    ta0 = int(max(np.floor(float(jax.device_get(fleet_eta[0])) - 1.0), 0.0))
+    assert incoming_np[0, 0, d_idx, ta0] == int(send_np[0]), "env 0 launch should be scheduled in incoming_fleets"
 
     # ---- Phase 5: compact buffer + turn_state_cache + gather. ----
     # Single-env slice: two p0 micro rows (dispatch then halt) and one p1 row.

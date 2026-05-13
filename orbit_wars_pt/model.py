@@ -11,6 +11,7 @@ from torch.utils.checkpoint import checkpoint
 
 from orbit_wars_pt.constants import (
     ENTITY_CLS,
+    FEATURE_DIM,
     FRACTIONS,
     MAX_PLANETS,
     NUM_ENTITY_TYPES,
@@ -149,7 +150,7 @@ class OrbitWarsPolicy(nn.Module):
         d_model: int = 384,
         n_heads: int = 8,
         n_layers: int = 4,
-        feature_dim: int = 8,
+        feature_dim: int = FEATURE_DIM,
         dropout: float = 0.0,
         activation_checkpointing: bool = False,
     ):

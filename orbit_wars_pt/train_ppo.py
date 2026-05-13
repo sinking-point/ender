@@ -54,7 +54,7 @@ from orbit_wars_pt.torch_replay import build_observation_torch, select_and_repla
 
 from jax_orbit_wars import OrbitWarsState
 
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 3
 
 
 @dataclass
@@ -684,11 +684,26 @@ def _combine_rollout_timing(items: list[RolloutTiming]) -> RolloutTiming:
     for rt in items:
         out.init_s += rt.init_s
         out.env_step_s += rt.env_step_s
+        out.env_prep_s += rt.env_prep_s
+        out.env_step_core_s += rt.env_step_core_s
+        out.env_reset_s += rt.env_reset_s
+        out.env_bookkeeping_s += rt.env_bookkeeping_s
+        out.env_python_s += rt.env_python_s
         out.micro_cap_s += rt.micro_cap_s
         out.obs_build_s += rt.obs_build_s
         out.policy_batch_s += rt.policy_batch_s
         out.policy_forward_s += rt.policy_forward_s
         out.micro_apply_s += rt.micro_apply_s
+        out.micro_apply_dlpack_in_s += rt.micro_apply_dlpack_in_s
+        out.micro_apply_jax_s += rt.micro_apply_jax_s
+        out.micro_apply_dlpack_out_s += rt.micro_apply_dlpack_out_s
+        out.micro_apply_torch_prep_s += rt.micro_apply_torch_prep_s
+        out.micro_prep_active_s += rt.micro_prep_active_s
+        out.micro_prep_wr_mk_s += rt.micro_prep_wr_mk_s
+        out.micro_prep_validate_s += rt.micro_prep_validate_s
+        out.micro_apply_buf_append_s += rt.micro_apply_buf_append_s
+        out.micro_apply_turn_tag_s += rt.micro_apply_turn_tag_s
+        out.micro_apply_numpy_s += rt.micro_apply_numpy_s
         out.state_unstack_s += rt.state_unstack_s
         out.loop_s += rt.loop_s
         out.wall_s += rt.wall_s
@@ -742,10 +757,24 @@ def _combine_segments_for_stats(segments: list[RolloutSegment]) -> RolloutSegmen
 
 def _rollout_timing_str(rt: RolloutTiming) -> str:
     unacc_loop = max(0.0, rt.loop_s - rt.accounted_loop_s())
+    env_accounted = (
+        rt.env_prep_s
+        + rt.env_step_core_s
+        + rt.env_reset_s
+        + rt.env_bookkeeping_s
+        + rt.env_python_s
+    )
+    env_other = max(0.0, rt.env_step_s - env_accounted)
     return (
         f"rollout_wall {rt.wall_s:.3f}s loop {rt.loop_s:.3f}s "
-        f"env_step {rt.env_step_s:.3f}s micro_cap {rt.micro_cap_s:.3f}s obs {rt.obs_build_s:.3f}s "
+        f"env_step {rt.env_step_s:.3f}s env_prep {rt.env_prep_s:.3f}s env_core {rt.env_step_core_s:.3f}s "
+        f"env_reset {rt.env_reset_s:.3f}s env_book {rt.env_bookkeeping_s:.3f}s env_py {rt.env_python_s:.3f}s "
+        f"env_other {env_other:.3f}s "
+        f"micro_cap {rt.micro_cap_s:.3f}s obs {rt.obs_build_s:.3f}s "
         f"pt_batch {rt.policy_batch_s:.3f}s pt_fwd {rt.policy_forward_s:.3f}s micro_apply {rt.micro_apply_s:.3f}s "
+        f"(dj {rt.micro_apply_dlpack_in_s:.3f} jax {rt.micro_apply_jax_s:.3f} jp {rt.micro_apply_dlpack_out_s:.3f} "
+        f"prep {rt.micro_apply_torch_prep_s:.3f}(act {rt.micro_prep_active_s:.3f} wr {rt.micro_prep_wr_mk_s:.3f} val {rt.micro_prep_validate_s:.3f}) "
+        f"app {rt.micro_apply_buf_append_s:.3f} tag {rt.micro_apply_turn_tag_s:.3f} np {rt.micro_apply_numpy_s:.3f}) "
         f"unstack {rt.state_unstack_s:.3f}s init {rt.init_s:.3f}s unaccounted_loop {unacc_loop:.3f}s outer {rt.outer_iters}"
     )
 
@@ -776,9 +805,9 @@ def _segment_rollout_counts(segment: RolloutSegment) -> Tuple[int, int, int, flo
 
 
 def _fleet_counts_from_state(state_b: OrbitWarsState) -> Tuple[int, float]:
-    """Return total and per-env mean active fleets from the batched state."""
+    """Return total and per-env mean nonempty incoming-arrival buckets."""
 
-    active = np.asarray(jax.device_get(state_b.fleet_active))
+    active = np.asarray(jax.device_get(state_b.incoming_fleets > 0))
     total_fleets = int(active.sum())
     mean_fleets_per_env = float(total_fleets / max(1, active.shape[0]))
     return total_fleets, mean_fleets_per_env
@@ -1150,6 +1179,22 @@ def _log_iter_tensorboard(
     if rt is not None:
         writer.add_scalar("timing/rollout_wall_s", rt.wall_s, it)
         writer.add_scalar("timing/rollout_loop_s", rt.loop_s, it)
+        writer.add_scalar("timing/env_step_s", rt.env_step_s, it)
+        writer.add_scalar("timing/env_prep_s", rt.env_prep_s, it)
+        writer.add_scalar("timing/env_step_core_s", rt.env_step_core_s, it)
+        writer.add_scalar("timing/env_reset_s", rt.env_reset_s, it)
+        writer.add_scalar("timing/env_bookkeeping_s", rt.env_bookkeeping_s, it)
+        writer.add_scalar("timing/env_python_s", rt.env_python_s, it)
+        writer.add_scalar("timing/micro_apply_dlpack_in_s", rt.micro_apply_dlpack_in_s, it)
+        writer.add_scalar("timing/micro_apply_jax_s", rt.micro_apply_jax_s, it)
+        writer.add_scalar("timing/micro_apply_dlpack_out_s", rt.micro_apply_dlpack_out_s, it)
+        writer.add_scalar("timing/micro_apply_torch_prep_s", rt.micro_apply_torch_prep_s, it)
+        writer.add_scalar("timing/micro_prep_active_s", rt.micro_prep_active_s, it)
+        writer.add_scalar("timing/micro_prep_wr_mk_s", rt.micro_prep_wr_mk_s, it)
+        writer.add_scalar("timing/micro_prep_validate_s", rt.micro_prep_validate_s, it)
+        writer.add_scalar("timing/micro_apply_buf_append_s", rt.micro_apply_buf_append_s, it)
+        writer.add_scalar("timing/micro_apply_turn_tag_s", rt.micro_apply_turn_tag_s, it)
+        writer.add_scalar("timing/micro_apply_numpy_s", rt.micro_apply_numpy_s, it)
     if ppo_t is not None:
         writer.add_scalar("timing/ppo_total_s", ppo_t.total_s, it)
 

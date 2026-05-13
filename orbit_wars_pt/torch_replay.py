@@ -14,9 +14,6 @@ import numpy as np
 import torch
 
 from jax_orbit_wars import (
-    FLEET_ETA,
-    FLEET_ROW_WIDTH,
-    FLEET_TARGET_PLANET,
     OrbitWarsState,
     PLANET_ID,
     PLANET_OWNER,
@@ -32,9 +29,9 @@ from orbit_wars_pt.constants import (
     CENTER,
     ENTITY_CLS,
     ENTITY_COMET,
-    ENTITY_FLEET,
+    FEATURE_DIM,
+    INCOMING_TA_BINS,
     ENTITY_PLANET,
-    MAX_FLEET_TOKENS,
     MAX_PLANETS,
     NUM_OWNER_SLOTS,
     ROTATION_RADIUS_LIMIT,
@@ -51,57 +48,6 @@ def _remap_owner_2p(owner: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
     return out.clamp_max(NUM_OWNER_SLOTS - 1).to(torch.long)
 
 
-def _fleet_rows_from_pair_torch(
-    planets: torch.Tensor,
-    ego: torch.Tensor,
-    pair_flat: torch.Tensor,
-    send: torch.Tensor,
-    angle: torch.Tensor,
-    fleet_eta: torch.Tensor,
-    dispatch: torch.Tensor,
-) -> torch.Tensor:
-    batch_shape = pair_flat.shape
-    flat_n = int(pair_flat.numel())
-    planets_flat = planets
-    if pair_flat.ndim == 2:
-        b, m = pair_flat.shape
-        planets_flat = planets[:, None, :, :].expand(b, m, planets.shape[1], planets.shape[2]).reshape(flat_n, planets.shape[1], planets.shape[2])
-        ego_flat = ego[:, None].expand(b, m).reshape(flat_n)
-    else:
-        planets_flat = planets
-        ego_flat = ego.reshape(flat_n)
-    p = MAX_PLANETS
-    pair_flat_f = pair_flat.reshape(flat_n)
-    send_f = send.reshape(flat_n)
-    angle_f = angle.reshape(flat_n)
-    fleet_eta_f = fleet_eta.reshape(flat_n)
-    dispatch_f = dispatch.reshape(flat_n)
-    o_idx = (pair_flat_f // p).to(torch.long)
-    d_idx = (pair_flat_f % p).to(torch.long)
-    bi = torch.arange(flat_n, device=planets.device)
-    o_xy = planets_flat[bi, o_idx, PLANET_X : PLANET_Y + 1]
-    o_r = planets_flat[bi, o_idx, PLANET_RADIUS]
-    oid = planets_flat[bi, o_idx, PLANET_ID]
-    sx = o_xy[:, 0] + torch.cos(angle_f) * (o_r + 0.1)
-    sy = o_xy[:, 1] + torch.sin(angle_f) * (o_r + 0.1)
-    send_eff = torch.where(dispatch_f, send_f, torch.zeros_like(send_f))
-    rows = torch.stack(
-        [
-            torch.zeros(flat_n, dtype=planets.dtype, device=planets.device),
-            ego_flat.to(planets.dtype),
-            sx,
-            sy,
-            angle_f.to(planets.dtype),
-            oid,
-            send_eff.to(planets.dtype),
-            d_idx.to(planets.dtype),
-            fleet_eta_f.to(planets.dtype),
-        ],
-        dim=-1,
-    )
-    return rows.reshape(batch_shape + (FLEET_ROW_WIDTH,))
-
-
 def apply_prefix_micro_deltas_torch(
     state: OrbitWarsState,
     ego: torch.Tensor,
@@ -115,6 +61,7 @@ def apply_prefix_micro_deltas_torch(
 ) -> OrbitWarsState:
     """Torch equivalent of ``apply_prefix_micro_deltas_batched``."""
 
+    del slot_m, angle_m
     b, m = micro_halt.shape
     device = state.planets.device
     k = torch.arange(m, device=device)
@@ -127,38 +74,20 @@ def apply_prefix_micro_deltas_torch(
     planets = state.planets.clone()
     planets[..., PLANET_SHIPS] = planets[..., PLANET_SHIPS] - deduct
 
-    fleets = state.fleets.clone()
-    active = state.fleet_active.clone()
-    rows = _fleet_rows_from_pair_torch(
-        planets,
-        ego,
-        pair_flat_m,
-        send_m,
-        angle_m,
-        fleet_eta_m,
+    ta_m = (fleet_eta_m - 1.0).clamp_min(0.0).floor().to(torch.long).clamp(0, INCOMING_TA_BINS - 1)
+    d_idx_m = (pair_flat_m % MAX_PLANETS).to(torch.long).clamp(0, MAX_PLANETS - 1)
+    num_players = int(state.incoming_fleets.shape[1])
+    ego_m = ego.to(torch.long).clamp(0, num_players - 1)[:, None].expand(b, m)
+    flat_idx = (ego_m * (MAX_PLANETS * INCOMING_TA_BINS)) + (d_idx_m * INCOMING_TA_BINS) + ta_m
+    add = torch.where(
         dispatch_bm,
+        send_m.clamp_min(0.0).clamp_max(65535.0).to(torch.int32),
+        torch.zeros_like(send_m, dtype=torch.int32),
     )
-    slot = slot_m.to(torch.long)
-    write = dispatch_bm & (slot >= 0) & (slot < fleets.shape[1])
-    sentinel = fleets.shape[1]
-    safe_slot = torch.where(write, slot, torch.full_like(slot, sentinel))
-    bi = torch.arange(b, device=device)[:, None].expand(b, m)
-    fleets_pad = torch.cat(
-        [fleets, torch.zeros((b, 1, fleets.shape[2]), dtype=fleets.dtype, device=device)],
-        dim=1,
-    )
-    active_pad = torch.cat(
-        [active, torch.zeros((b, 1), dtype=active.dtype, device=device)],
-        dim=1,
-    )
-    old_rows = fleets_pad[bi, safe_slot, :]
-    merged = torch.where(write[..., None], rows, old_rows)
-    fleets_pad[bi.reshape(-1), safe_slot.reshape(-1), :] = merged.reshape(-1, FLEET_ROW_WIDTH)
-    old_active = active_pad[bi, safe_slot]
-    active_pad[bi.reshape(-1), safe_slot.reshape(-1)] = (write | old_active).reshape(-1)
-    fleets = fleets_pad[:, :sentinel, :]
-    active = active_pad[:, :sentinel]
-    return state._replace(planets=planets, fleets=fleets, fleet_active=active)
+    incoming_i32 = state.incoming_fleets.to(torch.int32).reshape(b, -1).clone()
+    incoming_i32.scatter_add_(1, flat_idx, add)
+    incoming = incoming_i32.clamp_(0, 65535).reshape_as(state.incoming_fleets).to(state.incoming_fleets.dtype)
+    return state._replace(planets=planets, incoming_fleets=incoming)
 
 
 def select_and_replay_minibatch_torch(
@@ -306,8 +235,6 @@ def build_observation_torch(state: OrbitWarsState, ego: torch.Tensor, ship_speed
     del ship_speed
     planets = state.planets
     active = state.planet_active
-    fleets = state.fleets
-    fleet_active = state.fleet_active
     b = planets.shape[0]
     device = planets.device
     dtype = planets.dtype
@@ -317,72 +244,41 @@ def build_observation_torch(state: OrbitWarsState, ego: torch.Tensor, ship_speed
 
     planet_etype = torch.where(is_comet, torch.full_like(pid, ENTITY_COMET), torch.full_like(pid, ENTITY_PLANET)).long()
     planet_owner = _remap_owner_2p(planets[..., PLANET_OWNER], ego)
-    planet_features = torch.zeros((b, MAX_PLANETS, 8), dtype=dtype, device=device)
+    incoming = state.incoming_fleets.to(dtype)
+    batch_idx = torch.arange(b, device=device)
+    ego_i = ego.to(torch.long).clamp(0, int(state.incoming_fleets.shape[1]) - 1)
+    self_incoming = incoming[batch_idx, ego_i]
+    enemy_incoming = incoming.sum(dim=1) - self_incoming
+    incoming_net = (self_incoming - enemy_incoming) / 1000.0
+
+    planet_features = torch.zeros((b, MAX_PLANETS, FEATURE_DIM), dtype=dtype, device=device)
     planet_features[..., 0] = torch.log1p(planets[..., PLANET_PRODUCTION].clamp_min(0.0))
     planet_features[..., 1] = planets[..., PLANET_SHIPS] / 1000.0
     planet_features[..., 2] = vx / 5.0
     planet_features[..., 3] = vy / 5.0
     planet_features[..., 4] = active.to(dtype)
     planet_features[..., 5] = planets[..., PLANET_RADIUS] / 10.0
+    planet_features[..., 8:] = incoming_net
     planet_rope = torch.zeros((b, MAX_PLANETS, 3), dtype=dtype, device=device)
     xy = torch.where(active[..., None], planets[..., PLANET_X : PLANET_Y + 1], torch.zeros_like(planets[..., PLANET_X : PLANET_Y + 1]))
     planet_rope[..., 0] = xy[..., 0] / BOARD_SIZE
     planet_rope[..., 1] = xy[..., 1] / BOARD_SIZE
 
-    f_owner = fleets[..., 1]
-    f_origin = fleets[..., 5].to(torch.int32)
-    f_ships = fleets[..., 6]
-    f_target = fleets[..., FLEET_TARGET_PLANET].to(torch.int64)
-    f_eta = fleets[..., FLEET_ETA]
-    origin_match = pid[:, None, :] == f_origin[:, :, None]
-    has_origin = origin_match.any(dim=2)
-    safe_target = f_target.clamp(0, MAX_PLANETS - 1)
-    target_active = active.gather(1, safe_target)
-    valid_fleet = fleet_active & has_origin & (f_target >= 0) & (f_target < MAX_PLANETS) & target_active
-    f = fleets.shape[1]
-    f_idx = torch.arange(f, device=device)
-    sort_key = torch.where(valid_fleet, f_idx[None, :], f + f_idx[None, :])
-    order = torch.argsort(sort_key, dim=1, stable=True)
-    if f >= MAX_FLEET_TOKENS:
-        take = order[:, :MAX_FLEET_TOKENS]
-    else:
-        pad = torch.zeros((b, MAX_FLEET_TOKENS - f), dtype=torch.long, device=device)
-        take = torch.cat([order, pad], dim=1)
-    n_valid = valid_fleet.to(torch.int32).sum(dim=1)
-    fleet_token_active = torch.arange(MAX_FLEET_TOKENS, device=device)[None, :] < n_valid[:, None].clamp_max(MAX_FLEET_TOKENS)
-    g_owner = f_owner.gather(1, take)
-    g_ships = f_ships.gather(1, take)
-    g_hit = safe_target.gather(1, take)
-    eta = f_eta.gather(1, take).clamp(0.0, 500.0)
-    dst_xy = torch.gather(planets[..., PLANET_X : PLANET_Y + 1], 1, g_hit[..., None].expand(b, MAX_FLEET_TOKENS, 2))
-    fleet_etype = torch.where(fleet_token_active, torch.full_like(g_hit, ENTITY_FLEET), torch.zeros_like(g_hit)).long()
-    fleet_owner = torch.where(fleet_token_active, _remap_owner_2p(g_owner, ego), torch.zeros_like(g_hit).long())
-    fleet_features = torch.zeros((b, MAX_FLEET_TOKENS, 8), dtype=dtype, device=device)
-    fleet_features[..., 0] = g_ships / 1000.0
-    fleet_features[..., 1] = g_hit.to(dtype) / float(MAX_PLANETS)
-    fleet_rope = torch.zeros((b, MAX_FLEET_TOKENS, 3), dtype=dtype, device=device)
-    fleet_rope[..., 0] = dst_xy[..., 0] / BOARD_SIZE
-    fleet_rope[..., 1] = dst_xy[..., 1] / BOARD_SIZE
-    fleet_rope[..., 2] = eta / 500.0
-    fleet_features = torch.where(fleet_token_active[..., None], fleet_features, torch.zeros_like(fleet_features))
-    fleet_rope = torch.where(fleet_token_active[..., None], fleet_rope, torch.zeros_like(fleet_rope))
-
     cls_type = torch.full((b, 1), ENTITY_CLS, dtype=torch.long, device=device)
     cls_owner = torch.ones((b, 1), dtype=torch.long, device=device)
-    cls_features = torch.zeros((b, 1, 8), dtype=dtype, device=device)
+    cls_features = torch.zeros((b, 1, FEATURE_DIM), dtype=dtype, device=device)
     cls_features[:, 0, 6] = (state.step_count.to(dtype) / 498.0).clamp(0.0, 1.0)
     cls_rope = torch.tensor([CENTER / BOARD_SIZE, CENTER / BOARD_SIZE, 0.0], dtype=dtype, device=device).view(1, 1, 3).expand(b, 1, 3)
     return {
-        "entity_type": torch.cat([cls_type, planet_etype, fleet_etype], dim=1),
-        "owner_idx": torch.cat([cls_owner, planet_owner, fleet_owner], dim=1),
-        "features": torch.cat([cls_features, planet_features, fleet_features], dim=1),
-        "rope_pos": torch.cat([cls_rope, planet_rope, fleet_rope], dim=1),
-        "entity_mask": torch.cat([torch.ones((b, 1), dtype=torch.bool, device=device), active, fleet_token_active], dim=1),
+        "entity_type": torch.cat([cls_type, planet_etype], dim=1),
+        "owner_idx": torch.cat([cls_owner, planet_owner], dim=1),
+        "features": torch.cat([cls_features, planet_features], dim=1),
+        "rope_pos": torch.cat([cls_rope, planet_rope], dim=1),
+        "entity_mask": torch.cat([torch.ones((b, 1), dtype=torch.bool, device=device), active], dim=1),
         "planet_mask": torch.cat(
             [
                 torch.zeros((b, 1), dtype=torch.bool, device=device),
                 torch.ones((b, MAX_PLANETS), dtype=torch.bool, device=device),
-                torch.zeros((b, MAX_FLEET_TOKENS), dtype=torch.bool, device=device),
             ],
             dim=1,
         ),

@@ -7,7 +7,13 @@ ROTATION_RADIUS_LIMIT = 50.0
 
 MAX_PLANETS = 60  # MAX_BASE_PLANETS + MAX_COMETS in jax
 
-# Policy / tensor caps (truncate beyond this for speed)
+# Incoming-fleet countdown bins stored directly on each planet token.
+# Dispatch geometry only allows hits inside this horizon.
+INCOMING_TA_BINS = 24
+BASE_FEATURE_DIM = 8
+FEATURE_DIM = BASE_FEATURE_DIM + INCOMING_TA_BINS
+
+# Legacy cap retained for compatibility with older host/debug helpers.
 MAX_FLEET_TOKENS = 128
 
 ENTITY_CLS = 0

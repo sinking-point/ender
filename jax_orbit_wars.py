@@ -30,6 +30,7 @@ MAX_COMETS = 20
 MAX_PLANETS = MAX_BASE_PLANETS + MAX_COMETS
 MAX_COMET_GROUPS = 5
 MAX_COMET_PATH = 40
+INCOMING_TA_BINS = 24
 DEFAULT_MAX_FLEETS = 4096
 DEFAULT_MAX_ACTIONS = 64
 
@@ -67,6 +68,7 @@ class OrbitWarsState(NamedTuple):
     initial_active: jnp.ndarray  # [MAX_PLANETS], bool
     fleets: jnp.ndarray  # [max_fleets, FLEET_ROW_WIDTH], float32
     fleet_active: jnp.ndarray  # [max_fleets], bool
+    incoming_fleets: jnp.ndarray  # [num_agents, MAX_PLANETS, INCOMING_TA_BINS], uint16
     comet_paths: jnp.ndarray  # [5, 4, 40, 2], float32
     comet_path_lengths: jnp.ndarray  # [5, 4], int32
     comet_ships: jnp.ndarray  # [5], float32
@@ -84,9 +86,17 @@ class OrbitWarsState(NamedTuple):
 
 
 def empty_actions(num_agents: int = 2, max_actions: int = DEFAULT_MAX_ACTIONS) -> jnp.ndarray:
-    """Returns a no-op action tensor shaped [num_agents, max_actions, 3]."""
+    """Returns a no-op action tensor shaped [num_agents, max_actions, 5].
 
-    return jnp.zeros((num_agents, max_actions, 3), dtype=jnp.float32)
+    Columns are ``from_id, angle, ships, target_planet, hit_tick``. The final
+    two metadata columns are ignored for no-op rows but let trusted rollout
+    launches skip the old post-step fleet metadata recovery pass.
+    """
+
+    actions = jnp.zeros((num_agents, max_actions, 5), dtype=jnp.float32)
+    actions = actions.at[..., 3].set(-1.0)
+    actions = actions.at[..., 4].set(500.0)
+    return actions
 
 
 def reset_from_reference(
@@ -181,6 +191,7 @@ def reset_from_reference(
         initial_active=initial_active,
         fleets=jnp.zeros((max_fleets, FLEET_ROW_WIDTH), dtype=jnp.float32),
         fleet_active=jnp.zeros((max_fleets,), dtype=bool),
+        incoming_fleets=jnp.zeros((num_agents, MAX_PLANETS, INCOMING_TA_BINS), dtype=jnp.uint16),
         comet_paths=comet_paths,
         comet_path_lengths=comet_path_lengths,
         comet_ships=comet_ships,
@@ -331,63 +342,78 @@ def _spawn_comets(state: OrbitWarsState) -> OrbitWarsState:
 
 
 def _launch_fleets(state: OrbitWarsState, actions: jnp.ndarray) -> OrbitWarsState:
+    """Apply all launch rows in parallel (no ``scan`` over action slots).
+
+    Planet ships are reduced by a per-planet scatter-sum of all scheduled rows.
+    Callers are assumed never to submit an infeasible **total** outflow from a
+    source planet in one turn (same assumption as trusting sequential order
+    without redundant cross-checks).
+    """
+
     actions = jnp.asarray(actions, dtype=jnp.float32)
+    incoming_players = state.incoming_fleets.shape[0]
+    max_actions = actions.shape[1]
+    n_agent_rows = actions.shape[0]
+    total_actions = n_agent_rows * max_actions
 
-    def launch_one(carry, flat_idx):
-        planets, fleets, fleet_active, next_fleet_id, overflow = carry
-        max_actions = actions.shape[1]
-        player = flat_idx // max_actions
-        action_idx = flat_idx % max_actions
-        from_id, angle, ships_raw = actions[player, action_idx]
-        ships = jnp.floor(ships_raw)
-        planet_id_match = planets[:, PLANET_ID] == from_id
-        valid_planet_mask = state.planet_active & planet_id_match
-        has_planet, planet_idx = _first_true(valid_planet_mask)
-        planet = planets[planet_idx]
-        valid = (
-            (player < state.num_agents)
-            & has_planet
-            & (planet[PLANET_OWNER] == player.astype(jnp.float32))
-            & (planet[PLANET_SHIPS] >= ships)
-            & (ships > 0)
-        )
-        has_fleet_slot, fleet_idx = _first_true(~fleet_active)
-        write = valid & has_fleet_slot
-        start_x = planet[PLANET_X] + jnp.cos(angle) * (planet[PLANET_RADIUS] + 0.1)
-        start_y = planet[PLANET_Y] + jnp.sin(angle) * (planet[PLANET_RADIUS] + 0.1)
-        fleet = jnp.zeros((FLEET_ROW_WIDTH,), dtype=jnp.float32)
-        fleet = fleet.at[FLEET_ID].set(next_fleet_id.astype(jnp.float32))
-        fleet = fleet.at[FLEET_OWNER].set(player.astype(jnp.float32))
-        fleet = fleet.at[FLEET_X].set(start_x)
-        fleet = fleet.at[FLEET_Y].set(start_y)
-        fleet = fleet.at[FLEET_ANGLE].set(angle)
-        fleet = fleet.at[FLEET_FROM_PLANET].set(from_id)
-        fleet = fleet.at[FLEET_SHIPS].set(ships)
-        fleet = fleet.at[FLEET_TARGET_PLANET].set(-1.0)
-        fleet = fleet.at[FLEET_ETA].set(500.0)
+    aflat = actions.reshape((total_actions,) + tuple(actions.shape[2:]))
+    from_id = aflat[:, 0]
+    ships_raw = aflat[:, 2]
+    if actions.shape[-1] >= 5:
+        target_planet = aflat[:, 3]
+        eta = aflat[:, 4]
+    else:
+        target_planet = jnp.full((total_actions,), -1.0, dtype=jnp.float32)
+        eta = jnp.full((total_actions,), 500.0, dtype=jnp.float32)
 
-        safe_fleet_idx = jnp.where(has_fleet_slot, fleet_idx, 0)
-        planets = planets.at[planet_idx, PLANET_SHIPS].add(jnp.where(valid, -ships, 0.0))
-        fleets = fleets.at[safe_fleet_idx].set(jnp.where(write, fleet, fleets[safe_fleet_idx]))
-        fleet_active = fleet_active.at[safe_fleet_idx].set(write | fleet_active[safe_fleet_idx])
-        next_fleet_id = next_fleet_id + write.astype(jnp.int32)
-        overflow = overflow | (valid & ~has_fleet_slot)
-        return (planets, fleets, fleet_active, next_fleet_id, overflow), None
+    flat = jnp.arange(total_actions, dtype=jnp.int32)
+    player = flat // max_actions
+    ships = jnp.floor(ships_raw)
 
-    total_actions = actions.shape[0] * actions.shape[1]
-    carry = (
-        state.planets,
-        state.fleets,
-        state.fleet_active,
-        state.next_fleet_id,
-        state.overflow,
+    planets0 = state.planets
+    pid = planets0[:, PLANET_ID]
+    match = (pid[None, :] == from_id[:, None]) & state.planet_active[None, :]
+    has_planet, planet_idx = jax.vmap(_first_true)(match)
+
+    planet_owner = planets0[planet_idx, PLANET_OWNER]
+    planet_ships = planets0[planet_idx, PLANET_SHIPS]
+    valid = (
+        (player.astype(jnp.float32) < state.num_agents.astype(jnp.float32))
+        & has_planet
+        & (planet_owner == player.astype(jnp.float32))
+        & (planet_ships >= ships)
+        & (ships > 0)
     )
-    carry, _ = jax.lax.scan(launch_one, carry, jnp.arange(total_actions, dtype=jnp.int32))
-    planets, fleets, fleet_active, next_fleet_id, overflow = carry
+    target_i = target_planet.astype(jnp.int32)
+    ta_i = jnp.floor(jnp.maximum(eta - 1.0, 0.0)).astype(jnp.int32)
+    meta_ok = (
+        (player < incoming_players)
+        & (target_i >= 0)
+        & (target_i < MAX_PLANETS)
+        & (ta_i >= 0)
+        & (ta_i < INCOMING_TA_BINS)
+    )
+    sched = valid & meta_ok
+
+    safe_player = jnp.clip(player, 0, incoming_players - 1)
+    safe_target = jnp.clip(target_i, 0, MAX_PLANETS - 1)
+    safe_ta = jnp.clip(ta_i, 0, INCOMING_TA_BINS - 1)
+    ships_u32 = jnp.minimum(ships, jnp.asarray(65535.0, dtype=jnp.float32)).astype(jnp.uint32)
+    add = jnp.where(sched, ships_u32, jnp.asarray(0, dtype=jnp.uint32))
+
+    deduct = jnp.where(sched, ships, 0.0)
+    total_out = jnp.zeros((MAX_PLANETS,), dtype=jnp.float32).at[planet_idx].add(deduct)
+    new_ship_col = planets0[:, PLANET_SHIPS] - total_out
+    planets = planets0.at[:, PLANET_SHIPS].set(new_ship_col)
+
+    next_fleet_id = state.next_fleet_id + jnp.sum(sched.astype(jnp.int32))
+    overflow = state.overflow | jnp.any(valid & ~meta_ok)
+
+    incoming_u32 = state.incoming_fleets.astype(jnp.uint32)
+    incoming_u32 = incoming_u32.at[safe_player, safe_target, safe_ta].add(add)
     return state._replace(
         planets=planets,
-        fleets=fleets,
-        fleet_active=fleet_active,
+        incoming_fleets=jnp.minimum(incoming_u32, jnp.asarray(65535, dtype=jnp.uint32)).astype(jnp.uint16),
         next_fleet_id=next_fleet_id,
         overflow=overflow,
     )
@@ -464,55 +490,18 @@ def _move_fleets_and_collect_combats(
     planet_collision_enabled: jnp.ndarray,
     config: OrbitWarsConfig,
 ):
+    del old_planet_pos, new_planet_pos, planet_collision_enabled, config
+    arrivals = state.incoming_fleets[:, :, 0].astype(jnp.float32)  # [A, P]
     combat_ships = jnp.zeros((MAX_PLANETS, 4), dtype=jnp.float32)
-    fleets = state.fleets
-    fleet_active = state.fleet_active
-
-    def move_one(carry, fleet_idx):
-        fleets, fleet_active, combat_ships = carry
-        fleet = fleets[fleet_idx]
-        active = fleet_active[fleet_idx]
-        angle = fleet[FLEET_ANGLE]
-        ships = fleet[FLEET_SHIPS]
-        speed = 1.0 + (config.ship_speed - 1.0) * (
-            jnp.log(ships) / jnp.log(jnp.asarray(1000.0, dtype=jnp.float32))
-        ) ** 1.5
-        speed = jnp.minimum(speed, config.ship_speed)
-        old_pos = fleet[FLEET_X : FLEET_Y + 1]
-        new_pos = old_pos + jnp.asarray([jnp.cos(angle) * speed, jnp.sin(angle) * speed])
-
-        hit_mask = jax.vmap(_swept_pair_hit, in_axes=(None, None, 0, 0, 0))(
-            old_pos,
-            new_pos,
-            old_planet_pos,
-            new_planet_pos,
-            state.planets[:, PLANET_RADIUS],
-        )
-        hit_mask = hit_mask & state.planet_active & planet_collision_enabled & active
-        hit_planet, planet_idx = _first_true(hit_mask)
-        in_bounds = (
-            (new_pos[0] >= 0.0)
-            & (new_pos[0] <= config.board_size)
-            & (new_pos[1] >= 0.0)
-            & (new_pos[1] <= config.board_size)
-        )
-        sun_hit = _point_to_segment_distance(jnp.asarray([CENTER, CENTER]), old_pos, new_pos) < config.sun_radius
-        remove = active & (hit_planet | (~in_bounds) | sun_hit)
-        owner = fleet[FLEET_OWNER].astype(jnp.int32)
-        combat_ships = combat_ships.at[planet_idx, owner].add(
-            jnp.where(hit_planet, ships, 0.0)
-        )
-        fleet = fleet.at[FLEET_X : FLEET_Y + 1].set(jnp.where(active, new_pos, old_pos))
-        fleet = fleet.at[FLEET_ETA].set(
-            jnp.where(active, jnp.maximum(fleet[FLEET_ETA] - 1.0, 0.0), fleet[FLEET_ETA])
-        )
-        fleets = fleets.at[fleet_idx].set(fleet)
-        fleet_active = fleet_active.at[fleet_idx].set(active & ~remove)
-        return (fleets, fleet_active, combat_ships), None
-
-    carry = (fleets, fleet_active, combat_ships)
-    carry, _ = jax.lax.scan(move_one, carry, jnp.arange(fleets.shape[0], dtype=jnp.int32))
-    return carry
+    combat_ships = combat_ships.at[:, : state.incoming_fleets.shape[0]].set(jnp.transpose(arrivals, (1, 0)))
+    shifted = jnp.concatenate(
+        [
+            state.incoming_fleets[:, :, 1:],
+            jnp.zeros((state.incoming_fleets.shape[0], MAX_PLANETS, 1), dtype=state.incoming_fleets.dtype),
+        ],
+        axis=2,
+    )
+    return state.fleets, state.fleet_active, combat_ships, shifted
 
 
 def _resolve_combats(state: OrbitWarsState, combat_ships: jnp.ndarray) -> OrbitWarsState:
@@ -554,29 +543,23 @@ def _resolve_combats(state: OrbitWarsState, combat_ships: jnp.ndarray) -> OrbitW
 
 def _score_and_done(state: OrbitWarsState, config: OrbitWarsConfig) -> OrbitWarsState:
     planet_owners = state.planets[:, PLANET_OWNER].astype(jnp.int32)
-    fleet_owners = state.fleets[:, FLEET_OWNER].astype(jnp.int32)
     safe_planet_owners = jnp.maximum(planet_owners, 0)
-    safe_fleet_owners = jnp.maximum(fleet_owners, 0)
     planet_values = jnp.where(
         state.planet_active & (planet_owners >= 0), state.planets[:, PLANET_SHIPS], 0.0
     )
-    fleet_values = jnp.where(state.fleet_active, state.fleets[:, FLEET_SHIPS], 0.0)
     planet_scores = jnp.zeros((4,), dtype=jnp.float32).at[safe_planet_owners].add(
         planet_values
     )
-    fleet_scores = jnp.zeros((4,), dtype=jnp.float32).at[safe_fleet_owners].add(
-        fleet_values
-    )
+    fleet_scores_a = jnp.sum(state.incoming_fleets.astype(jnp.float32), axis=(1, 2))
+    fleet_scores = jnp.pad(fleet_scores_a, (0, 4 - state.incoming_fleets.shape[0]))
     scores = planet_scores + fleet_scores
     alive_planet_values = (state.planet_active & (planet_owners >= 0)).astype(jnp.int32)
-    alive_fleet_values = state.fleet_active.astype(jnp.int32)
     alive_from_planets = (
         jnp.zeros((4,), dtype=jnp.int32).at[safe_planet_owners].max(alive_planet_values)
         > 0
     )
-    alive_from_fleets = (
-        jnp.zeros((4,), dtype=jnp.int32).at[safe_fleet_owners].max(alive_fleet_values) > 0
-    )
+    alive_from_fleets_a = jnp.sum(state.incoming_fleets, axis=(1, 2)) > 0
+    alive_from_fleets = jnp.pad(alive_from_fleets_a, (0, 4 - state.incoming_fleets.shape[0]))
     alive = alive_from_planets | alive_from_fleets
     player_mask = jnp.arange(4, dtype=jnp.int32) < state.num_agents
     alive_count = jnp.sum(alive & player_mask)
@@ -611,7 +594,7 @@ def step(
         )
 
         old_pos, new_pos, collision_enabled, next_path_index, expired_after_move = _planet_paths(s)
-        fleets, fleet_active, combat_ships = _move_fleets_and_collect_combats(
+        fleets, fleet_active, combat_ships, incoming_fleets = _move_fleets_and_collect_combats(
             s, old_pos, new_pos, collision_enabled, config
         )
         planets = s.planets.at[:, PLANET_X : PLANET_Y + 1].set(new_pos)
@@ -633,6 +616,7 @@ def step(
             initial_active=initial_active,
             fleets=fleets,
             fleet_active=fleet_active,
+            incoming_fleets=incoming_fleets,
             comet_path_index=next_path_index,
             comet_group_active=s.comet_group_active & ~expired_group,
             comet_planet_ids=jnp.where(expired_group[:, None], -1, s.comet_planet_ids),

@@ -202,6 +202,84 @@ def append_to_torch_buffer(
     return buf
 
 
+@torch.no_grad()
+def append_active_to_torch_buffer(
+    buf: TorchTransitionBuffer,
+    env_idx: torch.Tensor,
+    micro_halt_now: torch.Tensor,
+    send_now: torch.Tensor,
+    angle_now: torch.Tensor,
+    fleet_eta_now: torch.Tensor,
+    slot_now: torch.Tensor,
+    halt_action: torch.Tensor,
+    pair_flat: torch.Tensor,
+    frac_idx: torch.Tensor,
+    no_valid_pairs: torch.Tensor,
+    no_valid_fracs: torch.Tensor,
+    must_halt_no_ships: torch.Tensor,
+    target_planet_reachable_now: torch.Tensor,
+    write_row: torch.Tensor,
+    micro_k: torch.Tensor,
+    max_micro_steps: int,
+) -> TorchTransitionBuffer:
+    """Write one transition per active env into a PyTorch-backed buffer."""
+
+    device = buf.micro_halt_now.device
+    env = env_idx.to(device=device, dtype=torch.long)
+    row = write_row.to(device=device, dtype=torch.long)
+    mk = micro_k.to(device=device, dtype=torch.long)
+    if os.environ.get("ORBIT_WARS_VALIDATE_CUDA_INDEXES") == "1" and int(env.numel()) > 0:
+        active_wr = row.detach().cpu()
+        active_mk = mk.detach().cpu()
+        h_buf = int(buf.micro_halt_now.shape[0])
+        m_buf = int(buf.micro_halt_now.shape[2])
+        if bool(torch.any((active_wr < 0) | (active_wr >= h_buf))):
+            raise RuntimeError(
+                f"append_active_to_torch_buffer write_row out of range: "
+                f"min={int(active_wr.min())} max={int(active_wr.max())} H_buf={h_buf}"
+            )
+        if bool(torch.any((active_mk < 0) | (active_mk >= m_buf) | (active_mk >= int(max_micro_steps)))):
+            raise RuntimeError(
+                f"append_active_to_torch_buffer micro_k out of range: "
+                f"min={int(active_mk.min())} max={int(active_mk.max())} "
+                f"M_buf={m_buf} max_micro_steps={int(max_micro_steps)}"
+            )
+
+    n_idx = torch.arange(env.shape[0], device=device, dtype=torch.long)
+    prev_row = torch.where(mk > 0, row - 1, torch.full_like(row, -1))
+    safe_prev = torch.clamp(prev_row, min=0)
+    has_prev = prev_row >= 0
+
+    def _grow(field: torch.Tensor, new_value: torch.Tensor, fill_value: int | float | bool) -> torch.Tensor:
+        base = field[safe_prev, env, :].clone()
+        base[~has_prev] = fill_value
+        base[n_idx, mk] = new_value.to(device=device, dtype=field.dtype)
+        return base
+
+    new_halt = _grow(buf.micro_halt_now, micro_halt_now, True)
+    new_send = _grow(buf.send, send_now, 0.0)
+    new_angle = _grow(buf.angle, angle_now, 0.0)
+    new_fleet_eta = _grow(buf.fleet_eta, fleet_eta_now, 0.0)
+    new_slot = _grow(buf.slot, slot_now, -1)
+    new_pf = _grow(buf.pair_flat, pair_flat, 0)
+    new_fi = _grow(buf.frac_idx, frac_idx, 0)
+
+    buf.micro_halt_now[row, env, :] = new_halt
+    buf.send[row, env, :] = new_send
+    buf.angle[row, env, :] = new_angle
+    buf.fleet_eta[row, env, :] = new_fleet_eta
+    buf.slot[row, env, :] = new_slot
+    buf.pair_flat[row, env, :] = new_pf
+    buf.frac_idx[row, env, :] = new_fi
+    buf.halt_action[row, env] = halt_action.to(device=device, dtype=torch.int32)
+    buf.no_valid_pairs[row, env] = no_valid_pairs.to(device=device, dtype=torch.bool)
+    buf.no_valid_fracs[row, env] = no_valid_fracs.to(device=device, dtype=torch.bool)
+    buf.must_halt_no_ships[row, env] = must_halt_no_ships.to(device=device, dtype=torch.bool)
+    buf.target_planet_reachable[row, env, :] = target_planet_reachable_now.to(device=device, dtype=torch.bool)
+    buf.phase_micro_idx[row, env] = micro_k.to(device=device, dtype=torch.int32)
+    return buf
+
+
 def _noop_prefix_planes(num_envs: int, max_micro_steps: int):
     m = int(max_micro_steps)
     return (

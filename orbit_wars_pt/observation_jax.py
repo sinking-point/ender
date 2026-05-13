@@ -6,15 +6,12 @@ device — no host loop, no per-env padding, no NumPy stacking.
 
 Output layout matches the original ``ObservationBatch`` semantics:
 
-* ``L = 1 (CLS) + MAX_PLANETS + MAX_FLEET_TOKENS = 1 + 60 + 128 = 189``.
+* ``L = 1 (CLS) + MAX_PLANETS = 61``.
 * CLS token feature index 6 = turn progress in ``[0,1]`` (``step_count / (episode_steps-2)``).
 * ``entity_type[..., 0] = ENTITY_CLS``;
-  ``[..., 1:1+MAX_PLANETS]`` are planet/comet tokens (fixed slots);
-  ``[..., 1+MAX_PLANETS:]`` are compacted active-fleet tokens.
-
-* Fleet tokens are emitted in slot order for active fleets that have persistent
-  destination metadata from dispatch. Fleets launched outside that path have
-  target ``-1`` and are omitted.
+  ``[..., 1:1+MAX_PLANETS]`` are planet/comet tokens (fixed slots).
+* Incoming fleets are collapsed into per-planet signed countdown bins appended
+  to the planet feature vector.
 """
 
 from __future__ import annotations
@@ -26,24 +23,24 @@ import jax
 import jax.numpy as jnp
 
 import jax_orbit_wars as jow
-from jax_orbit_wars import FLEET_ETA, FLEET_TARGET_PLANET, OrbitWarsState
+from jax_orbit_wars import OrbitWarsState
 
 from orbit_wars_pt.constants import (
     BOARD_SIZE,
     CENTER,
     ENTITY_CLS,
     ENTITY_COMET,
-    ENTITY_FLEET,
     ENTITY_PLANET,
-    MAX_FLEET_TOKENS,
+    FEATURE_DIM,
+    INCOMING_TA_BINS,
     MAX_PLANETS,
     NUM_OWNER_SLOTS,
     ROTATION_RADIUS_LIMIT,
 )
 
 
-# Fixed sequence length: [CLS, planet tokens, fleet tokens].
-SEQ_LEN = 1 + MAX_PLANETS + MAX_FLEET_TOKENS
+# Fixed sequence length: [CLS, planet tokens].
+SEQ_LEN = 1 + MAX_PLANETS
 
 
 # ---- Owner remap (2-agent specialization; matches host `_remap_owner` for num_agents <= 2). ----
@@ -148,8 +145,6 @@ def _build_observation_one_env(state: OrbitWarsState, ego: int, ship_speed: floa
 
     planets = state.planets
     planet_active = state.planet_active
-    fleets = state.fleets
-    fleet_active = state.fleet_active
 
     pid = planets[:, 0].astype(jnp.int32)  # [P]
     planet_xy = planets[:, 2:4]
@@ -157,6 +152,12 @@ def _build_observation_one_env(state: OrbitWarsState, ego: int, ship_speed: floa
     planet_owner = planets[:, 1]
     planet_ships = planets[:, 5]
     planet_prod = planets[:, 6]
+
+    incoming = state.incoming_fleets.astype(jnp.float32)  # [A, P, T]
+    self_incoming = incoming[jnp.asarray(ego, dtype=jnp.int32)]
+    other_mask = jnp.arange(state.incoming_fleets.shape[0], dtype=jnp.int32) != jnp.asarray(ego, dtype=jnp.int32)
+    enemy_incoming = jnp.sum(jnp.where(other_mask[:, None, None], incoming, 0.0), axis=0)
+    incoming_net = (self_incoming - enemy_incoming) / 1000.0
 
     # is_comet[i] = True iff pid[i] appears anywhere in comet_planet_ids (which holds
     # only currently spawned-and-alive comet pids; expired entries are -1).
@@ -180,13 +181,14 @@ def _build_observation_one_env(state: OrbitWarsState, ego: int, ship_speed: floa
     planet_etype = jnp.where(is_comet_per_planet, ENTITY_COMET, ENTITY_PLANET).astype(jnp.int32)
     planet_owner_idx = _remap_owner_2p(planet_owner, ego)  # [P], int32
 
-    planet_features = jnp.zeros((MAX_PLANETS, 8), dtype=jnp.float32)
+    planet_features = jnp.zeros((MAX_PLANETS, FEATURE_DIM), dtype=jnp.float32)
     planet_features = planet_features.at[:, 0].set(jnp.log1p(jnp.maximum(planet_prod, 0.0)))
     planet_features = planet_features.at[:, 1].set(planet_ships / 1000.0)
     planet_features = planet_features.at[:, 2].set(vx / 5.0)
     planet_features = planet_features.at[:, 3].set(vy / 5.0)
     planet_features = planet_features.at[:, 4].set(planet_active.astype(jnp.float32))
     planet_features = planet_features.at[:, 5].set(planet_r / 10.0)
+    planet_features = planet_features.at[:, 8:].set(incoming_net)
 
     planet_xy_for_rope = jnp.where(planet_active[:, None], planet_xy, 0.0)
     planet_rope = jnp.zeros((MAX_PLANETS, 3), dtype=jnp.float32)
@@ -195,90 +197,24 @@ def _build_observation_one_env(state: OrbitWarsState, ego: int, ship_speed: floa
 
     planet_entity_mask = planet_active
 
-    # ---- Fleet tokens. ----
-    F = fleets.shape[0]
-    f_owner = fleets[:, 1]
-    f_origin_pid = fleets[:, 5].astype(jnp.int32)
-    f_ships = fleets[:, 6]
-    f_target = fleets[:, FLEET_TARGET_PLANET].astype(jnp.int32)
-    f_eta = fleets[:, FLEET_ETA]
-
-    # Origin slot per fleet: argmax of (planet_id == origin_pid). 0 if no match;
-    # mask via has_origin separately.
-    origin_match = pid[None, :] == f_origin_pid[:, None]  # [F, P]
-    has_origin = jnp.any(origin_match, axis=1)  # [F]
-
-    safe_target = jnp.clip(f_target, 0, MAX_PLANETS - 1)
-    has_target = (f_target >= 0) & (f_target < MAX_PLANETS) & planet_active[safe_target]
-    valid_fleet = fleet_active & has_origin & has_target  # [F]
-
-    # Compact valid fleet slots into the first MAX_FLEET_TOKENS positions, slot-order preserving.
-    F_idx = jnp.arange(F, dtype=jnp.int32)
-    sort_key = jnp.where(valid_fleet, F_idx, F + F_idx)
-    order = jnp.argsort(sort_key)  # [F]
-
-    # When the underlying fleet buffer ``F`` is smaller than ``MAX_FLEET_TOKENS``,
-    # slicing produces a short array; pad to a static ``[MAX_FLEET_TOKENS]`` so
-    # downstream broadcasts have a stable shape. Padded positions point at slot 0
-    # (arbitrary; masked off via ``fleet_token_active``).
-    if F >= MAX_FLEET_TOKENS:
-        take_idx = order[:MAX_FLEET_TOKENS]
-    else:
-        pad_amount = MAX_FLEET_TOKENS - F
-        take_idx = jnp.concatenate(
-            [order, jnp.zeros((pad_amount,), dtype=order.dtype)],
-            axis=0,
-        )
-
-    num_valid = jnp.sum(valid_fleet.astype(jnp.int32))
-    # Compacted slots beyond the underlying buffer length can never be valid.
-    cap = jnp.minimum(num_valid, MAX_FLEET_TOKENS)
-    fleet_token_active = jnp.arange(MAX_FLEET_TOKENS, dtype=jnp.int32) < cap  # [MAX_FLEET_TOKENS]
-
-    # Gather fleet attributes at compact indices.
-    g_owner = f_owner[take_idx]
-    g_ships = f_ships[take_idx]
-    g_hit_pi = safe_target[take_idx]
-    eta = jnp.clip(f_eta[take_idx], 0.0, 500.0)
-
-    # Destination XY = planet center of the hit planet.
-    dst_xy = planet_xy[g_hit_pi]  # [MAX_FLEET_TOKENS, 2]
-    fleet_etype = jnp.where(fleet_token_active, ENTITY_FLEET, 0).astype(jnp.int32)
-    fleet_owner_idx = _remap_owner_2p(g_owner, ego)  # uses 2p remap; matches host
-    fleet_owner_idx = jnp.where(fleet_token_active, fleet_owner_idx, jnp.int32(0))
-
-    fleet_features = jnp.zeros((MAX_FLEET_TOKENS, 8), dtype=jnp.float32)
-    fleet_features = fleet_features.at[:, 0].set(g_ships / 1000.0)
-    fleet_features = fleet_features.at[:, 1].set(g_hit_pi.astype(jnp.float32) / float(MAX_PLANETS))
-
-    fleet_rope = jnp.zeros((MAX_FLEET_TOKENS, 3), dtype=jnp.float32)
-    fleet_rope = fleet_rope.at[:, 0].set(dst_xy[:, 0] / BOARD_SIZE)
-    fleet_rope = fleet_rope.at[:, 1].set(dst_xy[:, 1] / BOARD_SIZE)
-    fleet_rope = fleet_rope.at[:, 2].set(eta / 500.0)
-
-    # Mask features/rope for inactive token slots.
-    fleet_features = jnp.where(fleet_token_active[:, None], fleet_features, 0.0)
-    fleet_rope = jnp.where(fleet_token_active[:, None], fleet_rope, 0.0)
-
-    # ---- Assemble [CLS, planets, fleets]. ----
+    # ---- Assemble [CLS, planets]. ----
     cls_etype = jnp.asarray([ENTITY_CLS], dtype=jnp.int32)
     cls_owner = jnp.asarray([1], dtype=jnp.int32)
-    cls_features = jnp.zeros((1, 8), dtype=jnp.float32)
+    cls_features = jnp.zeros((1, FEATURE_DIM), dtype=jnp.float32)
     cls_features = cls_features.at[0, 6].set(_turn_fraction_jax(state.step_count))
     cls_rope = jnp.asarray([[CENTER / BOARD_SIZE, CENTER / BOARD_SIZE, 0.0]], dtype=jnp.float32)
     cls_entity_mask = jnp.asarray([True], dtype=jnp.bool_)
     cls_planet_mask = jnp.asarray([False], dtype=jnp.bool_)
 
-    entity_type = jnp.concatenate([cls_etype, planet_etype, fleet_etype], axis=0)
-    owner_idx = jnp.concatenate([cls_owner, planet_owner_idx, fleet_owner_idx], axis=0)
-    features = jnp.concatenate([cls_features, planet_features, fleet_features], axis=0)
-    rope_pos = jnp.concatenate([cls_rope, planet_rope, fleet_rope], axis=0)
-    entity_mask = jnp.concatenate([cls_entity_mask, planet_entity_mask, fleet_token_active], axis=0)
+    entity_type = jnp.concatenate([cls_etype, planet_etype], axis=0)
+    owner_idx = jnp.concatenate([cls_owner, planet_owner_idx], axis=0)
+    features = jnp.concatenate([cls_features, planet_features], axis=0)
+    rope_pos = jnp.concatenate([cls_rope, planet_rope], axis=0)
+    entity_mask = jnp.concatenate([cls_entity_mask, planet_entity_mask], axis=0)
     planet_mask = jnp.concatenate(
         [
             jnp.zeros((1,), dtype=jnp.bool_),
             jnp.ones((MAX_PLANETS,), dtype=jnp.bool_),
-            jnp.zeros((MAX_FLEET_TOKENS,), dtype=jnp.bool_),
         ],
         axis=0,
     )
@@ -299,7 +235,7 @@ def build_observation_batched_jax(state_b: OrbitWarsState, ego: int, ship_speed:
 
     Returns a dict of JAX arrays:
       ``entity_type[N, L] int32``,  ``owner_idx[N, L] int32``,
-      ``features[N, L, 8] float32``, ``rope_pos[N, L, 3] float32``,
+      ``features[N, L, FEATURE_DIM] float32``, ``rope_pos[N, L, 3] float32``,
       ``entity_mask[N, L] bool``,   ``planet_mask[N, L] bool``.
 
     The two integer fields are cast to ``torch.long`` inside

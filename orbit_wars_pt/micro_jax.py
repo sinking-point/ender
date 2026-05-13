@@ -460,57 +460,32 @@ def _per_env_apply_one(
     dist = jnp.sqrt(jnp.maximum(jnp.sum(diff * diff), 1e-12))
     direction = diff / dist
     angle = launch_angle
-    launch_dir = jnp.asarray([jnp.cos(angle), jnp.sin(angle)], dtype=state.planets.dtype)
-    sx = o_xy[0] + launch_dir[0] * (o_r + 0.1)
-    sy = o_xy[1] + launch_dir[1] * (o_r + 0.1)
-
-    not_active = ~state.fleet_active
-    has_slot = jnp.any(not_active)
-    slot = jnp.argmax(not_active.astype(jnp.int32))
+    del direction, dist, diff, d_xy, o_xy, o_r
 
     update_state = ~halt_now
-    write_fleet = update_state & has_slot
 
     ship_col = state.planets[:, PLANET_SHIPS]
     ship_col_after = ship_col.at[o_idx].add(-jnp.where(update_state, send, 0.0))
     new_planets = state.planets.at[:, PLANET_SHIPS].set(ship_col_after)
 
-    new_row = jnp.array(
-        [
-            0.0,
-            ego.astype(state.fleets.dtype),
-            sx,
-            sy,
-            angle,
-            oid,
-            send,
-            d_idx.astype(state.fleets.dtype),
-            fleet_eta.astype(state.fleets.dtype),
-        ],
-        dtype=state.fleets.dtype,
-    )
-
-    new_fleets = jnp.where(
-        write_fleet,
-        state.fleets.at[slot].set(new_row),
-        state.fleets,
-    )
-    new_fleet_active = jnp.where(
-        write_fleet,
-        state.fleet_active.at[slot].set(True),
-        state.fleet_active,
+    ta = jnp.floor(jnp.maximum(fleet_eta - 1.0, 0.0)).astype(jnp.int32)
+    ta = jnp.clip(ta, 0, state.incoming_fleets.shape[2] - 1)
+    incoming_u32 = state.incoming_fleets.astype(jnp.uint32)
+    send_u32 = jnp.minimum(send, jnp.asarray(65535.0, dtype=jnp.float32)).astype(jnp.uint32)
+    incoming_u32 = incoming_u32.at[
+        jnp.clip(ego.astype(jnp.int32), 0, state.incoming_fleets.shape[0] - 1), d_idx.astype(jnp.int32), ta
+    ].add(jnp.where(update_state, send_u32, jnp.asarray(0, dtype=jnp.uint32)))
+    new_incoming = jnp.minimum(incoming_u32, jnp.asarray(65535, dtype=jnp.uint32)).astype(
+        state.incoming_fleets.dtype
     )
 
     new_state = state._replace(
         planets=new_planets,
-        fleets=new_fleets,
-        fleet_active=new_fleet_active,
+        incoming_fleets=new_incoming,
     )
 
-    slot_out = jnp.where(
-        write_fleet, slot.astype(jnp.int32), jnp.full((), -1, dtype=jnp.int32)
-    )
-    return new_state, oid, angle, send, write_fleet, slot_out
+    slot_out = jnp.full((), -1, dtype=jnp.int32)
+    return new_state, oid, angle, send, update_state, slot_out
 
 
 @jax.jit
@@ -637,34 +612,20 @@ def apply_prefix_micro_deltas_batched(
     new_ships = ship_col - deduct
     new_planets = state.planets.at[..., PLANET_SHIPS].set(new_ships)
 
-    dtype = state.fleets.dtype
+    incoming0 = state.incoming_fleets.astype(jnp.uint32)
+    b_idx = jnp.arange(state.incoming_fleets.shape[0], dtype=jnp.int32)
 
     def body(k, carry):
-        fleets, active = carry
+        incoming = carry
         dispatch = dispatch_bm[:, k]
-        sl = slot_m[:, k]
-        rows = _fleet_rows_from_pair_batched(
-            new_planets,
-            ego_b,
-            pair_flat_m[:, k],
-            send_m[:, k],
-            angle_m[:, k],
-            fleet_eta_m[:, k],
-            dispatch,
-            dtype,
-        )
+        d_idx = (pair_flat_m[:, k] % p).astype(jnp.int32)
+        ta = jnp.floor(jnp.maximum(fleet_eta_m[:, k] - 1.0, 0.0)).astype(jnp.int32)
+        ta = jnp.clip(ta, 0, state.incoming_fleets.shape[2] - 1)
+        ego_i = jnp.clip(ego_b.astype(jnp.int32), 0, state.incoming_fleets.shape[1] - 1)
+        send_u32 = jnp.minimum(send_m[:, k], jnp.asarray(65535.0, dtype=jnp.float32)).astype(jnp.uint32)
+        add = jnp.where(dispatch, send_u32, jnp.asarray(0, dtype=jnp.uint32))
+        return incoming.at[b_idx, ego_i, d_idx, ta].add(add)
 
-        def write_f(f, _a, d, s, r):
-            return jnp.where(d & (s >= 0), f.at[s].set(r), f)
-
-        new_f = jax.vmap(write_f)(fleets, active, dispatch, sl, rows)
-
-        def write_a(a, d, s):
-            return jnp.where(d & (s >= 0), a.at[s].set(True), a)
-
-        new_a = jax.vmap(write_a)(active, dispatch, sl)
-        return new_f, new_a
-
-    fleets0, active0 = state.fleets, state.fleet_active
-    fleets1, active1 = jax.lax.fori_loop(0, max_micro_steps, body, (fleets0, active0))
-    return state._replace(planets=new_planets, fleets=fleets1, fleet_active=active1)
+    incoming1 = jax.lax.fori_loop(0, max_micro_steps, body, incoming0)
+    incoming1 = jnp.minimum(incoming1, jnp.asarray(65535, dtype=jnp.uint32)).astype(state.incoming_fleets.dtype)
+    return state._replace(planets=new_planets, incoming_fleets=incoming1)

@@ -135,7 +135,7 @@ def main() -> None:
 
     jax_np = {field: np.asarray(jax.device_get(getattr(state_jax, field))) for field in OrbitWarsState._fields}
     torch_np = _torch_to_np_tree(state_t)
-    for field in ("planets", "fleets", "fleet_active"):
+    for field in ("planets", "incoming_fleets"):
         _assert_close(f"state.{field}", torch_np[field], jax_np[field])
 
     obs_jax = build_observation_batched_jax_per_ego(state_jax, jnp.asarray(ego), 6.0)

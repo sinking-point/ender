@@ -204,7 +204,7 @@ def ship_ratio_scores_batched(state: OrbitWarsState) -> Tuple[jnp.ndarray, jnp.n
     """Vmap'd two-player ship-mass ratios; returns ``(r0[N], r1[N])`` on device."""
 
     r0, r1, _ = jax.vmap(_ship_ratio_scores_core)(
-        state.planets, state.planet_active, state.fleets, state.fleet_active
+        state.planets, state.planet_active, state.incoming_fleets
     )
     return r0, r1
 
@@ -214,9 +214,29 @@ def ship_totals_batched(state: OrbitWarsState) -> Tuple[jnp.ndarray, jnp.ndarray
     """Vmap'd absolute ship counts for players 0 and 1; returns ``(ships0[N], ships1[N])``."""
 
     s0, s1 = jax.vmap(_ship_totals_p01_core)(
-        state.planets, state.planet_active, state.fleets, state.fleet_active
+        state.planets, state.planet_active, state.incoming_fleets
     )
     return s0, s1
+
+
+@jax.jit
+def step_env_with_scores_batched(
+    state: OrbitWarsState,
+    actions: jnp.ndarray,
+) -> Tuple[OrbitWarsState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Step a bucket and return reward-delta score components in one dispatch."""
+
+    r0_pre, r1_pre, _ = jax.vmap(_ship_ratio_scores_core)(
+        state.planets, state.planet_active, state.incoming_fleets
+    )
+    next_state = _vmapped_step(state, actions, _DEFAULT_STEP_CFG)
+    r0_post, r1_post, _ = jax.vmap(_ship_ratio_scores_core)(
+        next_state.planets, next_state.planet_active, next_state.incoming_fleets
+    )
+    s0_post, s1_post = jax.vmap(_ship_totals_p01_core)(
+        next_state.planets, next_state.planet_active, next_state.incoming_fleets
+    )
+    return next_state, r0_post - r0_pre, r1_post - r1_pre, s0_post, s1_post
 
 
 @jax.jit

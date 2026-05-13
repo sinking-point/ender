@@ -8,14 +8,15 @@ from typing import Any, Dict, List, Tuple
 import jax
 import numpy as np
 
-from jax_orbit_wars import FLEET_ETA, FLEET_TARGET_PLANET, OrbitWarsConfig
+from jax_orbit_wars import FLEET_ETA, FLEET_OWNER, FLEET_SHIPS, FLEET_TARGET_PLANET, OrbitWarsConfig
 
 from orbit_wars_pt.constants import (
     BOARD_SIZE,
     CENTER,
     ENTITY_CLS,
     ENTITY_COMET,
-    ENTITY_FLEET,
+    FEATURE_DIM,
+    INCOMING_TA_BINS,
     ENTITY_PLANET,
     MAX_FLEET_TOKENS,
     MAX_PLANETS,
@@ -76,8 +77,7 @@ def build_observation(
     planet_active = np.asarray(state.planet_active)
     initial_planets = np.asarray(state.initial_planets)
     initial_active = np.asarray(state.initial_active)
-    fleets = np.asarray(state.fleets)
-    fleet_active = np.asarray(state.fleet_active)
+    incoming_fleets = np.asarray(state.incoming_fleets)
     angular_velocity = float(np.asarray(state.angular_velocity))
     step_count = int(np.asarray(state.step_count))
     num_agents = int(np.asarray(state.num_agents))
@@ -101,7 +101,12 @@ def build_observation(
             planet_idx_by_id[float(planet_ids[i])] = i
 
     cls_turn = _cls_turn_fraction(step_count)
-    cls_feat = np.zeros((8,), dtype=np.float32)
+    incoming = incoming_fleets.astype(np.float32)
+    self_incoming = incoming[int(ego_player)]
+    enemy_incoming = incoming[np.arange(incoming.shape[0]) != int(ego_player)].sum(axis=0)
+    incoming_net = (self_incoming - enemy_incoming) / 1000.0
+
+    cls_feat = np.zeros((FEATURE_DIM,), dtype=np.float32)
     cls_feat[6] = np.float32(cls_turn)
 
     types_list: List[int] = [ENTITY_CLS]
@@ -150,11 +155,11 @@ def build_observation(
                 vy / 5.0,
                 float(active),
                 float(planet_r[i]) / 10.0,
-                0.0,
-                0.0,
+                *([0.0] * (FEATURE_DIM - 6)),
             ],
             dtype=np.float32,
         )
+        feat[8:] = incoming_net[i]
 
         xy = planet_xy[i] if active else np.zeros((2,), dtype=np.float64)
         rope = np.array([float(xy[0]) / BOARD_SIZE, float(xy[1]) / BOARD_SIZE, 0.0], dtype=np.float32)
@@ -165,44 +170,6 @@ def build_observation(
         rope_list.append(rope)
         mask_list.append(active)
         planet_mask_list.append(True)
-
-    base_len = len(types_list)
-    fleet_insertions = 0
-
-    fleet_indices = np.where(fleet_active)[0]
-    for fi in fleet_indices:
-        if fleet_insertions >= max_fleet_tokens:
-            break
-        frow = fleets[fi]
-        oid = float(frow[5])
-        if oid not in planet_idx_by_id:
-            continue
-        origin_idx = planet_idx_by_id[oid]
-        ships_f = float(frow[6])
-        if frow.shape[0] <= FLEET_ETA:
-            continue
-        hit_pi = int(frow[FLEET_TARGET_PLANET])
-        if hit_pi < 0 or hit_pi >= MAX_PLANETS or not bool(planet_active[hit_pi]):
-            continue
-        dst_xy = planet_xy[hit_pi]
-        eta = float(np.clip(frow[FLEET_ETA], 0.0, 500.0))
-
-        ox = _remap_owner(float(frow[1]), ego_player, num_agents)
-        feat = np.zeros((8,), dtype=np.float32)
-        feat[0] = ships_f / 1000.0
-        feat[1] = float(hit_pi) / float(MAX_PLANETS)
-        rope = np.array(
-            [float(dst_xy[0]) / BOARD_SIZE, float(dst_xy[1]) / BOARD_SIZE, float(eta) / 500.0],
-            dtype=np.float32,
-        )
-
-        types_list.append(ENTITY_FLEET)
-        owner_list.append(min(ox, NUM_OWNER_SLOTS - 1))
-        feat_list.append(feat)
-        rope_list.append(rope)
-        mask_list.append(True)
-        planet_mask_list.append(False)
-        fleet_insertions += 1
 
     L = len(types_list)
     entity_type = np.asarray(types_list, dtype=np.int64)
@@ -242,6 +209,7 @@ def jax_state_to_numpy(state: Any) -> Any:
             initial_active=_to_np(state.initial_active),
             fleets=_to_np(state.fleets),
             fleet_active=_to_np(state.fleet_active),
+            incoming_fleets=_to_np(state.incoming_fleets),
             comet_paths=_to_np(state.comet_paths),
             comet_path_lengths=_to_np(state.comet_path_lengths),
             comet_ships=_to_np(state.comet_ships),
@@ -265,8 +233,7 @@ def total_ship_ratio_scores(state_np: Any) -> Tuple[float, float, float]:
 
     planets = np.asarray(state_np.planets)
     planet_active = np.asarray(state_np.planet_active)
-    fleets = np.asarray(state_np.fleets)
-    fleet_active = np.asarray(state_np.fleet_active)
+    incoming_fleets = np.asarray(state_np.incoming_fleets)
 
     scores = np.zeros((4,), dtype=np.float64)
     total = 1e-6
@@ -279,13 +246,9 @@ def total_ship_ratio_scores(state_np: Any) -> Tuple[float, float, float]:
         sh = float(planets[i, 5])
         scores[owner] += sh
         total += sh
-    for i in range(fleets.shape[0]):
-        if not fleet_active[i]:
-            continue
-        owner = int(fleets[i, 1])
-        sh = float(fleets[i, 6])
-        scores[owner] += sh
-        total += sh
+    fleet_scores = incoming_fleets.astype(np.float64).sum(axis=(1, 2))
+    scores[: fleet_scores.shape[0]] += fleet_scores
+    total += float(fleet_scores.sum())
 
     r0 = float(scores[0] / total)
     r1 = float(scores[1] / total)

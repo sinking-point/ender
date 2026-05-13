@@ -23,7 +23,6 @@ if ROOT not in sys.path:
 import jax
 import jax.numpy as jnp
 
-from jax_orbit_wars import FLEET_ETA, FLEET_TARGET_PLANET
 from orbit_wars_pt.batched_env import stack_initial_states
 from orbit_wars_pt.env_wrapper import OrbitWarsEnvConfig
 from orbit_wars_pt.observation import build_observation, jax_state_to_numpy
@@ -42,8 +41,8 @@ def _host_obs_dict(state_np, ego: int, ship_speed: float = 6.0) -> Dict[str, np.
     obs = build_observation(state_np, ego, ship_speed=ship_speed)
     # Host builder emits a variable-length sequence; pad to JAX builder's fixed L
     # so the per-field comparison sees aligned shapes.
-    from orbit_wars_pt.constants import MAX_FLEET_TOKENS, MAX_PLANETS
-    target_L = 1 + MAX_PLANETS + MAX_FLEET_TOKENS
+    from orbit_wars_pt.constants import MAX_PLANETS
+    target_L = 1 + MAX_PLANETS
     L = len(obs.entity_type)
     if L < target_L:
         pad = target_L - L
@@ -119,7 +118,7 @@ def main() -> int:
         ok = _diff_report(host, jax_, f"fresh reset, ego={ego}")
         all_ok = all_ok and ok
 
-    # Inject a couple of synthetic queued fleets.
+    # Inject a couple of synthetic queued arrivals.
     state_one = jax.tree.map(lambda x: x[0], state_b)
     planets_np = np.asarray(state_one.planets)
     pa_np = np.asarray(state_one.planet_active)
@@ -128,21 +127,11 @@ def main() -> int:
     if owned_idx is None or enemy_idx is None:
         print("Could not find self/enemy planets; skipping fleet test")
     else:
-        fleets_np = np.asarray(state_one.fleets).copy()
-        fa_np = np.asarray(state_one.fleet_active).copy()
-        ox, oy = float(planets_np[owned_idx, 2]), float(planets_np[owned_idx, 3])
-        ex, ey = float(planets_np[enemy_idx, 2]), float(planets_np[enemy_idx, 3])
-        ang = float(np.arctan2(ey - oy, ex - ox))
-        oid = float(planets_np[owned_idx, 0])
+        incoming_np = np.asarray(state_one.incoming_fleets).copy()
         for slot, ships in enumerate((5.0, 12.0, 30.0)):
-            row = np.zeros((fleets_np.shape[1],), dtype=np.float32)
-            row[:7] = [float(slot), 0.0, ox, oy, ang, oid, ships]
-            row[FLEET_TARGET_PLANET] = float(enemy_idx)
-            row[FLEET_ETA] = 10.0 + float(slot)
-            fleets_np[slot] = row
-            fa_np[slot] = True
+            incoming_np[0, enemy_idx, 10 + slot] = int(ships)
         state_one = state_one._replace(
-            fleets=jnp.asarray(fleets_np), fleet_active=jnp.asarray(fa_np),
+            incoming_fleets=jnp.asarray(incoming_np),
         )
         state_b2 = jax.tree.map(lambda x: x[None, ...], state_one)
         state_np2 = jax_state_to_numpy(state_one)
