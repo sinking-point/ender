@@ -294,7 +294,7 @@ class OrbitWarsPolicy(nn.Module):
             "planet_hidden": planet_h,
         }
 
-    def forward_dense_rollout(
+    def _forward_dense_fixed(
         self,
         entity_type: torch.Tensor,
         owner_idx: torch.Tensor,
@@ -303,13 +303,7 @@ class OrbitWarsPolicy(nn.Module):
         entity_mask: torch.Tensor,
         planet_mask: torch.Tensor,
     ) -> Dict[str, Any]:
-        """Fixed-length rollout forward path.
-
-        Rollout observations are only ``1 + MAX_PLANETS`` tokens. For these
-        small, frequently-called active batches, avoiding the packed path's
-        scalar sync, stable sort, gather, and dense scatter can beat reducing
-        attention length.
-        """
+        """Fixed-length dense path shared by rollout and PPO."""
 
         x = self.embed(entity_type, owner_idx, features)
         padding_mask = ~entity_mask
@@ -360,6 +354,30 @@ class OrbitWarsPolicy(nn.Module):
             "origin_frac_mask": origin_frac_mask,
             "planet_hidden": planet_h,
         }
+
+    def forward_dense_rollout(
+        self,
+        entity_type: torch.Tensor,
+        owner_idx: torch.Tensor,
+        features: torch.Tensor,
+        rope_pos: torch.Tensor,
+        entity_mask: torch.Tensor,
+        planet_mask: torch.Tensor,
+    ) -> Dict[str, Any]:
+        """Fixed-length rollout forward path.
+
+        This entry point is compiled separately for rollout, whose active
+        batch size changes across micro-steps.
+        """
+
+        return self._forward_dense_fixed(
+            entity_type=entity_type,
+            owner_idx=owner_idx,
+            features=features,
+            rope_pos=rope_pos,
+            entity_mask=entity_mask,
+            planet_mask=planet_mask,
+        )
 
     def target_logits_for_origin_fraction(
         self,

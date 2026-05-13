@@ -178,7 +178,13 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 # Saved in checkpoints for logging / inspection but safe to change when resuming.
-_RESUME_ARG_MISMATCH_IGNORE = frozenset({"activation_checkpointing"})
+_RESUME_ARG_MISMATCH_IGNORE = frozenset(
+    {
+        "activation_checkpointing",
+        "compile",
+        "compile_mode",
+    }
+)
 
 
 def _validate_checkpoint_args(saved: Dict[str, Any], args: argparse.Namespace) -> None:
@@ -1286,14 +1292,16 @@ def train(args: argparse.Namespace) -> None:
     #     forward + masking + logp + entropy + value + clipped surrogate
     #     in a single trace). Large minibatch ⇒ AOT-autograd + Inductor
     #     fusion is a clear win.
-    #   * rollout policy helpers — the rollout hot loop. PPO replay keeps
-    #     using packed ``policy.forward``; rollout uses a fixed-length dense
-    #     path because its 61-token observations are small and called often.
+    #   * rollout policy helpers — rollout uses a fixed-length dense path
+    #     because observations are 61 tokens and calls are frequent; PPO replay
+    #     keeps the packed forward path, which benchmarks faster there.
     compiled_loss_fn: Optional[Any] = None
     if args.compile:
         compile_mode = args.compile_mode
+        helper_compile_mode = "default" if compile_mode == "reduce-overhead" else compile_mode
         print(
-            f"[orbit_wars_pt] torch.compile enabled (mode='{compile_mode}', dynamic=True): "
+            f"[orbit_wars_pt] torch.compile enabled (mode='{compile_mode}', "
+            f"helper_mode='{helper_compile_mode}'): "
             f"policy.forward, rollout policy helpers, and PPO loss.",
             flush=True,
         )
@@ -1301,16 +1309,16 @@ def train(args: argparse.Namespace) -> None:
             compute_ppo_loss_torch, mode=compile_mode, dynamic=True
         )
         policy.forward = torch.compile(  # type: ignore[assignment]
-            policy.forward, mode=compile_mode, dynamic=True
+            policy.forward, mode=helper_compile_mode, dynamic=True
         )
         policy.forward_dense_rollout = torch.compile(  # type: ignore[assignment]
-            policy.forward_dense_rollout, mode=compile_mode, dynamic=True
+            policy.forward_dense_rollout, mode=helper_compile_mode, dynamic=True
         )
         policy.target_logits_for_origin_fraction = torch.compile(  # type: ignore[assignment]
-            policy.target_logits_for_origin_fraction, mode=compile_mode, dynamic=True
+            policy.target_logits_for_origin_fraction, mode=helper_compile_mode, dynamic=True
         )
         policy.fraction_logits = torch.compile(  # type: ignore[assignment]
-            policy.fraction_logits, mode=compile_mode, dynamic=True
+            policy.fraction_logits, mode=helper_compile_mode, dynamic=True
         )
 
     if mem_dbg:
@@ -1772,8 +1780,8 @@ def parse_args() -> argparse.Namespace:
         "--compile",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Compile policy.forward, policy.fraction_logits, and the PPO consolidated "
-        "loss with torch.compile (default on).",
+        help="Compile policy forwards, policy helper heads, and the PPO consolidated loss "
+        "with torch.compile (default on).",
     )
     p.add_argument(
         "--compile-mode",

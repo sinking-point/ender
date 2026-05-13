@@ -942,6 +942,124 @@ def first_hit_brute_rays_baseline_apply_jax(
     return first_lex, hit_any
 
 
+def first_hit_brute_rays_stream_apply_jax(
+    origin_xy: jnp.ndarray,
+    origin_radius: jnp.ndarray,
+    speed: jnp.ndarray,
+    object_p0_by_tick: jnp.ndarray,
+    object_p1_by_tick: jnp.ndarray,
+    object_radii: jnp.ndarray,
+    object_active_by_tick: jnp.ndarray,
+    *,
+    n_rays: int = 2048,
+    ray_angles: jnp.ndarray | None = None,
+    include_sun: bool = True,
+    include_board: bool = True,
+    sun_radius: float = SUN_RADIUS,
+    board_size: float = BOARD_SIZE,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Streaming version of ``first_hit_brute_rays_baseline_apply_jax``.
+
+    It computes one tick's ``[rays, planets]`` sweep at a time instead of
+    materializing the full ``[ticks, rays, planets]`` tensor, and skips the
+    expensive tick body once every ray has already found its first event.
+    """
+
+    dtype = origin_xy.dtype
+    ticks = int(object_active_by_tick.shape[0])
+    planets = int(object_radii.shape[0])
+    launch_off = origin_radius + jnp.asarray(0.1, dtype=dtype)
+
+    if ray_angles is None:
+        kvec = jnp.arange(n_rays, dtype=dtype)
+        theta = kvec * (TAU / jnp.asarray(float(n_rays), dtype=dtype))
+    else:
+        theta = ray_angles
+    u = jnp.stack([jnp.cos(theta), jnp.sin(theta)], axis=-1)
+
+    sun_xy = jnp.asarray([CENTER, CENTER], dtype=dtype)
+    sun_r2 = jnp.asarray(sun_radius, dtype=dtype) ** 2
+    board = jnp.asarray(board_size, dtype=dtype)
+    qa_small = jnp.asarray(1e-12, dtype=dtype)
+    sun_code = planets
+    board_code = planets + int(include_sun)
+    stride = planets + int(include_sun) + int(include_board)
+    stride_j = jnp.asarray(stride, dtype=jnp.int32)
+    big = jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32)
+
+    first0 = jnp.full((n_rays,), big, dtype=jnp.int32)
+    done0 = jnp.zeros((n_rays,), dtype=jnp.bool_)
+
+    def tick_body(tick_i, carry):
+        first_lex, done = carry
+
+        def compute_tick(carry_inner):
+            first_lex, done = carry_inner
+            tick_f = jnp.asarray(tick_i, dtype=dtype)
+            factor = launch_off + speed * tick_f
+            a0 = origin_xy[None, :] + u * factor
+            a1 = a0 + speed * u
+            p0 = object_p0_by_tick[tick_i]
+            p1 = object_p1_by_tick[tick_i]
+
+            d0 = a0[:, None, :] - p0[None, :, :]
+            dv = (a1[:, None, :] - a0[:, None, :]) - (p1[None, :, :] - p0[None, :, :])
+            qa = jnp.sum(dv * dv, axis=-1)
+            qb = 2.0 * jnp.sum(d0 * dv, axis=-1)
+            qc = jnp.sum(d0 * d0, axis=-1) - object_radii[None, :] ** 2
+            disc = qb * qb - 4.0 * qa * qc
+            static_hit = qc <= 0.0
+            sqrt_disc = jnp.sqrt(jnp.maximum(disc, 0.0))
+            qa_safe = jnp.where(qa < qa_small, 1.0, qa)
+            t1 = (-qb - sqrt_disc) / (2.0 * qa_safe)
+            t2 = (-qb + sqrt_disc) / (2.0 * qa_safe)
+            moving_hit = (disc >= 0.0) & (t2 >= 0.0) & (t1 <= 1.0)
+            hit_planet_raw = jnp.where(qa < qa_small, static_hit, moving_hit)
+            hit_planet = hit_planet_raw & object_active_by_tick[tick_i][None, :]
+            any_planet = jnp.any(hit_planet, axis=-1)
+            planet_idx = jnp.argmax(hit_planet.astype(jnp.int32), axis=-1)
+
+            delta = a1 - a0
+            l2 = jnp.sum(delta * delta, axis=-1, keepdims=True)
+            proj_t = jnp.where(
+                l2 == 0.0,
+                0.0,
+                jnp.sum((sun_xy - a0) * delta, axis=-1, keepdims=True) / l2,
+            )
+            proj_t = jnp.clip(proj_t, 0.0, 1.0)
+            projection = a0 + proj_t * delta
+            sun_dist2 = jnp.sum((sun_xy - projection) * (sun_xy - projection), axis=-1)
+            sun_hit_eff = (sun_dist2 < sun_r2) & jnp.asarray(include_sun, dtype=jnp.bool_)
+
+            in_bounds = (
+                (a1[..., 0] >= 0.0)
+                & (a1[..., 0] <= board)
+                & (a1[..., 1] >= 0.0)
+                & (a1[..., 1] <= board)
+            )
+            oob = (~in_bounds) & jnp.asarray(include_board, dtype=jnp.bool_)
+            event_code = jnp.where(
+                any_planet,
+                planet_idx.astype(jnp.int32),
+                jnp.where(
+                    sun_hit_eff,
+                    jnp.asarray(sun_code, dtype=jnp.int32),
+                    jnp.where(oob, jnp.asarray(board_code, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32)),
+                ),
+            )
+            had_event = any_planet | sun_hit_eff | oob
+            tick_lex = jnp.asarray(tick_i, dtype=jnp.int32) * stride_j + event_code
+            new_event = (~done) & had_event
+            first_lex = jnp.where(new_event, tick_lex, first_lex)
+            done = done | had_event
+            return first_lex, done
+
+        return jax.lax.cond(jnp.all(done), lambda x: x, compute_tick, (first_lex, done))
+
+    first_lex, done = jax.lax.fori_loop(0, ticks, tick_body, (first0, done0))
+    return first_lex, done
+
+
 def first_hit_brute_best_targets_from_rays_apply_jax(
     origin_xy: jnp.ndarray,
     origin_radius: jnp.ndarray,
@@ -972,7 +1090,7 @@ def first_hit_brute_best_targets_from_rays_apply_jax(
 
     dtype = origin_xy.dtype
     planets = int(object_radii.shape[0])
-    first_lex, hit_any = first_hit_brute_rays_baseline_apply_jax(
+    first_lex, hit_any = first_hit_brute_rays_stream_apply_jax(
         origin_xy,
         origin_radius,
         speed,
@@ -1051,7 +1169,7 @@ def first_hit_brute_best_targets_from_rays_chunked_apply_jax(
         ray_i = start + jnp.arange(chunk, dtype=jnp.int32)
         ray_valid = ray_i < jnp.asarray(n_rays, dtype=jnp.int32)
         theta = ray_i.astype(dtype) * dtheta
-        first_lex, hit_any = first_hit_brute_rays_baseline_apply_jax(
+        first_lex, hit_any = first_hit_brute_rays_stream_apply_jax(
             origin_xy,
             origin_radius,
             speed,
