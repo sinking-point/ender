@@ -7,6 +7,7 @@ Torch rollout buffers and builds policy observations directly in Torch.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import numpy as np
@@ -186,6 +187,14 @@ def select_and_replay_minibatch_torch(
     is_p0_s = is_p0.to(state_device)
     tag0, tag1 = turn_tag_cache
     turn_idx = torch.where(is_p0_s, tag0[mb_t_s, mb_n_s], tag1[mb_t_s, mb_n_s]).to(torch.long)
+    if os.environ.get("ORBIT_WARS_VALIDATE_CUDA_INDEXES") == "1":
+        turn_idx_cpu = turn_idx.detach().cpu()
+        cache_rows = int(segment.turn_state_cache.planets.shape[0])
+        if bool(torch.any((turn_idx_cpu < 0) | (turn_idx_cpu >= cache_rows))):
+            raise RuntimeError(
+                f"select_and_replay_minibatch_torch turn tag out of range: "
+                f"min={int(turn_idx_cpu.min())} max={int(turn_idx_cpu.max())} cache_rows={cache_rows}"
+            )
     import time
 
     t_select0 = time.perf_counter()
@@ -203,6 +212,14 @@ def select_and_replay_minibatch_torch(
         return torch.where(is_p0, f0[mb_t_t, mb_n_t], f1[mb_t_t, mb_n_t])
 
     phase = scalar(buf0.phase_micro_idx, buf1.phase_micro_idx).to(torch.long)
+    if os.environ.get("ORBIT_WARS_VALIDATE_CUDA_INDEXES") == "1":
+        phase_cpu = phase.detach().cpu()
+        m_buf = int(buf0.micro_halt_now.shape[2])
+        if bool(torch.any((phase_cpu < 0) | (phase_cpu >= m_buf))):
+            raise RuntimeError(
+                f"select_and_replay_minibatch_torch phase index out of range: "
+                f"min={int(phase_cpu.min())} max={int(phase_cpu.max())} M={m_buf}"
+            )
     if timing is not None:
         timing.gather_select_s += time.perf_counter() - t_select0
     t_prefix0 = time.perf_counter()

@@ -94,6 +94,18 @@ def _unique_padded_indices(active_idx: np.ndarray, capacity: int) -> tuple[np.nd
     return idx, mask
 
 
+def _validate_numpy_index_range(name: str, idx: np.ndarray, size: int, *, mask: Optional[np.ndarray] = None) -> None:
+    idx = np.asarray(idx)
+    if mask is not None:
+        idx = idx[np.asarray(mask, dtype=np.bool_)]
+    if idx.size == 0:
+        return
+    lo = int(np.min(idx))
+    hi = int(np.max(idx))
+    if lo < 0 or hi >= int(size):
+        raise RuntimeError(f"{name} out of range: min={lo} max={hi} size={int(size)}")
+
+
 @jax.jit
 def _scatter_state_bucket(
     state_b: OrbitWarsState,
@@ -246,6 +258,7 @@ def _scatter_turn_start_state(
 ) -> OrbitWarsState:
     """Write full ``state_b[n]`` into ``turn_state_cache[turn_slot_per_env[n], n]``."""
 
+    _validate_numpy_index_range("turn_slot_per_env", turn_slot_per_env, int(turn_state_cache.planets.shape[0]))
     device = turn_state_cache.planets.device
     slots = torch.as_tensor(turn_slot_per_env, dtype=torch.long, device=device)
     n_idx = torch.arange(slots.shape[0], dtype=torch.long, device=device)
@@ -768,6 +781,9 @@ def _run_micro_phase(
         active_t = torch.as_tensor(np.array([not h for h in halted], dtype=np.bool_), device=device)
         micro_k_t = torch.full((num_envs,), k, dtype=torch.int32, device=device)
         write_idx_t = torch.as_tensor(write_idx, dtype=torch.int32, device=device)
+        active_mask_np = ~np.array(halted, dtype=np.bool_)
+        _validate_numpy_index_range("rollout write_idx", write_idx, int(buf.micro_halt_now.shape[0]), mask=active_mask_np)
+        _validate_numpy_index_range("rollout micro_k", np.full((num_envs,), k, dtype=np.int32), max_micro_steps, mask=active_mask_np)
         buf = append_to_torch_buffer(
             buf,
             halt_now_all,
@@ -787,9 +803,11 @@ def _run_micro_phase(
             active_t,
             max_micro_steps,
         )
-        rows_t = torch.as_tensor(write_idx, dtype=torch.long, device=device)
-        env_t = torch.arange(num_envs, dtype=torch.long, device=device)
-        turn_tag_j[rows_t, env_t] = torch.as_tensor(turn_slot_np, dtype=torch.int32, device=device)
+        active_env_t = torch.as_tensor(np.flatnonzero(active_mask_np).astype(np.int32), dtype=torch.long, device=device)
+        rows_t = torch.as_tensor(write_idx[active_mask_np], dtype=torch.long, device=device)
+        turn_tag_j[rows_t, active_env_t] = torch.as_tensor(
+            turn_slot_np[active_mask_np], dtype=torch.int32, device=device
+        )
         oid_np = oid_t.detach().cpu().numpy()
         angle_np = angle_applied_t.detach().cpu().numpy()
         send_np = send_t.detach().cpu().numpy()
@@ -1006,6 +1024,8 @@ def _run_async_micro_step(
     active_t = torch.as_tensor(active_mask, dtype=torch.bool, device=device)
     micro_k_t = torch.as_tensor(micro_k, dtype=torch.int32, device=device)
     write_idx_t = torch.as_tensor(write_idx, dtype=torch.int32, device=device)
+    _validate_numpy_index_range("rollout write_idx", write_idx, int(buf.micro_halt_now.shape[0]), mask=active_mask)
+    _validate_numpy_index_range("rollout micro_k", micro_k, max_micro_steps, mask=active_mask)
     buf = append_to_torch_buffer(
         buf,
         halt_now_all,
@@ -1025,9 +1045,9 @@ def _run_async_micro_step(
         active_t,
         max_micro_steps,
     )
-    rows_t = torch.as_tensor(write_idx, dtype=torch.long, device=device)
-    env_t = torch.arange(num_envs, dtype=torch.long, device=device)
-    turn_tag_j[rows_t, env_t] = torch.as_tensor(turn_slot_np, dtype=torch.int32, device=device)
+    active_env_t = torch.as_tensor(active_envs, dtype=torch.long, device=device)
+    rows_t = torch.as_tensor(write_idx[active_mask], dtype=torch.long, device=device)
+    turn_tag_j[rows_t, active_env_t] = torch.as_tensor(turn_slot_np[active_mask], dtype=torch.int32, device=device)
     oid_np = oid_t.detach().cpu().numpy()
     angle_np = angle_applied_t.detach().cpu().numpy()
     send_np = send_t.detach().cpu().numpy()

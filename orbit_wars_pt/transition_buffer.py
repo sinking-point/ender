@@ -11,6 +11,7 @@ turn.  PPO gather replays a prefix with :func:`apply_prefix_micro_deltas_batched
 
 from __future__ import annotations
 
+import os
 from functools import partial
 from typing import Any, NamedTuple
 
@@ -141,21 +142,38 @@ def append_to_torch_buffer(
 ) -> TorchTransitionBuffer:
     """Write one transition per active env into a PyTorch-backed buffer."""
 
-    del max_micro_steps
     device = buf.micro_halt_now.device
     n = int(write_row.shape[0])
     n_idx = torch.arange(n, device=device, dtype=torch.long)
     wr = write_row.to(device=device, dtype=torch.long)
     mk = micro_k.to(device=device, dtype=torch.long)
     active_b = active.to(device=device, dtype=torch.bool)
-    prev_row = torch.where(mk > 0, wr - 1, torch.full_like(wr, -1))
+    safe_wr = torch.where(active_b, wr, torch.zeros_like(wr))
+    safe_mk = torch.where(active_b, mk, torch.zeros_like(mk))
+    if os.environ.get("ORBIT_WARS_VALIDATE_CUDA_INDEXES") == "1" and bool(torch.any(active_b).detach().cpu()):
+        active_wr = wr[active_b].detach().cpu()
+        active_mk = mk[active_b].detach().cpu()
+        h_buf = int(buf.micro_halt_now.shape[0])
+        m_buf = int(buf.micro_halt_now.shape[2])
+        if bool(torch.any((active_wr < 0) | (active_wr >= h_buf))):
+            raise RuntimeError(
+                f"append_to_torch_buffer write_row out of range: "
+                f"min={int(active_wr.min())} max={int(active_wr.max())} H_buf={h_buf}"
+            )
+        if bool(torch.any((active_mk < 0) | (active_mk >= m_buf) | (active_mk >= int(max_micro_steps)))):
+            raise RuntimeError(
+                f"append_to_torch_buffer micro_k out of range: "
+                f"min={int(active_mk.min())} max={int(active_mk.max())} "
+                f"M_buf={m_buf} max_micro_steps={int(max_micro_steps)}"
+            )
+    prev_row = torch.where((safe_mk > 0) & active_b, safe_wr - 1, torch.full_like(safe_wr, -1))
     safe_prev = torch.clamp(prev_row, min=0)
     has_prev = prev_row >= 0
 
     def _grow(field: torch.Tensor, new_value: torch.Tensor, fill_value: int | float | bool) -> torch.Tensor:
         base = field[safe_prev, n_idx, :].clone()
         base[~has_prev] = fill_value
-        base[n_idx, mk] = new_value.to(device=device, dtype=field.dtype)
+        base[n_idx, safe_mk] = new_value.to(device=device, dtype=field.dtype)
         return base
 
     new_halt = _grow(buf.micro_halt_now, micro_halt_now, True)
