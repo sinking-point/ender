@@ -55,11 +55,13 @@ from orbit_wars_pt.env_wrapper import OrbitWarsEnvConfig
 from orbit_wars_pt.gpu_mem import log_cuda_mem
 from orbit_wars_pt.micro_jax import (
     apply_micro_step_batched,
+    apply_micro_step_batched_per_ego,
     must_halt_no_owned_ships_batched,
+    must_halt_no_owned_ships_per_ego,
     selected_origin_fraction_targets_batched,
 )
 from orbit_wars_pt.model import OrbitWarsPolicy
-from orbit_wars_pt.observation_jax import build_observation_batched_jax
+from orbit_wars_pt.observation_jax import build_observation_batched_jax, build_observation_batched_jax_per_ego
 from orbit_wars_pt.transition_buffer import (
     TorchTransitionBuffer,
     append_active_to_torch_buffer,
@@ -128,6 +130,16 @@ def _copy_state_slices(
     idx: jnp.ndarray,
 ) -> OrbitWarsState:
     return jax.tree.map(lambda dst, src: dst.at[idx].set(src[idx]), dst_b, src_b)
+
+
+@jax.jit
+def _copy_state_slices_between(
+    dst_b: OrbitWarsState,
+    dst_idx: jnp.ndarray,
+    src_b: OrbitWarsState,
+    src_idx: jnp.ndarray,
+) -> OrbitWarsState:
+    return jax.tree.map(lambda dst, src: dst.at[dst_idx].set(src[src_idx]), dst_b, src_b)
 
 
 @dataclass
@@ -730,6 +742,337 @@ def _run_async_micro_step(
     return virt_b, buf, obs_buf
 
 
+def _run_async_micro_step_both(
+    *,
+    pending0: np.ndarray,
+    pending1: np.ndarray,
+    virt_b: OrbitWarsState,
+    buf0: TorchTransitionBuffer,
+    buf1: TorchTransitionBuffer,
+    obs0: CompressedObservationBuffer,
+    obs1: CompressedObservationBuffer,
+    write_idx_p0: np.ndarray,
+    write_idx_p1: np.ndarray,
+    write_idx_p0_dev: torch.Tensor,
+    write_idx_p1_dev: torch.Tensor,
+    micro_k: np.ndarray,
+    micro_k_dev: torch.Tensor,
+    valid_p0: np.ndarray,
+    valid_p1: np.ndarray,
+    old_logprob_p0: np.ndarray,
+    old_logprob_p1: np.ndarray,
+    old_value_p0: np.ndarray,
+    old_value_p1: np.ndarray,
+    pending_actions: np.ndarray,
+    pending_action_count: np.ndarray,
+    reward_idx: np.ndarray,
+    halted: np.ndarray,
+    policy: OrbitWarsPolicy,
+    device: torch.device,
+    rng: Optional[torch.Generator],
+    greedy: bool,
+    ship_speed: float,
+    max_micro_steps: int,
+    timing: RolloutTiming,
+    first_hit_n_rays: int,
+    first_hit_ray_chunk_size: int = 0,
+) -> tuple[
+    OrbitWarsState,
+    TorchTransitionBuffer,
+    TorchTransitionBuffer,
+    CompressedObservationBuffer,
+    CompressedObservationBuffer,
+]:
+    """Run one paired p0/p1 micro decision over a fixed ``2 * num_envs`` JAX batch."""
+
+    active0 = np.flatnonzero(pending0).astype(np.int32)
+    active1 = np.flatnonzero(pending1).astype(np.int32)
+    n0 = int(active0.size)
+    n1 = int(active1.size)
+    n_active = n0 + n1
+    total_env_rows = int(virt_b.planets.shape[0])
+    num_envs = total_env_rows // 2
+    if n_active == 0:
+        return virt_b, buf0, buf1, obs0, obs1
+
+    active_rows = np.concatenate([active0, active1 + num_envs]).astype(np.int32)
+    active_idx_t = torch.as_tensor(active_rows, device=device, dtype=torch.long)
+    active0_idx_t = torch.as_tensor(active0, device=device, dtype=torch.long)
+    active1_idx_t = torch.as_tensor(active1, device=device, dtype=torch.long)
+    active0_rows_t = active0_idx_t
+    active1_rows_t = active1_idx_t + int(num_envs)
+    pos0_t = torch.arange(0, n0, device=device, dtype=torch.long)
+    pos1_t = torch.arange(n0, n_active, device=device, dtype=torch.long)
+
+    ego_b_j = jnp.concatenate(
+        [
+            jnp.zeros((num_envs,), dtype=jnp.int32),
+            jnp.ones((num_envs,), dtype=jnp.int32),
+        ],
+        axis=0,
+    )
+
+    t0 = perf_counter()
+    obs_jax = build_observation_batched_jax_per_ego(virt_b, ego_b_j, ship_speed)
+    must_halt_j = must_halt_no_owned_ships_per_ego(virt_b, ego_b_j)
+    timing.obs_build_s += perf_counter() - t0
+
+    t0 = perf_counter()
+    obs_torch = obs_jax_to_torch(obs_jax)
+    must_halt_t = torch.from_dlpack(must_halt_j)
+    obs_torch = decode_observation(compress_observation(obs_torch))
+    obs_index = active_idx_t.to(next(iter(obs_torch.values())).device)
+    active_obs = {key: v.index_select(0, obs_index).to(device) for key, v in obs_torch.items()}
+    must_halt_a = must_halt_t.index_select(0, active_idx_t.to(must_halt_t.device)).to(device)
+    timing.policy_batch_s += perf_counter() - t0
+
+    t0 = perf_counter()
+    out = policy.forward_dense_rollout(**active_obs)
+    t_model = perf_counter()
+    timing.policy_model_s += t_model - t0
+
+    halt_logits = out["halt_logits"]
+    halt_lp = torch.log_softmax(halt_logits, dim=-1)
+    if greedy:
+        halt_sampled = halt_logits.argmax(dim=-1)
+    else:
+        halt_sampled = torch.multinomial(halt_lp.exp(), 1, generator=rng).squeeze(-1)
+    halt_action = torch.where(must_halt_a, torch.ones_like(halt_sampled), halt_sampled)
+    halt_logp = halt_lp.gather(1, halt_action[:, None]).squeeze(-1)
+
+    origin_frac_mask = out["origin_frac_mask"]
+    flat_mask = origin_frac_mask.flatten(start_dim=1)
+    any_valid_origin_frac = flat_mask.any(dim=-1)
+    flat_logits = out["origin_frac_logits"].flatten(start_dim=1)
+    masked_origin_frac = flat_logits.masked_fill(~flat_mask, -1e4)
+    origin_frac_lp = torch.log_softmax(masked_origin_frac, dim=-1)
+    safe_origin_frac = torch.where(
+        any_valid_origin_frac[:, None],
+        masked_origin_frac,
+        torch.zeros_like(masked_origin_frac),
+    )
+    if greedy:
+        origin_frac_flat = safe_origin_frac.argmax(dim=-1)
+    else:
+        origin_frac_flat = torch.multinomial(torch.softmax(safe_origin_frac, dim=-1), 1, generator=rng).squeeze(-1)
+    origin_frac_logp = origin_frac_lp.gather(1, origin_frac_flat[:, None]).squeeze(-1)
+
+    P = MAX_PLANETS
+    o_idx = origin_frac_flat // len(FRACTIONS)
+    frac_idx = origin_frac_flat % len(FRACTIONS)
+    origin_frac_used = (halt_action == 0) & any_valid_origin_frac
+    t_origin = perf_counter()
+    timing.policy_sample_origin_s += t_origin - t_model
+
+    o_idx_all = torch.zeros(total_env_rows, dtype=torch.int32, device=device)
+    frac_idx_geom_all = torch.zeros(total_env_rows, dtype=torch.int32, device=device)
+    o_idx_all.index_copy_(0, active_idx_t, o_idx.to(torch.int32))
+    frac_idx_geom_all.index_copy_(0, active_idx_t, frac_idx.to(torch.int32))
+    origin_idx_j = jax.dlpack.from_dlpack(o_idx_all.contiguous().detach())
+    frac_idx_geom_j = jax.dlpack.from_dlpack(frac_idx_geom_all.contiguous().detach())
+    target_angle_j, _target_width_j, target_valid_j, target_overflow_j, target_hit_tick_j = selected_origin_fraction_targets_batched(
+        virt_b,
+        origin_idx_j,
+        frac_idx_geom_j,
+        horizon=24,
+        ship_speed=ship_speed,
+        samples_per_span=17,
+        n_rays=first_hit_n_rays,
+        ray_chunk_size=first_hit_ray_chunk_size,
+    )
+    target_angle_t = torch.from_dlpack(target_angle_j).index_select(0, active_idx_t)
+    target_valid_t = torch.from_dlpack(target_valid_j).index_select(0, active_idx_t)
+    target_overflow_t = torch.from_dlpack(target_overflow_j).index_select(0, active_idx_t)
+    target_hit_tick_t = torch.from_dlpack(target_hit_tick_j).index_select(0, active_idx_t)
+    t_raycast = perf_counter()
+    timing.policy_raycast_s += t_raycast - t_origin
+
+    n_a_idx = torch.arange(n_active, device=device)
+    target_logits = policy.target_logits_for_origin_fraction(out["planet_hidden"], o_idx, frac_idx)
+    target_mask = out["pair_mask"][n_a_idx, o_idx, :] & target_valid_t & ~target_overflow_t[:, None]
+    any_valid_target = target_mask.any(dim=-1)
+    masked_target = target_logits.masked_fill(~target_mask, -1e4)
+    target_lp = torch.log_softmax(masked_target, dim=-1)
+    safe_target = torch.where(any_valid_target[:, None], masked_target, torch.zeros_like(masked_target))
+    if greedy:
+        d_idx = safe_target.argmax(dim=-1)
+    else:
+        d_idx = torch.multinomial(torch.softmax(safe_target, dim=-1), 1, generator=rng).squeeze(-1)
+    target_logp = target_lp.gather(1, d_idx[:, None]).squeeze(-1)
+    pair_flat = o_idx * P + d_idx
+    angle = target_angle_t[n_a_idx, d_idx]
+    fleet_eta = target_hit_tick_t[n_a_idx, d_idx]
+
+    dispatch_used = origin_frac_used & any_valid_target
+    total_logp = halt_logp + origin_frac_used.float() * origin_frac_logp + dispatch_used.float() * target_logp
+    values_active = out["value"].float()
+    halt_now = ~dispatch_used
+    t_target = perf_counter()
+    timing.policy_target_s += t_target - t_raycast
+
+    halt_now_all = torch.ones(total_env_rows, dtype=torch.bool, device=device)
+    pair_flat_all = torch.zeros(total_env_rows, dtype=torch.int32, device=device)
+    frac_idx_all = torch.zeros(total_env_rows, dtype=torch.int32, device=device)
+    angle_all = torch.zeros(total_env_rows, dtype=torch.float32, device=device)
+    fleet_eta_all = torch.zeros(total_env_rows, dtype=torch.float32, device=device)
+
+    halt_now_all.index_copy_(0, active_idx_t, halt_now)
+    pair_flat_all.index_copy_(0, active_idx_t, pair_flat.to(torch.int32))
+    frac_idx_all.index_copy_(0, active_idx_t, frac_idx.to(torch.int32))
+    angle_all.index_copy_(0, active_idx_t, angle.to(torch.float32))
+    fleet_eta_all.index_copy_(0, active_idx_t, fleet_eta.to(torch.float32))
+    t_scatter = perf_counter()
+    timing.policy_scatter_s += t_scatter - t_target
+    timing.policy_forward_s += t_scatter - t0
+
+    t0 = perf_counter()
+    halt_now_j = jax.dlpack.from_dlpack(halt_now_all.contiguous().detach())
+    pair_flat_j = jax.dlpack.from_dlpack(pair_flat_all.contiguous().detach())
+    frac_idx_j = jax.dlpack.from_dlpack(frac_idx_all.contiguous().detach())
+    angle_j = jax.dlpack.from_dlpack(angle_all.contiguous().detach())
+    fleet_eta_j = jax.dlpack.from_dlpack(fleet_eta_all.contiguous().detach())
+    t1 = perf_counter()
+
+    virt_b, oid_j, angle_j, send_j, dispatched_j, slot_j = apply_micro_step_batched_per_ego(
+        virt_b, ego_b_j, halt_now_j, pair_flat_j, frac_idx_j, angle_j, fleet_eta_j
+    )
+    t2 = perf_counter()
+
+    oid_t = torch.from_dlpack(oid_j)
+    angle_applied_t = torch.from_dlpack(angle_j)
+    send_t = torch.from_dlpack(send_j)
+    dispatched_t = torch.from_dlpack(dispatched_j)
+    slot_t = torch.from_dlpack(slot_j)
+    t3 = perf_counter()
+
+    t3a = perf_counter()
+    rows0_np = write_idx_p0[active0] if n0 else np.zeros((0,), dtype=np.int32)
+    rows1_np = write_idx_p1[active1] if n1 else np.zeros((0,), dtype=np.int32)
+    micro0_np = micro_k[0, active0] if n0 else np.zeros((0,), dtype=np.int32)
+    micro1_np = micro_k[1, active1] if n1 else np.zeros((0,), dtype=np.int32)
+    t3b = perf_counter()
+    if n0:
+        _validate_numpy_index_range("rollout write_idx p0", rows0_np, int(buf0.micro_halt_now.shape[0]))
+        _validate_numpy_index_range("rollout micro_k p0", micro0_np, max_micro_steps)
+    if n1:
+        _validate_numpy_index_range("rollout write_idx p1", rows1_np, int(buf1.micro_halt_now.shape[0]))
+        _validate_numpy_index_range("rollout micro_k p1", micro1_np, max_micro_steps)
+    t4 = perf_counter()
+
+    if n0:
+        micro_k0_t = micro_k_dev[0].index_select(0, active0_idx_t)
+        write_idx0_t = write_idx_p0_dev.index_select(0, active0_idx_t)
+        buf0 = append_active_to_torch_buffer(
+            buf0,
+            active0_idx_t,
+            halt_now.index_select(0, pos0_t),
+            send_t.index_select(0, active0_rows_t),
+            angle_applied_t.index_select(0, active0_rows_t),
+            fleet_eta.index_select(0, pos0_t),
+            slot_t.index_select(0, active0_rows_t),
+            halt_action.index_select(0, pos0_t).to(torch.int32),
+            pair_flat.index_select(0, pos0_t).to(torch.int32),
+            frac_idx.index_select(0, pos0_t).to(torch.int32),
+            (origin_frac_used & ~any_valid_target).index_select(0, pos0_t),
+            (~any_valid_origin_frac & (halt_action == 0)).index_select(0, pos0_t),
+            must_halt_a.index_select(0, pos0_t).to(torch.bool),
+            (target_valid_t & ~target_overflow_t[:, None]).index_select(0, pos0_t).to(torch.bool),
+            write_idx0_t,
+            micro_k0_t,
+            max_micro_steps,
+        )
+    if n1:
+        micro_k1_t = micro_k_dev[1].index_select(0, active1_idx_t)
+        write_idx1_t = write_idx_p1_dev.index_select(0, active1_idx_t)
+        buf1 = append_active_to_torch_buffer(
+            buf1,
+            active1_idx_t,
+            halt_now.index_select(0, pos1_t),
+            send_t.index_select(0, active1_rows_t),
+            angle_applied_t.index_select(0, active1_rows_t),
+            fleet_eta.index_select(0, pos1_t),
+            slot_t.index_select(0, active1_rows_t),
+            halt_action.index_select(0, pos1_t).to(torch.int32),
+            pair_flat.index_select(0, pos1_t).to(torch.int32),
+            frac_idx.index_select(0, pos1_t).to(torch.int32),
+            (origin_frac_used & ~any_valid_target).index_select(0, pos1_t),
+            (~any_valid_origin_frac & (halt_action == 0)).index_select(0, pos1_t),
+            must_halt_a.index_select(0, pos1_t).to(torch.bool),
+            (target_valid_t & ~target_overflow_t[:, None]).index_select(0, pos1_t).to(torch.bool),
+            write_idx1_t,
+            micro_k1_t,
+            max_micro_steps,
+        )
+    t5 = perf_counter()
+
+    if n0:
+        obs0_active = {key: v.index_select(0, pos0_t) for key, v in active_obs.items()}
+        obs0 = store_compressed_observation_rows(obs0, write_idx0_t.to(torch.long), active0_idx_t, obs0_active)
+    if n1:
+        obs1_active = {key: v.index_select(0, pos1_t) for key, v in active_obs.items()}
+        obs1 = store_compressed_observation_rows(obs1, write_idx1_t.to(torch.long), active1_idx_t, obs1_active)
+    t6 = perf_counter()
+
+    oid_active_t = oid_t.index_select(0, active_idx_t)
+    angle_active_t = angle_applied_t.index_select(0, active_idx_t)
+    send_active_t = send_t.index_select(0, active_idx_t)
+    dispatched_active_t = dispatched_t.index_select(0, active_idx_t)
+    oid_np = oid_active_t.detach().cpu().numpy()
+    angle_np = angle_active_t.detach().cpu().numpy()
+    send_np = send_active_t.detach().cpu().numpy()
+    dispatched_np = dispatched_active_t.detach().cpu().numpy()
+    t7 = perf_counter()
+    _accum_micro_apply_breakdown(timing, t0, t1, t2, t3, t3a, t3b, t4, t5, t6, t7)
+
+    total_logp_np = total_logp.detach().cpu().numpy()
+    values_np = values_active.detach().cpu().numpy()
+    halt_now_np = halt_now.detach().cpu().numpy()
+    d_idx_np = d_idx.detach().cpu().numpy()
+    fleet_eta_np = fleet_eta.detach().cpu().numpy()
+
+    if n0:
+        valid_p0[rows0_np, active0] = True
+        old_logprob_p0[rows0_np, active0] = total_logp_np[:n0]
+        old_value_p0[rows0_np, active0] = values_np[:n0]
+    if n1:
+        valid_p1[rows1_np, active1] = True
+        old_logprob_p1[rows1_np, active1] = total_logp_np[n0:]
+        old_value_p1[rows1_np, active1] = values_np[n0:]
+
+    for player, envs, offset, write_idx, micro_arr in (
+        (0, active0, 0, write_idx_p0, micro_k[0]),
+        (1, active1, n0, write_idx_p1, micro_k[1]),
+    ):
+        for local_j, env_i in enumerate(envs):
+            j_arr = offset + local_j
+            env_i = int(env_i)
+            reward_idx[player, env_i] = int(write_idx[env_i])
+            if bool(dispatched_np[j_arr]):
+                ac = int(pending_action_count[player, env_i])
+                if ac < pending_actions.shape[2]:
+                    pending_actions[env_i, player, ac, 0] = float(oid_np[j_arr])
+                    pending_actions[env_i, player, ac, 1] = float(angle_np[j_arr])
+                    pending_actions[env_i, player, ac, 2] = float(send_np[j_arr])
+                    pending_actions[env_i, player, ac, 3] = float(d_idx_np[j_arr])
+                    pending_actions[env_i, player, ac, 4] = float(fleet_eta_np[j_arr])
+                pending_action_count[player, env_i] = ac + 1
+            if bool(halt_now_np[j_arr]):
+                halted[player, env_i] = True
+            write_idx[env_i] += 1
+            micro_arr[env_i] += 1
+            if micro_arr[env_i] >= max_micro_steps:
+                halted[player, env_i] = True
+
+    if n0:
+        write_idx_p0_dev[active0_idx_t] = write_idx0_t + 1
+        micro_k_dev[0, active0_idx_t] = micro_k0_t + 1
+    if n1:
+        write_idx_p1_dev[active1_idx_t] = write_idx1_t + 1
+        micro_k_dev[1, active1_idx_t] = micro_k1_t + 1
+
+    return virt_b, buf0, buf1, obs0, obs1
+
+
 def _reset_prefetch_resync(
     reset_prefetch: Optional[RolloutResetPrefetch],
     seed_base: int,
@@ -853,8 +1196,9 @@ def collect_parallel_micro_rollouts(
         else nullcontext()
     )
 
-    virt0_b = state_b
-    virt1_b = state_b
+    t_state0 = perf_counter()
+    virt_b = jax.tree.map(lambda leaf: jnp.concatenate([leaf, leaf], axis=0), state_b)
+    timing.state_unstack_s += perf_counter() - t_state0
     halted = np.zeros((2, num_envs), dtype=np.bool_)
     micro_k = np.zeros((2, num_envs), dtype=np.int32)
     micro_k_dev = torch.zeros((2, num_envs), dtype=torch.int32, device=device)
@@ -978,8 +1322,17 @@ def collect_parallel_micro_rollouts(
                 micro_k_dev[:, step_env_t] = 0
                 _reset_prefetch_resync(reset_prefetch, seed_base, seeds_consumed, cfg)
                 actual_idx_j = jnp.asarray(step_envs, dtype=jnp.int32)
-                virt0_b = _copy_state_slices(virt0_b, state_b, actual_idx_j)
-                virt1_b = _copy_state_slices(virt1_b, state_b, actual_idx_j)
+                virt_dst_idx_j = jnp.concatenate(
+                    [actual_idx_j, actual_idx_j + jnp.asarray(num_envs, dtype=jnp.int32)],
+                    axis=0,
+                )
+                virt_src_idx_j = jnp.concatenate([actual_idx_j, actual_idx_j], axis=0)
+                virt_b = _copy_state_slices_between(
+                    virt_b,
+                    virt_dst_idx_j,
+                    state_b,
+                    virt_src_idx_j,
+                )
                 timing.env_bookkeeping_s += perf_counter() - t_book0
                 timing.env_step_s += perf_counter() - t0
                 continue
@@ -987,67 +1340,43 @@ def collect_parallel_micro_rollouts(
             if pending_total == 0:
                 break
 
-            ego = 0 if pending0_count >= pending1_count else 1
-            active_envs = np.flatnonzero(pending0 if ego == 0 else pending1).astype(np.int32)
-            if ego == 0:
-                virt0_b, buf0, obs0 = _run_async_micro_step(
-                    ego=0,
-                    active_envs=active_envs,
-                    virt_b=virt0_b,
-                    buf=buf0,
-                    obs_buf=obs0,
-                    write_idx=write_idx_p0,
-                    write_idx_dev=write_idx_p0_dev,
-                    micro_k=micro_k[0],
-                    micro_k_dev=micro_k_dev[0],
-                    valid=valid_p0,
-                    old_logprob=old_logprob_p0,
-                    old_value=old_value_p0,
-                    pending_actions=pending_actions,
-                    pending_action_count=pending_action_count,
-                    reward_idx=reward_idx[0],
-                    halted=halted,
-                    policy=policy,
-                    device=device,
-                    rng=rng,
-                    greedy=greedy,
-                    ship_speed=ship_speed,
-                    max_micro_steps=max_micro_steps_per_player,
-                    timing=timing,
-                    first_hit_n_rays=first_hit_n_rays,
-                    first_hit_ray_chunk_size=first_hit_ray_chunk_size,
-                )
-                if profile_rollout and device.type == "cuda" and not logged_first_policy_fwd:
-                    log_cuda_mem("rollout after first batched policy forward", device)
-                    logged_first_policy_fwd = True
-            else:
-                virt1_b, buf1, obs1 = _run_async_micro_step(
-                    ego=1,
-                    active_envs=active_envs,
-                    virt_b=virt1_b,
-                    buf=buf1,
-                    obs_buf=obs1,
-                    write_idx=write_idx_p1,
-                    write_idx_dev=write_idx_p1_dev,
-                    micro_k=micro_k[1],
-                    micro_k_dev=micro_k_dev[1],
-                    valid=valid_p1,
-                    old_logprob=old_logprob_p1,
-                    old_value=old_value_p1,
-                    pending_actions=pending_actions,
-                    pending_action_count=pending_action_count,
-                    reward_idx=reward_idx[1],
-                    halted=halted,
-                    policy=policy,
-                    device=device,
-                    rng=rng,
-                    greedy=greedy,
-                    ship_speed=ship_speed,
-                    max_micro_steps=max_micro_steps_per_player,
-                    timing=timing,
-                    first_hit_n_rays=first_hit_n_rays,
-                    first_hit_ray_chunk_size=first_hit_ray_chunk_size,
-                )
+            virt_b, buf0, buf1, obs0, obs1 = _run_async_micro_step_both(
+                pending0=pending0,
+                pending1=pending1,
+                virt_b=virt_b,
+                buf0=buf0,
+                buf1=buf1,
+                obs0=obs0,
+                obs1=obs1,
+                write_idx_p0=write_idx_p0,
+                write_idx_p1=write_idx_p1,
+                write_idx_p0_dev=write_idx_p0_dev,
+                write_idx_p1_dev=write_idx_p1_dev,
+                micro_k=micro_k,
+                micro_k_dev=micro_k_dev,
+                valid_p0=valid_p0,
+                valid_p1=valid_p1,
+                old_logprob_p0=old_logprob_p0,
+                old_logprob_p1=old_logprob_p1,
+                old_value_p0=old_value_p0,
+                old_value_p1=old_value_p1,
+                pending_actions=pending_actions,
+                pending_action_count=pending_action_count,
+                reward_idx=reward_idx,
+                halted=halted,
+                policy=policy,
+                device=device,
+                rng=rng,
+                greedy=greedy,
+                ship_speed=ship_speed,
+                max_micro_steps=max_micro_steps_per_player,
+                timing=timing,
+                first_hit_n_rays=first_hit_n_rays,
+                first_hit_ray_chunk_size=first_hit_ray_chunk_size,
+            )
+            if profile_rollout and device.type == "cuda" and not logged_first_policy_fwd:
+                log_cuda_mem("rollout after first batched policy forward", device)
+                logged_first_policy_fwd = True
 
             if np.any(write_idx_p0 >= rollout_micro_horizon) or np.any(write_idx_p1 >= rollout_micro_horizon):
                 horizon_fired = True

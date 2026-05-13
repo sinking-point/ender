@@ -510,6 +510,26 @@ def apply_micro_step_batched(
 
 
 @jax.jit
+def apply_micro_step_batched_per_ego(
+    state: OrbitWarsState,
+    ego_b: jnp.ndarray,
+    halt_now: jnp.ndarray,
+    pair_flat: jnp.ndarray,
+    frac_idx: jnp.ndarray,
+    launch_angle: jnp.ndarray,
+    fleet_eta: jnp.ndarray,
+):
+    """Per-row ego variant of ``apply_micro_step_batched``.
+
+    Returns ``(new_state, oid[B], angle[B], send[B], dispatched[B], slot[B])``.
+    """
+
+    return jax.vmap(_per_env_apply_one, in_axes=(0, 0, 0, 0, 0, 0, 0))(
+        state, ego_b, halt_now, pair_flat, frac_idx, launch_angle, fleet_eta
+    )
+
+
+@jax.jit
 def apply_micro_step_batched_masked(
     state: OrbitWarsState,
     ego_b: jnp.ndarray,
