@@ -50,7 +50,8 @@ from orbit_wars_pt.parallel_rollout import (
 from orbit_wars_pt.reset_prefetch import RolloutResetPrefetch
 from orbit_wars_pt.ppo_replay import compute_ppo_loss_torch
 from orbit_wars_pt.transition_buffer import TorchTransitionBuffer
-from orbit_wars_pt.torch_replay import build_observation_torch, select_and_replay_minibatch_torch
+from orbit_wars_pt.torch_replay import select_stored_observation_minibatch_torch
+from orbit_wars_pt.compressed_observation import compressed_observation_to_host
 
 from jax_orbit_wars import OrbitWarsState
 
@@ -510,10 +511,6 @@ def _torch_buffer_to_host(buf: TorchTransitionBuffer) -> TorchTransitionBuffer:
     )
 
 
-def _torch_state_cache_to_host(state_cache: OrbitWarsState) -> OrbitWarsState:
-    return jax.tree.map(lambda leaf: leaf.detach().cpu().contiguous(), state_cache)
-
-
 def _rollout_segment_to_host(segment: RolloutSegment) -> RolloutSegment:
     """Move device-resident rollout payload to CPU RAM.
 
@@ -525,9 +522,8 @@ def _rollout_segment_to_host(segment: RolloutSegment) -> RolloutSegment:
     return RolloutSegment(
         buf0=_torch_buffer_to_host(segment.buf0),
         buf1=_torch_buffer_to_host(segment.buf1),
-        turn_state_cache=_torch_state_cache_to_host(segment.turn_state_cache),
-        turn_tag_p0=segment.turn_tag_p0.detach().cpu().contiguous(),
-        turn_tag_p1=segment.turn_tag_p1.detach().cpu().contiguous(),
+        obs0=compressed_observation_to_host(segment.obs0),
+        obs1=compressed_observation_to_host(segment.obs1),
         write_idx_p0=np.asarray(segment.write_idx_p0),
         write_idx_p1=np.asarray(segment.write_idx_p1),
         valid_p0=np.asarray(segment.valid_p0),
@@ -713,7 +709,7 @@ def _combine_rollout_timing(items: list[RolloutTiming]) -> RolloutTiming:
         out.micro_prep_wr_mk_s += rt.micro_prep_wr_mk_s
         out.micro_prep_validate_s += rt.micro_prep_validate_s
         out.micro_apply_buf_append_s += rt.micro_apply_buf_append_s
-        out.micro_apply_turn_tag_s += rt.micro_apply_turn_tag_s
+        out.micro_apply_obs_store_s += rt.micro_apply_obs_store_s
         out.micro_apply_numpy_s += rt.micro_apply_numpy_s
         out.state_unstack_s += rt.state_unstack_s
         out.loop_s += rt.loop_s
@@ -743,9 +739,8 @@ def _combine_segments_for_stats(segments: list[RolloutSegment]) -> RolloutSegmen
     return RolloutSegment(
         buf0=first.buf0,
         buf1=first.buf1,
-        turn_state_cache=first.turn_state_cache,
-        turn_tag_p0=first.turn_tag_p0,
-        turn_tag_p1=first.turn_tag_p1,
+        obs0=first.obs0,
+        obs1=first.obs1,
         write_idx_p0=sum((s.write_idx_p0 for s in segments), np.zeros_like(first.write_idx_p0)),
         write_idx_p1=sum((s.write_idx_p1 for s in segments), np.zeros_like(first.write_idx_p1)),
         valid_p0=first.valid_p0,
@@ -788,7 +783,7 @@ def _rollout_timing_str(rt: RolloutTiming) -> str:
         f"micro_apply {rt.micro_apply_s:.3f}s "
         f"(dj {rt.micro_apply_dlpack_in_s:.3f} jax {rt.micro_apply_jax_s:.3f} jp {rt.micro_apply_dlpack_out_s:.3f} "
         f"prep {rt.micro_apply_torch_prep_s:.3f}(act {rt.micro_prep_active_s:.3f} wr {rt.micro_prep_wr_mk_s:.3f} val {rt.micro_prep_validate_s:.3f}) "
-        f"app {rt.micro_apply_buf_append_s:.3f} tag {rt.micro_apply_turn_tag_s:.3f} np {rt.micro_apply_numpy_s:.3f}) "
+        f"app {rt.micro_apply_buf_append_s:.3f} obs_store {rt.micro_apply_obs_store_s:.3f} np {rt.micro_apply_numpy_s:.3f}) "
         f"unstack {rt.state_unstack_s:.3f}s init {rt.init_s:.3f}s unaccounted_loop {unacc_loop:.3f}s outer {rt.outer_iters}"
     )
 
@@ -864,7 +859,7 @@ def _print_rollout_pre_ppo(
 
 def _torch_ppo_loss_from_replay(
     *,
-    state_b: OrbitWarsState,
+    obs: dict[str, torch.Tensor],
     actions: dict[str, torch.Tensor],
     adv: torch.Tensor,
     returns: torch.Tensor,
@@ -878,7 +873,7 @@ def _torch_ppo_loss_from_replay(
     loss_fn: Optional[Any],
     amp_dtype: Optional[torch.dtype],
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    obs = build_observation_torch(state_b, actions["ego"].to(state_b.planets.device), ship_speed)
+    del ship_speed
     fn = loss_fn if loss_fn is not None else compute_ppo_loss_torch
     target_valid = actions["target_planet_reachable"].to(device=adv.device, dtype=torch.bool)
     target_overflow = torch.zeros((target_valid.shape[0],), dtype=torch.bool, device=adv.device)
@@ -956,11 +951,6 @@ def ppo_iteration(
     timing = PPOTiming()
     stats = PPOStats()
     t_total0 = perf_counter()
-    state_device = segment.turn_state_cache.planets.device
-    turn_tag_cache = (
-        segment.turn_tag_p0.to(device=state_device, dtype=torch.long),
-        segment.turn_tag_p1.to(device=state_device, dtype=torch.long),
-    )
 
     for _ in range(ppo_epochs):
         rnd.shuffle(idx)
@@ -972,8 +962,8 @@ def ppo_iteration(
             mb_t = t_idx[mb_idx]
             mb_n = n_idx[mb_idx]
 
-            state_b, actions = select_and_replay_minibatch_torch(
-                segment, mb_player, mb_t, mb_n, turn_tag_cache, replay_device=device, timing=timing
+            obs, actions = select_stored_observation_minibatch_torch(
+                segment, mb_player, mb_t, mb_n, replay_device=device, timing=timing
             )
 
             adv = torch.as_tensor(advantages[mb_idx], device=device, dtype=torch.float32)
@@ -984,7 +974,7 @@ def ppo_iteration(
 
             t0 = perf_counter()
             loss, mb_stats = _torch_ppo_loss_from_replay(
-                state_b=state_b,
+                obs=obs,
                 actions=actions,
                 adv=adv,
                 returns=ret_t,
@@ -1051,15 +1041,6 @@ def ppo_iteration_host_staged(
     timing = PPOTiming()
     stats = PPOStats()
     t_total0 = perf_counter()
-    turn_tag_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
-    for chunk in chunks:
-        state_device = chunk.segment.turn_state_cache.planets.device
-        turn_tag_caches.append(
-            (
-                chunk.segment.turn_tag_p0.to(device=state_device, dtype=torch.long),
-                chunk.segment.turn_tag_p1.to(device=state_device, dtype=torch.long),
-            )
-        )
 
     for _ in range(ppo_epochs):
         chunk_order = np.arange(len(chunks))
@@ -1078,12 +1059,11 @@ def ppo_iteration_host_staged(
                 mb_player = samples["players"][mb_idx]
                 mb_t = samples["t_idx"][mb_idx]
                 mb_n = samples["n_idx"][mb_idx]
-                state_b, actions = select_and_replay_minibatch_torch(
+                obs, actions = select_stored_observation_minibatch_torch(
                     chunk.segment,
                     mb_player,
                     mb_t,
                     mb_n,
-                    turn_tag_caches[chunk_idx],
                     replay_device=device,
                     timing=timing,
                 )
@@ -1095,7 +1075,7 @@ def ppo_iteration_host_staged(
 
                 t0 = perf_counter()
                 loss, mb_stats = _torch_ppo_loss_from_replay(
-                    state_b=state_b,
+                    obs=obs,
                     actions=actions,
                     adv=adv,
                     returns=ret_t,
@@ -1207,7 +1187,7 @@ def _log_iter_tensorboard(
         writer.add_scalar("timing/micro_prep_wr_mk_s", rt.micro_prep_wr_mk_s, it)
         writer.add_scalar("timing/micro_prep_validate_s", rt.micro_prep_validate_s, it)
         writer.add_scalar("timing/micro_apply_buf_append_s", rt.micro_apply_buf_append_s, it)
-        writer.add_scalar("timing/micro_apply_turn_tag_s", rt.micro_apply_turn_tag_s, it)
+        writer.add_scalar("timing/micro_apply_obs_store_s", rt.micro_apply_obs_store_s, it)
         writer.add_scalar("timing/micro_apply_numpy_s", rt.micro_apply_numpy_s, it)
     if ppo_t is not None:
         writer.add_scalar("timing/ppo_total_s", ppo_t.total_s, it)

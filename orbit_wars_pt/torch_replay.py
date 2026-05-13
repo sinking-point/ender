@@ -7,12 +7,15 @@ Torch rollout buffers and builds policy observations directly in Torch.
 
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 import numpy as np
 import torch
 
+from orbit_wars_pt.compressed_observation import (
+    CompressedObservationBuffer,
+    decode_observation,
+)
 from jax_orbit_wars import (
     OrbitWarsState,
     PLANET_ID,
@@ -90,16 +93,51 @@ def apply_prefix_micro_deltas_torch(
     return state._replace(planets=planets, incoming_fleets=incoming)
 
 
-def select_and_replay_minibatch_torch(
+def _select_mixed_compressed_observation(
+    obs0: CompressedObservationBuffer,
+    obs1: CompressedObservationBuffer,
+    is_p0: torch.Tensor,
+    mb_t: torch.Tensor,
+    mb_n: torch.Tensor,
+    *,
+    device: torch.device,
+) -> CompressedObservationBuffer:
+    obs_device = obs0.token_meta.device
+    t = mb_t.to(device=obs_device, dtype=torch.long)
+    n = mb_n.to(device=obs_device, dtype=torch.long)
+    choose0 = is_p0.to(device=obs_device, dtype=torch.bool)
+
+    def pick(field: str) -> torch.Tensor:
+        a = getattr(obs0, field)[t, n]
+        b = getattr(obs1, field)[t, n]
+        mask = choose0
+        while mask.ndim < a.ndim:
+            mask = mask.unsqueeze(-1)
+        return torch.where(mask, a, b).to(device)
+
+    return CompressedObservationBuffer(
+        token_meta=pick("token_meta"),
+        owner_idx=pick("owner_idx"),
+        production=pick("production"),
+        ships=pick("ships"),
+        velocity=pick("velocity"),
+        xy=pick("xy"),
+        turn_progress=pick("turn_progress"),
+        incoming_net=pick("incoming_net"),
+    )
+
+
+def select_stored_observation_minibatch_torch(
     segment: RolloutSegment,
     mb_player: np.ndarray,
     mb_t: np.ndarray,
     mb_n: np.ndarray,
-    turn_tag_cache: tuple[torch.Tensor, torch.Tensor],
     replay_device: Optional[torch.device] = None,
     timing: Optional[object] = None,
-) -> tuple[OrbitWarsState, dict[str, torch.Tensor]]:
-    """Select rows from Torch rollout buffers and reconstruct pre-action state."""
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    """Select stored compressed observations and action records for PPO."""
+
+    import time
 
     buf0, buf1 = segment.buf0, segment.buf1
     storage_device = buf0.micro_halt_now.device
@@ -109,30 +147,16 @@ def select_and_replay_minibatch_torch(
     player_t = torch.as_tensor(mb_player, dtype=torch.long, device=storage_device)
     is_p0 = player_t == 0
 
-    state_device = segment.turn_state_cache.planets.device
-    mb_t_s = mb_t_t.to(state_device)
-    mb_n_s = mb_n_t.to(state_device)
-    player_s = player_t.to(state_device)
-    is_p0_s = is_p0.to(state_device)
-    tag0, tag1 = turn_tag_cache
-    turn_idx = torch.where(is_p0_s, tag0[mb_t_s, mb_n_s], tag1[mb_t_s, mb_n_s]).to(torch.long)
-    if os.environ.get("ORBIT_WARS_VALIDATE_CUDA_INDEXES") == "1":
-        turn_idx_cpu = turn_idx.detach().cpu()
-        cache_rows = int(segment.turn_state_cache.planets.shape[0])
-        if bool(torch.any((turn_idx_cpu < 0) | (turn_idx_cpu >= cache_rows))):
-            raise RuntimeError(
-                f"select_and_replay_minibatch_torch turn tag out of range: "
-                f"min={int(turn_idx_cpu.min())} max={int(turn_idx_cpu.max())} cache_rows={cache_rows}"
-            )
-    import time
-
     t_select0 = time.perf_counter()
-    state = OrbitWarsState(
-        **{
-            field: getattr(segment.turn_state_cache, field)[turn_idx, mb_n_s].to(out_device)
-            for field in OrbitWarsState._fields
-        }
+    comp = _select_mixed_compressed_observation(
+        segment.obs0,
+        segment.obs1,
+        is_p0,
+        mb_t_t,
+        mb_n_t,
+        device=out_device,
     )
+    obs = decode_observation(comp)
 
     def plane(f0: torch.Tensor, f1: torch.Tensor) -> torch.Tensor:
         return torch.where(is_p0[:, None], f0[mb_t_t, mb_n_t, :], f1[mb_t_t, mb_n_t, :])
@@ -141,32 +165,6 @@ def select_and_replay_minibatch_torch(
         return torch.where(is_p0, f0[mb_t_t, mb_n_t], f1[mb_t_t, mb_n_t])
 
     phase = scalar(buf0.phase_micro_idx, buf1.phase_micro_idx).to(torch.long)
-    if os.environ.get("ORBIT_WARS_VALIDATE_CUDA_INDEXES") == "1":
-        phase_cpu = phase.detach().cpu()
-        m_buf = int(buf0.micro_halt_now.shape[2])
-        if bool(torch.any((phase_cpu < 0) | (phase_cpu >= m_buf))):
-            raise RuntimeError(
-                f"select_and_replay_minibatch_torch phase index out of range: "
-                f"min={int(phase_cpu.min())} max={int(phase_cpu.max())} M={m_buf}"
-            )
-    if timing is not None:
-        timing.gather_select_s += time.perf_counter() - t_select0
-    t_prefix0 = time.perf_counter()
-    state = apply_prefix_micro_deltas_torch(
-        state,
-        player_s.to(out_device),
-        plane(buf0.micro_halt_now, buf1.micro_halt_now).to(out_device),
-        plane(buf0.send, buf1.send).to(out_device),
-        plane(buf0.slot, buf1.slot).to(out_device),
-        plane(buf0.pair_flat, buf1.pair_flat).to(out_device),
-        plane(buf0.angle, buf1.angle).to(out_device),
-        plane(buf0.fleet_eta, buf1.fleet_eta).to(out_device),
-        phase.to(out_device),
-    )
-    if timing is not None:
-        timing.prefix_replay_s += time.perf_counter() - t_prefix0
-
-    t_select0 = time.perf_counter()
     row = torch.arange(player_t.shape[0], device=storage_device)
     pf_m = plane(buf0.pair_flat, buf1.pair_flat)
     fi_m = plane(buf0.frac_idx, buf1.frac_idx)
@@ -186,7 +184,7 @@ def select_and_replay_minibatch_torch(
     }
     if timing is not None:
         timing.gather_select_s += time.perf_counter() - t_select0
-    return state, actions
+    return obs, actions
 
 
 def _planet_velocities_torch(state: OrbitWarsState, is_comet: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
