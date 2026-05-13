@@ -306,6 +306,11 @@ class RolloutTiming:
     obs_build_s: float = 0.0
     policy_batch_s: float = 0.0
     policy_forward_s: float = 0.0
+    policy_model_s: float = 0.0
+    policy_sample_origin_s: float = 0.0
+    policy_raycast_s: float = 0.0
+    policy_target_s: float = 0.0
+    policy_scatter_s: float = 0.0
     micro_apply_s: float = 0.0
     # Sub-phases of the ``micro_apply`` window (``_accum_micro_apply_breakdown``).
     micro_apply_dlpack_in_s: float = 0.0
@@ -615,7 +620,7 @@ def _run_micro_phase(
 
         # ---- Policy forward (active subset). ----
         t0 = perf_counter()
-        out = policy(**active_obs)
+        out = policy.forward_dense_rollout(**active_obs)
         timing.policy_forward_s += perf_counter() - t0
 
         # ---- Batched sampling (PyTorch). ----
@@ -888,10 +893,10 @@ def _run_async_micro_step(
     timing.policy_batch_s += perf_counter() - t0
 
     t0 = perf_counter()
-    out = policy(**active_obs)
-    timing.policy_forward_s += perf_counter() - t0
+    out = policy.forward_dense_rollout(**active_obs)
+    t_model = perf_counter()
+    timing.policy_model_s += t_model - t0
 
-    t0 = perf_counter()
     halt_logits = out["halt_logits"]
     halt_lp = torch.log_softmax(halt_logits, dim=-1)
     if greedy:
@@ -922,6 +927,8 @@ def _run_async_micro_step(
     o_idx = origin_frac_flat // len(FRACTIONS)
     frac_idx = origin_frac_flat % len(FRACTIONS)
     origin_frac_used = (halt_action == 0) & any_valid_origin_frac
+    t_origin = perf_counter()
+    timing.policy_sample_origin_s += t_origin - t_model
 
     o_idx_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
     frac_idx_geom_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
@@ -943,6 +950,8 @@ def _run_async_micro_step(
     target_valid_t = torch.from_dlpack(target_valid_j).index_select(0, active_idx_t)
     target_overflow_t = torch.from_dlpack(target_overflow_j).index_select(0, active_idx_t)
     target_hit_tick_t = torch.from_dlpack(target_hit_tick_j).index_select(0, active_idx_t)
+    t_raycast = perf_counter()
+    timing.policy_raycast_s += t_raycast - t_origin
 
     n_a_idx = torch.arange(n_active, device=device)
     target_logits = policy.target_logits_for_origin_fraction(out["planet_hidden"], o_idx, frac_idx)
@@ -964,6 +973,8 @@ def _run_async_micro_step(
     total_logp = halt_logp + origin_frac_used.float() * origin_frac_logp + dispatch_used.float() * target_logp
     values_active = out["value"].float()
     halt_now = ~dispatch_used
+    t_target = perf_counter()
+    timing.policy_target_s += t_target - t_raycast
 
     halt_now_all = torch.ones(num_envs, dtype=torch.bool, device=device)
     pair_flat_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
@@ -988,7 +999,9 @@ def _run_async_micro_step(
     must_halt_no_ships_all.index_copy_(0, active_idx_t, must_halt_a.to(torch.bool))
     total_logp_all.index_copy_(0, active_idx_t, total_logp)
     values_all.index_copy_(0, active_idx_t, values_active)
-    timing.policy_forward_s += perf_counter() - t0
+    t_scatter = perf_counter()
+    timing.policy_scatter_s += t_scatter - t_target
+    timing.policy_forward_s += t_scatter - t0
 
     t0 = perf_counter()
     halt_now_j = jax.dlpack.from_dlpack(halt_now_all.contiguous().detach())
@@ -1448,7 +1461,7 @@ def collect_parallel_micro_rollouts(
         timing.obs_build_s += perf_counter() - t0
         tb0 = perf_counter()
         with amp_ctx:
-            out0 = policy(**obs_jax_to_torch(obs0_j))
+            out0 = policy.forward_dense_rollout(**obs_jax_to_torch(obs0_j))
         timing.policy_batch_s += perf_counter() - tb0
         tf0 = perf_counter()
         v0_np = out0["value"].float().detach().cpu().numpy()
@@ -1459,7 +1472,7 @@ def collect_parallel_micro_rollouts(
         timing.obs_build_s += perf_counter() - t0
         tb1 = perf_counter()
         with amp_ctx:
-            out1 = policy(**obs_jax_to_torch(obs1_j))
+            out1 = policy.forward_dense_rollout(**obs_jax_to_torch(obs1_j))
         timing.policy_batch_s += perf_counter() - tb1
         tf1 = perf_counter()
         v1_np = out1["value"].float().detach().cpu().numpy()

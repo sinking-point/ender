@@ -294,6 +294,73 @@ class OrbitWarsPolicy(nn.Module):
             "planet_hidden": planet_h,
         }
 
+    def forward_dense_rollout(
+        self,
+        entity_type: torch.Tensor,
+        owner_idx: torch.Tensor,
+        features: torch.Tensor,
+        rope_pos: torch.Tensor,
+        entity_mask: torch.Tensor,
+        planet_mask: torch.Tensor,
+    ) -> Dict[str, Any]:
+        """Fixed-length rollout forward path.
+
+        Rollout observations are only ``1 + MAX_PLANETS`` tokens. For these
+        small, frequently-called active batches, avoiding the packed path's
+        scalar sync, stable sort, gather, and dense scatter can beat reducing
+        attention length.
+        """
+
+        x = self.embed(entity_type, owner_idx, features)
+        padding_mask = ~entity_mask
+
+        for blk in self.blocks:
+            if self.activation_checkpointing and torch.is_grad_enabled():
+                x = checkpoint(
+                    blk,
+                    x,
+                    rope_pos,
+                    padding_mask,
+                    use_reentrant=False,
+                )
+            else:
+                x = blk(x, rope_pos, padding_mask)
+        h = self.norm_f(x)
+
+        cls_h = h[:, 0, :]
+        halt_logits = self.halt_head(cls_h)
+        value = self.value_head(cls_h).squeeze(-1)
+
+        planet_h = h[:, 1 : 1 + MAX_PLANETS, :]
+        pq = self.pair_q(planet_h)
+        pk = self.pair_k(planet_h)
+        pair_logits = torch.matmul(pq, pk.transpose(-2, -1)) * (pq.shape[-1] ** -0.5)
+
+        pm = planet_mask[:, 1 : 1 + MAX_PLANETS]
+        em = entity_mask[:, 1 : 1 + MAX_PLANETS]
+        active_planet = pm & em
+        eye = torch.eye(MAX_PLANETS, device=h.device, dtype=torch.bool).unsqueeze(0).expand(h.shape[0], -1, -1)
+        owned_self = owner_idx[:, 1 : 1 + MAX_PLANETS] == 1
+        ships = features[:, 1 : 1 + MAX_PLANETS, 1] * 1000.0
+        has_ships = ships > 0.5
+        origin_ok = active_planet & owned_self & has_ships
+        dest_ok = active_planet
+        pair_mask = origin_ok[:, :, None] & dest_ok[:, None, :] & ~eye
+        sends = torch.floor(self._frac_const.to(features.dtype)[None, None, :] * ships[:, :, None])
+        origin_frac_mask = origin_ok[:, :, None] & (sends >= 1.0)
+        origin_frac_logits = self.origin_frac_head(planet_h)
+
+        return {
+            "hidden": h,
+            "halt_logits": halt_logits,
+            "value": value,
+            "pair_logits": pair_logits,
+            "pair_mask": pair_mask,
+            "origin_frac_logits": origin_frac_logits,
+            "origin_frac_mask": origin_frac_mask,
+            "planet_hidden": planet_h,
+        }
+
     def target_logits_for_origin_fraction(
         self,
         planet_hidden: torch.Tensor,

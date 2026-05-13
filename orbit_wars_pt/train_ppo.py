@@ -693,6 +693,11 @@ def _combine_rollout_timing(items: list[RolloutTiming]) -> RolloutTiming:
         out.obs_build_s += rt.obs_build_s
         out.policy_batch_s += rt.policy_batch_s
         out.policy_forward_s += rt.policy_forward_s
+        out.policy_model_s += rt.policy_model_s
+        out.policy_sample_origin_s += rt.policy_sample_origin_s
+        out.policy_raycast_s += rt.policy_raycast_s
+        out.policy_target_s += rt.policy_target_s
+        out.policy_scatter_s += rt.policy_scatter_s
         out.micro_apply_s += rt.micro_apply_s
         out.micro_apply_dlpack_in_s += rt.micro_apply_dlpack_in_s
         out.micro_apply_jax_s += rt.micro_apply_jax_s
@@ -771,7 +776,10 @@ def _rollout_timing_str(rt: RolloutTiming) -> str:
         f"env_reset {rt.env_reset_s:.3f}s env_book {rt.env_bookkeeping_s:.3f}s env_py {rt.env_python_s:.3f}s "
         f"env_other {env_other:.3f}s "
         f"micro_cap {rt.micro_cap_s:.3f}s obs {rt.obs_build_s:.3f}s "
-        f"pt_batch {rt.policy_batch_s:.3f}s pt_fwd {rt.policy_forward_s:.3f}s micro_apply {rt.micro_apply_s:.3f}s "
+        f"pt_batch {rt.policy_batch_s:.3f}s pt_fwd {rt.policy_forward_s:.3f}s "
+        f"(model {rt.policy_model_s:.3f} org {rt.policy_sample_origin_s:.3f} rays {rt.policy_raycast_s:.3f} "
+        f"target {rt.policy_target_s:.3f} scat {rt.policy_scatter_s:.3f}) "
+        f"micro_apply {rt.micro_apply_s:.3f}s "
         f"(dj {rt.micro_apply_dlpack_in_s:.3f} jax {rt.micro_apply_jax_s:.3f} jp {rt.micro_apply_dlpack_out_s:.3f} "
         f"prep {rt.micro_apply_torch_prep_s:.3f}(act {rt.micro_prep_active_s:.3f} wr {rt.micro_prep_wr_mk_s:.3f} val {rt.micro_prep_validate_s:.3f}) "
         f"app {rt.micro_apply_buf_append_s:.3f} tag {rt.micro_apply_turn_tag_s:.3f} np {rt.micro_apply_numpy_s:.3f}) "
@@ -1278,17 +1286,15 @@ def train(args: argparse.Namespace) -> None:
     #     forward + masking + logp + entropy + value + clipped surrogate
     #     in a single trace). Large minibatch ⇒ AOT-autograd + Inductor
     #     fusion is a clear win.
-    #   * ``policy.forward`` / ``policy.fraction_logits`` — the rollout
-    #     hot loop. With per-sample-front packing the encoder is plain
-    #     dense ops (no NestedTensor, no graph breaks), so wrapping the
-    #     module's ``forward`` with ``torch.compile`` stays cheap and
-    #     amortizes well even at small per-call batches.
+    #   * rollout policy helpers — the rollout hot loop. PPO replay keeps
+    #     using packed ``policy.forward``; rollout uses a fixed-length dense
+    #     path because its 61-token observations are small and called often.
     compiled_loss_fn: Optional[Any] = None
     if args.compile:
         compile_mode = args.compile_mode
         print(
             f"[orbit_wars_pt] torch.compile enabled (mode='{compile_mode}', dynamic=True): "
-            f"policy.forward, policy.fraction_logits, and PPO loss.",
+            f"policy.forward, rollout policy helpers, and PPO loss.",
             flush=True,
         )
         compiled_loss_fn = torch.compile(
@@ -1296,6 +1302,12 @@ def train(args: argparse.Namespace) -> None:
         )
         policy.forward = torch.compile(  # type: ignore[assignment]
             policy.forward, mode=compile_mode, dynamic=True
+        )
+        policy.forward_dense_rollout = torch.compile(  # type: ignore[assignment]
+            policy.forward_dense_rollout, mode=compile_mode, dynamic=True
+        )
+        policy.target_logits_for_origin_fraction = torch.compile(  # type: ignore[assignment]
+            policy.target_logits_for_origin_fraction, mode=compile_mode, dynamic=True
         )
         policy.fraction_logits = torch.compile(  # type: ignore[assignment]
             policy.fraction_logits, mode=compile_mode, dynamic=True
