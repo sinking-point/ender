@@ -339,7 +339,15 @@ def _jax_preamble_to_torch(
         overflow_j = jnp.zeros((target_planet_reachable.shape[0],), dtype=jnp.bool_)
     else:
         origin_idx = pair_flat // MAX_PLANETS
-        _angle_j, _width_j, target_valid_j, overflow_j, _hit_tick_j = selected_origin_fraction_targets_batched(
+        (
+            _angle_j,
+            _width_j,
+            target_valid_j,
+            overflow_j,
+            _hit_tick_j,
+            _true_planet_j,
+            _true_hit_tick_j,
+        ) = selected_origin_fraction_targets_batched(
             state_b,
             origin_idx.astype(jnp.int32),
             frac_idx.astype(jnp.int32),

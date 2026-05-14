@@ -85,7 +85,7 @@ def _run_one(args: argparse.Namespace) -> dict[str, Any]:
         jax.block_until_ready(out)
         times.append(time.perf_counter() - t0)
 
-    angle, _width, valid, overflow, _hit_tick = out
+    angle, _width, valid, overflow, _hit_tick, _true_planet, _true_hit_tick = out
     angle_np, valid_np, overflow_np = jax.device_get((angle, valid, overflow))
     return {
         "chunk_size": int(args.chunk_size),

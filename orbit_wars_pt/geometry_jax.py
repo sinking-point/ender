@@ -950,6 +950,7 @@ def first_hit_brute_rays_stream_apply_jax(
     object_p1_by_tick: jnp.ndarray,
     object_radii: jnp.ndarray,
     object_active_by_tick: jnp.ndarray,
+    policy_object_mask: jnp.ndarray | None = None,
     *,
     n_rays: int = 2048,
     ray_angles: jnp.ndarray | None = None,
@@ -957,7 +958,7 @@ def first_hit_brute_rays_stream_apply_jax(
     include_board: bool = True,
     sun_radius: float = SUN_RADIUS,
     board_size: float = BOARD_SIZE,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Streaming version of ``first_hit_brute_rays_baseline_apply_jax``.
 
     It computes one tick's ``[rays, planets]`` sweep at a time instead of
@@ -989,12 +990,16 @@ def first_hit_brute_rays_stream_apply_jax(
 
     first0 = jnp.full((n_rays,), big, dtype=jnp.int32)
     done0 = jnp.zeros((n_rays,), dtype=jnp.bool_)
+    if policy_object_mask is None:
+        policy_object_mask = jnp.ones((planets,), dtype=jnp.bool_)
+    else:
+        policy_object_mask = policy_object_mask.astype(jnp.bool_)
 
     def tick_body(tick_i, carry):
-        first_lex, done = carry
+        policy_first_lex, policy_done, true_first_lex, true_done = carry
 
         def compute_tick(carry_inner):
-            first_lex, done = carry_inner
+            policy_first_lex, policy_done, true_first_lex, true_done = carry_inner
             tick_f = jnp.asarray(tick_i, dtype=dtype)
             factor = launch_off + speed * tick_f
             a0 = origin_xy[None, :] + u * factor
@@ -1015,9 +1020,12 @@ def first_hit_brute_rays_stream_apply_jax(
             t2 = (-qb + sqrt_disc) / (2.0 * qa_safe)
             moving_hit = (disc >= 0.0) & (t2 >= 0.0) & (t1 <= 1.0)
             hit_planet_raw = jnp.where(qa < qa_small, static_hit, moving_hit)
-            hit_planet = hit_planet_raw & object_active_by_tick[tick_i][None, :]
-            any_planet = jnp.any(hit_planet, axis=-1)
-            planet_idx = jnp.argmax(hit_planet.astype(jnp.int32), axis=-1)
+            hit_planet_true = hit_planet_raw & object_active_by_tick[tick_i][None, :]
+            any_planet_true = jnp.any(hit_planet_true, axis=-1)
+            planet_idx_true = jnp.argmax(hit_planet_true.astype(jnp.int32), axis=-1)
+            hit_planet_policy = hit_planet_true & policy_object_mask[None, :]
+            any_planet_policy = jnp.any(hit_planet_policy, axis=-1)
+            planet_idx_policy = jnp.argmax(hit_planet_policy.astype(jnp.int32), axis=-1)
 
             delta = a1 - a0
             l2 = jnp.sum(delta * delta, axis=-1, keepdims=True)
@@ -1038,26 +1046,48 @@ def first_hit_brute_rays_stream_apply_jax(
                 & (a1[..., 1] <= board)
             )
             oob = (~in_bounds) & jnp.asarray(include_board, dtype=jnp.bool_)
-            event_code = jnp.where(
-                any_planet,
-                planet_idx.astype(jnp.int32),
+            policy_event_code = jnp.where(
+                any_planet_policy,
+                planet_idx_policy.astype(jnp.int32),
                 jnp.where(
                     sun_hit_eff,
                     jnp.asarray(sun_code, dtype=jnp.int32),
                     jnp.where(oob, jnp.asarray(board_code, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32)),
                 ),
             )
-            had_event = any_planet | sun_hit_eff | oob
-            tick_lex = jnp.asarray(tick_i, dtype=jnp.int32) * stride_j + event_code
-            new_event = (~done) & had_event
-            first_lex = jnp.where(new_event, tick_lex, first_lex)
-            done = done | had_event
-            return first_lex, done
+            true_event_code = jnp.where(
+                any_planet_true,
+                planet_idx_true.astype(jnp.int32),
+                jnp.where(
+                    sun_hit_eff,
+                    jnp.asarray(sun_code, dtype=jnp.int32),
+                    jnp.where(oob, jnp.asarray(board_code, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32)),
+                ),
+            )
+            had_policy_event = any_planet_policy | sun_hit_eff | oob
+            had_true_event = any_planet_true | sun_hit_eff | oob
+            tick = jnp.asarray(tick_i, dtype=jnp.int32)
+            policy_tick_lex = tick * stride_j + policy_event_code
+            true_tick_lex = tick * stride_j + true_event_code
+            new_policy_event = (~policy_done) & had_policy_event
+            new_true_event = (~true_done) & had_true_event
+            policy_first_lex = jnp.where(new_policy_event, policy_tick_lex, policy_first_lex)
+            true_first_lex = jnp.where(new_true_event, true_tick_lex, true_first_lex)
+            policy_done = policy_done | had_policy_event
+            true_done = true_done | had_true_event
+            return policy_first_lex, policy_done, true_first_lex, true_done
 
-        return jax.lax.cond(jnp.all(done), lambda x: x, compute_tick, (first_lex, done))
+        return jax.lax.cond(
+            jnp.all(policy_done & true_done),
+            lambda x: x,
+            compute_tick,
+            (policy_first_lex, policy_done, true_first_lex, true_done),
+        )
 
-    first_lex, done = jax.lax.fori_loop(0, ticks, tick_body, (first0, done0))
-    return first_lex, done
+    policy_first_lex, policy_done, true_first_lex, true_done = jax.lax.fori_loop(
+        0, ticks, tick_body, (first0, done0, first0, done0)
+    )
+    return policy_first_lex, policy_done, true_first_lex, true_done
 
 
 def first_hit_brute_best_targets_from_rays_apply_jax(
@@ -1068,13 +1098,14 @@ def first_hit_brute_best_targets_from_rays_apply_jax(
     object_p1_by_tick: jnp.ndarray,
     object_radii: jnp.ndarray,
     object_active_by_tick: jnp.ndarray,
+    policy_object_mask: jnp.ndarray | None = None,
     *,
     n_rays: int = 2048,
     include_sun: bool = True,
     include_board: bool = True,
     board_size: float = BOARD_SIZE,
     sun_radius: float = SUN_RADIUS,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Per-planet launch heading from discrete rays (same sweep as ``first_hit_brute_rays_baseline_apply_jax``).
 
     For each planet ``j``, keep only rays whose **first** terminal event is hitting ``j`` (same
@@ -1083,14 +1114,17 @@ def first_hit_brute_best_targets_from_rays_apply_jax(
     ties use the **smallest ray index**. The reported angle is that ray's heading; width is
     one bin ``2π / n_rays``. If no ray hits ``j`` first, ``valid[j]`` is false.
 
-    Returns ``(angle[P], width[P], valid[P], overflow, hit_tick[P])`` with
-    ``overflow`` always false. ``hit_tick`` is the first terminal-event tick for
-    the selected ray.
+    Returns ``(angle[P], width[P], valid[P], overflow, policy_hit_tick[P],
+    true_hit_planet[P], true_hit_tick[P])`` with ``overflow`` always false.
+    ``policy_hit_tick`` is the visible terminal-event tick for the selected ray.
+    ``true_hit_planet`` / ``true_hit_tick`` keep the unmasked first planet hit for
+    env bookkeeping, so a hidden future comet can receive incoming ships even
+    though it was ignored for policy target selection.
     """
 
     dtype = origin_xy.dtype
     planets = int(object_radii.shape[0])
-    first_lex, hit_any = first_hit_brute_rays_stream_apply_jax(
+    first_lex, hit_any, true_first_lex, true_hit_any = first_hit_brute_rays_stream_apply_jax(
         origin_xy,
         origin_radius,
         speed,
@@ -1098,6 +1132,7 @@ def first_hit_brute_best_targets_from_rays_apply_jax(
         object_p1_by_tick,
         object_radii,
         object_active_by_tick,
+        policy_object_mask,
         n_rays=n_rays,
         include_sun=include_sun,
         include_board=include_board,
@@ -1109,6 +1144,8 @@ def first_hit_brute_best_targets_from_rays_apply_jax(
     iinf = jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32)
     codes = jnp.where(hit_any, first_lex % stride_j, jnp.asarray(-1, dtype=jnp.int32))
     hit_ticks = jnp.where(hit_any, first_lex // stride_j, iinf)
+    true_codes = jnp.where(true_hit_any, true_first_lex % stride_j, jnp.asarray(-1, dtype=jnp.int32))
+    true_ticks = jnp.where(true_hit_any, true_first_lex // stride_j, iinf)
 
     kvec = jnp.arange(n_rays, dtype=dtype)
     theta = kvec * (TAU / jnp.asarray(float(n_rays), dtype=dtype))
@@ -1122,8 +1159,10 @@ def first_hit_brute_best_targets_from_rays_apply_jax(
     ang = jnp.where(ok, _norm_angle(theta[br]), jnp.asarray(0.0, dtype=dtype))
     wid = jnp.where(ok, dtheta, jnp.asarray(0.0, dtype=dtype))
     tick = jnp.where(ok, hit_ticks[br].astype(dtype), jnp.asarray(0.0, dtype=dtype))
+    true_planet = jnp.where(ok & (true_codes[br] < planets), true_codes[br], jnp.asarray(-1, dtype=jnp.int32))
+    true_tick = jnp.where(ok & (true_codes[br] < planets), true_ticks[br].astype(dtype), jnp.asarray(500.0, dtype=dtype))
     overflow = jnp.asarray(False)
-    return ang, wid, ok, overflow, tick
+    return ang, wid, ok, overflow, tick, true_planet, true_tick
 
 
 def first_hit_brute_best_targets_from_rays_chunked_apply_jax(
@@ -1134,6 +1173,7 @@ def first_hit_brute_best_targets_from_rays_chunked_apply_jax(
     object_p1_by_tick: jnp.ndarray,
     object_radii: jnp.ndarray,
     object_active_by_tick: jnp.ndarray,
+    policy_object_mask: jnp.ndarray | None = None,
     *,
     n_rays: int = 2048,
     ray_chunk_size: int = 256,
@@ -1141,7 +1181,7 @@ def first_hit_brute_best_targets_from_rays_chunked_apply_jax(
     include_board: bool = True,
     board_size: float = BOARD_SIZE,
     sun_radius: float = SUN_RADIUS,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Chunked version of ``first_hit_brute_best_targets_from_rays_apply_jax``.
 
     The result matches the full ray grid semantics, but the largest temporary
@@ -1160,16 +1200,18 @@ def first_hit_brute_best_targets_from_rays_chunked_apply_jax(
     best_score0 = jnp.full((planets,), score_inf, dtype=jnp.int32)
     best_ray0 = jnp.zeros((planets,), dtype=jnp.int32)
     best_tick0 = jnp.full((planets,), iinf, dtype=jnp.int32)
+    best_true_planet0 = jnp.full((planets,), -1, dtype=jnp.int32)
+    best_true_tick0 = jnp.full((planets,), iinf, dtype=jnp.int32)
     jp = jnp.arange(planets, dtype=jnp.int32)
     dtheta = TAU / jnp.asarray(float(n_rays), dtype=dtype)
 
     def body(ci, carry):
-        best_score, best_ray, best_tick = carry
+        best_score, best_ray, best_tick, best_true_planet, best_true_tick = carry
         start = ci * chunk
         ray_i = start + jnp.arange(chunk, dtype=jnp.int32)
         ray_valid = ray_i < jnp.asarray(n_rays, dtype=jnp.int32)
         theta = ray_i.astype(dtype) * dtheta
-        first_lex, hit_any = first_hit_brute_rays_stream_apply_jax(
+        first_lex, hit_any, true_first_lex, true_hit_any = first_hit_brute_rays_stream_apply_jax(
             origin_xy,
             origin_radius,
             speed,
@@ -1177,6 +1219,7 @@ def first_hit_brute_best_targets_from_rays_chunked_apply_jax(
             object_p1_by_tick,
             object_radii,
             object_active_by_tick,
+            policy_object_mask,
             n_rays=chunk,
             ray_angles=theta,
             include_sun=include_sun,
@@ -1187,6 +1230,8 @@ def first_hit_brute_best_targets_from_rays_chunked_apply_jax(
         hit_any = hit_any & ray_valid
         codes = jnp.where(hit_any, first_lex % stride_j, jnp.asarray(-1, dtype=jnp.int32))
         hit_ticks = jnp.where(hit_any, first_lex // stride_j, iinf)
+        true_codes = jnp.where(true_hit_any, true_first_lex % stride_j, jnp.asarray(-1, dtype=jnp.int32))
+        true_ticks = jnp.where(true_hit_any, true_first_lex // stride_j, iinf)
         mask = hit_any[:, None] & (codes[:, None] == jp[None, :])
         # ``n_rays + 1`` is plenty for the tie-break index and keeps the score int32.
         ray_score = hit_ticks[:, None] * jnp.asarray(n_rays + 1, dtype=jnp.int32) + ray_i[:, None]
@@ -1195,22 +1240,29 @@ def first_hit_brute_best_targets_from_rays_chunked_apply_jax(
         local_ray_idx = jnp.argmin(scores_rp, axis=0).astype(jnp.int32)
         local_ray = ray_i[local_ray_idx]
         local_tick = hit_ticks[local_ray_idx]
+        local_true_code = true_codes[local_ray_idx]
+        local_true_planet = jnp.where(local_true_code < planets, local_true_code, jnp.asarray(-1, dtype=jnp.int32))
+        local_true_tick = true_ticks[local_ray_idx]
         update = local_score < best_score
         return (
             jnp.where(update, local_score, best_score),
             jnp.where(update, local_ray, best_ray),
             jnp.where(update, local_tick, best_tick),
+            jnp.where(update, local_true_planet, best_true_planet),
+            jnp.where(update, local_true_tick, best_true_tick),
         )
 
-    best_score, best_ray, best_tick = jax.lax.fori_loop(
-        0, chunks, body, (best_score0, best_ray0, best_tick0)
+    best_score, best_ray, best_tick, best_true_planet, best_true_tick = jax.lax.fori_loop(
+        0, chunks, body, (best_score0, best_ray0, best_tick0, best_true_planet0, best_true_tick0)
     )
     ok = best_score < score_inf
     ang = jnp.where(ok, _norm_angle(best_ray.astype(dtype) * dtheta), jnp.asarray(0.0, dtype=dtype))
     wid = jnp.where(ok, dtheta, jnp.asarray(0.0, dtype=dtype))
     tick = jnp.where(ok, best_tick.astype(dtype), jnp.asarray(0.0, dtype=dtype))
+    true_planet = jnp.where(ok, best_true_planet, jnp.asarray(-1, dtype=jnp.int32))
+    true_tick = jnp.where(ok, best_true_tick.astype(dtype), jnp.asarray(500.0, dtype=dtype))
     overflow = jnp.asarray(False)
-    return ang, wid, ok, overflow, tick
+    return ang, wid, ok, overflow, tick, true_planet, true_tick
 
 
 def _sweep_best_targets_from_precomputed_hits_jax(
@@ -1418,6 +1470,7 @@ def first_hit_best_targets_apply_jax(
     object_p1_by_tick: jnp.ndarray,
     object_radii: jnp.ndarray,
     object_active_by_tick: jnp.ndarray,
+    policy_object_mask: jnp.ndarray | None = None,
     *,
     object_order: Sequence[int] | None = None,
     include_board: bool = True,
@@ -1429,7 +1482,7 @@ def first_hit_best_targets_apply_jax(
     same_tick_planets_parallel: bool = False,
     n_rays: int = 2048,
     ray_chunk_size: int = 0,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Discrete-ray first-hit targets (``first_hit_brute_best_targets_from_rays_apply_jax``).
 
     Per planet: among rays whose first event is that planet, use the ray with the **earliest
@@ -1452,6 +1505,7 @@ def first_hit_best_targets_apply_jax(
             object_p1_by_tick,
             object_radii,
             object_active_by_tick,
+            policy_object_mask,
             n_rays=n_rays,
             ray_chunk_size=ray_chunk_size,
             include_sun=include_sun,
@@ -1467,6 +1521,7 @@ def first_hit_best_targets_apply_jax(
         object_p1_by_tick,
         object_radii,
         object_active_by_tick,
+        policy_object_mask,
         n_rays=n_rays,
         include_sun=include_sun,
         include_board=include_board,

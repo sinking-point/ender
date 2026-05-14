@@ -74,3 +74,4 @@ checkpoints/
 artifacts/
 outputs/
 tensorboard/
+records/
