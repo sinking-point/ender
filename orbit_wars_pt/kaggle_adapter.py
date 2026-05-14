@@ -11,7 +11,9 @@ import hashlib
 import math
 import os
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Mapping, NamedTuple, Optional
 
 import numpy as np
@@ -38,8 +40,17 @@ from orbit_wars_pt.model import OrbitWarsPolicy
 DEFAULT_CHECKPOINT = "checkpoint.pt"
 DEFAULT_RAYCAST_RAYS = 256
 DEFAULT_MAX_ACTIONS = 64
+DEFAULT_CPU_THREADS = 1
 MAX_COMET_GROUPS = 5
 MAX_COMET_PATH = 40
+CPU_THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS",
+)
 
 PLANET_X = 2
 PLANET_Y = 3
@@ -52,6 +63,30 @@ FLEET_ANGLE = 4
 FLEET_FROM_PLANET = 5
 FLEET_SHIPS = 6
 FLEET_ROW_WIDTH = 9
+
+
+@dataclass
+class KaggleAgentCallTiming:
+    """Host-side ``perf_counter`` slices for the last ``KaggleOrbitWarsAgent.__call__``."""
+
+    obs_to_state_s: float = 0.0
+    micro_iters: int = 0
+    micro_obs_tensors_s: float = 0.0
+    micro_policy_forward_s: float = 0.0
+    micro_post_forward_s: float = 0.0
+    micro_raycast_s: float = 0.0
+    micro_target_s: float = 0.0
+    micro_book_s: float = 0.0
+
+    def micro_sum_s(self) -> float:
+        return (
+            self.micro_obs_tensors_s
+            + self.micro_policy_forward_s
+            + self.micro_post_forward_s
+            + self.micro_raycast_s
+            + self.micro_target_s
+            + self.micro_book_s
+        )
 
 
 class OrbitWarsState(NamedTuple):
@@ -84,6 +119,23 @@ def _cfg_get(config: Any, name: str, default: Any) -> Any:
     if isinstance(config, Mapping):
         return config.get(name, default)
     return getattr(config, name, default)
+
+
+def _configure_cpu_threads() -> None:
+    raw = os.environ.get("ORBIT_WARS_CPU_THREADS", str(DEFAULT_CPU_THREADS))
+    try:
+        n_threads = int(raw)
+    except ValueError:
+        return
+    if n_threads < 1:
+        return
+    for name in CPU_THREAD_ENV_VARS:
+        os.environ.setdefault(name, str(n_threads))
+    torch.set_num_threads(n_threads)
+    try:
+        torch.set_num_interop_threads(n_threads)
+    except RuntimeError:
+        pass
 
 
 def _as_array(rows: Any, width: int) -> np.ndarray:
@@ -551,6 +603,7 @@ def _build_turn_actions_torch_only(
     greedy: bool = False,
     rng: Optional[torch.Generator] = None,
     n_rays: int = DEFAULT_RAYCAST_RAYS,
+    timing: Optional[KaggleAgentCallTiming] = None,
 ) -> list[list[float]]:
     planets = np.array(np.asarray(state.planets), copy=True)
     incoming_fleets = np.array(np.asarray(state.incoming_fleets), copy=True)
@@ -558,9 +611,21 @@ def _build_turn_actions_torch_only(
     actions: list[list[float]] = []
 
     for _ in range(max_micro_steps):
+        if timing is not None:
+            timing.micro_iters += 1
+
+        t0 = perf_counter()
         virt = state._replace(planets=planets, incoming_fleets=incoming_fleets)
         batch = _obs_tensors_for_state(virt, ego_player, device)
+        if timing is not None:
+            timing.micro_obs_tensors_s += perf_counter() - t0
+
+        t0 = perf_counter()
         out = policy(**batch)
+        if timing is not None:
+            timing.micro_policy_forward_s += perf_counter() - t0
+
+        t0 = perf_counter()
         halt_logits = out["halt_logits"][0]
         if greedy:
             halt_action = int(torch.argmax(halt_logits, dim=-1).item())
@@ -568,10 +633,14 @@ def _build_turn_actions_torch_only(
             halt_probs = torch.softmax(halt_logits, dim=-1)
             halt_action = int(torch.multinomial(halt_probs, 1, generator=rng).item())
         if halt_action == 1:
+            if timing is not None:
+                timing.micro_post_forward_s += perf_counter() - t0
             break
 
         flat_mask = out["origin_frac_mask"].flatten(start_dim=1)[0]
         if not bool(flat_mask.any().item()):
+            if timing is not None:
+                timing.micro_post_forward_s += perf_counter() - t0
             break
         flat_logits = out["origin_frac_logits"].flatten(start_dim=1)[0]
         masked_origin_frac = flat_logits.masked_fill(~flat_mask, -1e4)
@@ -582,7 +651,10 @@ def _build_turn_actions_torch_only(
             origin_frac_flat = int(torch.multinomial(origin_frac_probs, 1, generator=rng).item())
         o_idx = origin_frac_flat // len(FRACTIONS)
         frac_idx = origin_frac_flat % len(FRACTIONS)
+        if timing is not None:
+            timing.micro_post_forward_s += perf_counter() - t0
 
+        t0 = perf_counter()
         ray_angle, ray_valid, ray_hit_tick, true_planet, true_hit_tick = _raycast_targets_np(
             virt,
             int(o_idx),
@@ -591,7 +663,10 @@ def _build_turn_actions_torch_only(
             horizon=INCOMING_TA_BINS,
             n_rays=n_rays,
         )
+        if timing is not None:
+            timing.micro_raycast_s += perf_counter() - t0
 
+        t0 = perf_counter()
         target_logits = policy.target_logits_for_origin_fraction(
             out["planet_hidden"],
             torch.tensor([o_idx], device=device, dtype=torch.long),
@@ -604,6 +679,8 @@ def _build_turn_actions_torch_only(
         ray_valid_t = torch.from_numpy(ray_valid).to(device=device, dtype=torch.bool)
         target_mask &= ray_valid_t
         if not bool(target_mask.any().item()):
+            if timing is not None:
+                timing.micro_target_s += perf_counter() - t0
             break
         masked_target = target_logits.masked_fill(~target_mask, -1e4)
         if greedy:
@@ -611,11 +688,16 @@ def _build_turn_actions_torch_only(
         else:
             target_probs = torch.softmax(masked_target, dim=-1)
             d_idx = int(torch.multinomial(target_probs, 1, generator=rng).item())
+        if timing is not None:
+            timing.micro_target_s += perf_counter() - t0
 
+        t0 = perf_counter()
         ships_avail = float(planets[o_idx, 5])
         send = max(1, math.floor(float(FRACTIONS[frac_idx]) * ships_avail))
         send = min(send, int(ships_avail))
         if send <= 0:
+            if timing is not None:
+                timing.micro_book_s += perf_counter() - t0
             break
         angle = float(ray_angle[d_idx])
         actions.append([float(planets[o_idx, 0]), float(angle), int(send)])
@@ -628,7 +710,11 @@ def _build_turn_actions_torch_only(
             cur = int(incoming_fleets[owner, env_target, ta])
             incoming_fleets[owner, env_target, ta] = min(cur + int(send), 65535)
         if not planet_active[o_idx] or planets[o_idx, 5] < 1.0:
+            if timing is not None:
+                timing.micro_book_s += perf_counter() - t0
             continue
+        if timing is not None:
+            timing.micro_book_s += perf_counter() - t0
 
     return actions
 
@@ -820,6 +906,7 @@ class KaggleOrbitWarsAgent:
         seed: Optional[int] = None,
         raycast_rays: Optional[int] = None,
     ):
+        _configure_cpu_threads()
         self.checkpoint_path = Path(checkpoint_path)
         self.policy, self.device, training_args = load_policy(self.checkpoint_path, device=device)
         self.greedy = bool(greedy)
@@ -838,6 +925,7 @@ class KaggleOrbitWarsAgent:
         self.rng.manual_seed(int(seed if seed is not None else os.environ.get("ORBIT_WARS_AGENT_SEED", "0")))
         self._game_key: Optional[str] = None
         self._next_step_count = 0
+        self._last_call_timing: Optional[KaggleAgentCallTiming] = None
 
     def _obs_game_key(self, obs: Mapping[str, Any]) -> str:
         initial = np.asarray(obs.get("initial_planets", obs.get("planets", [])), dtype=np.float32)
@@ -864,14 +952,18 @@ class KaggleOrbitWarsAgent:
 
     @torch.inference_mode()
     def __call__(self, obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
+        self._last_call_timing = None
+        timing = KaggleAgentCallTiming()
+        t0 = perf_counter()
         state = observation_to_state(
             obs,
             config,
             max_fleets=self.max_fleets,
             step_count_override=self._step_count_for_obs(obs),
         )
+        timing.obs_to_state_s = perf_counter() - t0
         ship_speed = float(_cfg_get(config, "shipSpeed", 6.0))
-        return _build_turn_actions_torch_only(
+        actions = _build_turn_actions_torch_only(
             self.policy,
             state,
             int(obs.get("player", 0)),
@@ -881,11 +973,23 @@ class KaggleOrbitWarsAgent:
             greedy=self.greedy,
             rng=self.rng,
             n_rays=self.raycast_rays,
+            timing=timing,
         )
+        self._last_call_timing = timing
+        return actions
 
 
 _AGENT: Optional[KaggleOrbitWarsAgent] = None
 _ERROR_REPORTED = False
+
+
+def get_last_agent_call_timing() -> Optional[KaggleAgentCallTiming]:
+    """Timing from the last successful ``KaggleOrbitWarsAgent.__call__`` (same global as ``agent``)."""
+
+    inst = _AGENT
+    if inst is None:
+        return None
+    return getattr(inst, "_last_call_timing", None)
 
 
 def _report_once(exc: BaseException) -> None:

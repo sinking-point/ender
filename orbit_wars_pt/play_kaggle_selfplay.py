@@ -10,6 +10,15 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+CPU_THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "BLIS_NUM_THREADS",
+)
+
 
 def _json_default(obj: Any) -> Any:
     if hasattr(obj, "toJSON"):
@@ -76,12 +85,26 @@ def main() -> None:
     )
     parser.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=1,
+        help="CPU worker threads for Torch/BLAS libraries. Use 0 to leave existing settings alone.",
+    )
+    parser.add_argument(
         "--timings",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Print per-agent-call wall-clock timings while the episode is running.",
+        help="Print per-agent-call wall-clock timings while the episode is running "
+        "(includes adapter internal breakdown from orbit_wars_pt.kaggle_adapter).",
     )
     args = parser.parse_args()
+
+    if args.cpu_threads > 0:
+        for name in CPU_THREAD_ENV_VARS:
+            os.environ[name] = str(int(args.cpu_threads))
+        os.environ["ORBIT_WARS_CPU_THREADS"] = str(int(args.cpu_threads))
+    else:
+        os.environ["ORBIT_WARS_CPU_THREADS"] = "0"
 
     os.environ["ORBIT_WARS_CHECKPOINT"] = str(Path(args.checkpoint).expanduser())
     os.environ["ORBIT_WARS_DEVICE"] = str(args.device)
@@ -99,6 +122,27 @@ def main() -> None:
     from kaggle_environments import make
 
     from agent import agent
+    from orbit_wars_pt.kaggle_adapter import get_last_agent_call_timing
+
+    def _agent_internal_timing_suffix(dt_wall: float) -> str:
+        t = get_last_agent_call_timing()
+        if t is None:
+            return " internal=unavailable"
+        micro_sum = t.micro_sum_s()
+        slack = dt_wall - t.obs_to_state_s - micro_sum
+        return (
+            " internal["
+            f"obs_to_state={t.obs_to_state_s:.4f}s "
+            f"micro_iters={t.micro_iters} "
+            f"micro_obs_tensors={t.micro_obs_tensors_s:.4f}s "
+            f"micro_policy_fwd={t.micro_policy_forward_s:.4f}s "
+            f"micro_post_fwd={t.micro_post_forward_s:.4f}s "
+            f"micro_raycast={t.micro_raycast_s:.4f}s "
+            f"micro_target={t.micro_target_s:.4f}s "
+            f"micro_book={t.micro_book_s:.4f}s "
+            f"micro_sum={micro_sum:.4f}s "
+            f"slack={slack:+.4f}s]"
+        )
 
     def _swap_owner(owner: Any) -> Any:
         if owner == 0:
@@ -126,7 +170,7 @@ def main() -> None:
             return config.get(key, default)
         return getattr(config, key, default)
 
-    def _timed_agent(base_agent: Callable[[dict[str, Any], Any], list[list[float]]]):
+    def _timed_agent(base_agent: Callable[[dict[str, Any], Any], list[list[float]]], *, show_internal: bool):
         def wrapped(obs: dict[str, Any], config: Any = None) -> list[list[float]]:
             step = obs.get("step", obs.get("step_count", "?"))
             player = obs.get("player", "?")
@@ -147,8 +191,9 @@ def main() -> None:
                 overage_suffix = ""
                 if before_overage is not None:
                     overage_suffix = f" remainingOverage {float(before_overage):.3f}->{after_overage:.3f}s"
+                internal_suffix = _agent_internal_timing_suffix(dt) if show_internal else ""
                 print(
-                    f"[timing] step={step} player={player} duration={dt:.6f}s"
+                    f"[timing] step={step} player={player} duration={dt:.6f}s{internal_suffix}"
                     f"{timeout_suffix}{overage_suffix}",
                     flush=True,
                 )
@@ -162,7 +207,7 @@ def main() -> None:
     env = make("orbit_wars", configuration=configuration, debug=bool(args.debug))
     run_agent = _swapped_view_agent if args.swap_player_view else agent
     if args.timings:
-        run_agent = _timed_agent(run_agent)
+        run_agent = _timed_agent(run_agent, show_internal=True)
     env.run([run_agent, run_agent])
 
     record = {
