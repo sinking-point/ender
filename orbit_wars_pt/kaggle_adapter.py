@@ -401,7 +401,7 @@ def _forecast_planet_paths_np(state: OrbitWarsState, horizon: int = INCOMING_TA_
     )
 
 
-def _raycast_targets_np(
+def _simulate_discrete_ray_policy_hits_np(
     state: OrbitWarsState,
     origin_idx: int,
     frac_idx: int,
@@ -409,8 +409,8 @@ def _raycast_targets_np(
     ship_speed: float = 6.0,
     horizon: int = INCOMING_TA_BINS,
     n_rays: int = DEFAULT_RAYCAST_RAYS,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """NumPy version of the rollout discrete first-hit ray target sampler."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Discrete per-tick fleet forward model; returns ray angles and first-hit bookkeeping."""
 
     planets = np.asarray(state.planets)
     current_active = np.asarray(state.planet_active).astype(bool)
@@ -484,6 +484,48 @@ def _raycast_targets_np(
         done_true |= had_true
 
         pos = a1
+
+    return angles, policy_code, policy_tick, true_code, true_tick, done_policy
+
+
+def discrete_policy_rays_hit_planet_mask(
+    state: OrbitWarsState,
+    origin_idx: int,
+    frac_idx: int,
+    *,
+    ship_speed: float = 6.0,
+    horizon: int = INCOMING_TA_BINS,
+    n_rays: int = DEFAULT_RAYCAST_RAYS,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Ray angles whose policy-side first stop is an active planet (same discrete sim as training).
+
+    Returns ``(angles, hits)`` with ``hits[i]`` true iff discrete ray ``i`` first resolved to a planet index
+    (``policy_code[i] >= 0``), as opposed to sun or out-of-bounds alone.
+    """
+
+    angles, policy_code, _, _, _, done_policy = _simulate_discrete_ray_policy_hits_np(
+        state, origin_idx, frac_idx, ship_speed=ship_speed, horizon=horizon, n_rays=n_rays
+    )
+    hits = (policy_code >= 0) & done_policy
+    return angles, hits
+
+
+def _raycast_targets_np(
+    state: OrbitWarsState,
+    origin_idx: int,
+    frac_idx: int,
+    *,
+    ship_speed: float = 6.0,
+    horizon: int = INCOMING_TA_BINS,
+    n_rays: int = DEFAULT_RAYCAST_RAYS,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """NumPy version of the rollout discrete first-hit ray target sampler."""
+
+    angles, policy_code, policy_tick, true_code, true_tick, done_policy = _simulate_discrete_ray_policy_hits_np(
+        state, origin_idx, frac_idx, ship_speed=ship_speed, horizon=horizon, n_rays=n_rays
+    )
+    planets = np.asarray(state.planets)
+    current_active = np.asarray(state.planet_active).astype(bool)
 
     out_angle = np.zeros((MAX_PLANETS,), dtype=np.float32)
     valid = np.zeros((MAX_PLANETS,), dtype=np.bool_)
