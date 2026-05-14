@@ -6,8 +6,9 @@ import argparse
 import copy
 import json
 import os
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 def _json_default(obj: Any) -> Any:
@@ -54,8 +55,14 @@ def main() -> None:
     parser.add_argument(
         "--raycast-rays",
         type=int,
-        default=256,
-        help="Discrete ray count for the NumPy first-hit target filter.",
+        default=None,
+        help="Override discrete ray count for the NumPy first-hit target filter. Default: checkpoint first_hit_n_rays.",
+    )
+    parser.add_argument(
+        "--max-micro-steps",
+        type=int,
+        default=None,
+        help="Override maximum policy micro-actions per turn. Default: checkpoint max_micro_steps.",
     )
     parser.add_argument(
         "--swap-player-view",
@@ -68,13 +75,26 @@ def main() -> None:
         ),
     )
     parser.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--timings",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print per-agent-call wall-clock timings while the episode is running.",
+    )
     args = parser.parse_args()
 
     os.environ["ORBIT_WARS_CHECKPOINT"] = str(Path(args.checkpoint).expanduser())
     os.environ["ORBIT_WARS_DEVICE"] = str(args.device)
     os.environ["ORBIT_WARS_GREEDY"] = "1" if args.greedy else "0"
     os.environ["ORBIT_WARS_AGENT_SEED"] = str(int(args.agent_seed))
-    os.environ["ORBIT_WARS_RAYCAST_RAYS"] = str(int(args.raycast_rays))
+    if args.raycast_rays is not None:
+        os.environ["ORBIT_WARS_RAYCAST_RAYS"] = str(int(args.raycast_rays))
+    else:
+        os.environ.pop("ORBIT_WARS_RAYCAST_RAYS", None)
+    if args.max_micro_steps is not None:
+        os.environ["ORBIT_WARS_MAX_MICRO_STEPS"] = str(int(args.max_micro_steps))
+    else:
+        os.environ.pop("ORBIT_WARS_MAX_MICRO_STEPS", None)
 
     from kaggle_environments import make
 
@@ -99,12 +119,50 @@ def main() -> None:
             fleet[1] = _swap_owner(fleet[1])
         return agent(obs2, config)
 
+    def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
+        if config is None:
+            return default
+        if isinstance(config, dict):
+            return config.get(key, default)
+        return getattr(config, key, default)
+
+    def _timed_agent(base_agent: Callable[[dict[str, Any], Any], list[list[float]]]):
+        def wrapped(obs: dict[str, Any], config: Any = None) -> list[list[float]]:
+            step = obs.get("step", obs.get("step_count", "?"))
+            player = obs.get("player", "?")
+            before_overage = obs.get("remainingOverageTime", None)
+            act_timeout = _cfg_get(config, "actTimeout", None)
+            t0 = time.perf_counter()
+            try:
+                return base_agent(obs, config)
+            finally:
+                dt = time.perf_counter() - t0
+                overage_spent = 0.0
+                if act_timeout is not None:
+                    overage_spent = max(0.0, dt - float(act_timeout))
+                after_overage = None if before_overage is None else float(before_overage) - overage_spent
+                timeout_suffix = ""
+                if act_timeout is not None:
+                    timeout_suffix = f" actTimeout={float(act_timeout):.3f}s overage_spent={overage_spent:.3f}s"
+                overage_suffix = ""
+                if before_overage is not None:
+                    overage_suffix = f" remainingOverage {float(before_overage):.3f}->{after_overage:.3f}s"
+                print(
+                    f"[timing] step={step} player={player} duration={dt:.6f}s"
+                    f"{timeout_suffix}{overage_suffix}",
+                    flush=True,
+                )
+
+        return wrapped
+
     configuration: dict[str, Any] = {}
     if args.seed is not None:
         configuration["seed"] = int(args.seed)
 
     env = make("orbit_wars", configuration=configuration, debug=bool(args.debug))
     run_agent = _swapped_view_agent if args.swap_player_view else agent
+    if args.timings:
+        run_agent = _timed_agent(run_agent)
     env.run([run_agent, run_agent])
 
     record = {

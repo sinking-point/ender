@@ -779,11 +779,19 @@ def _infer_policy_kwargs(payload: Any) -> dict[str, Any]:
     return kwargs
 
 
+def _checkpoint_training_args(payload: Any) -> Mapping[str, Any]:
+    if isinstance(payload, Mapping):
+        training_args = payload.get("training_args", {})
+        if isinstance(training_args, Mapping):
+            return training_args
+    return {}
+
+
 def load_policy(
     checkpoint_path: str | os.PathLike[str] = DEFAULT_CHECKPOINT,
     *,
     device: Optional[str | torch.device] = None,
-) -> tuple[OrbitWarsPolicy, torch.device]:
+) -> tuple[OrbitWarsPolicy, torch.device, Mapping[str, Any]]:
     """Load a training checkpoint or raw policy state dict for inference."""
 
     torch_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -795,7 +803,7 @@ def load_policy(
     policy = OrbitWarsPolicy(**_infer_policy_kwargs(payload)).to(torch_device)
     policy.load_state_dict(policy_state)
     policy.eval()
-    return policy, torch_device
+    return policy, torch_device, _checkpoint_training_args(payload)
 
 
 class KaggleOrbitWarsAgent:
@@ -807,17 +815,25 @@ class KaggleOrbitWarsAgent:
         *,
         device: Optional[str | torch.device] = None,
         greedy: bool = False,
-        max_micro_steps: int = DEFAULT_MAX_ACTIONS,
+        max_micro_steps: Optional[int] = None,
         max_fleets: int = 512,
         seed: Optional[int] = None,
-        raycast_rays: int = DEFAULT_RAYCAST_RAYS,
+        raycast_rays: Optional[int] = None,
     ):
         self.checkpoint_path = Path(checkpoint_path)
-        self.policy, self.device = load_policy(self.checkpoint_path, device=device)
+        self.policy, self.device, training_args = load_policy(self.checkpoint_path, device=device)
         self.greedy = bool(greedy)
-        self.max_micro_steps = int(max_micro_steps)
+        self.max_micro_steps = int(
+            max_micro_steps
+            if max_micro_steps is not None
+            else training_args.get("max_micro_steps", DEFAULT_MAX_ACTIONS)
+        )
         self.max_fleets = int(max_fleets)
-        self.raycast_rays = int(raycast_rays)
+        self.raycast_rays = int(
+            raycast_rays
+            if raycast_rays is not None
+            else training_args.get("first_hit_n_rays", DEFAULT_RAYCAST_RAYS)
+        )
         self.rng = torch.Generator(device=self.device)
         self.rng.manual_seed(int(seed if seed is not None else os.environ.get("ORBIT_WARS_AGENT_SEED", "0")))
         self._game_key: Optional[str] = None
@@ -893,9 +909,19 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
         greedy = os.environ.get("ORBIT_WARS_GREEDY", "0").lower() in {"1", "true", "yes", "on"}
         seed_raw = os.environ.get("ORBIT_WARS_AGENT_SEED")
         seed = int(seed_raw) if seed_raw is not None else None
-        rays = int(os.environ.get("ORBIT_WARS_RAYCAST_RAYS", str(DEFAULT_RAYCAST_RAYS)))
+        rays_raw = os.environ.get("ORBIT_WARS_RAYCAST_RAYS")
+        rays = int(rays_raw) if rays_raw is not None else None
+        max_micro_raw = os.environ.get("ORBIT_WARS_MAX_MICRO_STEPS")
+        max_micro_steps = int(max_micro_raw) if max_micro_raw is not None else None
         try:
-            _AGENT = KaggleOrbitWarsAgent(ckpt, device=device, greedy=greedy, seed=seed, raycast_rays=rays)
+            _AGENT = KaggleOrbitWarsAgent(
+                ckpt,
+                device=device,
+                greedy=greedy,
+                max_micro_steps=max_micro_steps,
+                seed=seed,
+                raycast_rays=rays,
+            )
         except Exception as exc:
             _report_once(exc)
             return []
