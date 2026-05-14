@@ -161,6 +161,7 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "ship_speed",
         "first_hit_n_rays",
         "first_hit_ray_chunk_size",
+        "micro_step_penalty",
         "max_grad_norm",
         "d_model",
         "n_heads",
@@ -877,6 +878,7 @@ def _torch_ppo_loss_from_replay(
     fn = loss_fn if loss_fn is not None else compute_ppo_loss_torch
     target_valid = actions["target_planet_reachable"].to(device=adv.device, dtype=torch.bool)
     target_overflow = torch.zeros((target_valid.shape[0],), dtype=torch.bool, device=adv.device)
+    target_hit_tick = actions["target_hit_tick"].to(device=adv.device, dtype=torch.float32)
     amp_ctx = (
         torch.autocast(device_type="cuda", dtype=amp_dtype)
         if amp_dtype is not None
@@ -893,6 +895,7 @@ def _torch_ppo_loss_from_replay(
             obs["planet_mask"].to(device=adv.device, dtype=torch.bool),
             target_valid,
             target_overflow,
+            target_hit_tick,
             actions["halt_action"].to(device=adv.device, dtype=torch.long),
             actions["pair_flat"].to(device=adv.device, dtype=torch.long),
             actions["frac_idx"].to(device=adv.device, dtype=torch.long),
@@ -1443,6 +1446,7 @@ def _train_loop(
                     reset_prefetch=reset_prefetch,
                     first_hit_n_rays=max(8, int(args.first_hit_n_rays)),
                     first_hit_ray_chunk_size=max(0, int(args.first_hit_ray_chunk_size)),
+                    micro_step_penalty=float(args.micro_step_penalty),
                 )
                 rollout_env_seed += seeds_used
                 cfg.max_fleets = rollout_carry.cfg.max_fleets
@@ -1504,6 +1508,7 @@ def _train_loop(
                 reset_prefetch=reset_prefetch,
                 first_hit_n_rays=max(8, int(args.first_hit_n_rays)),
                 first_hit_ray_chunk_size=max(0, int(args.first_hit_ray_chunk_size)),
+                micro_step_penalty=float(args.micro_step_penalty),
             )
             rollout_env_seed += seeds_used
             t_samples0 = time.perf_counter()
@@ -1713,7 +1718,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("--lr", type=float, default=3e-5)
-    p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--gamma", type=float, default=1.0)
     p.add_argument("--lam", type=float, default=0.95)
     p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--entropy-coef", type=float, default=0.01)
@@ -1741,6 +1746,15 @@ def parse_args() -> argparse.Namespace:
             "If >0 and smaller than --first-hit-n-rays, process discrete first-hit geometry "
             "in JAX ray chunks of this size to lower peak XLA temporary memory. 0 keeps "
             "the current full-ray implementation."
+        ),
+    )
+    p.add_argument(
+        "--micro-step-penalty",
+        type=float,
+        default=1e-4,
+        help=(
+            "Small reward penalty per dispatched micro-action/fleet launch. Halt-only "
+            "micro-steps are not charged. Set 0 to disable."
         ),
     )
     p.add_argument("--max-grad-norm", type=float, default=0.5)

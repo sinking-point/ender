@@ -180,6 +180,11 @@ def select_stored_observation_minibatch_torch(
             buf0.target_planet_reachable[mb_t_t, mb_n_t, :],
             buf1.target_planet_reachable[mb_t_t, mb_n_t, :],
         ).to(out_device, dtype=torch.bool),
+        "target_hit_tick": torch.where(
+            is_p0[:, None],
+            buf0.target_hit_tick[mb_t_t, mb_n_t, :],
+            buf1.target_hit_tick[mb_t_t, mb_n_t, :],
+        ).to(out_device, dtype=torch.float32),
         "ego": player_t.to(out_device),
     }
     if timing is not None:

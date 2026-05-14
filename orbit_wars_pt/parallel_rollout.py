@@ -599,7 +599,18 @@ def _run_async_micro_step(
     timing.policy_raycast_s += t_raycast - t_origin
 
     n_a_idx = torch.arange(n_active, device=device)
-    target_logits = policy.target_logits_for_origin_fraction(out["planet_hidden"], o_idx, frac_idx)
+    planet_ships = active_obs["features"][:, 1 : 1 + MAX_PLANETS, 1] * 1000.0
+    origin_ships = active_obs["features"][n_a_idx, 1 + o_idx, 1] * 1000.0
+    frac_values = origin_ships.new_tensor(FRACTIONS)
+    fleet_size_for_logits = torch.floor(frac_values[frac_idx] * origin_ships)
+    target_logits = policy.target_logits_for_origin_fraction(
+        out["planet_hidden"],
+        o_idx,
+        frac_idx,
+        fleet_size_for_logits,
+        target_hit_tick_t,
+        planet_ships,
+    )
     target_mask = out["pair_mask"][n_a_idx, o_idx, :] & target_valid_t & ~target_overflow_t[:, None]
     any_valid_target = target_mask.any(dim=-1)
     masked_target = target_logits.masked_fill(~target_mask, -1e4)
@@ -663,9 +674,6 @@ def _run_async_micro_step(
     no_valid_pairs_j = jax.dlpack.from_dlpack(no_valid_pairs_all.contiguous().detach())
     no_valid_fracs_j = jax.dlpack.from_dlpack(no_valid_fracs_all.contiguous().detach())
     must_halt_no_ships_j = jax.dlpack.from_dlpack(must_halt_no_ships_all.contiguous().detach())
-    target_pr_all = torch.zeros((num_envs, P), dtype=torch.bool, device=device)
-    target_pr_all.index_copy_(0, active_idx_t, (target_valid_t & ~target_overflow_t[:, None]).to(torch.bool))
-    target_planet_reachable_j = jax.dlpack.from_dlpack(target_pr_all.contiguous().detach())
     t1 = perf_counter()
 
     virt_b, oid_j, angle_j, send_j, dispatched_j, slot_j = apply_micro_step_batched(
@@ -704,6 +712,7 @@ def _run_async_micro_step(
         ~any_valid_origin_frac & (halt_action == 0),
         must_halt_a.to(torch.bool),
         (target_valid_t & ~target_overflow_t[:, None]).to(torch.bool),
+        target_hit_tick_t.to(torch.float32),
         write_idx_t,
         micro_k_t,
         max_micro_steps,
@@ -779,6 +788,8 @@ def _run_async_micro_step_both(
     old_logprob_p1: np.ndarray,
     old_value_p0: np.ndarray,
     old_value_p1: np.ndarray,
+    reward_p0: np.ndarray,
+    reward_p1: np.ndarray,
     pending_actions: np.ndarray,
     pending_action_count: np.ndarray,
     reward_idx: np.ndarray,
@@ -791,6 +802,7 @@ def _run_async_micro_step_both(
     max_micro_steps: int,
     timing: RolloutTiming,
     first_hit_n_rays: int,
+    micro_step_penalty: float = 0.0,
     first_hit_ray_chunk_size: int = 0,
 ) -> tuple[
     OrbitWarsState,
@@ -914,7 +926,18 @@ def _run_async_micro_step_both(
     timing.policy_raycast_s += t_raycast - t_origin
 
     n_a_idx = torch.arange(n_active, device=device)
-    target_logits = policy.target_logits_for_origin_fraction(out["planet_hidden"], o_idx, frac_idx)
+    planet_ships = active_obs["features"][:, 1 : 1 + MAX_PLANETS, 1] * 1000.0
+    origin_ships = active_obs["features"][n_a_idx, 1 + o_idx, 1] * 1000.0
+    frac_values = origin_ships.new_tensor(FRACTIONS)
+    fleet_size_for_logits = torch.floor(frac_values[frac_idx] * origin_ships)
+    target_logits = policy.target_logits_for_origin_fraction(
+        out["planet_hidden"],
+        o_idx,
+        frac_idx,
+        fleet_size_for_logits,
+        target_hit_tick_t,
+        planet_ships,
+    )
     target_mask = out["pair_mask"][n_a_idx, o_idx, :] & target_valid_t & ~target_overflow_t[:, None]
     any_valid_target = target_mask.any(dim=-1)
     masked_target = target_logits.masked_fill(~target_mask, -1e4)
@@ -1008,6 +1031,7 @@ def _run_async_micro_step_both(
             (~any_valid_origin_frac & (halt_action == 0)).index_select(0, pos0_t),
             must_halt_a.index_select(0, pos0_t).to(torch.bool),
             (target_valid_t & ~target_overflow_t[:, None]).index_select(0, pos0_t).to(torch.bool),
+            target_hit_tick_t.index_select(0, pos0_t).to(torch.float32),
             write_idx0_t,
             micro_k0_t,
             max_micro_steps,
@@ -1030,6 +1054,7 @@ def _run_async_micro_step_both(
             (~any_valid_origin_frac & (halt_action == 0)).index_select(0, pos1_t),
             must_halt_a.index_select(0, pos1_t).to(torch.bool),
             (target_valid_t & ~target_overflow_t[:, None]).index_select(0, pos1_t).to(torch.bool),
+            target_hit_tick_t.index_select(0, pos1_t).to(torch.float32),
             write_idx1_t,
             micro_k1_t,
             max_micro_steps,
@@ -1066,10 +1091,14 @@ def _run_async_micro_step_both(
         valid_p0[rows0_np, active0] = True
         old_logprob_p0[rows0_np, active0] = total_logp_np[:n0]
         old_value_p0[rows0_np, active0] = values_np[:n0]
+        if micro_step_penalty != 0.0:
+            reward_p0[rows0_np, active0] -= float(micro_step_penalty) * dispatched_np[:n0].astype(np.float32)
     if n1:
         valid_p1[rows1_np, active1] = True
         old_logprob_p1[rows1_np, active1] = total_logp_np[n0:]
         old_value_p1[rows1_np, active1] = values_np[n0:]
+        if micro_step_penalty != 0.0:
+            reward_p1[rows1_np, active1] -= float(micro_step_penalty) * dispatched_np[n0:].astype(np.float32)
 
     for player, envs, offset, write_idx, micro_arr in (
         (0, active0, 0, write_idx_p0, micro_k[0]),
@@ -1140,6 +1169,7 @@ def collect_parallel_micro_rollouts(
     reset_prefetch: Optional[RolloutResetPrefetch] = None,
     first_hit_n_rays: int = 2048,
     first_hit_ray_chunk_size: int = 0,
+    micro_step_penalty: float = 1e-4,
 ) -> Tuple[RolloutSegment, RolloutTiming, RolloutCarry, int, RolloutGameStats]:
     """Collect one rollout segment using device-resident transition buffers.
 
@@ -1392,6 +1422,8 @@ def collect_parallel_micro_rollouts(
                 old_logprob_p1=old_logprob_p1,
                 old_value_p0=old_value_p0,
                 old_value_p1=old_value_p1,
+                reward_p0=reward_p0,
+                reward_p1=reward_p1,
                 pending_actions=pending_actions,
                 pending_action_count=pending_action_count,
                 reward_idx=reward_idx,
@@ -1404,6 +1436,7 @@ def collect_parallel_micro_rollouts(
                 max_micro_steps=max_micro_steps_per_player,
                 timing=timing,
                 first_hit_n_rays=first_hit_n_rays,
+                micro_step_penalty=micro_step_penalty,
                 first_hit_ray_chunk_size=first_hit_ray_chunk_size,
             )
             if profile_rollout and device.type == "cuda" and not logged_first_policy_fwd:

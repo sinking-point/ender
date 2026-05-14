@@ -60,6 +60,7 @@ def _run_steps(
             tensors["no_valid_fracs"],
             tensors["must_halt_no_ships"],
             tensors["target_pr"],
+            tensors["target_hit_tick"],
             wr,
             mk,
             active,
@@ -109,6 +110,7 @@ def main() -> None:
         "no_valid_fracs": torch.zeros((N,), dtype=torch.bool, device=device),
         "must_halt_no_ships": torch.zeros((N,), dtype=torch.bool, device=device),
         "target_pr": torch.zeros((N, P), dtype=torch.bool, device=device),
+        "target_hit_tick": torch.zeros((N, P), dtype=torch.float32, device=device),
     }
 
     wr0 = max(1, H // 4)

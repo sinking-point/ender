@@ -145,6 +145,7 @@ def main() -> None:
     no_valid_fracs_1 = jnp.zeros((1,), dtype=jnp.bool_)
     must_halt_ns_1 = jnp.zeros((1,), dtype=jnp.bool_)
     tpr_1 = jnp.zeros((1, MAX_PLANETS), dtype=jnp.bool_).at[0, d_idx].set(True)
+    tht_1 = jnp.zeros((1, MAX_PLANETS), dtype=jnp.float32).at[0, d_idx].set(float(fleet_eta[0]))
 
     H_buf = 8
     M = 8
@@ -176,6 +177,7 @@ def main() -> None:
         no_valid_fracs_1,
         must_halt_ns_1,
         tpr_1,
+        tht_1,
         jnp.array([0], dtype=jnp.int32),
         jnp.array([0], dtype=jnp.int32),
         active_1,
@@ -195,6 +197,7 @@ def main() -> None:
         no_valid_fracs_1,
         must_halt_ns_1,
         tpr_1,
+        tht_1,
         jnp.array([1], dtype=jnp.int32),
         jnp.array([1], dtype=jnp.int32),
         active_1,
@@ -216,6 +219,7 @@ def main() -> None:
         no_valid_fracs_1,
         must_halt_ns_1,
         tpr_1,
+        tht_1,
         jnp.array([0], dtype=jnp.int32),
         jnp.array([0], dtype=jnp.int32),
         active_1,
@@ -244,7 +248,7 @@ def main() -> None:
     mb_t = jnp.array([1, 0], dtype=jnp.int32)
     mb_n = jnp.array([0, 0], dtype=jnp.int32)
 
-    state_mb, halt_action_mb, pair_flat_mb, frac_idx_mb, nvp_mb, nvf_mb, _mh_mb, tpr_mb = gather_minibatch(
+    state_mb, halt_action_mb, pair_flat_mb, frac_idx_mb, nvp_mb, nvf_mb, _mh_mb, tpr_mb, tht_mb = gather_minibatch(
         buf0,
         buf1,
         mb_player,
@@ -286,6 +290,7 @@ def main() -> None:
             device=device,
             ship_speed=6.0,
             target_planet_reachable=tpr_mb,
+            target_hit_tick=tht_mb,
         )
     print(
         f"replay_jax: logp shape {tuple(new_logp.shape)}, "

@@ -2,8 +2,9 @@
 
 Each buffer row stores a length-``M`` prefix of in-phase micro deltas (halt, stored
 ``send``, ``slot``, ``pair_flat``, ``frac_idx``), padded with no-ops, plus the
-scalar policy bookkeeping fields and ``target_planet_reachable`` (snapshot of
-which planets are valid first-hit targets for the sampled origin/fraction).
+scalar policy bookkeeping fields, ``target_planet_reachable`` (snapshot of
+which planets are valid first-hit targets for the sampled origin/fraction), and
+``target_hit_tick`` (the matching per-target ETA feature used by the target head).
 Canonical ``planets`` / ``fleets`` / ``fleet_active`` live in ``turn_state_cache`` per
 turn.  PPO gather replays a prefix with :func:`apply_prefix_micro_deltas_batched`
 (no scan over ``H_buf``).
@@ -28,9 +29,9 @@ from orbit_wars_pt.micro_jax import apply_prefix_micro_deltas_batched
 class TransitionBuffer(NamedTuple):
     """One player's transitions for one segment, all on device.
 
-    ``target_planet_reachable`` stores rollout-time ``target_valid & ~overflow``
-    per planet for the sampled origin/fraction (used at PPO replay instead of
-    recomputing first-hit rays).
+    ``target_planet_reachable`` and ``target_hit_tick`` store rollout-time
+    first-hit geometry per planet for the sampled origin/fraction (used at PPO
+    replay instead of recomputing first-hit rays).
     """
 
     micro_halt_now: jnp.ndarray
@@ -45,6 +46,7 @@ class TransitionBuffer(NamedTuple):
     no_valid_fracs: jnp.ndarray
     must_halt_no_ships: jnp.ndarray
     target_planet_reachable: jnp.ndarray
+    target_hit_tick: jnp.ndarray
     phase_micro_idx: jnp.ndarray
 
 
@@ -68,6 +70,7 @@ class TorchTransitionBuffer(NamedTuple):
     no_valid_fracs: torch.Tensor
     must_halt_no_ships: torch.Tensor
     target_planet_reachable: torch.Tensor
+    target_hit_tick: torch.Tensor
     phase_micro_idx: torch.Tensor
 
 
@@ -89,6 +92,7 @@ def init_transition_buffer(num_envs: int, H_buf: int, max_micro_steps: int) -> T
         no_valid_fracs=jnp.zeros((H_buf, num_envs), dtype=jnp.bool_),
         must_halt_no_ships=jnp.zeros((H_buf, num_envs), dtype=jnp.bool_),
         target_planet_reachable=jnp.zeros((H_buf, num_envs, MAX_PLANETS), dtype=jnp.bool_),
+        target_hit_tick=jnp.zeros((H_buf, num_envs, MAX_PLANETS), dtype=jnp.float32),
         phase_micro_idx=jnp.zeros((H_buf, num_envs), dtype=jnp.int32),
     )
 
@@ -116,6 +120,7 @@ def init_torch_transition_buffer(
         no_valid_fracs=torch.zeros((H_buf, num_envs), dtype=torch.bool, device=device),
         must_halt_no_ships=torch.zeros((H_buf, num_envs), dtype=torch.bool, device=device),
         target_planet_reachable=torch.zeros((H_buf, num_envs, MAX_PLANETS), dtype=torch.bool, device=device),
+        target_hit_tick=torch.zeros((H_buf, num_envs, MAX_PLANETS), dtype=torch.float32, device=device),
         phase_micro_idx=torch.zeros((H_buf, num_envs), dtype=torch.int32, device=device),
     )
 
@@ -135,6 +140,7 @@ def append_to_torch_buffer(
     no_valid_fracs: torch.Tensor,
     must_halt_no_ships: torch.Tensor,
     target_planet_reachable_now: torch.Tensor,
+    target_hit_tick_now: torch.Tensor,
     write_row: torch.Tensor,
     micro_k: torch.Tensor,
     active: torch.Tensor,
@@ -198,6 +204,7 @@ def append_to_torch_buffer(
     buf.no_valid_fracs[row, env] = no_valid_fracs.to(device=device, dtype=torch.bool)[active_b]
     buf.must_halt_no_ships[row, env] = must_halt_no_ships.to(device=device, dtype=torch.bool)[active_b]
     buf.target_planet_reachable[row, env, :] = target_planet_reachable_now.to(device=device, dtype=torch.bool)[active_b]
+    buf.target_hit_tick[row, env, :] = target_hit_tick_now.to(device=device, dtype=torch.float32)[active_b]
     buf.phase_micro_idx[row, env] = micro_k.to(device=device, dtype=torch.int32)[active_b]
     return buf
 
@@ -218,6 +225,7 @@ def append_active_to_torch_buffer(
     no_valid_fracs: torch.Tensor,
     must_halt_no_ships: torch.Tensor,
     target_planet_reachable_now: torch.Tensor,
+    target_hit_tick_now: torch.Tensor,
     write_row: torch.Tensor,
     micro_k: torch.Tensor,
     max_micro_steps: int,
@@ -276,6 +284,7 @@ def append_active_to_torch_buffer(
     buf.no_valid_fracs[row, env] = no_valid_fracs.to(device=device, dtype=torch.bool)
     buf.must_halt_no_ships[row, env] = must_halt_no_ships.to(device=device, dtype=torch.bool)
     buf.target_planet_reachable[row, env, :] = target_planet_reachable_now.to(device=device, dtype=torch.bool)
+    buf.target_hit_tick[row, env, :] = target_hit_tick_now.to(device=device, dtype=torch.float32)
     buf.phase_micro_idx[row, env] = micro_k.to(device=device, dtype=torch.int32)
     return buf
 
@@ -307,6 +316,7 @@ def append_to_buffer(
     no_valid_fracs,
     must_halt_no_ships,
     target_planet_reachable_now,
+    target_hit_tick_now,
     write_row: jnp.ndarray,
     micro_k: jnp.ndarray,
     active: jnp.ndarray,
@@ -353,6 +363,7 @@ def append_to_buffer(
     out_tpr = buf.target_planet_reachable.at[write_row, n_idx, :].set(
         target_planet_reachable_now.astype(jnp.bool_)
     )
+    out_tht = buf.target_hit_tick.at[write_row, n_idx, :].set(target_hit_tick_now.astype(jnp.float32))
 
     old_pm = buf.phase_micro_idx[write_row, n_idx]
     new_pm = jnp.where(active, micro_k.astype(jnp.int32), old_pm)
@@ -371,6 +382,7 @@ def append_to_buffer(
         no_valid_fracs=out_nvf,
         must_halt_no_ships=out_mh,
         target_planet_reachable=out_tpr,
+        target_hit_tick=out_tht,
         phase_micro_idx=out_pm,
     )
 
@@ -456,6 +468,9 @@ def gather_minibatch(
     tpr0 = buf0.target_planet_reachable[t_b, n_b, :]
     tpr1 = buf1.target_planet_reachable[t_b, n_b, :]
     target_planet_reachable = jnp.where(is_p0[:, None], tpr0, tpr1)
+    tht0 = buf0.target_hit_tick[t_b, n_b, :]
+    tht1 = buf1.target_hit_tick[t_b, n_b, :]
+    target_hit_tick = jnp.where(is_p0[:, None], tht0, tht1)
 
     return (
         state_mb,
@@ -466,6 +481,7 @@ def gather_minibatch(
         no_valid_fracs,
         must_halt_no_ships,
         target_planet_reachable,
+        target_hit_tick,
     )
 
 
@@ -486,6 +502,7 @@ def gather_minibatch_selected(
     no_valid_fracs: jnp.ndarray,
     must_halt_no_ships: jnp.ndarray,
     target_planet_reachable: jnp.ndarray,
+    target_hit_tick: jnp.ndarray,
     phase_micro_idx: jnp.ndarray,
 ):
     """Reconstruct a minibatch from rows already selected on the host.
@@ -525,4 +542,5 @@ def gather_minibatch_selected(
         no_valid_fracs,
         must_halt_no_ships,
         target_planet_reachable,
+        target_hit_tick,
     )

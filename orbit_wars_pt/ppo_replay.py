@@ -44,6 +44,7 @@ def _compute_logp_value_entropy_torch(
     planet_mask: torch.Tensor,
     target_valid: torch.Tensor,
     target_overflow: torch.Tensor,
+    target_hit_tick: torch.Tensor,
     halt_action: torch.Tensor,
     pair_flat: torch.Tensor,
     frac_idx: torch.Tensor,
@@ -106,7 +107,16 @@ def _compute_logp_value_entropy_torch(
     mb = halt_action.shape[0]
     n_idx = torch.arange(mb, device=halt_action.device)
     ph = out["planet_hidden"]
-    target_logits = policy.target_logits_for_origin_fraction(ph, o_idx, frac_idx)
+    ships = features[:, 1 : 1 + MAX_PLANETS, 1] * 1000.0
+    fleet_size = torch.floor(features.new_tensor(FRACTIONS)[frac_idx] * ships[n_idx, o_idx])
+    target_logits = policy.target_logits_for_origin_fraction(
+        ph,
+        o_idx,
+        frac_idx,
+        fleet_size,
+        target_hit_tick,
+        ships,
+    )
     target_mask = (
         out["pair_mask"][n_idx, o_idx, :]
         & target_valid
@@ -156,6 +166,7 @@ def compute_ppo_loss_torch(
     planet_mask: torch.Tensor,
     target_valid: torch.Tensor,
     target_overflow: torch.Tensor,
+    target_hit_tick: torch.Tensor,
     halt_action: torch.Tensor,
     pair_flat: torch.Tensor,
     frac_idx: torch.Tensor,
@@ -229,6 +240,7 @@ def compute_ppo_loss_torch(
         planet_mask,
         target_valid,
         target_overflow,
+        target_hit_tick,
         halt_action,
         pair_flat,
         frac_idx,
@@ -325,11 +337,13 @@ def _jax_preamble_to_torch(
     first_hit_n_rays: int = 2048,
     first_hit_ray_chunk_size: int = 0,
     target_planet_reachable: Optional[jnp.ndarray] = None,
+    target_hit_tick: Optional[jnp.ndarray] = None,
 ):
     """Run the JAX side (obs builder + optional first-hit) and dlpack-import results.
 
-    When ``target_planet_reachable`` is set (shape ``[B, MAX_PLANETS]``, rollout snapshot
-    of ``target_valid & ~overflow``), skips ``selected_origin_fraction_targets_batched``.
+    When rollout snapshots are set (shape ``[B, MAX_PLANETS]``), skips
+    ``selected_origin_fraction_targets_batched`` and reuses both
+    ``target_valid & ~overflow`` and the matching per-target ETA feature.
     """
 
     t0 = perf_counter()
@@ -337,6 +351,10 @@ def _jax_preamble_to_torch(
     if target_planet_reachable is not None:
         target_valid_j = target_planet_reachable.astype(jnp.bool_)
         overflow_j = jnp.zeros((target_planet_reachable.shape[0],), dtype=jnp.bool_)
+        if target_hit_tick is None:
+            hit_tick_j = jnp.zeros(target_planet_reachable.shape, dtype=jnp.float32)
+        else:
+            hit_tick_j = target_hit_tick.astype(jnp.float32)
     else:
         origin_idx = pair_flat // MAX_PLANETS
         (
@@ -344,7 +362,7 @@ def _jax_preamble_to_torch(
             _width_j,
             target_valid_j,
             overflow_j,
-            _hit_tick_j,
+            hit_tick_j,
             _true_planet_j,
             _true_hit_tick_j,
         ) = selected_origin_fraction_targets_batched(
@@ -364,6 +382,7 @@ def _jax_preamble_to_torch(
     obs_torch = obs_jax_to_torch(obs_jax)
     target_valid_t = torch.from_dlpack(target_valid_j)
     target_overflow_t = torch.from_dlpack(overflow_j)
+    target_hit_tick_t = torch.from_dlpack(hit_tick_j)
     halt_action_t = torch.from_dlpack(halt_action).to(torch.long)
     pair_flat_t = torch.from_dlpack(pair_flat).to(torch.long)
     frac_idx_t = torch.from_dlpack(frac_idx).to(torch.long)
@@ -376,6 +395,7 @@ def _jax_preamble_to_torch(
         obs_torch,
         target_valid_t,
         target_overflow_t,
+        target_hit_tick_t,
         halt_action_t,
         pair_flat_t,
         frac_idx_t,
@@ -400,6 +420,7 @@ def replay_logprob_value_entropy_jax(
     first_hit_n_rays: int = 2048,
     first_hit_ray_chunk_size: int = 0,
     target_planet_reachable: Optional[jnp.ndarray] = None,
+    target_hit_tick: Optional[jnp.ndarray] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Diagnostic entry: returns ``(new_logp, new_value, new_entropy)``.
 
@@ -412,6 +433,7 @@ def replay_logprob_value_entropy_jax(
         obs_torch,
         target_valid_t,
         target_overflow_t,
+        target_hit_tick_t,
         halt_action_t,
         pair_flat_t,
         frac_idx_t,
@@ -430,6 +452,7 @@ def replay_logprob_value_entropy_jax(
         first_hit_n_rays=first_hit_n_rays,
         first_hit_ray_chunk_size=first_hit_ray_chunk_size,
         target_planet_reachable=target_planet_reachable,
+        target_hit_tick=target_hit_tick,
     )
 
     new_logp, new_value, new_entropy, *_ = _compute_logp_value_entropy_torch(
@@ -442,6 +465,7 @@ def replay_logprob_value_entropy_jax(
         obs_torch["planet_mask"],
         target_valid_t,
         target_overflow_t,
+        target_hit_tick_t,
         halt_action_t,
         pair_flat_t,
         frac_idx_t,
@@ -474,6 +498,7 @@ def replay_ppo_loss(
     timing: Optional[Any] = None,
     amp_dtype: Optional[torch.dtype] = None,
     target_planet_reachable: Optional[jnp.ndarray] = None,
+    target_hit_tick: Optional[jnp.ndarray] = None,
     first_hit_n_rays: int = 2048,
     first_hit_ray_chunk_size: int = 0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -498,6 +523,7 @@ def replay_ppo_loss(
         obs_torch,
         target_valid_t,
         target_overflow_t,
+        target_hit_tick_t,
         halt_action_t,
         pair_flat_t,
         frac_idx_t,
@@ -516,6 +542,7 @@ def replay_ppo_loss(
         first_hit_n_rays=first_hit_n_rays,
         first_hit_ray_chunk_size=first_hit_ray_chunk_size,
         target_planet_reachable=target_planet_reachable,
+        target_hit_tick=target_hit_tick,
     )
     must_halt_no_ships_t = torch.from_dlpack(must_halt_no_ships).to(
         device=adv.device, dtype=torch.bool
@@ -539,6 +566,7 @@ def replay_ppo_loss(
             obs_torch["planet_mask"],
             target_valid_t,
             target_overflow_t,
+            target_hit_tick_t,
             halt_action_t,
             pair_flat_t,
             frac_idx_t,

@@ -583,7 +583,7 @@ def _build_turn_actions_torch_only(
         o_idx = origin_frac_flat // len(FRACTIONS)
         frac_idx = origin_frac_flat % len(FRACTIONS)
 
-        ray_angle, ray_valid, _ray_hit_tick, true_planet, true_hit_tick = _raycast_targets_np(
+        ray_angle, ray_valid, ray_hit_tick, true_planet, true_hit_tick = _raycast_targets_np(
             virt,
             int(o_idx),
             int(frac_idx),
@@ -596,6 +596,9 @@ def _build_turn_actions_torch_only(
             out["planet_hidden"],
             torch.tensor([o_idx], device=device, dtype=torch.long),
             torch.tensor([frac_idx], device=device, dtype=torch.long),
+            torch.tensor([math.floor(float(FRACTIONS[frac_idx]) * float(planets[o_idx, 5]))], device=device, dtype=torch.float32),
+            torch.from_numpy(ray_hit_tick[None, :]).to(device=device, dtype=torch.float32),
+            torch.from_numpy(planets[None, :, 5]).to(device=device, dtype=torch.float32),
         )[0]
         target_mask = out["pair_mask"][0, o_idx].clone()
         ray_valid_t = torch.from_numpy(ray_valid).to(device=device, dtype=torch.bool)

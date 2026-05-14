@@ -171,9 +171,14 @@ class OrbitWarsPolicy(nn.Module):
 
         self.pair_q = nn.Linear(d_model, d_model // 2, bias=False)
         self.pair_k = nn.Linear(d_model, d_model // 2, bias=False)
-        self.target_q = nn.Linear(d_model, d_model // 2, bias=False)
-        self.frac_emb = nn.Embedding(NUM_FRACTIONS, d_model)
         self.origin_frac_head = nn.Linear(d_model, NUM_FRACTIONS)
+        self.target_pick_head = nn.Sequential(
+            nn.Linear(d_model + 3, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Linear(d_model // 2, 1),
+        )
 
         self.time_proj = nn.Linear(1, 32)
         self.frac_heads = nn.ModuleList([nn.Linear(d_model * 2 + 32, 1) for _ in range(NUM_FRACTIONS)])
@@ -384,16 +389,38 @@ class OrbitWarsPolicy(nn.Module):
         planet_hidden: torch.Tensor,
         origin_idx: torch.Tensor,
         frac_idx: torch.Tensor,
+        fleet_size: Optional[torch.Tensor] = None,
+        target_eta: Optional[torch.Tensor] = None,
+        target_ships: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Target logits ``[B, MAX_PLANETS]`` conditioned on sampled origin/fraction."""
+        """Per-target pick logits after sampled launch size/reachability are known.
+
+        ``origin_idx`` and ``frac_idx`` are accepted for call-site stability, but
+        target scoring intentionally ignores origin identity: once fleet size is
+        fixed, the launch angle is chosen by first-hit geometry.
+        """
 
         b = origin_idx.shape[0]
         device = planet_hidden.device
-        ho = planet_hidden[torch.arange(b, device=device), origin_idx]
-        hf = ho + self.frac_emb(frac_idx)
-        q = self.target_q(hf)
-        k = self.pair_k(planet_hidden)
-        return torch.einsum("bd,bpd->bp", q, k) * (q.shape[-1] ** -0.5)
+        del frac_idx
+        if fleet_size is None:
+            fleet_scalar = torch.zeros((b, 1, 1), device=device, dtype=planet_hidden.dtype)
+        else:
+            fleet_scalar = (fleet_size.to(device=device, dtype=planet_hidden.dtype) / 1000.0).reshape(b, 1, 1)
+        fleet_feat = fleet_scalar.expand(-1, planet_hidden.shape[1], -1)
+        if target_eta is None:
+            eta_feat = torch.zeros(
+                (b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype
+            )
+        else:
+            eta_feat = (target_eta.to(device=device, dtype=planet_hidden.dtype) / 500.0).unsqueeze(-1)
+        if target_ships is None:
+            is_bigger = torch.zeros((b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype)
+        else:
+            target_ships_t = target_ships.to(device=device, dtype=planet_hidden.dtype)
+            is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
+        target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
+        return self.target_pick_head(target_in).squeeze(-1)
 
     def fraction_logits(
         self,
