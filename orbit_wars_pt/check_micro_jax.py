@@ -99,7 +99,13 @@ def main() -> None:
 
     pre_planets = np.asarray(jax.device_get(state_b.planets))
     new_state, oid_j, angle_j, send_j, dispatched_j, _slot_j = apply_micro_step_batched(
-        state_b, jnp.int32(0), halt_now, pair_flat, frac_idx, launch_angle, fleet_eta
+        state_b,
+        jnp.int32(0),
+        halt_now,
+        pair_flat,
+        frac_idx,
+        launch_angle,
+        fleet_eta,
     )
     post_planets = np.asarray(jax.device_get(new_state.planets))
     oid_np, angle_np, send_np, dispatched_np = jax.device_get(

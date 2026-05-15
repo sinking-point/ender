@@ -108,9 +108,10 @@ def _serialize_rollout_carry(carry: RolloutCarry) -> Dict[str, Any]:
 
 
 def _deserialize_rollout_carry(obj: Dict[str, Any]) -> RolloutCarry:
-    state_b = OrbitWarsState(
-        **{k: jnp.asarray(v) for k, v in obj["state_b"].items()}
-    )
+    state_d = dict(obj["state_b"])
+    if "incoming_fake_correction" not in state_d:
+        state_d["incoming_fake_correction"] = np.zeros_like(state_d["incoming_fleets"])
+    state_b = OrbitWarsState(**{k: jnp.asarray(v) for k, v in state_d.items()})
     cfg_d = dict(obj["cfg"])
     cfg = OrbitWarsEnvConfig(**cfg_d)
     ne = int(state_b.planets.shape[0])

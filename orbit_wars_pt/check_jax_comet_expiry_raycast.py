@@ -57,6 +57,7 @@ def kaggle_np_state_to_jax(np_state) -> jow.OrbitWarsState:
         fleets=jnp.asarray(np_state.fleets),
         fleet_active=jnp.asarray(np_state.fleet_active),
         incoming_fleets=jnp.asarray(np_state.incoming_fleets),
+        incoming_fake_correction=jnp.zeros_like(jnp.asarray(np_state.incoming_fleets), dtype=jnp.uint16),
         comet_paths=jnp.asarray(np_state.comet_paths),
         comet_path_lengths=jnp.asarray(np_state.comet_path_lengths),
         comet_ships=jnp.asarray(np_state.comet_ships),

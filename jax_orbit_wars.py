@@ -69,6 +69,7 @@ class OrbitWarsState(NamedTuple):
     fleets: jnp.ndarray  # [max_fleets, FLEET_ROW_WIDTH], float32
     fleet_active: jnp.ndarray  # [max_fleets], bool
     incoming_fleets: jnp.ndarray  # [num_agents, MAX_PLANETS, INCOMING_TA_BINS], uint16
+    incoming_fake_correction: jnp.ndarray  # [num_agents, MAX_PLANETS, INCOMING_TA_BINS], uint16
     comet_paths: jnp.ndarray  # [5, 4, 40, 2], float32
     comet_path_lengths: jnp.ndarray  # [5, 4], int32
     comet_ships: jnp.ndarray  # [5], float32
@@ -86,16 +87,17 @@ class OrbitWarsState(NamedTuple):
 
 
 def empty_actions(num_agents: int = 2, max_actions: int = DEFAULT_MAX_ACTIONS) -> jnp.ndarray:
-    """Returns a no-op action tensor shaped [num_agents, max_actions, 5].
+    """Returns a no-op action tensor shaped [num_agents, max_actions, 6].
 
-    Columns are ``from_id, angle, ships, target_planet, hit_tick``. The final
-    two metadata columns are ignored for no-op rows but let trusted rollout
-    launches skip the old post-step fleet metadata recovery pass.
+    Columns are ``from_id, angle, ships, true_target, hit_tick, policy_target``.
+    ``policy_target`` defaults to ``-1`` (use ``true_target`` only). The metadata
+    columns are ignored for no-op rows.
     """
 
-    actions = jnp.zeros((num_agents, max_actions, 5), dtype=jnp.float32)
+    actions = jnp.zeros((num_agents, max_actions, 6), dtype=jnp.float32)
     actions = actions.at[..., 3].set(-1.0)
     actions = actions.at[..., 4].set(500.0)
+    actions = actions.at[..., 5].set(-1.0)
     return actions
 
 
@@ -192,6 +194,9 @@ def reset_from_reference(
         fleets=jnp.zeros((max_fleets, FLEET_ROW_WIDTH), dtype=jnp.float32),
         fleet_active=jnp.zeros((max_fleets,), dtype=bool),
         incoming_fleets=jnp.zeros((num_agents, MAX_PLANETS, INCOMING_TA_BINS), dtype=jnp.uint16),
+        incoming_fake_correction=jnp.zeros(
+            (num_agents, MAX_PLANETS, INCOMING_TA_BINS), dtype=jnp.uint16
+        ),
         comet_paths=comet_paths,
         comet_path_lengths=comet_path_lengths,
         comet_ships=comet_ships,
@@ -324,6 +329,17 @@ def _spawn_comets(state: OrbitWarsState) -> OrbitWarsState:
     carry, _ = jax.lax.scan(add_one, carry, jnp.arange(4, dtype=jnp.int32))
     planets, initial_planets, planet_active, initial_active, comet_ids, comet_slots, overflow = carry
 
+    incoming_u32 = state.incoming_fleets.astype(jnp.uint32)
+    correction_u32 = state.incoming_fake_correction.astype(jnp.uint32)
+    incoming_after = jnp.maximum(incoming_u32 - correction_u32, jnp.asarray(0, dtype=jnp.uint32)).astype(
+        jnp.uint16
+    )
+    correction_after = jnp.where(
+        should_spawn,
+        jnp.zeros_like(correction_u32, dtype=jnp.uint16),
+        state.incoming_fake_correction,
+    )
+
     return state._replace(
         planets=planets,
         initial_planets=initial_planets,
@@ -337,6 +353,8 @@ def _spawn_comets(state: OrbitWarsState) -> OrbitWarsState:
         comet_group_active=state.comet_group_active.at[group_idx].set(
             should_spawn | state.comet_group_active[group_idx]
         ),
+        incoming_fleets=jnp.where(should_spawn, incoming_after, state.incoming_fleets),
+        incoming_fake_correction=correction_after,
         overflow=overflow,
     )
 
@@ -365,6 +383,14 @@ def _launch_fleets(state: OrbitWarsState, actions: jnp.ndarray) -> OrbitWarsStat
     else:
         target_planet = jnp.full((total_actions,), -1.0, dtype=jnp.float32)
         eta = jnp.full((total_actions,), 500.0, dtype=jnp.float32)
+    if actions.shape[-1] >= 6:
+        policy_planet = aflat[:, 5]
+    else:
+        policy_planet = target_planet
+    if actions.shape[-1] >= 7:
+        policy_eta = aflat[:, 6]
+    else:
+        policy_eta = eta
 
     flat = jnp.arange(total_actions, dtype=jnp.int32)
     player = flat // max_actions
@@ -385,21 +411,35 @@ def _launch_fleets(state: OrbitWarsState, actions: jnp.ndarray) -> OrbitWarsStat
         & (ships > 0)
     )
     target_i = target_planet.astype(jnp.int32)
-    ta_i = jnp.floor(jnp.maximum(eta - 1.0, 0.0)).astype(jnp.int32)
+    policy_i = policy_planet.astype(jnp.int32)
+    ta_true_i = jnp.floor(jnp.maximum(eta - 1.0, 0.0)).astype(jnp.int32)
+    ta_policy_i = jnp.floor(jnp.maximum(policy_eta - 1.0, 0.0)).astype(jnp.int32)
     meta_ok = (
         (player < incoming_players)
         & (target_i >= 0)
         & (target_i < MAX_PLANETS)
-        & (ta_i >= 0)
-        & (ta_i < INCOMING_TA_BINS)
+        & (ta_true_i >= 0)
+        & (ta_true_i < INCOMING_TA_BINS)
+        & (ta_policy_i >= 0)
+        & (ta_policy_i < INCOMING_TA_BINS)
     )
     sched = valid & meta_ok
 
     safe_player = jnp.clip(player, 0, incoming_players - 1)
     safe_target = jnp.clip(target_i, 0, MAX_PLANETS - 1)
-    safe_ta = jnp.clip(ta_i, 0, INCOMING_TA_BINS - 1)
+    policy_valid = (policy_i >= 0) & (policy_i < MAX_PLANETS)
+    safe_policy = jnp.clip(jnp.maximum(policy_i, 0), 0, MAX_PLANETS - 1)
+    safe_ta_true = jnp.clip(ta_true_i, 0, INCOMING_TA_BINS - 1)
+    safe_ta_policy = jnp.clip(ta_policy_i, 0, INCOMING_TA_BINS - 1)
     ships_u32 = jnp.minimum(ships, jnp.asarray(65535.0, dtype=jnp.float32)).astype(jnp.uint32)
     add = jnp.where(sched, ships_u32, jnp.asarray(0, dtype=jnp.uint32))
+    use_fake_display = (
+        sched
+        & policy_valid
+        & (policy_i != target_i)
+        & (~state.planet_active[safe_target])
+    )
+    fake_add = jnp.where(use_fake_display, add, jnp.asarray(0, dtype=jnp.uint32))
 
     deduct = jnp.where(sched, ships, 0.0)
     total_out = jnp.zeros((MAX_PLANETS,), dtype=jnp.float32).at[planet_idx].add(deduct)
@@ -410,10 +450,16 @@ def _launch_fleets(state: OrbitWarsState, actions: jnp.ndarray) -> OrbitWarsStat
     overflow = state.overflow | jnp.any(valid & ~meta_ok)
 
     incoming_u32 = state.incoming_fleets.astype(jnp.uint32)
-    incoming_u32 = incoming_u32.at[safe_player, safe_target, safe_ta].add(add)
+    incoming_u32 = incoming_u32.at[safe_player, safe_target, safe_ta_true].add(add)
+    incoming_u32 = incoming_u32.at[safe_player, safe_policy, safe_ta_policy].add(fake_add)
+    correction_u32 = state.incoming_fake_correction.astype(jnp.uint32)
+    correction_u32 = correction_u32.at[safe_player, safe_policy, safe_ta_policy].add(fake_add)
     return state._replace(
         planets=planets,
         incoming_fleets=jnp.minimum(incoming_u32, jnp.asarray(65535, dtype=jnp.uint32)).astype(jnp.uint16),
+        incoming_fake_correction=jnp.minimum(correction_u32, jnp.asarray(65535, dtype=jnp.uint32)).astype(
+            jnp.uint16
+        ),
         next_fleet_id=next_fleet_id,
         overflow=overflow,
     )
@@ -494,14 +540,16 @@ def _move_fleets_and_collect_combats(
     arrivals = state.incoming_fleets[:, :, 0].astype(jnp.float32)  # [A, P]
     combat_ships = jnp.zeros((MAX_PLANETS, 4), dtype=jnp.float32)
     combat_ships = combat_ships.at[:, : state.incoming_fleets.shape[0]].set(jnp.transpose(arrivals, (1, 0)))
-    shifted = jnp.concatenate(
-        [
-            state.incoming_fleets[:, :, 1:],
-            jnp.zeros((state.incoming_fleets.shape[0], MAX_PLANETS, 1), dtype=state.incoming_fleets.dtype),
-        ],
-        axis=2,
+    zero_bin = jnp.zeros(
+        (state.incoming_fleets.shape[0], MAX_PLANETS, 1), dtype=state.incoming_fleets.dtype
     )
-    return state.fleets, state.fleet_active, combat_ships, shifted
+
+    def _shift_bins(table: jnp.ndarray) -> jnp.ndarray:
+        return jnp.concatenate([table[:, :, 1:], zero_bin], axis=2)
+
+    shifted = _shift_bins(state.incoming_fleets)
+    shifted_correction = _shift_bins(state.incoming_fake_correction)
+    return state.fleets, state.fleet_active, combat_ships, shifted, shifted_correction
 
 
 def _resolve_combats(state: OrbitWarsState, combat_ships: jnp.ndarray) -> OrbitWarsState:
@@ -594,8 +642,8 @@ def step(
         )
 
         old_pos, new_pos, collision_enabled, next_path_index, expired_after_move = _planet_paths(s)
-        fleets, fleet_active, combat_ships, incoming_fleets = _move_fleets_and_collect_combats(
-            s, old_pos, new_pos, collision_enabled, config
+        fleets, fleet_active, combat_ships, incoming_fleets, incoming_fake_correction = (
+            _move_fleets_and_collect_combats(s, old_pos, new_pos, collision_enabled, config)
         )
         planets = s.planets.at[:, PLANET_X : PLANET_Y + 1].set(new_pos)
         planet_active = s.planet_active & ~expired_after_move
@@ -617,6 +665,7 @@ def step(
             fleets=fleets,
             fleet_active=fleet_active,
             incoming_fleets=incoming_fleets,
+            incoming_fake_correction=incoming_fake_correction,
             comet_path_index=next_path_index,
             comet_group_active=s.comet_group_active & ~expired_group,
             comet_planet_ids=jnp.where(expired_group[:, None], -1, s.comet_planet_ids),

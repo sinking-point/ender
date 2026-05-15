@@ -623,10 +623,9 @@ def _run_async_micro_step(
     target_logp = target_lp.gather(1, d_idx[:, None]).squeeze(-1)
     pair_flat = o_idx * P + d_idx
     angle = target_angle_t[n_a_idx, d_idx]
-    fleet_eta = target_hit_tick_t[n_a_idx, d_idx]
+    policy_fleet_eta = target_hit_tick_t[n_a_idx, d_idx]
     true_d_idx = target_true_planet_t[n_a_idx, d_idx].to(torch.long).clamp(0, P - 1)
     true_fleet_eta = target_true_hit_tick_t[n_a_idx, d_idx]
-    env_pair_flat = o_idx * P + true_d_idx
 
     dispatch_used = origin_frac_used & any_valid_target
     total_logp = halt_logp + origin_frac_used.float() * origin_frac_logp + dispatch_used.float() * target_logp
@@ -637,7 +636,6 @@ def _run_async_micro_step(
 
     halt_now_all = torch.ones(num_envs, dtype=torch.bool, device=device)
     pair_flat_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
-    env_pair_flat_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
     frac_idx_all = torch.zeros(num_envs, dtype=torch.int32, device=device)
     angle_all = torch.zeros(num_envs, dtype=torch.float32, device=device)
     fleet_eta_all = torch.zeros(num_envs, dtype=torch.float32, device=device)
@@ -650,11 +648,10 @@ def _run_async_micro_step(
 
     halt_now_all.index_copy_(0, active_idx_t, halt_now)
     pair_flat_all.index_copy_(0, active_idx_t, pair_flat.to(torch.int32))
-    env_pair_flat_all.index_copy_(0, active_idx_t, env_pair_flat.to(torch.int32))
     frac_idx_all.index_copy_(0, active_idx_t, frac_idx.to(torch.int32))
     halt_action_all.index_copy_(0, active_idx_t, halt_action.to(torch.int32))
     angle_all.index_copy_(0, active_idx_t, angle.to(torch.float32))
-    fleet_eta_all.index_copy_(0, active_idx_t, true_fleet_eta.to(torch.float32))
+    fleet_eta_all.index_copy_(0, active_idx_t, policy_fleet_eta.to(torch.float32))
     no_valid_pairs_all.index_copy_(0, active_idx_t, origin_frac_used & ~any_valid_target)
     no_valid_fracs_all.index_copy_(0, active_idx_t, ~any_valid_origin_frac & (halt_action == 0))
     must_halt_no_ships_all.index_copy_(0, active_idx_t, must_halt_a.to(torch.bool))
@@ -666,7 +663,7 @@ def _run_async_micro_step(
 
     t0 = perf_counter()
     halt_now_j = jax.dlpack.from_dlpack(halt_now_all.contiguous().detach())
-    pair_flat_j = jax.dlpack.from_dlpack(env_pair_flat_all.contiguous().detach())
+    pair_flat_j = jax.dlpack.from_dlpack(pair_flat_all.contiguous().detach())
     frac_idx_j = jax.dlpack.from_dlpack(frac_idx_all.contiguous().detach())
     angle_j = jax.dlpack.from_dlpack(angle_all.contiguous().detach())
     fleet_eta_j = jax.dlpack.from_dlpack(fleet_eta_all.contiguous().detach())
@@ -703,7 +700,7 @@ def _run_async_micro_step(
         halt_now,
         send_t.index_select(0, active_idx_t),
         angle_applied_t.index_select(0, active_idx_t),
-        fleet_eta,
+        policy_fleet_eta,
         slot_t.index_select(0, active_idx_t),
         halt_action.to(torch.int32),
         pair_flat.to(torch.int32),
@@ -736,6 +733,7 @@ def _run_async_micro_step(
     d_idx_np = d_idx.detach().cpu().numpy()
     true_d_idx_np = true_d_idx.detach().cpu().numpy()
     true_fleet_eta_np = true_fleet_eta.detach().cpu().numpy()
+    policy_fleet_eta_np = policy_fleet_eta.detach().cpu().numpy()
 
     rows = rows_active_np
     valid[rows, active_envs] = True
@@ -753,6 +751,8 @@ def _run_async_micro_step(
                 pending_actions[env_i, ego, ac, 2] = float(send_np[j_arr])
                 pending_actions[env_i, ego, ac, 3] = float(true_d_idx_np[j_arr])
                 pending_actions[env_i, ego, ac, 4] = float(true_fleet_eta_np[j_arr])
+                pending_actions[env_i, ego, ac, 5] = float(d_idx_np[j_arr])
+                pending_actions[env_i, ego, ac, 6] = float(policy_fleet_eta_np[j_arr])
             pending_action_count[ego, env_i] = ac + 1
         if bool(halt_now_np[j_arr]):
             halted[ego, env_i] = True
@@ -950,10 +950,9 @@ def _run_async_micro_step_both(
     target_logp = target_lp.gather(1, d_idx[:, None]).squeeze(-1)
     pair_flat = o_idx * P + d_idx
     angle = target_angle_t[n_a_idx, d_idx]
-    fleet_eta = target_hit_tick_t[n_a_idx, d_idx]
+    policy_fleet_eta = target_hit_tick_t[n_a_idx, d_idx]
     true_d_idx = target_true_planet_t[n_a_idx, d_idx].to(torch.long).clamp(0, P - 1)
     true_fleet_eta = target_true_hit_tick_t[n_a_idx, d_idx]
-    env_pair_flat = o_idx * P + true_d_idx
 
     dispatch_used = origin_frac_used & any_valid_target
     total_logp = halt_logp + origin_frac_used.float() * origin_frac_logp + dispatch_used.float() * target_logp
@@ -964,24 +963,22 @@ def _run_async_micro_step_both(
 
     halt_now_all = torch.ones(total_env_rows, dtype=torch.bool, device=device)
     pair_flat_all = torch.zeros(total_env_rows, dtype=torch.int32, device=device)
-    env_pair_flat_all = torch.zeros(total_env_rows, dtype=torch.int32, device=device)
     frac_idx_all = torch.zeros(total_env_rows, dtype=torch.int32, device=device)
     angle_all = torch.zeros(total_env_rows, dtype=torch.float32, device=device)
     fleet_eta_all = torch.zeros(total_env_rows, dtype=torch.float32, device=device)
 
     halt_now_all.index_copy_(0, active_idx_t, halt_now)
     pair_flat_all.index_copy_(0, active_idx_t, pair_flat.to(torch.int32))
-    env_pair_flat_all.index_copy_(0, active_idx_t, env_pair_flat.to(torch.int32))
     frac_idx_all.index_copy_(0, active_idx_t, frac_idx.to(torch.int32))
     angle_all.index_copy_(0, active_idx_t, angle.to(torch.float32))
-    fleet_eta_all.index_copy_(0, active_idx_t, true_fleet_eta.to(torch.float32))
+    fleet_eta_all.index_copy_(0, active_idx_t, policy_fleet_eta.to(torch.float32))
     t_scatter = perf_counter()
     timing.policy_scatter_s += t_scatter - t_target
     timing.policy_forward_s += t_scatter - t0
 
     t0 = perf_counter()
     halt_now_j = jax.dlpack.from_dlpack(halt_now_all.contiguous().detach())
-    pair_flat_j = jax.dlpack.from_dlpack(env_pair_flat_all.contiguous().detach())
+    pair_flat_j = jax.dlpack.from_dlpack(pair_flat_all.contiguous().detach())
     frac_idx_j = jax.dlpack.from_dlpack(frac_idx_all.contiguous().detach())
     angle_j = jax.dlpack.from_dlpack(angle_all.contiguous().detach())
     fleet_eta_j = jax.dlpack.from_dlpack(fleet_eta_all.contiguous().detach())
@@ -1022,7 +1019,7 @@ def _run_async_micro_step_both(
             halt_now.index_select(0, pos0_t),
             send_t.index_select(0, active0_rows_t),
             angle_applied_t.index_select(0, active0_rows_t),
-            fleet_eta.index_select(0, pos0_t),
+            policy_fleet_eta.index_select(0, pos0_t),
             slot_t.index_select(0, active0_rows_t),
             halt_action.index_select(0, pos0_t).to(torch.int32),
             pair_flat.index_select(0, pos0_t).to(torch.int32),
@@ -1045,7 +1042,7 @@ def _run_async_micro_step_both(
             halt_now.index_select(0, pos1_t),
             send_t.index_select(0, active1_rows_t),
             angle_applied_t.index_select(0, active1_rows_t),
-            fleet_eta.index_select(0, pos1_t),
+            policy_fleet_eta.index_select(0, pos1_t),
             slot_t.index_select(0, active1_rows_t),
             halt_action.index_select(0, pos1_t).to(torch.int32),
             pair_flat.index_select(0, pos1_t).to(torch.int32),
@@ -1086,6 +1083,7 @@ def _run_async_micro_step_both(
     d_idx_np = d_idx.detach().cpu().numpy()
     true_d_idx_np = true_d_idx.detach().cpu().numpy()
     true_fleet_eta_np = true_fleet_eta.detach().cpu().numpy()
+    policy_fleet_eta_np = policy_fleet_eta.detach().cpu().numpy()
 
     if n0:
         valid_p0[rows0_np, active0] = True
@@ -1116,6 +1114,8 @@ def _run_async_micro_step_both(
                     pending_actions[env_i, player, ac, 2] = float(send_np[j_arr])
                     pending_actions[env_i, player, ac, 3] = float(true_d_idx_np[j_arr])
                     pending_actions[env_i, player, ac, 4] = float(true_fleet_eta_np[j_arr])
+                    pending_actions[env_i, player, ac, 5] = float(d_idx_np[j_arr])
+                    pending_actions[env_i, player, ac, 6] = float(policy_fleet_eta_np[j_arr])
                 pending_action_count[player, env_i] = ac + 1
             if bool(halt_now_np[j_arr]):
                 halted[player, env_i] = True
@@ -1264,9 +1264,11 @@ def collect_parallel_micro_rollouts(
     halted = np.zeros((2, num_envs), dtype=np.bool_)
     micro_k = np.zeros((2, num_envs), dtype=np.int32)
     micro_k_dev = torch.zeros((2, num_envs), dtype=torch.int32, device=device)
-    pending_actions = np.zeros((num_envs, 2, DEFAULT_MAX_ACTIONS, 5), dtype=np.float32)
+    pending_actions = np.zeros((num_envs, 2, DEFAULT_MAX_ACTIONS, 7), dtype=np.float32)
     pending_actions[..., 3] = -1.0
     pending_actions[..., 4] = 500.0
+    pending_actions[..., 5] = -1.0
+    pending_actions[..., 6] = 500.0
     pending_action_count = np.zeros((2, num_envs), dtype=np.int32)
     reward_idx = np.full((2, num_envs), -1, dtype=np.int32)
     segment_done = np.zeros((num_envs,), dtype=np.bool_)
@@ -1303,6 +1305,8 @@ def collect_parallel_micro_rollouts(
                 actions_bucket[~bucket_mask] = 0.0
                 actions_bucket[~bucket_mask, :, :, 3] = -1.0
                 actions_bucket[~bucket_mask, :, :, 4] = 500.0
+                actions_bucket[~bucket_mask, :, :, 5] = -1.0
+                actions_bucket[~bucket_mask, :, :, 6] = 500.0
                 timing.env_prep_s += perf_counter() - t_prep0
 
                 t_core0 = perf_counter()
@@ -1373,6 +1377,8 @@ def collect_parallel_micro_rollouts(
                     pending_actions[env_i] = 0.0
                     pending_actions[env_i, :, :, 3] = -1.0
                     pending_actions[env_i, :, :, 4] = 500.0
+                    pending_actions[env_i, :, :, 5] = -1.0
+                    pending_actions[env_i, :, :, 6] = 500.0
                     pending_action_count[:, env_i] = 0
                     reward_idx[:, env_i] = -1
                     if horizon_fired:
