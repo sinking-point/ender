@@ -91,6 +91,41 @@ def _launch_debug(msg: str) -> None:
         print(f"[orbit_wars:launch] {msg}", file=sys.stderr, flush=True)
 
 
+def _active_comet_planet_ids(
+    comet_group_active: np.ndarray,
+    comet_planet_ids: np.ndarray,
+) -> frozenset[int]:
+    ids: list[int] = []
+    for g in range(int(comet_group_active.shape[0])):
+        if not bool(comet_group_active[g]):
+            continue
+        for k in range(int(comet_planet_ids.shape[1])):
+            pid = int(comet_planet_ids[g, k])
+            if pid >= 0:
+                ids.append(pid)
+    return frozenset(ids)
+
+
+def _is_comet_planet_id(planet_id: int, comet_planet_ids: np.ndarray) -> bool:
+    return planet_id >= 0 and bool(np.any(comet_planet_ids == planet_id))
+
+
+def _forecast_hits_comet_spawned_after_launch(
+    forecast_slot: int,
+    planets: np.ndarray,
+    comet_planet_ids: np.ndarray,
+    comet_planet_ids_at_launch: frozenset[int],
+) -> bool:
+    """True if forecast first-hit is a comet that was not active at fleet launch."""
+
+    if forecast_slot < 0 or forecast_slot >= MAX_PLANETS:
+        return False
+    pid = int(planets[forecast_slot, 0])
+    if pid in comet_planet_ids_at_launch:
+        return False
+    return _is_comet_planet_id(pid, comet_planet_ids)
+
+
 def _fleet_exits_board_next_tick(
     x: float,
     y: float,
@@ -129,6 +164,7 @@ class LaunchRaycastRecord:
     true_target_planet_id: float
     policy_hit_tick: float
     true_hit_tick: float
+    comet_planet_ids_at_launch: frozenset[int] = field(default_factory=frozenset)
     fleet_id: Optional[int] = None
     debug_serial: int = 0
 
@@ -164,6 +200,7 @@ class FleetLaunchDebugTracker:
     """Maps fleet ids to launch/raycast records; warns when a friendly fleet exits the map."""
 
     warn_oob: bool = True
+    warn_forecast_mismatch: bool = True
     _pending: list[LaunchRaycastRecord] = field(default_factory=list)
     _by_fleet_id: dict[int, LaunchRaycastRecord] = field(default_factory=dict)
     _last_fleets_all: dict[int, tuple[int, float, float, float, float, float]] = field(default_factory=dict)
@@ -174,6 +211,7 @@ class FleetLaunchDebugTracker:
     _game_key: Optional[str] = None
     _call_seq: int = 0
     _next_launch_serial: int = 0
+    _warned_forecast_mismatch: set[int] = field(default_factory=set)
 
     def reset_game(self) -> None:
         if _launch_debug_enabled() and (self._pending or self._by_fleet_id):
@@ -186,6 +224,7 @@ class FleetLaunchDebugTracker:
         self._last_fleets_all.clear()
         self._last_fleets_by_player.clear()
         self._last_step_by_player.clear()
+        self._warned_forecast_mismatch.clear()
 
     def sync_game(self, game_key: str, *, game_step: int = -1) -> None:
         if game_key != self._game_key:
@@ -430,6 +469,76 @@ class FleetLaunchDebugTracker:
         self._pending.append(rec)
         if _launch_debug_enabled():
             _launch_debug(f"record_launch {rec.debug_summary()}")
+
+    def check_forecast_vs_raycast(
+        self,
+        obs: Mapping[str, Any],
+        fleet_arrivals: np.ndarray,
+        planets: np.ndarray,
+        comet_planet_ids: np.ndarray,
+        *,
+        game_step: int,
+        ego_player: int,
+    ) -> None:
+        """Warn when ``_forecast_incoming_fleets`` first-hit slot differs from raycast at launch."""
+
+        if not self.warn_forecast_mismatch:
+            return
+        fleets_in = obs.get("fleets") or []
+        n = min(len(fleets_in), int(fleet_arrivals.shape[0]))
+        for i in range(n):
+            row = fleets_in[i]
+            fid = int(row[0])
+            owner = int(row[1])
+            if owner != ego_player:
+                continue
+            rec = self._by_fleet_id.get(fid)
+            if rec is None or fid in self._warned_forecast_mismatch:
+                continue
+            fc_slot = int(fleet_arrivals[i, 0])
+            fc_tick = int(fleet_arrivals[i, 1])
+            ray_slot = int(rec.true_target_slot)
+            ray_tick = int(rec.true_hit_tick) if rec.true_hit_tick < 500.0 else -1
+            if ray_slot == fc_slot:
+                continue
+            if _forecast_hits_comet_spawned_after_launch(
+                fc_slot, planets, comet_planet_ids, rec.comet_planet_ids_at_launch
+            ):
+                if _launch_debug_enabled():
+                    fc_pid_dbg = float(planets[fc_slot, 0]) if 0 <= fc_slot < MAX_PLANETS else -1.0
+                    _launch_debug(
+                        f"forecast mismatch suppressed fleet_id={fid}: "
+                        f"comet {fc_pid_dbg:.0f} spawned after launch_step={rec.game_step}"
+                    )
+                continue
+            self._warned_forecast_mismatch.add(fid)
+            ray_pid = (
+                float(planets[ray_slot, 0])
+                if 0 <= ray_slot < MAX_PLANETS
+                else float(rec.true_target_planet_id)
+            )
+            fc_pid = float(planets[fc_slot, 0]) if 0 <= fc_slot < MAX_PLANETS else -1.0
+            print(
+                "[orbit_wars] forecast incoming target differs from raycast at launch"
+                + (f" (fleet_id={fid})" if fid >= 0 else ""),
+                f"\n  game_step={game_step} ego_player={ego_player} launch_step={rec.game_step}",
+                f"\n  raycast: slot={ray_slot} planet_id={ray_pid:.0f} hit_tick={ray_tick}",
+                f"\n  forecast_incoming_fleets: slot={fc_slot} planet_id={fc_pid:.0f} hit_tick={fc_tick}",
+                f"\n  launch: from_id={rec.origin_planet_id:.0f} angle={rec.launch_angle:.6f} "
+                f"send={rec.planned_send} micro={rec.micro_idx}",
+                sep="",
+                file=sys.stderr,
+                flush=True,
+            )
+            if _launch_debug_enabled():
+                _launch_debug(f"forecast mismatch fleet_id={fid} {rec.debug_summary()}")
+
+
+def _warn_forecast_mismatch_enabled() -> bool:
+    raw = os.environ.get("ORBIT_WARS_WARN_FORECAST_MISMATCH")
+    if raw is not None:
+        return raw.lower() not in {"0", "false", "no", "off"}
+    return os.environ.get("ORBIT_WARS_WARN_OOB_LAUNCHES", "1").lower() not in {"0", "false", "no", "off"}
 
 
 @dataclass
@@ -740,12 +849,21 @@ def _forecast_incoming_fleets(
     *,
     ship_speed: float = 6.0,
     horizon: int = INCOMING_TA_BINS,
+    per_fleet_arrival: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Fill policy incoming bins with only public fleets that hit a planet in the forecast."""
+    """Fill policy incoming bins with only public fleets that hit a planet in the forecast.
+
+    If ``per_fleet_arrival`` is provided, shape ``(len(fleets_in), 2)`` int32, row ``f`` is set to
+    ``[hit_slot, hit_tick]`` on planet hit, else ``[-1, -1]`` (sun / OOB / no hit within horizon).
+    """
 
     incoming = np.zeros((num_agents, MAX_PLANETS, INCOMING_TA_BINS), dtype=np.uint16)
     if fleets_in.size == 0:
+        if per_fleet_arrival is not None and per_fleet_arrival.size:
+            per_fleet_arrival[...] = -1
         return incoming
+    if per_fleet_arrival is not None:
+        per_fleet_arrival[...] = -1
 
     positions = fleets_in[:, 2:4].astype(np.float32, copy=True)
     alive = np.ones((len(fleets_in),), dtype=np.bool_)
@@ -796,6 +914,9 @@ def _forecast_incoming_fleets(
                 add = int(min(max(int(ships[f]), 0), 65535))
                 cur = int(incoming[owner, hit_slot, t])
                 incoming[owner, hit_slot, t] = min(cur + add, 65535)
+                if per_fleet_arrival is not None and f < per_fleet_arrival.shape[0]:
+                    per_fleet_arrival[f, 0] = hit_slot
+                    per_fleet_arrival[f, 1] = t
                 alive[f] = False
             else:
                 if _point_to_segment_distance(np.asarray([CENTER, CENTER], dtype=np.float32), a0, a1) < SUN_RADIUS:
@@ -1249,6 +1370,10 @@ def _build_turn_actions_torch_only(
                     true_target_planet_id=float(planets[true_slot, 0]) if 0 <= true_slot < MAX_PLANETS else -1.0,
                     policy_hit_tick=float(ray_hit_tick[d_idx]),
                     true_hit_tick=float(true_hit_tick[d_idx]),
+                    comet_planet_ids_at_launch=_active_comet_planet_ids(
+                        np.asarray(virt.comet_group_active),
+                        np.asarray(virt.comet_planet_ids),
+                    ),
                 )
             )
             micro_idx += 1
@@ -1277,6 +1402,7 @@ def observation_to_state(
     *,
     max_fleets: int = 512,
     step_count_override: Optional[int] = None,
+    fleet_forecast_arrival: Optional[np.ndarray] = None,
 ) -> OrbitWarsState:
     """Convert an official Kaggle observation dict into a padded ``OrbitWarsState``.
 
@@ -1366,6 +1492,7 @@ def observation_to_state(
         planet_collision_rank,
         ship_speed=float(_cfg_get(config, "shipSpeed", 6.0)),
         horizon=INCOMING_TA_BINS,
+        per_fleet_arrival=fleet_forecast_arrival,
     )
     rewards = np.zeros((max(num_agents, 4),), dtype=np.float32)
 
@@ -1487,7 +1614,10 @@ class KaggleOrbitWarsAgent:
         self._last_env_step: Optional[int] = None
         self._last_call_timing: Optional[KaggleAgentCallTiming] = None
         warn_oob = os.environ.get("ORBIT_WARS_WARN_OOB_LAUNCHES", "1").lower() not in {"0", "false", "no", "off"}
-        self.launch_tracker = FleetLaunchDebugTracker(warn_oob=warn_oob)
+        self.launch_tracker = FleetLaunchDebugTracker(
+            warn_oob=warn_oob,
+            warn_forecast_mismatch=_warn_forecast_mismatch_enabled(),
+        )
 
     def _obs_game_key(self, obs: Mapping[str, Any]) -> str:
         """Stable per-episode id.
@@ -1553,14 +1683,25 @@ class KaggleOrbitWarsAgent:
             ship_speed=ship_speed,
             n_rays=self.raycast_rays,
         )
+        fleets_in = obs.get("fleets") or []
+        fleet_arrivals = np.full((len(fleets_in), 2), -1, dtype=np.int32)
         t0 = perf_counter()
         state = observation_to_state(
             obs,
             config,
             max_fleets=self.max_fleets,
             step_count_override=step_count,
+            fleet_forecast_arrival=fleet_arrivals,
         )
         timing.obs_to_state_s = perf_counter() - t0
+        self.launch_tracker.check_forecast_vs_raycast(
+            obs,
+            fleet_arrivals,
+            np.asarray(state.planets),
+            np.asarray(state.comet_planet_ids),
+            game_step=step_count,
+            ego_player=ego_player,
+        )
         actions = _build_turn_actions_torch_only(
             self.policy,
             state,

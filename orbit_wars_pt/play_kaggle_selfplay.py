@@ -103,6 +103,16 @@ def main() -> None:
         default=False,
         help="Set ORBIT_WARS_DEBUG_LAUNCH=1: log launch/raycast bookkeeping and fleet matching to stderr.",
     )
+    parser.add_argument(
+        "--warn-forecast-mismatch",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Set ORBIT_WARS_WARN_FORECAST_MISMATCH: warn when _forecast_incoming_fleets "
+            "predicts a different planet than launch raycast for a tracked friendly fleet. "
+            "Default follows ORBIT_WARS_WARN_OOB_LAUNCHES (on)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.cpu_threads > 0:
@@ -126,6 +136,8 @@ def main() -> None:
         os.environ.pop("ORBIT_WARS_MAX_MICRO_STEPS", None)
     if args.debug_launch:
         os.environ["ORBIT_WARS_DEBUG_LAUNCH"] = "1"
+    if args.warn_forecast_mismatch is not None:
+        os.environ["ORBIT_WARS_WARN_FORECAST_MISMATCH"] = "1" if args.warn_forecast_mismatch else "0"
 
     from kaggle_environments import make
 
