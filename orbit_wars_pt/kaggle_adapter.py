@@ -733,13 +733,22 @@ def _expire_comets_for_forecast(
     return planet_active, initial_active, comet_group_active, comet_planet_ids, comet_slots
 
 
+def _collapse_opponents_enabled() -> bool:
+    return os.environ.get("ORBIT_WARS_COLLAPSE_OPPONENTS", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _remap_owner(owner: float, ego: int, num_agents: int) -> int:
     o = int(owner)
     if o < 0:
         return 0
     if o == ego:
         return 1
-    if num_agents <= 2:
+    if num_agents <= 2 or _collapse_opponents_enabled():
         return 2
     return 2 + o if o < ego else 2 + (o - 1)
 
