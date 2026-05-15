@@ -1564,6 +1564,47 @@ def _checkpoint_training_args(payload: Any) -> Mapping[str, Any]:
     return {}
 
 
+def _checkpoint_search_roots() -> list[Path]:
+    """Directories to try when resolving a relative checkpoint path."""
+
+    pkg = Path(__file__).resolve().parent
+    roots: list[Path] = [Path.cwd(), pkg.parent, pkg]
+    for entry in sys.path[:4]:
+        if not entry or entry in {".", ""}:
+            continue
+        try:
+            roots.append(Path(entry).resolve())
+        except OSError:
+            continue
+    seen: set[Path] = set()
+    unique: list[Path] = []
+    for root in roots:
+        if root in seen:
+            continue
+        seen.add(root)
+        unique.append(root)
+    return unique
+
+
+def resolve_checkpoint_path(path: str | os.PathLike[str]) -> Path:
+    """Resolve ``checkpoint.pt`` from cwd, submission bundle root, or this package."""
+
+    raw = Path(path).expanduser()
+    if raw.is_file():
+        return raw.resolve()
+
+    if raw.is_absolute():
+        raise FileNotFoundError(f"Checkpoint not found: {raw}")
+
+    candidates = [root / raw for root in _checkpoint_search_roots()]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+
+    searched = ", ".join(str(c) for c in candidates)
+    raise FileNotFoundError(f"Checkpoint not found: {raw!s} (searched: {searched})")
+
+
 def load_policy(
     checkpoint_path: str | os.PathLike[str] = DEFAULT_CHECKPOINT,
     *,
@@ -1571,9 +1612,10 @@ def load_policy(
 ) -> tuple[OrbitWarsPolicy, torch.device, Mapping[str, Any]]:
     """Load a training checkpoint or raw policy state dict for inference."""
 
+    resolved = resolve_checkpoint_path(checkpoint_path)
     torch_device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     try:
-        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        payload = torch.load(resolved, map_location="cpu", weights_only=False)
     except TypeError:
         payload = torch.load(checkpoint_path, map_location="cpu")
     policy_state = payload.get("policy", payload) if isinstance(payload, Mapping) else payload
@@ -1598,7 +1640,7 @@ class KaggleOrbitWarsAgent:
         raycast_rays: Optional[int] = None,
     ):
         _configure_cpu_threads()
-        self.checkpoint_path = Path(checkpoint_path)
+        self.checkpoint_path = resolve_checkpoint_path(checkpoint_path)
         self.policy, self.device, training_args = load_policy(self.checkpoint_path, device=device)
         self.greedy = bool(greedy)
         self.max_micro_steps = int(
@@ -1762,12 +1804,13 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
     """Kaggle entry point.
 
     Set ``ORBIT_WARS_CHECKPOINT`` to choose a checkpoint path.  By default the
-    adapter looks for ``checkpoint.pt`` next to the submission's working dir.
+    adapter looks for ``checkpoint.pt`` in the process cwd, the submission bundle
+    root (parent of ``orbit_wars_pt/``), and next to this module.
     """
 
     global _AGENT
     if _AGENT is None:
-        ckpt = os.environ.get("ORBIT_WARS_CHECKPOINT", DEFAULT_CHECKPOINT)
+        ckpt = resolve_checkpoint_path(os.environ.get("ORBIT_WARS_CHECKPOINT", DEFAULT_CHECKPOINT))
         device = os.environ.get("ORBIT_WARS_DEVICE")
         greedy = os.environ.get("ORBIT_WARS_GREEDY", "0").lower() in {"1", "true", "yes", "on"}
         seed_raw = os.environ.get("ORBIT_WARS_AGENT_SEED")
