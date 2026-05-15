@@ -967,6 +967,9 @@ class KaggleOrbitWarsAgent:
         self.rng.manual_seed(int(seed if seed is not None else os.environ.get("ORBIT_WARS_AGENT_SEED", "0")))
         self._game_key: Optional[str] = None
         self._next_step_count = 0
+        # Kaggle omits ``step`` on player 1's observation; after player 0 runs, mirror that value here
+        # so a single shared ``KaggleOrbitWarsAgent`` (``agent()``) still builds the correct state.
+        self._last_env_step: Optional[int] = None
         self._last_call_timing: Optional[KaggleAgentCallTiming] = None
 
     def _obs_game_key(self, obs: Mapping[str, Any]) -> str:
@@ -974,20 +977,26 @@ class KaggleOrbitWarsAgent:
         h = hashlib.blake2b(digest_size=16)
         h.update(initial.tobytes())
         h.update(str(obs.get("angular_velocity", 0.0)).encode("ascii", errors="ignore"))
-        h.update(str(obs.get("player", 0)).encode("ascii", errors="ignore"))
         return h.hexdigest()
 
     def _step_count_for_obs(self, obs: Mapping[str, Any]) -> int:
         step_raw = obs.get("step", obs.get("step_count", None))
         if step_raw is not None:
-            self._next_step_count = int(step_raw) + 1
+            s = int(step_raw)
+            self._last_env_step = s
+            self._next_step_count = s + 1
             self._game_key = self._obs_game_key(obs)
-            return int(step_raw)
+            return s
 
         key = self._obs_game_key(obs)
         if key != self._game_key:
             self._game_key = key
             self._next_step_count = 0
+            self._last_env_step = None
+
+        if self._last_env_step is not None:
+            return int(self._last_env_step)
+
         step_count = self._next_step_count
         self._next_step_count += 1
         return step_count
