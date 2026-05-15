@@ -97,6 +97,12 @@ def main() -> None:
         help="Print per-agent-call wall-clock timings while the episode is running "
         "(includes adapter internal breakdown from orbit_wars_pt.kaggle_adapter).",
     )
+    parser.add_argument(
+        "--debug-launch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Set ORBIT_WARS_DEBUG_LAUNCH=1: log launch/raycast bookkeeping and fleet matching to stderr.",
+    )
     args = parser.parse_args()
 
     if args.cpu_threads > 0:
@@ -118,6 +124,8 @@ def main() -> None:
         os.environ["ORBIT_WARS_MAX_MICRO_STEPS"] = str(int(args.max_micro_steps))
     else:
         os.environ.pop("ORBIT_WARS_MAX_MICRO_STEPS", None)
+    if args.debug_launch:
+        os.environ["ORBIT_WARS_DEBUG_LAUNCH"] = "1"
 
     from kaggle_environments import make
 

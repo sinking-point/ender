@@ -10,8 +10,9 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import sys
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Mapping, NamedTuple, Optional
@@ -65,6 +66,372 @@ FLEET_SHIPS = 6
 FLEET_ROW_WIDTH = 9
 
 
+def _norm_angle(angle: float) -> float:
+    return float(angle) % (2.0 * math.pi)
+
+
+def _angle_diff(a: float, b: float) -> float:
+    return abs(((_norm_angle(a) - _norm_angle(b)) + math.pi) % (2.0 * math.pi) - math.pi)
+
+
+def _planet_id_match(recorded: float, observed: float) -> bool:
+    return abs(float(recorded) - float(observed)) < 0.5
+
+
+def _ships_match(recorded: int, observed: float) -> bool:
+    return int(recorded) == int(round(float(observed)))
+
+
+def _launch_debug_enabled() -> bool:
+    return os.environ.get("ORBIT_WARS_DEBUG_LAUNCH", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _launch_debug(msg: str) -> None:
+    if _launch_debug_enabled():
+        print(f"[orbit_wars:launch] {msg}", file=sys.stderr, flush=True)
+
+
+def _fleet_exits_board_next_tick(
+    x: float,
+    y: float,
+    angle: float,
+    ships: float,
+    *,
+    ship_speed: float = 6.0,
+) -> bool:
+    sp = _fleet_speed(ships, ship_speed)
+    nx = x + math.cos(angle) * sp
+    ny = y + math.sin(angle) * sp
+    return nx < 0.0 or nx > BOARD_SIZE or ny < 0.0 or ny > BOARD_SIZE
+
+
+@dataclass
+class LaunchRaycastRecord:
+    """Bookkeeping for one micro-launch decision (raycast inputs and targets)."""
+
+    game_step: int
+    ego_player: int
+    micro_idx: int
+    origin_slot: int
+    origin_planet_id: float
+    origin_xy: tuple[float, float]
+    origin_radius: float
+    frac_idx: int
+    fraction: float
+    ships_avail: float
+    planned_send: int
+    n_rays: int
+    ship_speed: float
+    launch_angle: float
+    policy_target_slot: int
+    policy_target_planet_id: float
+    true_target_slot: int
+    true_target_planet_id: float
+    policy_hit_tick: float
+    true_hit_tick: float
+    fleet_id: Optional[int] = None
+    debug_serial: int = 0
+
+    def debug_summary(self) -> str:
+        return (
+            f"serial={self.debug_serial} step={self.game_step} ego={self.ego_player} micro={self.micro_idx} "
+            f"from_id={self.origin_planet_id:.0f} send={self.planned_send} "
+            f"angle={self.launch_angle:.8f} tgt={self.policy_target_planet_id:.0f} "
+            f"hit_tick={self.true_hit_tick:.1f} fleet_id={self.fleet_id}"
+        )
+
+    def format_warning(self, *, last_x: float, last_y: float, last_ships: float) -> str:
+        lines = [
+            f"[orbit_wars] friendly fleet left the board"
+            + (f" (fleet_id={self.fleet_id})" if self.fleet_id is not None else ""),
+            f"  last_pos=({last_x:.4f}, {last_y:.4f}) ships={last_ships:.0f}",
+            f"  game_step={self.game_step} ego_player={self.ego_player} micro_idx={self.micro_idx}",
+            f"  raycast: origin_slot={self.origin_slot} planet_id={self.origin_planet_id:.0f}"
+            f" pos=({self.origin_xy[0]:.4f},{self.origin_xy[1]:.4f}) r={self.origin_radius:.4f}",
+            f"    frac_idx={self.frac_idx} fraction={self.fraction} ships_avail={self.ships_avail:.0f}"
+            f" planned_send={self.planned_send} n_rays={self.n_rays} ship_speed={self.ship_speed}",
+            f"  launch_angle={self.launch_angle:.6f} rad ({math.degrees(self.launch_angle):.2f} deg)",
+            f"  policy_target: slot={self.policy_target_slot} planet_id={self.policy_target_planet_id:.0f}"
+            f" projected_hit_tick={self.policy_hit_tick:.1f}",
+            f"  true_target: slot={self.true_target_slot} planet_id={self.true_target_planet_id:.0f}"
+            f" projected_hit_tick={self.true_hit_tick:.1f}",
+        ]
+        return "\n".join(lines)
+
+
+@dataclass
+class FleetLaunchDebugTracker:
+    """Maps fleet ids to launch/raycast records; warns when a friendly fleet exits the map."""
+
+    warn_oob: bool = True
+    _pending: list[LaunchRaycastRecord] = field(default_factory=list)
+    _by_fleet_id: dict[int, LaunchRaycastRecord] = field(default_factory=dict)
+    _last_fleets_all: dict[int, tuple[int, float, float, float, float, float]] = field(default_factory=dict)
+    _last_fleets_by_player: dict[int, dict[int, tuple[int, float, float, float, float, float]]] = field(
+        default_factory=dict
+    )
+    _last_step_by_player: dict[int, int] = field(default_factory=dict)
+    _game_key: Optional[str] = None
+    _call_seq: int = 0
+    _next_launch_serial: int = 0
+
+    def reset_game(self) -> None:
+        if _launch_debug_enabled() and (self._pending or self._by_fleet_id):
+            _launch_debug(
+                f"reset_game pending={len(self._pending)} by_fleet_id={len(self._by_fleet_id)} "
+                f"keys={sorted(self._by_fleet_id.keys())[:20]}"
+            )
+        self._pending.clear()
+        self._by_fleet_id.clear()
+        self._last_fleets_all.clear()
+        self._last_fleets_by_player.clear()
+        self._last_step_by_player.clear()
+
+    def sync_game(self, game_key: str, *, game_step: int = -1) -> None:
+        if game_key != self._game_key:
+            if (
+                self._game_key is not None
+                and game_step > 0
+                and (self._pending or self._by_fleet_id)
+            ):
+                print(
+                    f"[orbit_wars] launch tracker reset mid-game at step={game_step} "
+                    f"(key {str(self._game_key)[:8]} -> {game_key[:8]}); "
+                    f"dropping {len(self._pending)} pending and {len(self._by_fleet_id)} fleet records",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if _launch_debug_enabled():
+                _launch_debug(f"sync_game new_key={game_key[:8]} old={str(self._game_key)[:8]} step={game_step}")
+            self._game_key = game_key
+            self.reset_game()
+
+    def _debug_dump_state(self, label: str, *, ego_player: int, game_step: int, obs_step: Any) -> None:
+        if not _launch_debug_enabled():
+            return
+        pending_by_ego: dict[int, int] = {}
+        for rec in self._pending:
+            pending_by_ego[rec.ego_player] = pending_by_ego.get(rec.ego_player, 0) + 1
+        _launch_debug(
+            f"{label} ego={ego_player} game_step={game_step} obs.step={obs_step!r} "
+            f"call_seq={self._call_seq} pending={len(self._pending)}{pending_by_ego} "
+            f"by_fleet_id={len(self._by_fleet_id)} last_step_by_player={dict(self._last_step_by_player)}"
+        )
+        for rec in self._pending[:12]:
+            _launch_debug(f"  pending: {rec.debug_summary()}")
+        if len(self._pending) > 12:
+            _launch_debug(f"  ... {len(self._pending) - 12} more pending")
+
+    def _debug_explain_fleet_match(
+        self,
+        owner: int,
+        from_id: float,
+        angle: float,
+        ships: float,
+        *,
+        n_rays: int,
+        fleet_id: int,
+    ) -> None:
+        if not _launch_debug_enabled():
+            return
+        angle_tol = max(0.06, (2.0 * math.pi / float(max(n_rays, 8))) + 1e-6)
+        _launch_debug(
+            f"no match for fleet_id={fleet_id} owner={owner} from={from_id:.0f} "
+            f"ships={ships:.0f} angle={angle:.8f} (tol={angle_tol:.5f})"
+        )
+        if not self._pending:
+            _launch_debug("  pending queue is EMPTY")
+            return
+        for i, rec in enumerate(self._pending):
+            reasons: list[str] = []
+            if rec.ego_player != owner:
+                reasons.append(f"ego {rec.ego_player}!={owner}")
+            if not _planet_id_match(rec.origin_planet_id, from_id):
+                reasons.append(f"from {rec.origin_planet_id:.0f}!={from_id:.0f}")
+            if not _ships_match(rec.planned_send, ships):
+                reasons.append(f"ships {rec.planned_send}!={int(round(ships))}")
+            ang_diff = _angle_diff(rec.launch_angle, angle)
+            if ang_diff > angle_tol:
+                reasons.append(f"angle_diff={ang_diff:.5f}>{angle_tol:.5f}")
+            _launch_debug(f"  pending[{i}] {rec.debug_summary()} -> {reasons or 'SHOULD MATCH'}")
+        if fleet_id in self._by_fleet_id:
+            _launch_debug(f"  NOTE: fleet_id {fleet_id} IS in by_fleet_id: {self._by_fleet_id[fleet_id].debug_summary()}")
+
+    @staticmethod
+    def _fleet_tuple(f: Any) -> tuple[int, float, float, float, float, float]:
+        return (
+            int(f[1]),
+            float(f[2]),
+            float(f[3]),
+            float(f[4]),
+            float(f[5]),
+            float(f[6]),
+        )
+
+    def _match_pending(
+        self,
+        owner: int,
+        from_id: float,
+        angle: float,
+        ships: float,
+        *,
+        n_rays: int = DEFAULT_RAYCAST_RAYS,
+    ) -> Optional[LaunchRaycastRecord]:
+        """Match a Kaggle fleet row to a pending launch (tolerant angle, not exact floats)."""
+
+        angle_tol = max(0.06, (2.0 * math.pi / float(max(n_rays, 8))) + 1e-6)
+        best: Optional[LaunchRaycastRecord] = None
+        best_i = -1
+        best_score = 1e9
+        for i, rec in enumerate(self._pending):
+            if rec.ego_player != owner:
+                continue
+            if not _planet_id_match(rec.origin_planet_id, from_id):
+                continue
+            if not _ships_match(rec.planned_send, ships):
+                continue
+            ang_diff = _angle_diff(rec.launch_angle, angle)
+            if ang_diff < best_score:
+                best_score = ang_diff
+                best = rec
+                best_i = i
+        if best is not None and best_score <= angle_tol:
+            rec = self._pending.pop(best_i)
+            if _launch_debug_enabled():
+                _launch_debug(
+                    f"matched pending[{rec.debug_serial}] -> fleet owner={owner} from={from_id:.0f} "
+                    f"angle_diff={best_score:.6f}"
+                )
+            return rec
+
+        # Fallback: unique pending launch from this planet (ships can disagree if
+        # micro bookkeeping diverged, but angle + owner + from_id should still match).
+        candidates = [
+            (i, rec)
+            for i, rec in enumerate(self._pending)
+            if rec.ego_player == owner and _planet_id_match(rec.origin_planet_id, from_id)
+        ]
+        if len(candidates) == 1:
+            i, rec = candidates[0]
+            ang_diff = _angle_diff(rec.launch_angle, angle)
+            if ang_diff <= angle_tol:
+                rec = self._pending.pop(i)
+                if _launch_debug_enabled():
+                    _launch_debug(
+                        f"matched pending[{rec.debug_serial}] (fallback unique from) "
+                        f"angle_diff={ang_diff:.6f}"
+                    )
+                return rec
+        return None
+
+    def _attach_pending_to_observed_fleets(
+        self,
+        current: dict[int, tuple[int, float, float, float, float, float]],
+        *,
+        n_rays: int,
+        ego_player: int,
+    ) -> None:
+        unmatched = 0
+        for fid, tup in sorted(current.items()):
+            if fid in self._by_fleet_id:
+                continue
+            owner, _x, _y, ang, from_id, ships = tup
+            rec = self._match_pending(owner, from_id, ang, ships, n_rays=n_rays)
+            if rec is not None:
+                rec.fleet_id = fid
+                self._by_fleet_id[fid] = rec
+                if _launch_debug_enabled():
+                    _launch_debug(f"attached fleet_id={fid} <- {rec.debug_summary()}")
+            else:
+                unmatched += 1
+                if _launch_debug_enabled() and owner == ego_player:
+                    self._debug_explain_fleet_match(
+                        owner, from_id, ang, ships, n_rays=n_rays, fleet_id=fid
+                    )
+        if _launch_debug_enabled() and unmatched:
+            _launch_debug(f"attach pass: {unmatched} fleet(s) still without launch record")
+
+    def observe_fleets(
+        self,
+        obs: Mapping[str, Any],
+        ego_player: int,
+        *,
+        game_step: int,
+        ship_speed: float = 6.0,
+        n_rays: int = DEFAULT_RAYCAST_RAYS,
+    ) -> None:
+        self._call_seq += 1
+        obs_step = obs.get("step", obs.get("step_count", None))
+        self._debug_dump_state("observe IN", ego_player=ego_player, game_step=game_step, obs_step=obs_step)
+
+        fleets_in = obs.get("fleets") or []
+        current: dict[int, tuple[int, float, float, float, float, float]] = {}
+        for f in fleets_in:
+            fid = int(f[0])
+            current[fid] = self._fleet_tuple(f)
+
+        new_ids = sorted(set(current) - set(self._last_fleets_all))
+        if _launch_debug_enabled() and new_ids:
+            _launch_debug(f"new fleet ids this obs ({len(new_ids)}): {new_ids[:30]}")
+
+        self._attach_pending_to_observed_fleets(current, n_rays=n_rays, ego_player=ego_player)
+
+        prev_step = self._last_step_by_player.get(ego_player)
+        prev_snap = self._last_fleets_by_player.get(ego_player, {})
+        if prev_step is not None and game_step > prev_step:
+            if _launch_debug_enabled():
+                vanished = [fid for fid in prev_snap if fid not in current]
+                _launch_debug(
+                    f"step advanced {prev_step}->{game_step} ego={ego_player}: "
+                    f"{len(vanished)} friendly fleet(s) vanished from snap"
+                )
+            for fid, last in prev_snap.items():
+                if fid in current:
+                    continue
+                owner, x, y, ang, _from_id, ships = last
+                if owner != ego_player:
+                    continue
+                oob = _fleet_exits_board_next_tick(x, y, ang, ships, ship_speed=ship_speed)
+                if _launch_debug_enabled():
+                    _launch_debug(
+                        f"vanished fid={fid} oob={oob} pos=({x:.3f},{y:.3f}) ang={ang:.6f} "
+                        f"from={_from_id:.0f} ships={ships:.0f} in_by_fleet_id={fid in self._by_fleet_id}"
+                    )
+                if not oob:
+                    continue
+                if not self.warn_oob:
+                    continue
+                rec = self._by_fleet_id.get(fid)
+                if rec is not None:
+                    print(rec.format_warning(last_x=x, last_y=y, last_ships=ships), file=sys.stderr, flush=True)
+                else:
+                    print(
+                        f"[orbit_wars] friendly fleet left the board (fleet_id={fid}, no launch record)\n"
+                        f"  last_pos=({x:.4f}, {y:.4f}) ships={ships:.0f} angle={ang:.6f} from_planet={_from_id:.0f}\n"
+                        f"  game_step={game_step} ego_player={ego_player}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    self._debug_explain_fleet_match(
+                        owner, _from_id, ang, ships, n_rays=n_rays, fleet_id=fid
+                    )
+                    self._debug_dump_state("OOB no record", ego_player=ego_player, game_step=game_step, obs_step=obs_step)
+
+        self._last_fleets_all = current
+        self._last_fleets_by_player[ego_player] = {
+            fid: tup for fid, tup in current.items() if int(tup[0]) == ego_player
+        }
+        self._last_step_by_player[ego_player] = game_step
+        self._debug_dump_state("observe OUT", ego_player=ego_player, game_step=game_step, obs_step=obs_step)
+
+    def record_launch(self, rec: LaunchRaycastRecord) -> None:
+        self._next_launch_serial += 1
+        rec.debug_serial = self._next_launch_serial
+        self._pending.append(rec)
+        if _launch_debug_enabled():
+            _launch_debug(f"record_launch {rec.debug_summary()}")
+
+
 @dataclass
 class KaggleAgentCallTiming:
     """Host-side ``perf_counter`` slices for the last ``KaggleOrbitWarsAgent.__call__``."""
@@ -104,6 +471,7 @@ class OrbitWarsState(NamedTuple):
     comet_path_index: np.ndarray
     comet_planet_ids: np.ndarray
     comet_slots: np.ndarray
+    planet_collision_rank: np.ndarray
     next_fleet_id: np.ndarray
     angular_velocity: np.ndarray
     step_count: np.ndarray
@@ -175,6 +543,85 @@ def _fleet_speed(ships: float, max_speed: float = 6.0) -> float:
     if ships <= 1.0:
         return 1.0
     return float(min(max_speed, 1.0 + (max_speed - 1.0) * (math.log(ships) / math.log(1000.0)) ** 1.5))
+
+
+def _planned_send(ships_avail: float, frac_idx: int) -> int:
+    """Ships dispatched for a fraction choice (matches ``_build_turn_actions_torch_only``)."""
+
+    avail = int(ships_avail)
+    if avail <= 0:
+        return 0
+    send = int(math.floor(float(FRACTIONS[frac_idx]) * ships_avail))
+    return min(max(1, send), avail)
+
+
+def _planet_collision_rank_from_obs(
+    planets_in: np.ndarray,
+    id_to_slot: dict[int, int],
+) -> np.ndarray:
+    """Per-slot collision priority mirroring Kaggle ``obs0.planets`` iteration order."""
+
+    rank = np.full((MAX_PLANETS,), MAX_PLANETS, dtype=np.int32)
+    for pri, row in enumerate(planets_in[:MAX_PLANETS]):
+        slot = id_to_slot.get(int(row[0]), -1)
+        if 0 <= slot < MAX_PLANETS:
+            rank[slot] = pri
+    return rank
+
+
+def _earliest_hit_planet_index(
+    hit_mask: np.ndarray,
+    t_enter: np.ndarray,
+    collision_rank: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """First planet along each ray's segment (earliest ``t``, then Kaggle list order)."""
+
+    big = np.float32(1e9)
+    score = np.where(hit_mask, t_enter, big)
+    score = score + collision_rank.astype(np.float32)[None, :] * 1e-6
+    idx = np.argmin(score, axis=1).astype(np.int32)
+    any_hit = np.any(hit_mask, axis=1)
+    return idx, any_hit
+
+
+def _expire_comets_for_forecast(
+    planet_active: np.ndarray,
+    initial_active: np.ndarray,
+    comet_group_active: np.ndarray,
+    comet_path_index: np.ndarray,
+    comet_path_lengths: np.ndarray,
+    comet_slots: np.ndarray,
+    comet_planet_ids: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Drop comets the official interpreter removes before fleet launch."""
+
+    planet_active = planet_active.copy()
+    initial_active = initial_active.copy()
+    comet_group_active = comet_group_active.copy()
+    comet_planet_ids = comet_planet_ids.copy()
+    comet_slots = comet_slots.copy()
+
+    for g in range(MAX_COMET_GROUPS):
+        if not comet_group_active[g]:
+            continue
+        idx = int(comet_path_index[g])
+        group_dead = True
+        for k in range(4):
+            slot = int(comet_slots[g, k])
+            length = int(comet_path_lengths[g, k])
+            if slot < 0 or slot >= MAX_PLANETS:
+                continue
+            if idx < length:
+                group_dead = False
+            else:
+                planet_active[slot] = False
+                initial_active[slot] = False
+                comet_slots[g, k] = -1
+                comet_planet_ids[g, k] = -1
+        if group_dead:
+            comet_group_active[g] = False
+
+    return planet_active, initial_active, comet_group_active, comet_planet_ids, comet_slots
 
 
 def _remap_owner(owner: float, ego: int, num_agents: int) -> int:
@@ -257,10 +704,19 @@ def _next_planet_positions(
             length = int(comet_path_lengths[g, k])
             expired = idx >= length
             in_path = idx < length
+            if not planet_active[slot]:
+                # Kaggle removes expired comets after the expiry tick; no ghost collisions.
+                collision_enabled[slot] = False
+                continue
             if in_path:
                 new_pos[slot] = comet_paths[g, k, max(idx, 0)]
-            first_placement = planets[slot, PLANET_X] < 0.0
-            collision_enabled[slot] = (not first_placement) or expired
+                first_placement = planets[slot, PLANET_X] < 0.0
+                collision_enabled[slot] = not first_placement
+            elif expired:
+                # Expiry tick only: stationary segment, then planet_active clears.
+                collision_enabled[slot] = True
+            else:
+                collision_enabled[slot] = False
             expired_after_move[slot] = expired_after_move[slot] or expired
 
     return old_pos, new_pos, collision_enabled, next_path_index, planet_active & ~expired_after_move, initial_active & ~expired_after_move
@@ -280,6 +736,7 @@ def _forecast_incoming_fleets(
     num_agents: int,
     step_count: int,
     angular_velocity: float,
+    collision_rank: np.ndarray,
     *,
     ship_speed: float = 6.0,
     horizon: int = INCOMING_TA_BINS,
@@ -329,11 +786,11 @@ def _forecast_incoming_fleets(
             a1 = a0 + speeds[f] * dirs[f]
 
             hit_slot = -1
-            for i in range(MAX_PLANETS):
-                if not collision_enabled[i]:
+            for i in np.argsort(collision_rank):
+                if collision_rank[i] >= MAX_PLANETS or not collision_enabled[i]:
                     continue
                 if _swept_pair_hit(a0, a1, old_pos[i], new_pos[i], float(p[i, PLANET_RADIUS])):
-                    hit_slot = i
+                    hit_slot = int(i)
                     break
             if hit_slot >= 0:
                 add = int(min(max(int(ships[f]), 0), 65535))
@@ -367,6 +824,16 @@ def _forecast_planet_paths_np(state: OrbitWarsState, horizon: int = INCOMING_TA_
     comet_group_active = np.asarray(state.comet_group_active).astype(bool)
     comet_path_index = np.asarray(state.comet_path_index).astype(np.int32).copy()
     comet_slots = np.asarray(state.comet_slots).astype(np.int32)
+    comet_planet_ids = np.asarray(state.comet_planet_ids)
+    planet_active, initial_active, comet_group_active, comet_planet_ids, comet_slots = _expire_comets_for_forecast(
+        planet_active,
+        initial_active,
+        comet_group_active,
+        comet_path_index,
+        comet_path_lengths,
+        comet_slots,
+        comet_planet_ids,
+    )
     angular_velocity = float(np.asarray(state.angular_velocity))
     step_count = int(np.asarray(state.step_count))
 
@@ -415,12 +882,15 @@ def _simulate_discrete_ray_policy_hits_np(
     planets = np.asarray(state.planets)
     current_active = np.asarray(state.planet_active).astype(bool)
     p0, p1, active_by_tick = _forecast_planet_paths_np(state, horizon=horizon)
+    # Terminal events use per-tick collision flags (same as Kaggle fleet movement),
+    # not the static visibility mask used only when marking valid policy targets.
     radii = planets[:, PLANET_RADIUS].astype(np.float32)
     origin_xy = planets[origin_idx, PLANET_X : PLANET_Y + 1].astype(np.float32)
     origin_radius = float(planets[origin_idx, PLANET_RADIUS])
     ships_avail = float(planets[origin_idx, 5])
-    send = math.floor(float(FRACTIONS[frac_idx]) * ships_avail)
-    speed = _fleet_speed(float(send), ship_speed)
+    send = _planned_send(ships_avail, frac_idx)
+    speed = _fleet_speed(float(max(send, 1)), ship_speed)
+    collision_rank = np.asarray(state.planet_collision_rank, dtype=np.int32)
 
     angles = np.arange(n_rays, dtype=np.float32) * (2.0 * math.pi / float(n_rays))
     dirs = np.stack([np.cos(angles), np.sin(angles)], axis=1).astype(np.float32)
@@ -453,12 +923,15 @@ def _simulate_discrete_ray_policy_hits_np(
         moving_hit = (disc >= 0.0) & (t2 >= 0.0) & (t1 <= 1.0)
         hit_raw = np.where(qa < 1e-12, static_hit, moving_hit)
         hit_true = hit_raw & active_by_tick[t][None, :]
-        hit_policy = hit_true & current_active[None, :]
+        hit_policy = hit_true
+        t_enter = np.where(
+            qa < 1e-12,
+            np.where(static_hit, 0.0, np.float32(1e9)),
+            np.where(moving_hit, np.clip(t1, 0.0, 1.0), np.float32(1e9)),
+        ).astype(np.float32)
 
-        any_true = np.any(hit_true, axis=1)
-        idx_true = np.argmax(hit_true, axis=1).astype(np.int32)
-        any_policy = np.any(hit_policy, axis=1)
-        idx_policy = np.argmax(hit_policy, axis=1).astype(np.int32)
+        idx_true, any_true = _earliest_hit_planet_index(hit_true, t_enter, collision_rank)
+        idx_policy, any_policy = _earliest_hit_planet_index(hit_policy, t_enter, collision_rank)
 
         delta = a1 - a0
         l2 = np.sum(delta * delta, axis=1)
@@ -473,13 +946,21 @@ def _simulate_discrete_ray_policy_hits_np(
 
         had_policy = any_policy | sun_hit | oob
         new_policy = (~done_policy) & had_policy
-        policy_code[new_policy] = np.where(any_policy[new_policy], idx_policy[new_policy], -1)
+        policy_code[new_policy] = np.where(
+            any_policy[new_policy],
+            idx_policy[new_policy],
+            -1,
+        )
         policy_tick[new_policy] = t
         done_policy |= had_policy
 
         had_true = any_true | sun_hit | oob
         new_true = (~done_true) & had_true
-        true_code[new_true] = np.where(any_true[new_true], idx_true[new_true], -1)
+        true_code[new_true] = np.where(
+            any_true[new_true],
+            idx_true[new_true],
+            -1,
+        )
         true_tick[new_true] = t
         done_true |= had_true
 
@@ -646,11 +1127,14 @@ def _build_turn_actions_torch_only(
     rng: Optional[torch.Generator] = None,
     n_rays: int = DEFAULT_RAYCAST_RAYS,
     timing: Optional[KaggleAgentCallTiming] = None,
+    launch_tracker: Optional[FleetLaunchDebugTracker] = None,
+    game_step: int = 0,
 ) -> list[list[float]]:
     planets = np.array(np.asarray(state.planets), copy=True)
     incoming_fleets = np.array(np.asarray(state.incoming_fleets), copy=True)
     planet_active = np.asarray(state.planet_active).astype(bool)
     actions: list[list[float]] = []
+    micro_idx = 0
 
     for _ in range(max_micro_steps):
         if timing is not None:
@@ -713,7 +1197,7 @@ def _build_turn_actions_torch_only(
             out["planet_hidden"],
             torch.tensor([o_idx], device=device, dtype=torch.long),
             torch.tensor([frac_idx], device=device, dtype=torch.long),
-            torch.tensor([math.floor(float(FRACTIONS[frac_idx]) * float(planets[o_idx, 5]))], device=device, dtype=torch.float32),
+            torch.tensor([float(_planned_send(float(planets[o_idx, 5]), int(frac_idx)))], device=device, dtype=torch.float32),
             torch.from_numpy(ray_hit_tick[None, :]).to(device=device, dtype=torch.float32),
             torch.from_numpy(planets[None, :, 5]).to(device=device, dtype=torch.float32),
         )[0]
@@ -735,13 +1219,39 @@ def _build_turn_actions_torch_only(
 
         t0 = perf_counter()
         ships_avail = float(planets[o_idx, 5])
-        send = max(1, math.floor(float(FRACTIONS[frac_idx]) * ships_avail))
-        send = min(send, int(ships_avail))
+        send = _planned_send(ships_avail, int(frac_idx))
         if send <= 0:
             if timing is not None:
                 timing.micro_book_s += perf_counter() - t0
             break
         angle = float(ray_angle[d_idx])
+        if launch_tracker is not None:
+            true_slot = int(true_planet[d_idx])
+            launch_tracker.record_launch(
+                LaunchRaycastRecord(
+                    game_step=int(game_step),
+                    ego_player=int(ego_player),
+                    micro_idx=micro_idx,
+                    origin_slot=int(o_idx),
+                    origin_planet_id=float(planets[o_idx, 0]),
+                    origin_xy=(float(planets[o_idx, PLANET_X]), float(planets[o_idx, PLANET_Y])),
+                    origin_radius=float(planets[o_idx, PLANET_RADIUS]),
+                    frac_idx=int(frac_idx),
+                    fraction=float(FRACTIONS[frac_idx]),
+                    ships_avail=float(ships_avail),
+                    planned_send=int(send),
+                    n_rays=int(n_rays),
+                    ship_speed=float(ship_speed),
+                    launch_angle=angle,
+                    policy_target_slot=int(d_idx),
+                    policy_target_planet_id=float(planets[d_idx, 0]),
+                    true_target_slot=true_slot,
+                    true_target_planet_id=float(planets[true_slot, 0]) if 0 <= true_slot < MAX_PLANETS else -1.0,
+                    policy_hit_tick=float(ray_hit_tick[d_idx]),
+                    true_hit_tick=float(true_hit_tick[d_idx]),
+                )
+            )
+            micro_idx += 1
         actions.append([float(planets[o_idx, 0]), float(angle), int(send)])
         planets[o_idx, 5] -= float(send)
         env_target = int(true_planet[d_idx])
@@ -838,6 +1348,7 @@ def observation_to_state(
 
     angular_velocity = float(obs.get("angular_velocity", 0.0))
     step_count = int(step_count_override if step_count_override is not None else obs.get("step", obs.get("step_count", 0)))
+    planet_collision_rank = _planet_collision_rank_from_obs(planets_in, id_to_slot)
     incoming_fleets = _forecast_incoming_fleets(
         planets,
         planet_active,
@@ -852,6 +1363,7 @@ def observation_to_state(
         num_agents,
         step_count,
         angular_velocity,
+        planet_collision_rank,
         ship_speed=float(_cfg_get(config, "shipSpeed", 6.0)),
         horizon=INCOMING_TA_BINS,
     )
@@ -872,6 +1384,7 @@ def observation_to_state(
         comet_path_index=comet_path_index,
         comet_planet_ids=comet_planet_ids,
         comet_slots=comet_slots,
+        planet_collision_rank=planet_collision_rank,
         next_fleet_id=np.asarray(len(fleets_in), dtype=np.int32),
         angular_velocity=np.asarray(angular_velocity, dtype=np.float32),
         step_count=np.asarray(step_count, dtype=np.int32),
@@ -966,18 +1479,41 @@ class KaggleOrbitWarsAgent:
         self.rng = torch.Generator(device=self.device)
         self.rng.manual_seed(int(seed if seed is not None else os.environ.get("ORBIT_WARS_AGENT_SEED", "0")))
         self._game_key: Optional[str] = None
+        # ``initial_planets`` in Kaggle obs grows/shrinks as comets appear; hash only at step 0.
+        self._frozen_game_key: Optional[str] = None
         self._next_step_count = 0
         # Kaggle omits ``step`` on player 1's observation; after player 0 runs, mirror that value here
         # so a single shared ``KaggleOrbitWarsAgent`` (``agent()``) still builds the correct state.
         self._last_env_step: Optional[int] = None
         self._last_call_timing: Optional[KaggleAgentCallTiming] = None
+        warn_oob = os.environ.get("ORBIT_WARS_WARN_OOB_LAUNCHES", "1").lower() not in {"0", "false", "no", "off"}
+        self.launch_tracker = FleetLaunchDebugTracker(warn_oob=warn_oob)
 
     def _obs_game_key(self, obs: Mapping[str, Any]) -> str:
-        initial = np.asarray(obs.get("initial_planets", obs.get("planets", [])), dtype=np.float32)
+        """Stable per-episode id.
+
+        Kaggle mutates ``initial_planets`` during play (e.g. comets added/removed), so we only
+        refresh the key on step 0; mid-game changes must not reset launch bookkeeping.
+        """
+
+        step_raw = obs.get("step", obs.get("step_count", None))
+        step = int(step_raw) if step_raw is not None else None
+
+        initial = obs.get("initial_planets")
+        if not initial:
+            if self._frozen_game_key is not None:
+                return self._frozen_game_key
+            initial = obs.get("planets", [])
+
+        arr = np.asarray(initial, dtype=np.float32)
         h = hashlib.blake2b(digest_size=16)
-        h.update(initial.tobytes())
+        h.update(arr.tobytes())
         h.update(str(obs.get("angular_velocity", 0.0)).encode("ascii", errors="ignore"))
-        return h.hexdigest()
+        key = h.hexdigest()
+
+        if step == 0 or self._frozen_game_key is None:
+            self._frozen_game_key = key
+        return self._frozen_game_key
 
     def _step_count_for_obs(self, obs: Mapping[str, Any]) -> int:
         step_raw = obs.get("step", obs.get("step_count", None))
@@ -1005,19 +1541,30 @@ class KaggleOrbitWarsAgent:
     def __call__(self, obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
         self._last_call_timing = None
         timing = KaggleAgentCallTiming()
+        ego_player = int(obs.get("player", 0))
+        step_count = self._step_count_for_obs(obs)
+        game_key = self._obs_game_key(obs)
+        self.launch_tracker.sync_game(game_key, game_step=step_count)
+        ship_speed = float(_cfg_get(config, "shipSpeed", 6.0))
+        self.launch_tracker.observe_fleets(
+            obs,
+            ego_player,
+            game_step=step_count,
+            ship_speed=ship_speed,
+            n_rays=self.raycast_rays,
+        )
         t0 = perf_counter()
         state = observation_to_state(
             obs,
             config,
             max_fleets=self.max_fleets,
-            step_count_override=self._step_count_for_obs(obs),
+            step_count_override=step_count,
         )
         timing.obs_to_state_s = perf_counter() - t0
-        ship_speed = float(_cfg_get(config, "shipSpeed", 6.0))
         actions = _build_turn_actions_torch_only(
             self.policy,
             state,
-            int(obs.get("player", 0)),
+            ego_player,
             self.device,
             ship_speed=ship_speed,
             max_micro_steps=self.max_micro_steps,
@@ -1025,8 +1572,19 @@ class KaggleOrbitWarsAgent:
             rng=self.rng,
             n_rays=self.raycast_rays,
             timing=timing,
+            launch_tracker=self.launch_tracker,
+            game_step=step_count,
         )
         self._last_call_timing = timing
+        if _launch_debug_enabled():
+            action_summaries = [
+                f"[{float(a[0]):.0f},{float(a[1]):.6f},{int(a[2])}]" for a in actions[:8]
+            ]
+            _launch_debug(
+                f"call OUT ego={ego_player} game_step={step_count} obs.step={obs.get('step')!r} "
+                f"actions={len(actions)} {action_summaries}"
+                + (f" (+{len(actions) - 8} more)" if len(actions) > 8 else "")
+            )
         return actions
 
 
