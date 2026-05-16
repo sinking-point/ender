@@ -26,19 +26,23 @@ from orbit_wars_pt.constants import (
     ENTITY_CLS,
     ENTITY_COMET,
     ENTITY_PLANET,
-    FEATURE_DIM,
+    FEATURE_DIM_MULTI,
     FRACTIONS,
+    INCOMING_SURVIVOR_FLAT,
     INCOMING_TA_BINS,
     MAX_PLANETS,
     NUM_OWNER_SLOTS,
     ROTATION_RADIUS_LIMIT,
     SUN_RADIUS,
+    obs_feature_dim_for_num_agents,
 )
 from orbit_wars_pt.geometry import estimate_time_to_hit, planet_pred_velocity
 from orbit_wars_pt.model import OrbitWarsPolicy
 
 
 DEFAULT_CHECKPOINT = "checkpoint.pt"
+DEFAULT_CHECKPOINT_4P = "checkpoint_4p.pt"
+DEFAULT_CHECKPOINT_2P = "checkpoint_2p.pt"
 DEFAULT_RAYCAST_RAYS = 256
 DEFAULT_MAX_ACTIONS = 64
 DEFAULT_CPU_THREADS = 1
@@ -733,13 +737,33 @@ def _expire_comets_for_forecast(
     return planet_active, initial_active, comet_group_active, comet_planet_ids, comet_slots
 
 
-def _collapse_opponents_enabled() -> bool:
-    return os.environ.get("ORBIT_WARS_COLLAPSE_OPPONENTS", "0").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+def _incoming_interfleet_np(
+    incoming: np.ndarray,
+    ego: int,
+    num_agents: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Interfleet largest-vs-2nd reduction; returns (signed_net[P,T], survivor_slot[P,T] int)."""
+
+    a = incoming.shape[0]
+    padded = np.pad(incoming.astype(np.float32), ((0, 4 - a), (0, 0), (0, 0)))
+    ships = np.transpose(padded, (1, 2, 0))
+    order = np.argsort(-ships, axis=-1)
+    top_s = np.take_along_axis(ships, order[..., :1], axis=-1)[..., 0]
+    second_s = np.take_along_axis(ships, order[..., 1:2], axis=-1)[..., 0]
+    top_p = order[..., 0].astype(np.int32)
+    survivor = np.where(top_s == second_s, 0.0, top_s - second_s)
+    ego_j = int(ego)
+    signed = np.where(survivor <= 0.0, 0.0, np.where(top_p == ego_j, survivor, -survivor))
+    is_self = top_p == ego_j
+    slot_le2 = np.where(survivor <= 0.0, 0, np.where(is_self, 1, 2))
+    slot_gt2 = np.where(
+        survivor <= 0.0,
+        0,
+        np.where(is_self, 1, np.where(top_p < ego_j, 2 + top_p, 2 + (top_p - 1))),
+    )
+    survivor_slot = np.where(num_agents <= 2, slot_le2, slot_gt2)
+    survivor_slot = np.clip(survivor_slot, 0, NUM_OWNER_SLOTS - 1).astype(np.int32)
+    return signed / 1000.0, survivor_slot
 
 
 def _remap_owner(owner: float, ego: int, num_agents: int) -> int:
@@ -748,9 +772,41 @@ def _remap_owner(owner: float, ego: int, num_agents: int) -> int:
         return 0
     if o == ego:
         return 1
-    if num_agents <= 2 or _collapse_opponents_enabled():
+    if num_agents <= 2:
         return 2
     return 2 + o if o < ego else 2 + (o - 1)
+
+
+def _count_live_opponents(state: OrbitWarsState, ego: int) -> int:
+    """Players other than ``ego`` still in the game (planets, fleets, or forecast incoming)."""
+
+    num_agents = int(np.asarray(state.num_agents))
+    alive = np.zeros(num_agents, dtype=bool)
+
+    planets = np.asarray(state.planets)
+    planet_active = np.asarray(state.planet_active)
+    owners = planets[:, 1].astype(np.int32)
+    valid_planet = planet_active & (owners >= 0) & (owners < num_agents)
+    for p in np.unique(owners[valid_planet]):
+        if int(p) != ego:
+            alive[int(p)] = True
+
+    fleets = np.asarray(state.fleets)
+    fleet_active = np.asarray(state.fleet_active)
+    if fleet_active.any():
+        fo = fleets[:, FLEET_OWNER].astype(np.int32)
+        fs = fleets[:, FLEET_SHIPS]
+        in_play = fleet_active & (fo >= 0) & (fo < num_agents) & (fs > 0)
+        for p in np.unique(fo[in_play]):
+            if int(p) != ego:
+                alive[int(p)] = True
+
+    incoming = np.asarray(state.incoming_fleets)
+    for p in range(min(num_agents, incoming.shape[0])):
+        if p != ego and incoming[p].sum() > 0:
+            alive[p] = True
+
+    return int(alive.sum())
 
 
 def _point_to_segment_distance(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
@@ -1162,7 +1218,13 @@ def _raycast_targets_np(
     return out_angle, valid, hit_tick, true_planet, true_hit_tick
 
 
-def _obs_tensors_for_state(state: OrbitWarsState, ego_player: int, device: torch.device) -> dict[str, torch.Tensor]:
+def _obs_tensors_for_state(
+    state: OrbitWarsState,
+    ego_player: int,
+    device: torch.device,
+    *,
+    policy_player_count: Optional[int] = None,
+) -> dict[str, torch.Tensor]:
     planets = np.asarray(state.planets)
     planet_active = np.asarray(state.planet_active)
     initial_planets = np.asarray(state.initial_planets)
@@ -1171,12 +1233,14 @@ def _obs_tensors_for_state(state: OrbitWarsState, ego_player: int, device: torch
     angular_velocity = float(np.asarray(state.angular_velocity))
     step_count = int(np.asarray(state.step_count))
     num_agents = int(np.asarray(state.num_agents))
+    player_count = int(policy_player_count if policy_player_count is not None else num_agents)
     comet_ids = np.asarray(state.comet_planet_ids)
     comet_set = set(float(x) for x in comet_ids.flatten() if int(x) >= 0)
 
     entity_type = np.zeros((1 + MAX_PLANETS,), dtype=np.int64)
     owner_idx = np.zeros((1 + MAX_PLANETS,), dtype=np.int64)
-    features = np.zeros((1 + MAX_PLANETS, FEATURE_DIM), dtype=np.float32)
+    fdim = obs_feature_dim_for_num_agents(player_count)
+    features = np.zeros((1 + MAX_PLANETS, fdim), dtype=np.float32)
     rope_pos = np.zeros((1 + MAX_PLANETS, 3), dtype=np.float32)
     entity_mask = np.zeros((1 + MAX_PLANETS,), dtype=np.bool_)
     planet_mask = np.zeros((1 + MAX_PLANETS,), dtype=np.bool_)
@@ -1187,10 +1251,9 @@ def _obs_tensors_for_state(state: OrbitWarsState, ego_player: int, device: torch
     rope_pos[0] = np.asarray([CENTER / BOARD_SIZE, CENTER / BOARD_SIZE, 0.0], dtype=np.float32)
     entity_mask[0] = True
 
-    incoming = incoming_fleets.astype(np.float32)
-    self_incoming = incoming[int(ego_player)]
-    enemy_incoming = incoming[np.arange(incoming.shape[0]) != int(ego_player)].sum(axis=0)
-    incoming_net = (self_incoming - enemy_incoming) / 1000.0
+    incoming_net, survivor_slot = _incoming_interfleet_np(
+        incoming_fleets.astype(np.float32), int(ego_player), player_count
+    )
 
     for i in range(MAX_PLANETS):
         j = 1 + i
@@ -1198,7 +1261,7 @@ def _obs_tensors_for_state(state: OrbitWarsState, ego_player: int, device: torch
         pid = float(planets[i, 0])
         is_comet = pid in comet_set
         entity_type[j] = ENTITY_COMET if is_comet else ENTITY_PLANET
-        owner_idx[j] = min(_remap_owner(float(planets[i, 1]), ego_player, num_agents), NUM_OWNER_SLOTS - 1)
+        owner_idx[j] = min(_remap_owner(float(planets[i, 1]), ego_player, player_count), NUM_OWNER_SLOTS - 1)
         vx, vy = planet_pred_velocity(
             initial_planets[i, 2:4].astype(np.float64),
             planets[i, 2:4].astype(np.float64),
@@ -1225,7 +1288,12 @@ def _obs_tensors_for_state(state: OrbitWarsState, ego_player: int, device: torch
         features[j, 3] = float(vy) / 5.0
         features[j, 4] = float(active)
         features[j, 5] = float(planets[i, 4]) / 10.0
-        features[j, 8:] = incoming_net[i]
+        features[j, 8 : 8 + INCOMING_TA_BINS] = incoming_net[i].astype(np.float32)
+        if fdim == FEATURE_DIM_MULTI and player_count > 2:
+            oh = np.eye(NUM_OWNER_SLOTS, dtype=np.float32)[survivor_slot[i]]
+            features[
+                j, 8 + INCOMING_TA_BINS : 8 + INCOMING_TA_BINS + INCOMING_SURVIVOR_FLAT
+            ] = oh.reshape(INCOMING_SURVIVOR_FLAT)
         if active:
             rope_pos[j, 0] = float(planets[i, 2]) / BOARD_SIZE
             rope_pos[j, 1] = float(planets[i, 3]) / BOARD_SIZE
@@ -1259,6 +1327,7 @@ def _build_turn_actions_torch_only(
     timing: Optional[KaggleAgentCallTiming] = None,
     launch_tracker: Optional[FleetLaunchDebugTracker] = None,
     game_step: int = 0,
+    policy_player_count: Optional[int] = None,
 ) -> list[list[float]]:
     planets = np.array(np.asarray(state.planets), copy=True)
     incoming_fleets = np.array(np.asarray(state.incoming_fleets), copy=True)
@@ -1272,7 +1341,9 @@ def _build_turn_actions_torch_only(
 
         t0 = perf_counter()
         virt = state._replace(planets=planets, incoming_fleets=incoming_fleets)
-        batch = _obs_tensors_for_state(virt, ego_player, device)
+        batch = _obs_tensors_for_state(
+            virt, ego_player, device, policy_player_count=policy_player_count
+        )
         if timing is not None:
             timing.micro_obs_tensors_s += perf_counter() - t0
 
@@ -1542,8 +1613,9 @@ def _infer_policy_kwargs(payload: Any) -> dict[str, Any]:
     }
     if isinstance(policy_state, Mapping):
         w = policy_state.get("feat_proj.weight")
-        if hasattr(w, "shape"):
+        if hasattr(w, "shape") and len(w.shape) >= 2:
             kwargs["d_model"] = int(w.shape[0])
+            kwargs["feature_dim"] = int(w.shape[1])
         layer_ids = []
         for key in policy_state:
             if key.startswith("blocks."):
@@ -1780,7 +1852,167 @@ class KaggleOrbitWarsAgent:
         return actions
 
 
-_AGENT: Optional[KaggleOrbitWarsAgent] = None
+class KaggleOrbitWarsDualPolicyAgent:
+    """4p policy while two or more opponents are alive; 2p policy once only one remains.
+
+    Both checkpoints are loaded eagerly at construction so a mid-game switch does not
+    pay load/JIT cost under the 1s turn timer.
+    """
+
+    def __init__(
+        self,
+        checkpoint_4p: str | os.PathLike[str],
+        checkpoint_2p: str | os.PathLike[str],
+        *,
+        device: Optional[str | torch.device] = None,
+        greedy: bool = False,
+        max_micro_steps: Optional[int] = None,
+        max_fleets: int = 512,
+        seed: Optional[int] = None,
+        raycast_rays: Optional[int] = None,
+    ):
+        _configure_cpu_threads()
+        self.checkpoint_4p = resolve_checkpoint_path(checkpoint_4p)
+        self.checkpoint_2p = resolve_checkpoint_path(checkpoint_2p)
+        self.policy_4p, self.device, training_args_4p = load_policy(self.checkpoint_4p, device=device)
+        self.policy_2p, _, training_args_2p = load_policy(self.checkpoint_2p, device=self.device)
+        self.greedy = bool(greedy)
+        micro_4p = int(training_args_4p.get("max_micro_steps", DEFAULT_MAX_ACTIONS))
+        micro_2p = int(training_args_2p.get("max_micro_steps", DEFAULT_MAX_ACTIONS))
+        self.max_micro_steps = int(
+            max_micro_steps if max_micro_steps is not None else max(micro_4p, micro_2p)
+        )
+        self.max_fleets = int(max_fleets)
+        rays_4p = int(training_args_4p.get("first_hit_n_rays", DEFAULT_RAYCAST_RAYS))
+        rays_2p = int(training_args_2p.get("first_hit_n_rays", DEFAULT_RAYCAST_RAYS))
+        self.raycast_rays = int(
+            raycast_rays if raycast_rays is not None else max(rays_4p, rays_2p)
+        )
+        self.rng = torch.Generator(device=self.device)
+        self.rng.manual_seed(int(seed if seed is not None else os.environ.get("ORBIT_WARS_AGENT_SEED", "0")))
+        self._game_key: Optional[str] = None
+        self._frozen_game_key: Optional[str] = None
+        self._next_step_count = 0
+        self._last_env_step: Optional[int] = None
+        self._last_call_timing: Optional[KaggleAgentCallTiming] = None
+        warn_oob = os.environ.get("ORBIT_WARS_WARN_OOB_LAUNCHES", "1").lower() not in {"0", "false", "no", "off"}
+        self.launch_tracker = FleetLaunchDebugTracker(
+            warn_oob=warn_oob,
+            warn_forecast_mismatch=_warn_forecast_mismatch_enabled(),
+        )
+
+    def _obs_game_key(self, obs: Mapping[str, Any]) -> str:
+        step_raw = obs.get("step", obs.get("step_count", None))
+        step = int(step_raw) if step_raw is not None else None
+
+        initial = obs.get("initial_planets")
+        if not initial:
+            if self._frozen_game_key is not None:
+                return self._frozen_game_key
+            initial = obs.get("planets", [])
+
+        arr = np.asarray(initial, dtype=np.float32)
+        h = hashlib.blake2b(digest_size=16)
+        h.update(arr.tobytes())
+        h.update(str(obs.get("angular_velocity", 0.0)).encode("ascii", errors="ignore"))
+        key = h.hexdigest()
+
+        if step == 0 or self._frozen_game_key is None:
+            self._frozen_game_key = key
+        return self._frozen_game_key
+
+    def _step_count_for_obs(self, obs: Mapping[str, Any]) -> int:
+        step_raw = obs.get("step", obs.get("step_count", None))
+        if step_raw is not None:
+            s = int(step_raw)
+            self._last_env_step = s
+            self._next_step_count = s + 1
+            self._game_key = self._obs_game_key(obs)
+            return s
+
+        key = self._obs_game_key(obs)
+        if key != self._game_key:
+            self._game_key = key
+            self._next_step_count = 0
+            self._last_env_step = None
+
+        if self._last_env_step is not None:
+            return int(self._last_env_step)
+
+        step_count = self._next_step_count
+        self._next_step_count += 1
+        return step_count
+
+    @torch.inference_mode()
+    def __call__(self, obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
+        self._last_call_timing = None
+        timing = KaggleAgentCallTiming()
+        ego_player = int(obs.get("player", 0))
+        step_count = self._step_count_for_obs(obs)
+        game_key = self._obs_game_key(obs)
+        self.launch_tracker.sync_game(game_key, game_step=step_count)
+        ship_speed = float(_cfg_get(config, "shipSpeed", 6.0))
+        self.launch_tracker.observe_fleets(
+            obs,
+            ego_player,
+            game_step=step_count,
+            ship_speed=ship_speed,
+            n_rays=self.raycast_rays,
+        )
+        fleets_in = obs.get("fleets") or []
+        fleet_arrivals = np.full((len(fleets_in), 2), -1, dtype=np.int32)
+        t0 = perf_counter()
+        state = observation_to_state(
+            obs,
+            config,
+            max_fleets=self.max_fleets,
+            step_count_override=step_count,
+            fleet_forecast_arrival=fleet_arrivals,
+        )
+        timing.obs_to_state_s = perf_counter() - t0
+        self.launch_tracker.check_forecast_vs_raycast(
+            obs,
+            fleet_arrivals,
+            np.asarray(state.planets),
+            np.asarray(state.comet_planet_ids),
+            game_step=step_count,
+            ego_player=ego_player,
+        )
+        live_opponents = _count_live_opponents(state, ego_player)
+        use_4p_policy = live_opponents >= 2
+        policy = self.policy_4p if use_4p_policy else self.policy_2p
+        policy_player_count = int(np.asarray(state.num_agents)) if use_4p_policy else 2
+        actions = _build_turn_actions_torch_only(
+            policy,
+            state,
+            ego_player,
+            self.device,
+            ship_speed=ship_speed,
+            max_micro_steps=self.max_micro_steps,
+            greedy=self.greedy,
+            rng=self.rng,
+            n_rays=self.raycast_rays,
+            timing=timing,
+            launch_tracker=self.launch_tracker,
+            game_step=step_count,
+            policy_player_count=policy_player_count,
+        )
+        self._last_call_timing = timing
+        if _launch_debug_enabled():
+            action_summaries = [
+                f"[{float(a[0]):.0f},{float(a[1]):.6f},{int(a[2])}]" for a in actions[:8]
+            ]
+            mode = "4p" if use_4p_policy else "2p"
+            _launch_debug(
+                f"call OUT ego={ego_player} policy={mode} live_opponents={live_opponents} "
+                f"game_step={step_count} obs.step={obs.get('step')!r} "
+                f"actions={len(actions)} {action_summaries}"
+                + (f" (+{len(actions) - 8} more)" if len(actions) > 8 else "")
+            )
+        return actions
+
+
+_AGENT: Optional[KaggleOrbitWarsAgent | KaggleOrbitWarsDualPolicyAgent] = None
 _ERROR_REPORTED = False
 
 
@@ -1803,14 +2035,14 @@ def _report_once(exc: BaseException) -> None:
 def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
     """Kaggle entry point.
 
-    Set ``ORBIT_WARS_CHECKPOINT`` to choose a checkpoint path.  By default the
-    adapter looks for ``checkpoint.pt`` in the process cwd, the submission bundle
-    root (parent of ``orbit_wars_pt/``), and next to this module.
+    Single-policy: set ``ORBIT_WARS_CHECKPOINT`` (default ``checkpoint.pt``).
+
+    Dual-policy (4p FFA + 2p endgame): set ``ORBIT_WARS_CHECKPOINT_4P`` and
+    ``ORBIT_WARS_CHECKPOINT_2P``.  Both are loaded at startup.
     """
 
     global _AGENT
     if _AGENT is None:
-        ckpt = resolve_checkpoint_path(os.environ.get("ORBIT_WARS_CHECKPOINT", DEFAULT_CHECKPOINT))
         device = os.environ.get("ORBIT_WARS_DEVICE")
         greedy = os.environ.get("ORBIT_WARS_GREEDY", "0").lower() in {"1", "true", "yes", "on"}
         seed_raw = os.environ.get("ORBIT_WARS_AGENT_SEED")
@@ -1819,15 +2051,31 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
         rays = int(rays_raw) if rays_raw is not None else None
         max_micro_raw = os.environ.get("ORBIT_WARS_MAX_MICRO_STEPS")
         max_micro_steps = int(max_micro_raw) if max_micro_raw is not None else None
+        ckpt_4p = os.environ.get("ORBIT_WARS_CHECKPOINT_4P")
+        ckpt_2p = os.environ.get("ORBIT_WARS_CHECKPOINT_2P")
         try:
-            _AGENT = KaggleOrbitWarsAgent(
-                ckpt,
-                device=device,
-                greedy=greedy,
-                max_micro_steps=max_micro_steps,
-                seed=seed,
-                raycast_rays=rays,
-            )
+            if ckpt_4p and ckpt_2p:
+                _AGENT = KaggleOrbitWarsDualPolicyAgent(
+                    resolve_checkpoint_path(ckpt_4p),
+                    resolve_checkpoint_path(ckpt_2p),
+                    device=device,
+                    greedy=greedy,
+                    max_micro_steps=max_micro_steps,
+                    seed=seed,
+                    raycast_rays=rays,
+                )
+            else:
+                ckpt = resolve_checkpoint_path(
+                    os.environ.get("ORBIT_WARS_CHECKPOINT", DEFAULT_CHECKPOINT)
+                )
+                _AGENT = KaggleOrbitWarsAgent(
+                    ckpt,
+                    device=device,
+                    greedy=greedy,
+                    max_micro_steps=max_micro_steps,
+                    seed=seed,
+                    raycast_rays=rays,
+                )
         except Exception as exc:
             _report_once(exc)
             return []

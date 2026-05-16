@@ -1,12 +1,14 @@
-"""Build a Kaggle Orbit Wars submission bundle from a training checkpoint.
+"""Build a Kaggle Orbit Wars submission bundle from training checkpoints.
 
 The bundle is a directory (or ``.tar.gz``) with ``main.py`` at the root, a
-minimal ``orbit_wars_pt`` inference package, and ``checkpoint.pt``.
+minimal ``orbit_wars_pt`` inference package, and two policy checkpoints (4-player
+FFA and 2-player endgame).  Both policies are loaded at startup.
 
 Example::
 
     python -m orbit_wars_pt.package_kaggle_submission \\
-        --checkpoint experiments/25/checkpoints/iter_00000520.pt \\
+        --checkpoint-4p experiments/4p/checkpoints/iter_00000520.pt \\
+        --checkpoint-2p experiments/2p/checkpoints/iter_00000520.pt \\
         --out dist/orbit-wars-submission.tar.gz
 
     kaggle competitions submit orbit-wars -f dist/orbit-wars-submission.tar.gz -m "exp25 iter520"
@@ -37,10 +39,10 @@ from __future__ import annotations
 import os
 
 # Defaults for the competition runtime (override via env if needed).
-os.environ.setdefault("ORBIT_WARS_CHECKPOINT", "checkpoint.pt")
+os.environ.setdefault("ORBIT_WARS_CHECKPOINT_4P", "checkpoint_4p.pt")
+os.environ.setdefault("ORBIT_WARS_CHECKPOINT_2P", "checkpoint_2p.pt")
 os.environ.setdefault("ORBIT_WARS_DEVICE", {device!r})
 os.environ.setdefault("ORBIT_WARS_GREEDY", {greedy!r})
-os.environ.setdefault("ORBIT_WARS_COLLAPSE_OPPONENTS", {collapse_opponents!r})
 {extra_env}
 
 from orbit_wars_pt.kaggle_adapter import agent
@@ -54,7 +56,6 @@ def _write_main_py(
     *,
     device: str,
     greedy: bool,
-    collapse_opponents: bool,
     extra_env: dict[str, str],
 ) -> None:
     extra_lines = []
@@ -67,7 +68,6 @@ def _write_main_py(
         _MAIN_PY_TEMPLATE.format(
             device=device,
             greedy="1" if greedy else "0",
-            collapse_opponents="1" if collapse_opponents else "0",
             extra_env=extra_block,
         ),
         encoding="utf-8",
@@ -103,20 +103,23 @@ def _submission_paths(out: Path) -> tuple[Path, Path | None]:
 
 
 def package_submission(
-    checkpoint: Path,
+    checkpoint_4p: Path,
+    checkpoint_2p: Path,
     out: Path,
     *,
     greedy: bool = False,
     device: str = "cpu",
-    collapse_opponents: bool = True,
     extra_env: dict[str, str] | None = None,
     source_pkg: Path | None = None,
 ) -> Path:
     """Write a submission bundle directory; return its path."""
 
-    checkpoint = checkpoint.expanduser().resolve()
-    if not checkpoint.is_file():
-        raise FileNotFoundError(checkpoint)
+    checkpoint_4p = checkpoint_4p.expanduser().resolve()
+    checkpoint_2p = checkpoint_2p.expanduser().resolve()
+    if not checkpoint_4p.is_file():
+        raise FileNotFoundError(checkpoint_4p)
+    if not checkpoint_2p.is_file():
+        raise FileNotFoundError(checkpoint_2p)
 
     source_pkg = (source_pkg or Path(__file__).resolve().parent).resolve()
     out = out.expanduser().resolve()
@@ -126,13 +129,13 @@ def package_submission(
         shutil.rmtree(bundle_dir)
     bundle_dir.mkdir(parents=True)
 
-    shutil.copy2(checkpoint, bundle_dir / "checkpoint.pt")
+    shutil.copy2(checkpoint_4p, bundle_dir / "checkpoint_4p.pt")
+    shutil.copy2(checkpoint_2p, bundle_dir / "checkpoint_2p.pt")
     _copy_inference_package(bundle_dir / "orbit_wars_pt", source_pkg=source_pkg)
     _write_main_py(
         bundle_dir / "main.py",
         device=device,
         greedy=greedy,
-        collapse_opponents=collapse_opponents,
         extra_env=extra_env or {},
     )
 
@@ -141,10 +144,14 @@ def package_submission(
         Orbit Wars Kaggle submission bundle
         ===================================
 
-        Checkpoint: {checkpoint.name} (copied to checkpoint.pt)
+        4-player checkpoint: {checkpoint_4p.name} (copied to checkpoint_4p.pt)
+        2-player checkpoint: {checkpoint_2p.name} (copied to checkpoint_2p.pt)
         Greedy: {greedy}
         Device: {device}
-        Collapse opponents (4p -> single enemy owner slot): {collapse_opponents}
+
+        Policy selection: 4-player policy while two or more opponents are alive;
+        switches to the 2-player policy as soon as only one opponent remains.
+        Both policies are loaded at process start.
 
         Test locally (from this directory):
 
@@ -152,8 +159,8 @@ def package_submission(
             python -c "
         from kaggle_environments import make
         from main import agent
-        env = make('orbit_wars', configuration={{'seed': 42}}, debug=True)
-        env.run([agent, agent])
+        env = make('orbit_wars', configuration={{'seed': 42, 'agentCount': 4}}, debug=True)
+        env.run([agent] * 4)
         print([(i, s.reward) for i, s in enumerate(env.steps[-1])])
         "
 
@@ -173,10 +180,16 @@ def package_submission(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--checkpoint",
+        "--checkpoint-4p",
         type=Path,
         required=True,
-        help="Training checkpoint (.pt) to ship as checkpoint.pt in the bundle.",
+        help="4-player FFA training checkpoint (.pt) shipped as checkpoint_4p.pt.",
+    )
+    parser.add_argument(
+        "--checkpoint-2p",
+        type=Path,
+        required=True,
+        help="2-player training checkpoint (.pt) shipped as checkpoint_2p.pt.",
     )
     parser.add_argument(
         "--out",
@@ -197,15 +210,6 @@ def main() -> None:
         help="Torch device written into main.py (default: cpu for Kaggle).",
     )
     parser.add_argument(
-        "--collapse-opponents",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "Map every non-ego player to owner slot 2 in observations (2p-trained policy "
-            "in 4p FFA). Incoming threat features already sum all opponents."
-        ),
-    )
-    parser.add_argument(
         "--keep-dir",
         action="store_true",
         help="When --out ends with .tar.gz, keep the extracted bundle directory beside the archive.",
@@ -213,11 +217,11 @@ def main() -> None:
     args = parser.parse_args()
 
     result = package_submission(
-        args.checkpoint,
+        args.checkpoint_4p,
+        args.checkpoint_2p,
         args.out,
         greedy=bool(args.greedy),
         device=str(args.device),
-        collapse_opponents=bool(args.collapse_opponents),
     )
 
     bundle_dir, archive_path = _submission_paths(args.out.expanduser().resolve())

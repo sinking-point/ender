@@ -32,6 +32,7 @@ import jax.numpy as jnp
 
 from orbit_wars_pt.batched_env import heal_terminal_env_slices
 from orbit_wars_pt.env_wrapper import OrbitWarsEnvConfig
+from orbit_wars_pt.constants import obs_feature_dim_for_num_agents
 from orbit_wars_pt.gpu_mem import (
     log_cuda_mem,
     print_cuda_memory_summary,
@@ -168,6 +169,7 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "n_heads",
         "n_layers",
         "max_fleets",
+        "num_agents",
         "activation_checkpointing",
         "device",
         "compile",
@@ -288,25 +290,17 @@ def build_ppo_samples(
     """
 
     advs, rets, players, t_idx, n_idx, old_lp, old_v = [], [], [], [], [], [], []
-    num_envs = int(segment.valid_p0.shape[1])
+    num_envs = int(segment.valid[0].shape[1])
+    num_players = len(segment.bufs)
 
-    for player in (0, 1):
-        if player == 0:
-            old_value = segment.old_value_p0
-            old_logprob = segment.old_logprob_p0
-            rewards = segment.reward_p0
-            dones = segment.done_p0
-            bootstrap = segment.bootstrap_p0
-            bootstrap_valid = segment.bootstrap_valid_p0
-            write_idx = segment.write_idx_p0
-        else:
-            old_value = segment.old_value_p1
-            old_logprob = segment.old_logprob_p1
-            rewards = segment.reward_p1
-            dones = segment.done_p1
-            bootstrap = segment.bootstrap_p1
-            bootstrap_valid = segment.bootstrap_valid_p1
-            write_idx = segment.write_idx_p1
+    for player in range(num_players):
+        old_value = segment.old_value[player]
+        old_logprob = segment.old_logprob[player]
+        rewards = segment.reward[player]
+        dones = segment.done[player]
+        bootstrap = segment.bootstrap[player]
+        bootstrap_valid = segment.bootstrap_valid[player]
+        write_idx = segment.write_idx[player]
 
         for n in range(num_envs):
             T = int(write_idx[n])
@@ -522,26 +516,16 @@ def _rollout_segment_to_host(segment: RolloutSegment) -> RolloutSegment:
     """
 
     return RolloutSegment(
-        buf0=_torch_buffer_to_host(segment.buf0),
-        buf1=_torch_buffer_to_host(segment.buf1),
-        obs0=compressed_observation_to_host(segment.obs0),
-        obs1=compressed_observation_to_host(segment.obs1),
-        write_idx_p0=np.asarray(segment.write_idx_p0),
-        write_idx_p1=np.asarray(segment.write_idx_p1),
-        valid_p0=np.asarray(segment.valid_p0),
-        valid_p1=np.asarray(segment.valid_p1),
-        old_logprob_p0=np.asarray(segment.old_logprob_p0),
-        old_logprob_p1=np.asarray(segment.old_logprob_p1),
-        old_value_p0=np.asarray(segment.old_value_p0),
-        old_value_p1=np.asarray(segment.old_value_p1),
-        reward_p0=np.asarray(segment.reward_p0),
-        reward_p1=np.asarray(segment.reward_p1),
-        done_p0=np.asarray(segment.done_p0),
-        done_p1=np.asarray(segment.done_p1),
-        bootstrap_p0=np.asarray(segment.bootstrap_p0),
-        bootstrap_p1=np.asarray(segment.bootstrap_p1),
-        bootstrap_valid_p0=np.asarray(segment.bootstrap_valid_p0),
-        bootstrap_valid_p1=np.asarray(segment.bootstrap_valid_p1),
+        bufs=[_torch_buffer_to_host(b) for b in segment.bufs],
+        obs_bufs=[compressed_observation_to_host(o) for o in segment.obs_bufs],
+        write_idx=[np.asarray(w) for w in segment.write_idx],
+        valid=[np.asarray(v) for v in segment.valid],
+        old_logprob=[np.asarray(x) for x in segment.old_logprob],
+        old_value=[np.asarray(x) for x in segment.old_value],
+        reward=[np.asarray(x) for x in segment.reward],
+        done=[np.asarray(x) for x in segment.done],
+        bootstrap=[np.asarray(x) for x in segment.bootstrap],
+        bootstrap_valid=[np.asarray(x) for x in segment.bootstrap_valid],
         env_steps_per_env=np.asarray(segment.env_steps_per_env),
     )
 
@@ -589,9 +573,10 @@ def _build_host_chunk_samples(
 
     keys = ("advantages", "returns", "players", "t_idx", "n_idx", "old_logprob", "old_value")
     per_chunk = [{k: [] for k in keys} for _ in segments]
-    num_envs = int(segments[0].valid_p0.shape[1])
+    num_envs = int(segments[0].valid[0].shape[1])
+    num_players = len(segments[0].bufs)
 
-    for player in (0, 1):
+    for player in range(num_players):
         for n in range(num_envs):
             values_parts, rewards_parts, dones_parts, old_lp_parts = [], [], [], []
             t_parts: list[np.ndarray] = []
@@ -599,18 +584,11 @@ def _build_host_chunk_samples(
             last_nonempty_i: Optional[int] = None
 
             for ci, segment in enumerate(segments):
-                if player == 0:
-                    old_value = segment.old_value_p0
-                    old_logprob = segment.old_logprob_p0
-                    rewards = segment.reward_p0
-                    dones = segment.done_p0
-                    write_idx = segment.write_idx_p0
-                else:
-                    old_value = segment.old_value_p1
-                    old_logprob = segment.old_logprob_p1
-                    rewards = segment.reward_p1
-                    dones = segment.done_p1
-                    write_idx = segment.write_idx_p1
+                old_value = segment.old_value[player]
+                old_logprob = segment.old_logprob[player]
+                rewards = segment.reward[player]
+                dones = segment.done[player]
+                write_idx = segment.write_idx[player]
 
                 T = int(write_idx[n])
                 lengths.append(T)
@@ -630,18 +608,11 @@ def _build_host_chunk_samples(
             rewards = np.concatenate(rewards_parts).astype(np.float32)
             dones = np.concatenate(dones_parts).astype(np.bool_)
             last_segment = segments[last_nonempty_i]
-            if player == 0:
-                bootstrap = (
-                    float(last_segment.bootstrap_p0[n])
-                    if bool(last_segment.bootstrap_valid_p0[n])
-                    else None
-                )
-            else:
-                bootstrap = (
-                    float(last_segment.bootstrap_p1[n])
-                    if bool(last_segment.bootstrap_valid_p1[n])
-                    else None
-                )
+            bootstrap = (
+                float(last_segment.bootstrap[player][n])
+                if bool(last_segment.bootstrap_valid[player][n])
+                else None
+            )
             adv, ret = compute_gae(rewards, values, dones, gamma, lam, bootstrap=bootstrap)
 
             offset = 0
@@ -738,27 +709,18 @@ def _combine_segments_for_stats(segments: list[RolloutSegment]) -> RolloutSegmen
     """Small synthetic segment for logging aggregate rollout counts."""
 
     first = segments[0]
+    P = len(first.bufs)
     return RolloutSegment(
-        buf0=first.buf0,
-        buf1=first.buf1,
-        obs0=first.obs0,
-        obs1=first.obs1,
-        write_idx_p0=sum((s.write_idx_p0 for s in segments), np.zeros_like(first.write_idx_p0)),
-        write_idx_p1=sum((s.write_idx_p1 for s in segments), np.zeros_like(first.write_idx_p1)),
-        valid_p0=first.valid_p0,
-        valid_p1=first.valid_p1,
-        old_logprob_p0=first.old_logprob_p0,
-        old_logprob_p1=first.old_logprob_p1,
-        old_value_p0=first.old_value_p0,
-        old_value_p1=first.old_value_p1,
-        reward_p0=np.concatenate([s.reward_p0 for s in segments], axis=0),
-        reward_p1=np.concatenate([s.reward_p1 for s in segments], axis=0),
-        done_p0=first.done_p0,
-        done_p1=first.done_p1,
-        bootstrap_p0=first.bootstrap_p0,
-        bootstrap_p1=first.bootstrap_p1,
-        bootstrap_valid_p0=first.bootstrap_valid_p0,
-        bootstrap_valid_p1=first.bootstrap_valid_p1,
+        bufs=list(first.bufs),
+        obs_bufs=list(first.obs_bufs),
+        write_idx=[sum((s.write_idx[p] for s in segments), np.zeros_like(first.write_idx[p])) for p in range(P)],
+        valid=[first.valid[p] for p in range(P)],
+        old_logprob=[first.old_logprob[p] for p in range(P)],
+        old_value=[first.old_value[p] for p in range(P)],
+        reward=[np.concatenate([s.reward[p] for s in segments], axis=0) for p in range(P)],
+        done=[first.done[p] for p in range(P)],
+        bootstrap=[first.bootstrap[p] for p in range(P)],
+        bootstrap_valid=[first.bootstrap_valid[p] for p in range(P)],
         env_steps_per_env=sum((s.env_steps_per_env for s in segments), np.zeros_like(first.env_steps_per_env)),
     )
 
@@ -805,14 +767,14 @@ def _ppo_timing_str(pt: PPOTiming) -> str:
 def _segment_rollout_counts(segment: RolloutSegment) -> Tuple[int, int, int, float]:
     """``micro_p0``, total micro transitions, env_steps, mean_r0."""
 
-    total_p0 = int(segment.write_idx_p0.sum())
-    total_p1 = int(segment.write_idx_p1.sum())
+    total_p0 = int(segment.write_idx[0].sum())
+    total_micro = int(sum(int(segment.write_idx[p].sum()) for p in range(len(segment.bufs))))
     total_env_steps = int(segment.env_steps_per_env.sum())
     if total_env_steps > 0:
-        mean_r0 = float(segment.reward_p0.sum() / total_env_steps)
+        mean_r0 = float(segment.reward[0].sum() / total_env_steps)
     else:
         mean_r0 = 0.0
-    return total_p0, total_p0 + total_p1, total_env_steps, mean_r0
+    return total_p0, total_micro, total_env_steps, mean_r0
 
 
 def _fleet_counts_from_state(state_b: OrbitWarsState) -> Tuple[int, float]:
@@ -932,6 +894,7 @@ def ppo_iteration(
     rnd: np.random.Generator,
     loss_fn: Optional[Any] = None,
     amp_dtype: Optional[torch.dtype] = None,
+    obs_feature_dim: int,
 ) -> Tuple[float, PPOTiming, PPOStats]:
     """Multiple epochs of clipped PPO surrogate with minibatches.
 
@@ -967,7 +930,13 @@ def ppo_iteration(
             mb_n = n_idx[mb_idx]
 
             obs, actions = select_stored_observation_minibatch_torch(
-                segment, mb_player, mb_t, mb_n, replay_device=device, timing=timing
+                segment,
+                mb_player,
+                mb_t,
+                mb_n,
+                replay_device=device,
+                timing=timing,
+                obs_feature_dim=obs_feature_dim,
             )
 
             adv = torch.as_tensor(advantages[mb_idx], device=device, dtype=torch.float32)
@@ -1037,6 +1006,7 @@ def ppo_iteration_host_staged(
     rnd: np.random.Generator,
     loss_fn: Optional[Any] = None,
     amp_dtype: Optional[torch.dtype] = None,
+    obs_feature_dim: int,
 ) -> Tuple[float, PPOTiming, PPOStats]:
     """PPO over CPU-resident rollout chunks, staging only minibatches to device."""
 
@@ -1070,6 +1040,7 @@ def ppo_iteration_host_staged(
                     mb_n,
                     replay_device=device,
                     timing=timing,
+                    obs_feature_dim=obs_feature_dim,
                 )
                 adv = torch.as_tensor(samples["advantages"][mb_idx], device=device, dtype=torch.float32)
                 ret_t = torch.as_tensor(samples["returns"][mb_idx], device=device, dtype=torch.float32)
@@ -1261,13 +1232,14 @@ def train(args: argparse.Namespace) -> None:
         else:
             print("[orbit_wars_pt] no checkpoint in experiment dir — starting fresh", flush=True)
 
-    cfg = OrbitWarsEnvConfig(num_agents=2, max_fleets=args.max_fleets, episode_seed=args.seed)
+    cfg = OrbitWarsEnvConfig(num_agents=args.num_agents, max_fleets=args.max_fleets, episode_seed=args.seed)
 
     policy = OrbitWarsPolicy(
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
         activation_checkpointing=args.activation_checkpointing,
+        feature_dim=obs_feature_dim_for_num_agents(args.num_agents),
     ).to(device)
     opt = optim.Adam(policy.parameters(), lr=args.lr)
 
@@ -1355,6 +1327,11 @@ def train(args: argparse.Namespace) -> None:
                 episode_turns=heal_et,
             )
             rollout_env_seed += heal_seeds
+            if int(rollout_carry.cfg.num_agents) != int(args.num_agents):
+                raise RuntimeError(
+                    f"Checkpoint rollout state is num_agents={rollout_carry.cfg.num_agents} but "
+                    f"--num-agents={args.num_agents}; use matching player count to resume."
+                )
         print(f"[orbit_wars_pt] resumed at iteration {start_iter}", flush=True)
 
     reset_prefetch: Optional[RolloutResetPrefetch] = None
@@ -1451,7 +1428,7 @@ def _train_loop(
                 )
                 rollout_env_seed += seeds_used
                 cfg.max_fleets = rollout_carry.cfg.max_fleets
-                chunk_sample_count = int(segment_i.write_idx_p0.sum() + segment_i.write_idx_p1.sum())
+                chunk_sample_count = int(sum(segment_i.write_idx[p].sum() for p in range(len(segment_i.bufs))))
                 t_host0 = time.perf_counter()
                 host_segment_i = _rollout_segment_to_host(segment_i)
                 host_transfer_s = time.perf_counter() - t_host0
@@ -1554,6 +1531,7 @@ def _train_loop(
                 )
 
             t_ppo0 = time.perf_counter()
+            obs_fd = obs_feature_dim_for_num_agents(int(cfg.num_agents))
             if host_chunks is not None:
                 loss_mb, ppo_t, ppo_stats = ppo_iteration_host_staged(
                     policy,
@@ -1572,6 +1550,7 @@ def _train_loop(
                     rnd=rnd,
                     loss_fn=compiled_loss_fn,
                     amp_dtype=amp_dtype,
+                    obs_feature_dim=obs_fd,
                 )
             else:
                 loss_mb, ppo_t, ppo_stats = ppo_iteration(
@@ -1592,6 +1571,7 @@ def _train_loop(
                     rnd=rnd,
                     loss_fn=compiled_loss_fn,
                     amp_dtype=amp_dtype,
+                    obs_feature_dim=obs_fd,
                 )
             ppo_s = time.perf_counter() - t_ppo0
 
@@ -1682,6 +1662,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--iterations", type=int, default=100000)
     p.add_argument("--num-envs", type=int, default=256, help="Parallel env rollouts per iteration.")
     p.add_argument(
+        "--num-agents",
+        type=int,
+        default=2,
+        choices=(2, 4),
+        help=(
+            "Orbit Wars player count (2 or 4). Each seat uses egocentric observations; "
+            "rollout collects trajectories for all agents and trains the shared policy on every seat."
+        ),
+    )
+    p.add_argument(
         "--max-micro-steps",
         type=int,
         default=16,
@@ -1692,7 +1682,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=128,
         help=(
-            "Stop a rollout segment after a full env-step when any env's player-0 or player-1 "
+            "Stop a rollout segment after a full env-step when any env's any player's "
             "micro-step count in this segment reaches this value (end-of-turn cut). "
             "State carries to the next iteration; GAE bootstraps truncated trajectories."
         ),

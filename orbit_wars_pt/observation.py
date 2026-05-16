@@ -15,12 +15,14 @@ from orbit_wars_pt.constants import (
     CENTER,
     ENTITY_CLS,
     ENTITY_COMET,
-    FEATURE_DIM,
+    FEATURE_DIM_MULTI,
+    INCOMING_SURVIVOR_FLAT,
     INCOMING_TA_BINS,
     ENTITY_PLANET,
     MAX_FLEET_TOKENS,
     MAX_PLANETS,
     NUM_OWNER_SLOTS,
+    obs_feature_dim_for_num_agents,
 )
 from orbit_wars_pt.geometry import planet_pred_velocity
 
@@ -46,6 +48,35 @@ def _remap_owner(owner: float, ego: int, num_agents: int) -> int:
     if o < ego:
         return 2 + o
     return 2 + (o - 1)
+
+
+def _incoming_interfleet_np(
+    incoming: np.ndarray,
+    ego: int,
+    num_agents: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Interfleet largest-vs-2nd reduction; returns (signed_net[P,T], survivor_slot[P,T] int)."""
+
+    a = incoming.shape[0]
+    padded = np.pad(incoming.astype(np.float32), ((0, 4 - a), (0, 0), (0, 0)))
+    ships = np.transpose(padded, (1, 2, 0))
+    order = np.argsort(-ships, axis=-1)
+    top_s = np.take_along_axis(ships, order[..., :1], axis=-1)[..., 0]
+    second_s = np.take_along_axis(ships, order[..., 1:2], axis=-1)[..., 0]
+    top_p = order[..., 0].astype(np.int32)
+    survivor = np.where(top_s == second_s, 0.0, top_s - second_s)
+    ego_j = int(ego)
+    signed = np.where(survivor <= 0.0, 0.0, np.where(top_p == ego_j, survivor, -survivor))
+    is_self = top_p == ego_j
+    slot_le2 = np.where(survivor <= 0.0, 0, np.where(is_self, 1, 2))
+    slot_gt2 = np.where(
+        survivor <= 0.0,
+        0,
+        np.where(is_self, 1, np.where(top_p < ego_j, 2 + top_p, 2 + (top_p - 1))),
+    )
+    survivor_slot = np.where(num_agents <= 2, slot_le2, slot_gt2)
+    survivor_slot = np.clip(survivor_slot, 0, NUM_OWNER_SLOTS - 1).astype(np.int32)
+    return signed / 1000.0, survivor_slot
 
 
 @dataclass
@@ -102,11 +133,10 @@ def build_observation(
 
     cls_turn = _cls_turn_fraction(step_count)
     incoming = incoming_fleets.astype(np.float32)
-    self_incoming = incoming[int(ego_player)]
-    enemy_incoming = incoming[np.arange(incoming.shape[0]) != int(ego_player)].sum(axis=0)
-    incoming_net = (self_incoming - enemy_incoming) / 1000.0
+    fdim = obs_feature_dim_for_num_agents(num_agents)
+    incoming_net, survivor_slot = _incoming_interfleet_np(incoming, int(ego_player), num_agents)
 
-    cls_feat = np.zeros((FEATURE_DIM,), dtype=np.float32)
+    cls_feat = np.zeros((fdim,), dtype=np.float32)
     cls_feat[6] = np.float32(cls_turn)
 
     types_list: List[int] = [ENTITY_CLS]
@@ -147,19 +177,19 @@ def build_observation(
                     vx = float(p1[0] - p0[0])
                     vy = float(p1[1] - p0[1])
 
-        feat = np.array(
-            [
-                np.log1p(max(planet_prod[i], 0.0)),
-                planet_ships[i] / 1000.0,
-                vx / 5.0,
-                vy / 5.0,
-                float(active),
-                float(planet_r[i]) / 10.0,
-                *([0.0] * (FEATURE_DIM - 6)),
-            ],
-            dtype=np.float32,
-        )
-        feat[8:] = incoming_net[i]
+        feat = np.zeros((fdim,), dtype=np.float32)
+        feat[0] = np.float32(np.log1p(max(planet_prod[i], 0.0)))
+        feat[1] = np.float32(planet_ships[i] / 1000.0)
+        feat[2] = np.float32(vx / 5.0)
+        feat[3] = np.float32(vy / 5.0)
+        feat[4] = np.float32(active)
+        feat[5] = np.float32(planet_r[i] / 10.0)
+        feat[8 : 8 + INCOMING_TA_BINS] = incoming_net[i].astype(np.float32)
+        if fdim == FEATURE_DIM_MULTI and num_agents > 2:
+            oh = np.eye(NUM_OWNER_SLOTS, dtype=np.float32)[survivor_slot[i]]
+            feat[
+                8 + INCOMING_TA_BINS : 8 + INCOMING_TA_BINS + INCOMING_SURVIVOR_FLAT
+            ] = oh.reshape(INCOMING_SURVIVOR_FLAT)
 
         xy = planet_xy[i] if active else np.zeros((2,), dtype=np.float64)
         rope = np.array([float(xy[0]) / BOARD_SIZE, float(xy[1]) / BOARD_SIZE, 0.0], dtype=np.float32)

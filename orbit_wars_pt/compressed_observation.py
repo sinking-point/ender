@@ -11,7 +11,16 @@ from typing import NamedTuple
 
 import torch
 
-from orbit_wars_pt.constants import BOARD_SIZE, CENTER, FEATURE_DIM, INCOMING_TA_BINS, MAX_PLANETS
+from orbit_wars_pt.constants import (
+    BOARD_SIZE,
+    CENTER,
+    FEATURE_DIM,
+    FEATURE_DIM_MULTI,
+    INCOMING_SURVIVOR_FLAT,
+    INCOMING_TA_BINS,
+    MAX_PLANETS,
+    NUM_OWNER_SLOTS,
+)
 
 
 SEQ_LEN = 1 + MAX_PLANETS
@@ -32,6 +41,7 @@ class CompressedObservationBuffer(NamedTuple):
     xy: torch.Tensor
     turn_progress: torch.Tensor
     incoming_net: torch.Tensor
+    incoming_survivor: torch.Tensor
 
 
 def _u16_to_i16(x: torch.Tensor) -> torch.Tensor:
@@ -68,6 +78,11 @@ def init_compressed_observation_buffer(
             dtype=torch.int16,
             device=device,
         ),
+        incoming_survivor=torch.zeros(
+            (H_buf, num_envs, MAX_PLANETS, INCOMING_TA_BINS),
+            dtype=torch.int16,
+            device=device,
+        ),
     )
 
 
@@ -89,6 +104,13 @@ def _obs_to_compressed_planes(obs: dict[str, torch.Tensor]) -> CompressedObserva
     velocity = planet_f[..., 2:4].to(torch.float16)
     incoming_net = (planet_f[..., 8 : 8 + INCOMING_TA_BINS] * 1000.0).round()
     incoming_net = incoming_net.clamp(_I16_MIN, _I16_MAX).to(torch.int16)
+    incoming_survivor = torch.zeros_like(incoming_net)
+    multi_min_f = 8 + INCOMING_TA_BINS + INCOMING_SURVIVOR_FLAT
+    if planet_f.shape[-1] >= multi_min_f:
+        oh = planet_f[..., 8 + INCOMING_TA_BINS : multi_min_f].reshape(
+            planet_f.shape[0], MAX_PLANETS, INCOMING_TA_BINS, NUM_OWNER_SLOTS
+        )
+        incoming_survivor = oh.argmax(dim=-1).to(torch.int16)
     xy = obs["rope_pos"][:, 1 : 1 + MAX_PLANETS, 0:2].to(torch.float16)
     turn_progress = features[:, 0, 6].to(torch.float16)
 
@@ -101,6 +123,7 @@ def _obs_to_compressed_planes(obs: dict[str, torch.Tensor]) -> CompressedObserva
         xy=xy,
         turn_progress=turn_progress,
         incoming_net=incoming_net,
+        incoming_survivor=incoming_survivor,
     )
 
 
@@ -109,16 +132,20 @@ def compress_observation(obs: dict[str, torch.Tensor]) -> CompressedObservationB
     return _obs_to_compressed_planes(obs)
 
 
-def decode_observation(comp: CompressedObservationBuffer) -> dict[str, torch.Tensor]:
+def decode_observation(
+    comp: CompressedObservationBuffer, *, feature_dim: int = FEATURE_DIM
+) -> dict[str, torch.Tensor]:
     token_meta = _i16_to_u16_int(comp.token_meta)
     entity_type = (token_meta & 0xF).to(torch.long)
     entity_mask = (token_meta & _META_ENTITY_MASK) != 0
     planet_mask = (token_meta & _META_PLANET_MASK) != 0
     owner_idx = comp.owner_idx.to(torch.long)
 
+    if feature_dim not in (FEATURE_DIM, FEATURE_DIM_MULTI):
+        raise ValueError(f"feature_dim must be {FEATURE_DIM} or {FEATURE_DIM_MULTI}, got {feature_dim}")
     prefix_shape = comp.token_meta.shape[:-1]
     device = comp.token_meta.device
-    features = torch.zeros((*prefix_shape, SEQ_LEN, FEATURE_DIM), dtype=torch.float32, device=device)
+    features = torch.zeros((*prefix_shape, SEQ_LEN, feature_dim), dtype=torch.float32, device=device)
     rope_pos = torch.zeros((*prefix_shape, SEQ_LEN, 3), dtype=torch.float32, device=device)
 
     prod = _i16_to_u16_float(comp.production)
@@ -130,6 +157,13 @@ def decode_observation(comp: CompressedObservationBuffer) -> dict[str, torch.Ten
     planet_f[..., 4] = entity_mask[..., 1 : 1 + MAX_PLANETS].to(torch.float32)
     planet_f[..., 5] = (1.0 + torch.log(prod_for_radius)) / 10.0
     planet_f[..., 8 : 8 + INCOMING_TA_BINS] = comp.incoming_net.to(torch.float32) / 1000.0
+    if feature_dim == FEATURE_DIM_MULTI:
+        idx = comp.incoming_survivor.to(torch.long).clamp(0, NUM_OWNER_SLOTS - 1)
+        oh = torch.nn.functional.one_hot(idx, NUM_OWNER_SLOTS).to(dtype=torch.float32, device=device)
+        planet_f[
+            ...,
+            8 + INCOMING_TA_BINS : 8 + INCOMING_TA_BINS + INCOMING_SURVIVOR_FLAT,
+        ] = oh.reshape(*prefix_shape, MAX_PLANETS, INCOMING_SURVIVOR_FLAT)
     features[..., 0, 6] = comp.turn_progress.to(torch.float32)
 
     rope_pos[..., 0, 0] = CENTER / BOARD_SIZE
@@ -164,6 +198,7 @@ def store_compressed_observation_rows(
     dst.xy[r, e, :, :] = comp.xy.to(dst.xy.device)
     dst.turn_progress[r, e] = comp.turn_progress.to(dst.turn_progress.device)
     dst.incoming_net[r, e, :, :] = comp.incoming_net.to(dst.incoming_net.device)
+    dst.incoming_survivor[r, e, :, :] = comp.incoming_survivor.to(dst.incoming_survivor.device)
     return dst
 
 
@@ -185,6 +220,7 @@ def select_compressed_observation(
         xy=src.xy[tt, nn].to(device),
         turn_progress=src.turn_progress[tt, nn].to(device),
         incoming_net=src.incoming_net[tt, nn].to(device),
+        incoming_survivor=src.incoming_survivor[tt, nn].to(device),
     )
 
 

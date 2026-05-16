@@ -33,13 +33,17 @@ from orbit_wars_pt.constants import (
     ENTITY_CLS,
     ENTITY_COMET,
     FEATURE_DIM,
+    FEATURE_DIM_MULTI,
+    INCOMING_SURVIVOR_FLAT,
     INCOMING_TA_BINS,
     ENTITY_PLANET,
     MAX_PLANETS,
     NUM_OWNER_SLOTS,
     ROTATION_RADIUS_LIMIT,
+    obs_feature_dim_for_num_agents,
 )
 from orbit_wars_pt.parallel_rollout import RolloutSegment
+from orbit_wars_pt.transition_buffer import TorchTransitionBuffer
 
 
 def _remap_owner_2p(owner: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
@@ -49,6 +53,36 @@ def _remap_owner_2p(owner: torch.Tensor, ego: torch.Tensor) -> torch.Tensor:
         e = e.unsqueeze(-1)
     out = torch.where(o < 0, torch.zeros_like(o), torch.where(o == e, torch.ones_like(o), torch.full_like(o, 2)))
     return out.clamp_max(NUM_OWNER_SLOTS - 1).to(torch.long)
+
+
+def _incoming_interfleet_torch(
+    incoming: torch.Tensor,
+    ego: torch.Tensor,
+    num_agents: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``incoming`` ``[B, A, P, T]`` — same interfleet reduction as ``observation_jax``."""
+
+    b, a, p, t_bins = incoming.shape
+    pad = 4 - a
+    padded = torch.nn.functional.pad(incoming.float(), (0, 0, 0, 0, 0, pad))
+    ships = padded.permute(0, 2, 3, 1)
+    order = ships.argsort(dim=-1, descending=True)
+    top_s = ships.gather(-1, order[..., :1]).squeeze(-1)
+    second_s = ships.gather(-1, order[..., 1:2]).squeeze(-1)
+    top_p = order[..., 0]
+    survivor = torch.where(top_s == second_s, torch.zeros_like(top_s), top_s - second_s)
+    ego_e = ego.to(torch.long).view(b, 1, 1).expand(b, p, t_bins)
+    signed = torch.where(survivor <= 0.0, torch.zeros_like(survivor), torch.where(top_p == ego_e, survivor, -survivor))
+    is_self = top_p == ego_e
+    slot_le2 = torch.where(survivor <= 0.0, torch.zeros_like(top_p), torch.where(is_self, torch.ones_like(top_p), torch.full_like(top_p, 2)))
+    slot_gt2 = torch.where(
+        survivor <= 0.0,
+        torch.zeros_like(top_p),
+        torch.where(is_self, torch.ones_like(top_p), torch.where(top_p < ego_e, 2 + top_p, 2 + (top_p - 1))),
+    )
+    survivor_slot = slot_gt2 if num_agents > 2 else slot_le2
+    survivor_slot = survivor_slot.clamp(0, NUM_OWNER_SLOTS - 1).to(torch.long)
+    return signed / 1000.0, survivor_slot
 
 
 def apply_prefix_micro_deltas_torch(
@@ -93,38 +127,117 @@ def apply_prefix_micro_deltas_torch(
     return state._replace(planets=planets, incoming_fleets=incoming)
 
 
-def _select_mixed_compressed_observation(
-    obs0: CompressedObservationBuffer,
-    obs1: CompressedObservationBuffer,
-    is_p0: torch.Tensor,
+def _select_multi_compressed_observation(
+    obs_bufs: list[CompressedObservationBuffer],
+    mb_player: torch.Tensor,
     mb_t: torch.Tensor,
     mb_n: torch.Tensor,
     *,
     device: torch.device,
 ) -> CompressedObservationBuffer:
-    obs_device = obs0.token_meta.device
-    t = mb_t.to(device=obs_device, dtype=torch.long)
-    n = mb_n.to(device=obs_device, dtype=torch.long)
-    choose0 = is_p0.to(device=obs_device, dtype=torch.bool)
+    """Gather compressed obs rows from the per-ego buffer selected by ``mb_player``."""
 
-    def pick(field: str) -> torch.Tensor:
-        a = getattr(obs0, field)[t, n]
-        b = getattr(obs1, field)[t, n]
-        mask = choose0
-        while mask.ndim < a.ndim:
-            mask = mask.unsqueeze(-1)
-        return torch.where(mask, a, b).to(device)
+    storage_device = obs_bufs[0].token_meta.device
+    t = mb_t.to(device=storage_device, dtype=torch.long)
+    n = mb_n.to(device=storage_device, dtype=torch.long)
+    player = mb_player.to(device=storage_device, dtype=torch.long)
+    bsz = int(t.shape[0])
+
+    first = obs_bufs[0]
+    token_meta = torch.zeros((bsz,) + first.token_meta.shape[2:], device=device, dtype=first.token_meta.dtype)
+    owner_idx = torch.zeros((bsz,) + first.owner_idx.shape[2:], device=device, dtype=first.owner_idx.dtype)
+    production = torch.zeros((bsz,) + first.production.shape[2:], device=device, dtype=first.production.dtype)
+    ships = torch.zeros((bsz,) + first.ships.shape[2:], device=device, dtype=first.ships.dtype)
+    velocity = torch.zeros((bsz,) + first.velocity.shape[2:], device=device, dtype=first.velocity.dtype)
+    xy = torch.zeros((bsz,) + first.xy.shape[2:], device=device, dtype=first.xy.dtype)
+    turn_progress = torch.zeros((bsz,) + first.turn_progress.shape[2:], device=device, dtype=first.turn_progress.dtype)
+    incoming_net = torch.zeros((bsz,) + first.incoming_net.shape[2:], device=device, dtype=first.incoming_net.dtype)
+    incoming_survivor = torch.zeros(
+        (bsz,) + first.incoming_survivor.shape[2:], device=device, dtype=first.incoming_survivor.dtype
+    )
+
+    for p, obs in enumerate(obs_bufs):
+        m = player == p
+        if not bool(m.any().item()):
+            continue
+        tp, np_ = t[m], n[m]
+        token_meta[m] = obs.token_meta[tp, np_].to(device)
+        owner_idx[m] = obs.owner_idx[tp, np_].to(device)
+        production[m] = obs.production[tp, np_].to(device)
+        ships[m] = obs.ships[tp, np_].to(device)
+        velocity[m] = obs.velocity[tp, np_].to(device)
+        xy[m] = obs.xy[tp, np_].to(device)
+        turn_progress[m] = obs.turn_progress[tp, np_].to(device)
+        incoming_net[m] = obs.incoming_net[tp, np_].to(device)
+        incoming_survivor[m] = obs.incoming_survivor[tp, np_].to(device)
 
     return CompressedObservationBuffer(
-        token_meta=pick("token_meta"),
-        owner_idx=pick("owner_idx"),
-        production=pick("production"),
-        ships=pick("ships"),
-        velocity=pick("velocity"),
-        xy=pick("xy"),
-        turn_progress=pick("turn_progress"),
-        incoming_net=pick("incoming_net"),
+        token_meta=token_meta,
+        owner_idx=owner_idx,
+        production=production,
+        ships=ships,
+        velocity=velocity,
+        xy=xy,
+        turn_progress=turn_progress,
+        incoming_net=incoming_net,
+        incoming_survivor=incoming_survivor,
     )
+
+
+def _gather_transition_fields_for_players(
+    bufs: list[TorchTransitionBuffer],
+    mb_player: torch.Tensor,
+    mb_t: torch.Tensor,
+    mb_n_v: torch.Tensor,
+    *,
+    storage_device: torch.device,
+    out_device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Build per-minibatch action records by gathering from each player's rollout buffer."""
+
+    t = mb_t.to(device=storage_device, dtype=torch.long)
+    n = mb_n_v.to(device=storage_device, dtype=torch.long)
+    player = mb_player.to(device=storage_device, dtype=torch.long)
+    bsz = int(t.shape[0])
+    row = torch.arange(bsz, device=storage_device)
+
+    phase = torch.zeros((bsz,), device=storage_device, dtype=torch.long)
+    pair_flat_acc = torch.zeros((bsz, bufs[0].pair_flat.shape[-1]), device=storage_device, dtype=torch.int32)
+    frac_acc = torch.zeros((bsz, bufs[0].frac_idx.shape[-1]), device=storage_device, dtype=torch.int32)
+    halt_action = torch.zeros((bsz,), device=storage_device, dtype=torch.long)
+    no_valid_pairs = torch.zeros((bsz,), device=storage_device, dtype=torch.bool)
+    no_valid_fracs = torch.zeros((bsz,), device=storage_device, dtype=torch.bool)
+    must_halt_no_ships = torch.zeros((bsz,), device=storage_device, dtype=torch.bool)
+    tpr = torch.zeros((bsz, MAX_PLANETS), device=storage_device, dtype=torch.bool)
+    tht = torch.zeros((bsz, MAX_PLANETS), device=storage_device, dtype=torch.float32)
+
+    for p, buf in enumerate(bufs):
+        m = player == p
+        if not bool(m.any().item()):
+            continue
+        tp, np_ = t[m], n[m]
+        phase[m] = buf.phase_micro_idx[tp, np_].to(torch.long)
+        pair_flat_acc[m] = buf.pair_flat[tp, np_, :]
+        frac_acc[m] = buf.frac_idx[tp, np_, :]
+        halt_action[m] = buf.halt_action[tp, np_].to(torch.long)
+        no_valid_pairs[m] = buf.no_valid_pairs[tp, np_]
+        no_valid_fracs[m] = buf.no_valid_fracs[tp, np_]
+        must_halt_no_ships[m] = buf.must_halt_no_ships[tp, np_]
+        tpr[m] = buf.target_planet_reachable[tp, np_, :]
+        tht[m] = buf.target_hit_tick[tp, np_, :]
+
+    actions = {
+        "halt_action": halt_action.to(out_device, dtype=torch.long),
+        "pair_flat": pair_flat_acc[row, phase.to(storage_device)].to(out_device, dtype=torch.long),
+        "frac_idx": frac_acc[row, phase.to(storage_device)].to(out_device, dtype=torch.long),
+        "no_valid_pairs": no_valid_pairs.to(out_device, dtype=torch.bool),
+        "no_valid_fracs": no_valid_fracs.to(out_device, dtype=torch.bool),
+        "must_halt_no_ships": must_halt_no_ships.to(out_device, dtype=torch.bool),
+        "target_planet_reachable": tpr.to(out_device, dtype=torch.bool),
+        "target_hit_tick": tht.to(out_device, dtype=torch.float32),
+        "ego": player.to(out_device),
+    }
+    return actions
 
 
 def select_stored_observation_minibatch_torch(
@@ -134,59 +247,38 @@ def select_stored_observation_minibatch_torch(
     mb_n: np.ndarray,
     replay_device: Optional[torch.device] = None,
     timing: Optional[object] = None,
+    *,
+    obs_feature_dim: int = FEATURE_DIM,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
     """Select stored compressed observations and action records for PPO."""
 
     import time
 
-    buf0, buf1 = segment.buf0, segment.buf1
-    storage_device = buf0.micro_halt_now.device
+    bufs = segment.bufs
+    storage_device = bufs[0].micro_halt_now.device
     out_device = replay_device if replay_device is not None else storage_device
     mb_t_t = torch.as_tensor(mb_t, dtype=torch.long, device=storage_device)
     mb_n_t = torch.as_tensor(mb_n, dtype=torch.long, device=storage_device)
     player_t = torch.as_tensor(mb_player, dtype=torch.long, device=storage_device)
-    is_p0 = player_t == 0
 
     t_select0 = time.perf_counter()
-    comp = _select_mixed_compressed_observation(
-        segment.obs0,
-        segment.obs1,
-        is_p0,
+    comp = _select_multi_compressed_observation(
+        segment.obs_bufs,
+        player_t,
         mb_t_t,
         mb_n_t,
         device=out_device,
     )
-    obs = decode_observation(comp)
+    obs = decode_observation(comp, feature_dim=obs_feature_dim)
 
-    def plane(f0: torch.Tensor, f1: torch.Tensor) -> torch.Tensor:
-        return torch.where(is_p0[:, None], f0[mb_t_t, mb_n_t, :], f1[mb_t_t, mb_n_t, :])
-
-    def scalar(f0: torch.Tensor, f1: torch.Tensor) -> torch.Tensor:
-        return torch.where(is_p0, f0[mb_t_t, mb_n_t], f1[mb_t_t, mb_n_t])
-
-    phase = scalar(buf0.phase_micro_idx, buf1.phase_micro_idx).to(torch.long)
-    row = torch.arange(player_t.shape[0], device=storage_device)
-    pf_m = plane(buf0.pair_flat, buf1.pair_flat)
-    fi_m = plane(buf0.frac_idx, buf1.frac_idx)
-    actions = {
-        "halt_action": scalar(buf0.halt_action, buf1.halt_action).to(out_device, dtype=torch.long),
-        "pair_flat": pf_m[row, phase.to(storage_device)].to(out_device, dtype=torch.long),
-        "frac_idx": fi_m[row, phase.to(storage_device)].to(out_device, dtype=torch.long),
-        "no_valid_pairs": scalar(buf0.no_valid_pairs, buf1.no_valid_pairs).to(out_device, dtype=torch.bool),
-        "no_valid_fracs": scalar(buf0.no_valid_fracs, buf1.no_valid_fracs).to(out_device, dtype=torch.bool),
-        "must_halt_no_ships": scalar(buf0.must_halt_no_ships, buf1.must_halt_no_ships).to(out_device, dtype=torch.bool),
-        "target_planet_reachable": torch.where(
-            is_p0[:, None],
-            buf0.target_planet_reachable[mb_t_t, mb_n_t, :],
-            buf1.target_planet_reachable[mb_t_t, mb_n_t, :],
-        ).to(out_device, dtype=torch.bool),
-        "target_hit_tick": torch.where(
-            is_p0[:, None],
-            buf0.target_hit_tick[mb_t_t, mb_n_t, :],
-            buf1.target_hit_tick[mb_t_t, mb_n_t, :],
-        ).to(out_device, dtype=torch.float32),
-        "ego": player_t.to(out_device),
-    }
+    actions = _gather_transition_fields_for_players(
+        bufs,
+        player_t,
+        mb_t_t,
+        mb_n_t,
+        storage_device=storage_device,
+        out_device=out_device,
+    )
     if timing is not None:
         timing.gather_select_s += time.perf_counter() - t_select0
     return obs, actions
@@ -248,20 +340,25 @@ def build_observation_torch(state: OrbitWarsState, ego: torch.Tensor, ship_speed
     planet_etype = torch.where(is_comet, torch.full_like(pid, ENTITY_COMET), torch.full_like(pid, ENTITY_PLANET)).long()
     planet_owner = _remap_owner_2p(planets[..., PLANET_OWNER], ego)
     incoming = state.incoming_fleets.to(dtype)
-    batch_idx = torch.arange(b, device=device)
-    ego_i = ego.to(torch.long).clamp(0, int(state.incoming_fleets.shape[1]) - 1)
-    self_incoming = incoming[batch_idx, ego_i]
-    enemy_incoming = incoming.sum(dim=1) - self_incoming
-    incoming_net = (self_incoming - enemy_incoming) / 1000.0
+    na = int(incoming.shape[1])
+    fdim = obs_feature_dim_for_num_agents(na)
+    incoming_net, survivor_slot = _incoming_interfleet_torch(incoming, ego, na)
 
-    planet_features = torch.zeros((b, MAX_PLANETS, FEATURE_DIM), dtype=dtype, device=device)
+    planet_features = torch.zeros((b, MAX_PLANETS, fdim), dtype=dtype, device=device)
     planet_features[..., 0] = torch.log1p(planets[..., PLANET_PRODUCTION].clamp_min(0.0))
     planet_features[..., 1] = planets[..., PLANET_SHIPS] / 1000.0
     planet_features[..., 2] = vx / 5.0
     planet_features[..., 3] = vy / 5.0
     planet_features[..., 4] = active.to(dtype)
     planet_features[..., 5] = planets[..., PLANET_RADIUS] / 10.0
-    planet_features[..., 8:] = incoming_net
+    planet_features[..., 8 : 8 + INCOMING_TA_BINS] = incoming_net
+    if fdim == FEATURE_DIM_MULTI and na > 2:
+        idx = survivor_slot.clamp(0, NUM_OWNER_SLOTS - 1)
+        oh = torch.nn.functional.one_hot(idx, NUM_OWNER_SLOTS).to(dtype=dtype)
+        oh_flat = oh.reshape(b, MAX_PLANETS, INCOMING_SURVIVOR_FLAT)
+        planet_features[
+            ..., 8 + INCOMING_TA_BINS : 8 + INCOMING_TA_BINS + INCOMING_SURVIVOR_FLAT
+        ] = oh_flat
     planet_rope = torch.zeros((b, MAX_PLANETS, 3), dtype=dtype, device=device)
     xy = torch.where(active[..., None], planets[..., PLANET_X : PLANET_Y + 1], torch.zeros_like(planets[..., PLANET_X : PLANET_Y + 1]))
     planet_rope[..., 0] = xy[..., 0] / BOARD_SIZE
@@ -269,7 +366,7 @@ def build_observation_torch(state: OrbitWarsState, ego: torch.Tensor, ship_speed
 
     cls_type = torch.full((b, 1), ENTITY_CLS, dtype=torch.long, device=device)
     cls_owner = torch.ones((b, 1), dtype=torch.long, device=device)
-    cls_features = torch.zeros((b, 1, FEATURE_DIM), dtype=dtype, device=device)
+    cls_features = torch.zeros((b, 1, fdim), dtype=dtype, device=device)
     cls_features[:, 0, 6] = (state.step_count.to(dtype) / 498.0).clamp(0.0, 1.0)
     cls_rope = torch.tensor([CENTER / BOARD_SIZE, CENTER / BOARD_SIZE, 0.0], dtype=dtype, device=device).view(1, 1, 3).expand(b, 1, 3)
     return {

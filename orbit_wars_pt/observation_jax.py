@@ -10,8 +10,10 @@ Output layout matches the original ``ObservationBatch`` semantics:
 * CLS token feature index 6 = turn progress in ``[0,1]`` (``step_count / (episode_steps-2)``).
 * ``entity_type[..., 0] = ENTITY_CLS``;
   ``[..., 1:1+MAX_PLANETS]`` are planet/comet tokens (fixed slots).
-* Incoming fleets are collapsed into per-planet signed countdown bins appended
-  to the planet feature vector.
+* Incoming fleets: per-planet signed **post–inter-fleet** mass for each TA bin
+  (``features[..., 8 : 8 + INCOMING_TA_BINS]``). With ``FEATURE_DIM_MULTI``, the following
+  ``INCOMING_TA_BINS * NUM_OWNER_SLOTS`` dimensions are a **one-hot per TA bin** for egocentric
+  survivor owner after the interfleet step (TA-major: bin0 slots 0..4, bin1 slots 0..4, ...).
 """
 
 from __future__ import annotations
@@ -32,6 +34,8 @@ from orbit_wars_pt.constants import (
     ENTITY_COMET,
     ENTITY_PLANET,
     FEATURE_DIM,
+    FEATURE_DIM_MULTI,
+    INCOMING_SURVIVOR_FLAT,
     INCOMING_TA_BINS,
     MAX_PLANETS,
     NUM_OWNER_SLOTS,
@@ -43,20 +47,21 @@ from orbit_wars_pt.constants import (
 SEQ_LEN = 1 + MAX_PLANETS
 
 
-# ---- Owner remap (2-agent specialization; matches host `_remap_owner` for num_agents <= 2). ----
+# ---- Owner remap (matches host ``observation._remap_owner``). ----
 
 
-def _remap_owner_2p(owner: jnp.ndarray, ego: int) -> jnp.ndarray:
-    """0 = neutral, 1 = self, 2 = enemy. Result clipped to ``NUM_OWNER_SLOTS - 1``.
-
-    Returns ``int32`` (JAX's default integer width); the dlpack handoff casts to
-    ``torch.long`` for the embedding lookups.
-    """
+def _remap_owner_jax(owner: jnp.ndarray, ego: int, num_agents: jnp.ndarray) -> jnp.ndarray:
+    """Egocentric owner bucket per planet: 0 neutral, 1 self, 2–4 opponents (4p) or 2 (2p)."""
 
     o = owner.astype(jnp.int32)
+    ego_j = jnp.asarray(ego, dtype=jnp.int32)
+    na = jnp.asarray(num_agents, dtype=jnp.int32)
     is_neutral = o < 0
-    is_self = o == ego
-    out = jnp.where(is_neutral, 0, jnp.where(is_self, 1, 2))
+    is_self = o == ego_j
+    slot_2p = jnp.full_like(o, 2)
+    slot_4p = jnp.where(o < ego_j, 2 + o, 2 + (o - 1))
+    opponent_slot = jnp.where(na <= 2, slot_2p, slot_4p)
+    out = jnp.where(is_neutral, 0, jnp.where(is_self, 1, opponent_slot))
     return jnp.minimum(out, NUM_OWNER_SLOTS - 1).astype(jnp.int32)
 
 # ---- Per-env observation builder (called via vmap over num_envs). ----
@@ -140,7 +145,50 @@ def _turn_fraction_jax(step_count: jnp.ndarray) -> jnp.ndarray:
     return jnp.clip(step_count.astype(jnp.float32) / denom, 0.0, 1.0)
 
 
-def _build_observation_one_env(state: OrbitWarsState, ego: int, ship_speed: float) -> Dict[str, jnp.ndarray]:
+def _incoming_interfleet_ego_features(
+    incoming_apt: jnp.ndarray,
+    ego: int,
+    num_agents: jnp.ndarray,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Match ``jax_orbit_wars._resolve_combats`` interfleet step (largest vs 2nd largest per slot).
+
+    Returns
+    -------
+    signed_net
+        ``[P, T]`` egocentric signed surviving attacker ships / 1000 (positive if self wins duel).
+    survivor_slot
+        ``[P, T] int32`` egocentric owner bucket after remap (0 = none/tie, 1 = self, 2–4 = opponents).
+    """
+
+    a = incoming_apt.shape[0]
+    pad = 4 - a
+    incoming_f = incoming_apt.astype(jnp.float32)
+    padded = jnp.pad(incoming_f, ((0, pad), (0, 0), (0, 0)))
+    ships = jnp.transpose(padded, (1, 2, 0))
+    order = jnp.argsort(-ships, axis=-1)
+    top_s = jnp.take_along_axis(ships, order[..., :1], axis=-1)[..., 0]
+    second_s = jnp.take_along_axis(ships, order[..., 1:2], axis=-1)[..., 0]
+    top_p = order[..., 0].astype(jnp.int32)
+    survivor = jnp.where(top_s == second_s, 0.0, top_s - second_s)
+    ego_j = jnp.asarray(ego, dtype=jnp.int32)
+    signed = jnp.where(survivor <= 0.0, 0.0, jnp.where(top_p == ego_j, survivor, -survivor))
+
+    na = jnp.asarray(num_agents, dtype=jnp.int32)
+    is_self = top_p == ego_j
+    slot_le2 = jnp.where(survivor <= 0.0, 0, jnp.where(is_self, 1, 2))
+    slot_gt2 = jnp.where(
+        survivor <= 0.0,
+        0,
+        jnp.where(is_self, 1, jnp.where(top_p < ego_j, 2 + top_p, 2 + (top_p - 1))),
+    )
+    survivor_slot = jnp.where(na <= 2, slot_le2, slot_gt2)
+    survivor_slot = jnp.clip(survivor_slot, 0, NUM_OWNER_SLOTS - 1).astype(jnp.int32)
+    return signed / 1000.0, survivor_slot
+
+
+def _build_observation_one_env(
+    state: OrbitWarsState, ego: int, ship_speed: float, obs_feature_dim: int
+) -> Dict[str, jnp.ndarray]:
     """Single-env observation (the function that we vmap over the num_envs axis)."""
 
     planets = state.planets
@@ -154,10 +202,7 @@ def _build_observation_one_env(state: OrbitWarsState, ego: int, ship_speed: floa
     planet_prod = planets[:, 6]
 
     incoming = state.incoming_fleets.astype(jnp.float32)  # [A, P, T]
-    self_incoming = incoming[jnp.asarray(ego, dtype=jnp.int32)]
-    other_mask = jnp.arange(state.incoming_fleets.shape[0], dtype=jnp.int32) != jnp.asarray(ego, dtype=jnp.int32)
-    enemy_incoming = jnp.sum(jnp.where(other_mask[:, None, None], incoming, 0.0), axis=0)
-    incoming_net = (self_incoming - enemy_incoming) / 1000.0
+    incoming_net, survivor_slot = _incoming_interfleet_ego_features(incoming, ego, state.num_agents)
 
     # is_comet[i] = True iff pid[i] appears anywhere in comet_planet_ids (which holds
     # only currently spawned-and-alive comet pids; expired entries are -1).
@@ -179,16 +224,25 @@ def _build_observation_one_env(state: OrbitWarsState, ego: int, ship_speed: floa
 
     # ---- Planet token tensors (slot 1 .. 1+P). ----
     planet_etype = jnp.where(is_comet_per_planet, ENTITY_COMET, ENTITY_PLANET).astype(jnp.int32)
-    planet_owner_idx = _remap_owner_2p(planet_owner, ego)  # [P], int32
+    planet_owner_idx = _remap_owner_jax(planet_owner, ego, state.num_agents)  # [P], int32
 
-    planet_features = jnp.zeros((MAX_PLANETS, FEATURE_DIM), dtype=jnp.float32)
+    assert obs_feature_dim in (FEATURE_DIM, FEATURE_DIM_MULTI)
+    planet_features = jnp.zeros((MAX_PLANETS, obs_feature_dim), dtype=jnp.float32)
     planet_features = planet_features.at[:, 0].set(jnp.log1p(jnp.maximum(planet_prod, 0.0)))
     planet_features = planet_features.at[:, 1].set(planet_ships / 1000.0)
     planet_features = planet_features.at[:, 2].set(vx / 5.0)
     planet_features = planet_features.at[:, 3].set(vy / 5.0)
     planet_features = planet_features.at[:, 4].set(planet_active.astype(jnp.float32))
     planet_features = planet_features.at[:, 5].set(planet_r / 10.0)
-    planet_features = planet_features.at[:, 8:].set(incoming_net)
+    planet_features = planet_features.at[:, 8 : 8 + INCOMING_TA_BINS].set(incoming_net)
+    na_i = jnp.asarray(state.num_agents, dtype=jnp.int32)
+    if obs_feature_dim == FEATURE_DIM_MULTI:
+        oh = jax.nn.one_hot(survivor_slot, NUM_OWNER_SLOTS, axis=-1)
+        oh_flat = oh.reshape(MAX_PLANETS, INCOMING_SURVIVOR_FLAT).astype(jnp.float32)
+        surv_write = jnp.where(na_i > 2, oh_flat, jnp.zeros_like(oh_flat))
+        planet_features = planet_features.at[
+            :, 8 + INCOMING_TA_BINS : 8 + INCOMING_TA_BINS + INCOMING_SURVIVOR_FLAT
+        ].set(surv_write)
 
     planet_xy_for_rope = jnp.where(planet_active[:, None], planet_xy, 0.0)
     planet_rope = jnp.zeros((MAX_PLANETS, 3), dtype=jnp.float32)
@@ -200,7 +254,7 @@ def _build_observation_one_env(state: OrbitWarsState, ego: int, ship_speed: floa
     # ---- Assemble [CLS, planets]. ----
     cls_etype = jnp.asarray([ENTITY_CLS], dtype=jnp.int32)
     cls_owner = jnp.asarray([1], dtype=jnp.int32)
-    cls_features = jnp.zeros((1, FEATURE_DIM), dtype=jnp.float32)
+    cls_features = jnp.zeros((1, obs_feature_dim), dtype=jnp.float32)
     cls_features = cls_features.at[0, 6].set(_turn_fraction_jax(state.step_count))
     cls_rope = jnp.asarray([[CENTER / BOARD_SIZE, CENTER / BOARD_SIZE, 0.0]], dtype=jnp.float32)
     cls_entity_mask = jnp.asarray([True], dtype=jnp.bool_)
@@ -229,25 +283,33 @@ def _build_observation_one_env(state: OrbitWarsState, ego: int, ship_speed: floa
     }
 
 
-@partial(jax.jit, static_argnames=("ego", "ship_speed"))
-def build_observation_batched_jax(state_b: OrbitWarsState, ego: int, ship_speed: float = 6.0) -> Dict[str, jnp.ndarray]:
+@partial(jax.jit, static_argnames=("ego", "ship_speed", "obs_feature_dim"))
+def build_observation_batched_jax(
+    state_b: OrbitWarsState,
+    ego: int,
+    ship_speed: float = 6.0,
+    obs_feature_dim: int = FEATURE_DIM,
+) -> Dict[str, jnp.ndarray]:
     """Batched observation: ``state_b`` has leading ``num_envs`` axis on every leaf.
 
     Returns a dict of JAX arrays:
       ``entity_type[N, L] int32``,  ``owner_idx[N, L] int32``,
-      ``features[N, L, FEATURE_DIM] float32``, ``rope_pos[N, L, 3] float32``,
+      ``features[N, L, obs_feature_dim] float32``, ``rope_pos[N, L, 3] float32``,
       ``entity_mask[N, L] bool``,   ``planet_mask[N, L] bool``.
 
     The two integer fields are cast to ``torch.long`` inside
     ``obs_jax_to_torch`` (``nn.Embedding`` requires long indices).
     """
 
-    return jax.vmap(lambda s: _build_observation_one_env(s, ego, ship_speed))(state_b)
+    return jax.vmap(lambda s: _build_observation_one_env(s, ego, ship_speed, obs_feature_dim))(state_b)
 
 
-@partial(jax.jit, static_argnames=("ship_speed",))
+@partial(jax.jit, static_argnames=("ship_speed", "obs_feature_dim"))
 def build_observation_batched_jax_per_ego(
-    state_b: OrbitWarsState, ego_b: jnp.ndarray, ship_speed: float = 6.0
+    state_b: OrbitWarsState,
+    ego_b: jnp.ndarray,
+    ship_speed: float = 6.0,
+    obs_feature_dim: int = FEATURE_DIM,
 ) -> Dict[str, jnp.ndarray]:
     """Per-element ego variant used at PPO replay.
 
@@ -256,4 +318,6 @@ def build_observation_batched_jax_per_ego(
     state and the ego.
     """
 
-    return jax.vmap(_build_observation_one_env, in_axes=(0, 0, None))(state_b, ego_b, ship_speed)
+    return jax.vmap(_build_observation_one_env, in_axes=(0, 0, None, None))(
+        state_b, ego_b, ship_speed, obs_feature_dim
+    )
