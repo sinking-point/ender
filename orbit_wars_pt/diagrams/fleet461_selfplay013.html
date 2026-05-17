@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Fleet 461 — planet forecast vs board exit</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0c0f14;
+      --panel: #151b24;
+      --text: #e8edf4;
+      --muted: #7d8da6;
+      --board: #334155;
+      --origin: #fbbf24;
+      --fleet: #2dd4bf;
+      --p35: #818cf8;
+      --oob: #f87171;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "DM Sans", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      min-height: 100vh;
+    }
+    aside {
+      background: var(--panel);
+      padding: 1.25rem 1.5rem;
+      border-right: 1px solid #243044;
+      font-size: 0.88rem;
+      line-height: 1.55;
+    }
+    h1 { font-size: 1.1rem; margin-bottom: 0.5rem; }
+    h2 { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 1rem 0 0.35rem; }
+    .tag { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; margin-right: 0.25rem; }
+    .tag-p { background: #312e81; color: #a5b4fc; }
+    .tag-b { background: #450a0a; color: #fca5a5; }
+    .tag-g { background: #134e4a; color: #5eead4; }
+    ul { margin: 0.35rem 0 0 1rem; color: var(--muted); }
+    li { margin: 0.2rem 0; }
+    code { font-family: "JetBrains Mono", monospace; font-size: 0.8em; color: #93c5fd; }
+    main { padding: 1rem; }
+    canvas { display: block; border-radius: 10px; border: 1px solid #243044; background: #0a0e14; }
+    .timeline { margin-top: 1rem; display: flex; gap: 2px; height: 28px; border-radius: 6px; overflow: hidden; font-size: 0.65rem; }
+    .tick { flex: 1; display: flex; align-items: center; justify-content: center; color: #64748b; background: #1a2230; position: relative; }
+    .tick.horizon { background: #1e3a5f; color: #93c5fd; }
+    .tick.hit { background: #312e81; color: #c4b5fd; font-weight: 600; }
+    .tick.oob { background: #7f1d1d; color: #fecaca; font-weight: 600; }
+    .tick-label { text-align: center; font-size: 0.7rem; color: var(--muted); margin-top: 0.35rem; }
+  </style>
+</head>
+<body>
+  <aside>
+    <h1>Fleet 461 · selfplay_013</h1>
+    <p>Launch <strong>step 108</strong> from planet <strong>22</strong>, θ ≈ 6.18 rad (~354°), <strong>16 ships</strong>.</p>
+
+    <h2>What models say (24-tick horizon)</h2>
+    <p>
+      <span class="tag tag-p">orthogonal</span>
+      <span class="tag tag-g">raycast</span>
+      both: <strong>planet 35 @ tick 10</strong>
+    </p>
+    <p>Not orthogonal-vs-raycast disagreement in current code — they agree.</p>
+
+    <h2>What actually happened</h2>
+    <p>
+      <span class="tag tag-b">replay</span>
+      Flyby near planet 35 at step ~118 (dist ≈ 1.1), no capture; fleet exits right edge ~step 138.
+    </p>
+    <ul>
+      <li>Board exit ≈ <strong>tick 30</strong> from launch — outside policy horizon (24)</li>
+      <li>Closest approach step 118 — matches predicted tick 10 + launch 108</li>
+    </ul>
+
+    <h2>Why “planet vs board” still matters</h2>
+    <ul>
+      <li><strong>Horizon gap:</strong> policy never scores OOB; game does at tick ~30</li>
+      <li><strong>Orthogonal order:</strong> all planet cones processed before board-exit cones</li>
+      <li><strong>Flyby:</strong> swept segment can “hit” in forecast while fleet sails past</li>
+    </ul>
+  </aside>
+  <main>
+    <canvas id="c" width="800" height="520"></canvas>
+    <div class="timeline" id="tl"></div>
+    <p class="tick-label">Ticks from launch (0–35). Blue = model planet hit. Red = actual OOB. Shaded = policy horizon (0–23).</p>
+  </main>
+  <script>
+    const W = 800, H = 520;
+    const canvas = document.getElementById("c");
+    const ctx = canvas.getContext("2d");
+
+    // Replay keyframes (from selfplay_013)
+    const origin = [28.0, 75.39];
+    const originR = 2.39;
+    const theta = 6.18329;
+    const speed = 2.271;
+    const p35 = [62.6, 69.3];
+    const p35r = 1.0;
+    const path = [
+      [33.5, 75.6],   // step 108
+      [49.4, 74.0],   // 115
+      [56.1, 73.3],   // 118 closest
+      [72.0, 71.7],   // 125
+      [99.1, 69.0],   // 137
+    ];
+    const pathSteps = [108, 115, 118, 125, 137];
+
+    const xmin = 20, xmax = 105, ymin = 64, ymax = 80;
+    const pad = 44;
+    const sx = (W - 2 * pad) / (xmax - xmin);
+    const sy = (H - 2 * pad) / (ymax - ymin);
+    const w = (x, y) => [pad + (x - xmin) * sx, H - pad - (y - ymin) * sy];
+
+    function draw() {
+      ctx.fillStyle = "#0a0e14";
+      ctx.fillRect(0, 0, W, H);
+
+      // Board
+      const [x0, y0] = w(0, 0);
+      const [x1, y1] = w(100, 100);
+      ctx.strokeStyle = "#334155";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x0, y1, x1 - x0, y0 - y1);
+
+      // Right edge (exit)
+      ctx.setLineDash([6, 4]);
+      ctx.strokeStyle = "#f87171";
+      ctx.beginPath();
+      const [rx, _] = w(100, 70);
+      ctx.moveTo(rx, pad);
+      ctx.lineTo(rx, H - pad);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#f87171";
+      ctx.font = "600 11px DM Sans";
+      ctx.fillText("x = 100 (exit)", rx - 72, pad + 14);
+
+      // Planet 35
+      const [cx, cy] = w(p35[0], p35[1]);
+      ctx.beginPath();
+      ctx.arc(cx, cy, p35r * sx, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(129,140,248,0.25)";
+      ctx.fill();
+      ctx.strokeStyle = "#818cf8";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = "#a5b4fc";
+      ctx.fillText("planet 35", cx + 10, cy - 8);
+
+      // Origin
+      const [ox, oy] = w(origin[0], origin[1]);
+      ctx.beginPath();
+      ctx.arc(ox, oy, originR * sx, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(251,191,36,0.2)";
+      ctx.fill();
+      ctx.strokeStyle = "#fbbf24";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Fleet path (replay samples + extrapolation)
+      ctx.strokeStyle = "#2dd4bf";
+      ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      const launch = [origin[0] + (originR + 0.1) * Math.cos(theta), origin[1] + (originR + 0.1) * Math.sin(theta)];
+      let [px, py] = w(launch[0], launch[1]);
+      ctx.moveTo(px, py);
+      for (const pt of path) {
+        [px, py] = w(pt[0], pt[1]);
+        ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+
+      // Closest approach marker
+      const [mx, my] = w(56.1, 73.3);
+      ctx.fillStyle = "#2dd4bf";
+      ctx.beginPath();
+      ctx.arc(mx, my, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "11px DM Sans";
+      ctx.fillText("step 118 · dist≈1.1", mx + 10, my + 4);
+
+      // Model hit tick 10 position (forecast)
+      const hitPos = [
+        launch[0] + (originR + 0.1 + 10 * speed) * Math.cos(theta),
+        launch[1] + (originR + 0.1 + 10 * speed) * Math.sin(theta),
+      ];
+      const [hx, hy] = w(hitPos[0], hitPos[1]);
+      ctx.strokeStyle = "#818cf8";
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      ctx.moveTo(hx, hy);
+      ctx.lineTo(cx, cy);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#c4b5fd";
+      ctx.fillText("model hit tick 10", hx - 20, hy - 12);
+
+      // Launch arrow
+      const [lx, ly] = w(launch[0], launch[1]);
+      const [ax, ay] = w(launch[0] + 8 * Math.cos(theta), launch[1] + 8 * Math.sin(theta));
+      ctx.strokeStyle = "#64748b";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(ox, oy);
+      ctx.lineTo(ax, ay);
+      ctx.stroke();
+    }
+
+    draw();
+
+    const tl = document.getElementById("tl");
+    for (let t = 0; t <= 35; t++) {
+      const d = document.createElement("div");
+      d.className = "tick";
+      d.textContent = t;
+      if (t < 24) d.classList.add("horizon");
+      if (t === 10) d.classList.add("hit");
+      if (t === 30) d.classList.add("oob");
+      tl.appendChild(d);
+    }
+  </script>
+</body>
+</html>

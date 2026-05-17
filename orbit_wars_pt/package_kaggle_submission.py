@@ -21,12 +21,17 @@ import shutil
 import tarfile
 import textwrap
 from pathlib import Path
+from typing import Any
+
+import torch
 
 # Modules required by ``orbit_wars_pt.kaggle_adapter`` at inference time (no JAX).
 _SUBMISSION_PACKAGE_FILES = (
     "__init__.py",
     "constants.py",
     "geometry.py",
+    "interval_geometry_np.py",
+    "orthogonal_geometry_np.py",
     "model.py",
     "kaggle_adapter.py",
 )
@@ -74,6 +79,28 @@ def _write_main_py(
     )
 
 
+def _slim_checkpoint_payload(payload: Any) -> dict[str, Any]:
+    """Drop optimizer / rollout state; keep only what ``load_policy`` needs."""
+
+    if not isinstance(payload, dict) or "policy" not in payload:
+        raise ValueError("Expected a training checkpoint dict with a 'policy' key")
+    slim: dict[str, Any] = {
+        "policy": payload["policy"],
+        "training_args": payload.get("training_args", {}),
+    }
+    if "version" in payload:
+        slim["version"] = payload["version"]
+    return slim
+
+
+def _write_slim_checkpoint(src: Path, dest: Path) -> None:
+    try:
+        payload = torch.load(src, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(src, map_location="cpu")
+    torch.save(_slim_checkpoint_payload(payload), dest)
+
+
 def _copy_inference_package(dest_pkg: Path, *, source_pkg: Path) -> None:
     dest_pkg.mkdir(parents=True, exist_ok=True)
     for name in _SUBMISSION_PACKAGE_FILES:
@@ -111,6 +138,7 @@ def package_submission(
     device: str = "cpu",
     extra_env: dict[str, str] | None = None,
     source_pkg: Path | None = None,
+    slim: bool = True,
 ) -> Path:
     """Write a submission bundle directory; return its path."""
 
@@ -129,8 +157,12 @@ def package_submission(
         shutil.rmtree(bundle_dir)
     bundle_dir.mkdir(parents=True)
 
-    shutil.copy2(checkpoint_4p, bundle_dir / "checkpoint_4p.pt")
-    shutil.copy2(checkpoint_2p, bundle_dir / "checkpoint_2p.pt")
+    if slim:
+        _write_slim_checkpoint(checkpoint_4p, bundle_dir / "checkpoint_4p.pt")
+        _write_slim_checkpoint(checkpoint_2p, bundle_dir / "checkpoint_2p.pt")
+    else:
+        shutil.copy2(checkpoint_4p, bundle_dir / "checkpoint_4p.pt")
+        shutil.copy2(checkpoint_2p, bundle_dir / "checkpoint_2p.pt")
     _copy_inference_package(bundle_dir / "orbit_wars_pt", source_pkg=source_pkg)
     _write_main_py(
         bundle_dir / "main.py",
@@ -214,6 +246,12 @@ def main() -> None:
         action="store_true",
         help="When --out ends with .tar.gz, keep the extracted bundle directory beside the archive.",
     )
+    parser.add_argument(
+        "--no-slim",
+        action="store_true",
+        help="Copy full training checkpoints (optimizer, rollout carry, etc.). "
+        "Default strips to policy weights only so the bundle fits Kaggle's 100 MiB limit.",
+    )
     args = parser.parse_args()
 
     result = package_submission(
@@ -222,6 +260,7 @@ def main() -> None:
         args.out,
         greedy=bool(args.greedy),
         device=str(args.device),
+        slim=not args.no_slim,
     )
 
     bundle_dir, archive_path = _submission_paths(args.out.expanduser().resolve())

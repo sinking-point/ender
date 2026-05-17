@@ -53,7 +53,22 @@ def main() -> None:
         "--greedy",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Use argmax action selection instead of rollout-style stochastic sampling.",
+        help=(
+            "Use argmax action selection for both players (unless overridden by "
+            "--greedy-p0 / --greedy-p1)."
+        ),
+    )
+    parser.add_argument(
+        "--greedy-p0",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Greedy (argmax) for player 0. Default: same as --greedy.",
+    )
+    parser.add_argument(
+        "--greedy-p1",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Greedy (argmax) for player 1. Default: same as --greedy.",
     )
     parser.add_argument(
         "--agent-seed",
@@ -113,6 +128,25 @@ def main() -> None:
             "Default follows ORBIT_WARS_WARN_OOB_LAUNCHES (on)."
         ),
     )
+    parser.add_argument(
+        "--interval-geometry",
+        choices=("sampled", "orthogonal"),
+        default=None,
+        help=(
+            "Set ORBIT_WARS_INTERVAL_GEOMETRY for interval target_method: "
+            "sampled (per-tick hulls) or orthogonal (tangent growing-circle cones)."
+        ),
+    )
+    parser.add_argument(
+        "--warn-unmatched-fleet",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Set ORBIT_WARS_WARN_UNMATCHED_FLEET: warn when a friendly fleet in obs "
+            "cannot be matched to a LaunchRaycastRecord. "
+            "Default follows ORBIT_WARS_WARN_OOB_LAUNCHES (on)."
+        ),
+    )
     args = parser.parse_args()
 
     if args.cpu_threads > 0:
@@ -124,7 +158,11 @@ def main() -> None:
 
     os.environ["ORBIT_WARS_CHECKPOINT"] = str(Path(args.checkpoint).expanduser())
     os.environ["ORBIT_WARS_DEVICE"] = str(args.device)
+    greedy_p0 = args.greedy if args.greedy_p0 is None else args.greedy_p0
+    greedy_p1 = args.greedy if args.greedy_p1 is None else args.greedy_p1
     os.environ["ORBIT_WARS_GREEDY"] = "1" if args.greedy else "0"
+    os.environ["ORBIT_WARS_GREEDY_P0"] = "1" if greedy_p0 else "0"
+    os.environ["ORBIT_WARS_GREEDY_P1"] = "1" if greedy_p1 else "0"
     os.environ["ORBIT_WARS_AGENT_SEED"] = str(int(args.agent_seed))
     if args.raycast_rays is not None:
         os.environ["ORBIT_WARS_RAYCAST_RAYS"] = str(int(args.raycast_rays))
@@ -138,6 +176,10 @@ def main() -> None:
         os.environ["ORBIT_WARS_DEBUG_LAUNCH"] = "1"
     if args.warn_forecast_mismatch is not None:
         os.environ["ORBIT_WARS_WARN_FORECAST_MISMATCH"] = "1" if args.warn_forecast_mismatch else "0"
+    if args.warn_unmatched_fleet is not None:
+        os.environ["ORBIT_WARS_WARN_UNMATCHED_FLEET"] = "1" if args.warn_unmatched_fleet else "0"
+    if args.interval_geometry is not None:
+        os.environ["ORBIT_WARS_INTERVAL_GEOMETRY"] = str(args.interval_geometry)
 
     from kaggle_environments import make
 
@@ -150,6 +192,7 @@ def main() -> None:
             return " internal=unavailable"
         micro_sum = t.micro_sum_s()
         slack = dt_wall - t.obs_to_state_s - micro_sum
+        target_detail = t.micro_target.format_suffix()
         return (
             " internal["
             f"obs_to_state={t.obs_to_state_s:.4f}s "
@@ -157,7 +200,8 @@ def main() -> None:
             f"micro_obs_tensors={t.micro_obs_tensors_s:.4f}s "
             f"micro_policy_fwd={t.micro_policy_forward_s:.4f}s "
             f"micro_post_fwd={t.micro_post_forward_s:.4f}s "
-            f"micro_raycast={t.micro_raycast_s:.4f}s "
+            f"micro_raycast={t.micro_raycast_s:.4f}s"
+            f"{target_detail} "
             f"micro_target={t.micro_target_s:.4f}s "
             f"micro_book={t.micro_book_s:.4f}s "
             f"micro_sum={micro_sum:.4f}s "

@@ -44,6 +44,8 @@ DEFAULT_CHECKPOINT = "checkpoint.pt"
 DEFAULT_CHECKPOINT_4P = "checkpoint_4p.pt"
 DEFAULT_CHECKPOINT_2P = "checkpoint_2p.pt"
 DEFAULT_RAYCAST_RAYS = 256
+DEFAULT_INTERVAL_SAMPLES_PER_SPAN = 9
+DEFAULT_TARGET_METHOD = "rays"
 DEFAULT_MAX_ACTIONS = 64
 DEFAULT_CPU_THREADS = 1
 MAX_COMET_GROUPS = 5
@@ -205,6 +207,7 @@ class FleetLaunchDebugTracker:
 
     warn_oob: bool = True
     warn_forecast_mismatch: bool = True
+    warn_unmatched_fleet: bool = True
     _pending: list[LaunchRaycastRecord] = field(default_factory=list)
     _by_fleet_id: dict[int, LaunchRaycastRecord] = field(default_factory=dict)
     _last_fleets_all: dict[int, tuple[int, float, float, float, float, float]] = field(default_factory=dict)
@@ -216,6 +219,8 @@ class FleetLaunchDebugTracker:
     _call_seq: int = 0
     _next_launch_serial: int = 0
     _warned_forecast_mismatch: set[int] = field(default_factory=set)
+    _warned_forecast_tick_mismatch: set[int] = field(default_factory=set)
+    _warned_unmatched_fleet: set[int] = field(default_factory=set)
 
     def reset_game(self) -> None:
         if _launch_debug_enabled() and (self._pending or self._by_fleet_id):
@@ -229,6 +234,8 @@ class FleetLaunchDebugTracker:
         self._last_fleets_by_player.clear()
         self._last_step_by_player.clear()
         self._warned_forecast_mismatch.clear()
+        self._warned_forecast_tick_mismatch.clear()
+        self._warned_unmatched_fleet.clear()
 
     def sync_game(self, game_key: str, *, game_step: int = -1) -> None:
         if game_key != self._game_key:
@@ -373,12 +380,13 @@ class FleetLaunchDebugTracker:
         *,
         n_rays: int,
         ego_player: int,
+        game_step: int,
     ) -> None:
         unmatched = 0
         for fid, tup in sorted(current.items()):
             if fid in self._by_fleet_id:
                 continue
-            owner, _x, _y, ang, from_id, ships = tup
+            owner, x, y, ang, from_id, ships = tup
             rec = self._match_pending(owner, from_id, ang, ships, n_rays=n_rays)
             if rec is not None:
                 rec.fleet_id = fid
@@ -387,10 +395,27 @@ class FleetLaunchDebugTracker:
                     _launch_debug(f"attached fleet_id={fid} <- {rec.debug_summary()}")
             else:
                 unmatched += 1
-                if _launch_debug_enabled() and owner == ego_player:
-                    self._debug_explain_fleet_match(
-                        owner, from_id, ang, ships, n_rays=n_rays, fleet_id=fid
-                    )
+                if owner == ego_player:
+                    if _launch_debug_enabled():
+                        self._debug_explain_fleet_match(
+                            owner, from_id, ang, ships, n_rays=n_rays, fleet_id=fid
+                        )
+                    if (
+                        self.warn_unmatched_fleet
+                        and fid not in self._warned_unmatched_fleet
+                    ):
+                        self._warned_unmatched_fleet.add(fid)
+                        print(
+                            "[orbit_wars] friendly fleet has no LaunchRaycastRecord"
+                            f" (fleet_id={fid})",
+                            f"\n  game_step={game_step} ego_player={ego_player}",
+                            f"\n  pos=({x:.4f}, {y:.4f}) ships={ships:.0f} angle={ang:.6f} "
+                            f"from_planet={from_id:.0f}",
+                            f"\n  pending_launches={len(self._pending)}",
+                            sep="",
+                            file=sys.stderr,
+                            flush=True,
+                        )
         if _launch_debug_enabled() and unmatched:
             _launch_debug(f"attach pass: {unmatched} fleet(s) still without launch record")
 
@@ -417,7 +442,9 @@ class FleetLaunchDebugTracker:
         if _launch_debug_enabled() and new_ids:
             _launch_debug(f"new fleet ids this obs ({len(new_ids)}): {new_ids[:30]}")
 
-        self._attach_pending_to_observed_fleets(current, n_rays=n_rays, ego_player=ego_player)
+        self._attach_pending_to_observed_fleets(
+            current, n_rays=n_rays, ego_player=ego_player, game_step=game_step
+        )
 
         prev_step = self._last_step_by_player.get(ego_player)
         prev_snap = self._last_fleets_by_player.get(ego_player, {})
@@ -474,6 +501,25 @@ class FleetLaunchDebugTracker:
         if _launch_debug_enabled():
             _launch_debug(f"record_launch {rec.debug_summary()}")
 
+    @staticmethod
+    def _fleet_forecast_ticks_aligned(
+        ray_hit_tick: float,
+        forecast_hit_tick: int,
+        *,
+        launch_step: int,
+        observe_step: int,
+    ) -> bool:
+        """True if launch raycast tick (from origin) matches forecast tick (from current fleet pos).
+
+        Raycast counts ticks forward from launch; ``_forecast_incoming_fleets`` counts from the
+        fleet's position in the current obs, which is ``observe_step - launch_step`` ticks later.
+        """
+
+        if ray_hit_tick >= 500.0 or forecast_hit_tick < 0:
+            return False
+        elapsed = max(0, int(observe_step) - int(launch_step))
+        return int(forecast_hit_tick) + elapsed == int(ray_hit_tick)
+
     def check_forecast_vs_raycast(
         self,
         obs: Mapping[str, Any],
@@ -484,7 +530,7 @@ class FleetLaunchDebugTracker:
         game_step: int,
         ego_player: int,
     ) -> None:
-        """Warn when ``_forecast_incoming_fleets`` first-hit slot differs from raycast at launch."""
+        """Warn when fleet forecast first-hit slot or ETA disagrees with launch raycast."""
 
         if not self.warn_forecast_mismatch:
             return
@@ -497,12 +543,48 @@ class FleetLaunchDebugTracker:
             if owner != ego_player:
                 continue
             rec = self._by_fleet_id.get(fid)
-            if rec is None or fid in self._warned_forecast_mismatch:
+            if rec is None:
                 continue
             fc_slot = int(fleet_arrivals[i, 0])
             fc_tick = int(fleet_arrivals[i, 1])
             ray_slot = int(rec.true_target_slot)
             ray_tick = int(rec.true_hit_tick) if rec.true_hit_tick < 500.0 else -1
+            elapsed = max(0, int(game_step) - int(rec.game_step))
+            ticks_aligned = self._fleet_forecast_ticks_aligned(
+                float(rec.true_hit_tick),
+                fc_tick,
+                launch_step=int(rec.game_step),
+                observe_step=int(game_step),
+            )
+            if (
+                ray_slot == fc_slot
+                and ray_slot >= 0
+                and fc_slot >= 0
+                and ray_tick >= 0
+                and fc_tick >= 0
+                and not ticks_aligned
+                and fid not in self._warned_forecast_tick_mismatch
+            ):
+                ray_remaining = ray_tick - elapsed
+                ray_ta = int(math.floor(max(float(ray_remaining) - 1.0, 0.0)))
+                fc_ta = max(0, fc_tick - 1)
+                self._warned_forecast_tick_mismatch.add(fid)
+                ray_pid = float(planets[ray_slot, 0]) if 0 <= ray_slot < MAX_PLANETS else -1.0
+                print(
+                    "[orbit_wars] forecast hit_tick/ETA differs from geometry at launch"
+                    + (f" (fleet_id={fid})" if fid >= 0 else ""),
+                    f"\n  game_step={game_step} ego_player={ego_player} launch_step={rec.game_step}"
+                    f" elapsed_ticks={elapsed}",
+                    f"\n  geometry at launch: slot={ray_slot} planet_id={ray_pid:.0f} "
+                    f"hit_tick_from_launch={ray_tick} remaining={ray_remaining} incoming_TA={ray_ta}",
+                    f"\n  forecast: slot={fc_slot} hit_tick_from_obs={fc_tick} incoming_TA={fc_ta}"
+                    f" (expect hit_tick_from_obs + elapsed == hit_tick_from_launch)",
+                    sep="",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            if fid in self._warned_forecast_mismatch:
+                continue
             if ray_slot == fc_slot:
                 continue
             if _forecast_hits_comet_spawned_after_launch(
@@ -523,10 +605,10 @@ class FleetLaunchDebugTracker:
             )
             fc_pid = float(planets[fc_slot, 0]) if 0 <= fc_slot < MAX_PLANETS else -1.0
             print(
-                "[orbit_wars] forecast incoming target differs from raycast at launch"
+                "[orbit_wars] forecast incoming target differs from geometry at launch"
                 + (f" (fleet_id={fid})" if fid >= 0 else ""),
                 f"\n  game_step={game_step} ego_player={ego_player} launch_step={rec.game_step}",
-                f"\n  raycast: slot={ray_slot} planet_id={ray_pid:.0f} hit_tick={ray_tick}",
+                f"\n  geometry at launch: slot={ray_slot} planet_id={ray_pid:.0f} hit_tick={ray_tick}",
                 f"\n  forecast_incoming_fleets: slot={fc_slot} planet_id={fc_pid:.0f} hit_tick={fc_tick}",
                 f"\n  launch: from_id={rec.origin_planet_id:.0f} angle={rec.launch_angle:.6f} "
                 f"send={rec.planned_send} micro={rec.micro_idx}",
@@ -545,6 +627,88 @@ def _warn_forecast_mismatch_enabled() -> bool:
     return os.environ.get("ORBIT_WARS_WARN_OOB_LAUNCHES", "1").lower() not in {"0", "false", "no", "off"}
 
 
+def _interval_geometry_mode() -> str:
+    """``sampled``, ``tangent`` (external/internal tangency), or ``orthogonal`` (shelved)."""
+
+    raw = os.environ.get("ORBIT_WARS_INTERVAL_GEOMETRY", "tangent").strip().lower()
+    if raw in {"orthogonal", "cone"}:
+        return "orthogonal"
+    if raw in {"tangent", "external", "internal"}:
+        return "tangent"
+    return "sampled"
+
+
+def _check_interval_raycast_enabled() -> bool:
+    raw = os.environ.get("ORBIT_WARS_CHECK_INTERVAL_RAYCAST")
+    if raw is None:
+        return False
+    return raw.lower() not in {"0", "false", "no", "off"}
+
+
+def _warn_unmatched_fleet_enabled() -> bool:
+    raw = os.environ.get("ORBIT_WARS_WARN_UNMATCHED_FLEET")
+    if raw is not None:
+        return raw.lower() not in {"0", "false", "no", "off"}
+    return os.environ.get("ORBIT_WARS_WARN_OOB_LAUNCHES", "1").lower() not in {"0", "false", "no", "off"}
+
+
+@dataclass
+class MicroTargetTiming:
+    """Breakdown of ``micro_raycast`` (first-hit target selection: rays vs interval)."""
+
+    calls: int = 0
+    rays_calls: int = 0
+    interval_calls: int = 0
+    rays_planet_paths_s: float = 0.0
+    rays_sim_s: float = 0.0
+    rays_aggregate_s: float = 0.0
+    interval_planet_paths_s: float = 0.0
+    interval_precompute_s: float = 0.0
+    interval_sweep_s: float = 0.0
+    interval_check_calls: int = 0
+    interval_check_s: float = 0.0
+    interval_check_ray_mismatches: int = 0
+    interval_check_superset_failures: int = 0
+
+    def rays_total_s(self) -> float:
+        return self.rays_planet_paths_s + self.rays_sim_s + self.rays_aggregate_s
+
+    def interval_total_s(self) -> float:
+        return (
+            self.interval_planet_paths_s
+            + self.interval_precompute_s
+            + self.interval_sweep_s
+            + self.interval_check_s
+        )
+
+    def format_suffix(self) -> str:
+        if self.calls <= 0:
+            return ""
+        parts: list[str] = []
+        if self.rays_calls:
+            parts.append(
+                "rays×"
+                f"{self.rays_calls}={self.rays_total_s():.4f}s"
+                f"(paths={self.rays_planet_paths_s:.4f}"
+                f" sim={self.rays_sim_s:.4f}"
+                f" agg={self.rays_aggregate_s:.4f})"
+            )
+        if self.interval_calls:
+            chk = (
+                f" chk={self.interval_check_s:.4f}"
+                if self.interval_check_s > 0.0
+                else ""
+            )
+            parts.append(
+                "interval×"
+                f"{self.interval_calls}={self.interval_total_s():.4f}s"
+                f"(paths={self.interval_planet_paths_s:.4f}"
+                f" pre={self.interval_precompute_s:.4f}"
+                f" sweep={self.interval_sweep_s:.4f}{chk})"
+            )
+        return " micro_target{" + " ".join(parts) + "}"
+
+
 @dataclass
 class KaggleAgentCallTiming:
     """Host-side ``perf_counter`` slices for the last ``KaggleOrbitWarsAgent.__call__``."""
@@ -555,6 +719,7 @@ class KaggleAgentCallTiming:
     micro_policy_forward_s: float = 0.0
     micro_post_forward_s: float = 0.0
     micro_raycast_s: float = 0.0
+    micro_target: MicroTargetTiming = field(default_factory=MicroTargetTiming)
     micro_target_s: float = 0.0
     micro_book_s: float = 0.0
 
@@ -682,16 +847,19 @@ def _planet_collision_rank_from_obs(
     return rank
 
 
-def _earliest_hit_planet_index(
+def _first_hit_planet_index(
     hit_mask: np.ndarray,
-    t_enter: np.ndarray,
     collision_rank: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """First planet along each ray's segment (earliest ``t``, then Kaggle list order)."""
+    """First planet per ray in Kaggle ``obs0.planets`` scan order (``collision_rank``)."""
 
-    big = np.float32(1e9)
-    score = np.where(hit_mask, t_enter, big)
-    score = score + collision_rank.astype(np.float32)[None, :] * 1e-6
+    n_planets = int(hit_mask.shape[-1])
+    rank = np.asarray(collision_rank, dtype=np.int32)
+    order = np.argsort(rank)
+    priority = np.full((n_planets,), n_planets, dtype=np.int32)
+    priority[order] = np.arange(n_planets, dtype=np.int32)
+    big = np.int32(n_planets)
+    score = np.where(hit_mask, priority[None, :], big)
     idx = np.argmin(score, axis=1).astype(np.int32)
     any_hit = np.any(hit_mask, axis=1)
     return idx, any_hit
@@ -1062,12 +1230,21 @@ def _simulate_discrete_ray_policy_hits_np(
     ship_speed: float = 6.0,
     horizon: int = INCOMING_TA_BINS,
     n_rays: int = DEFAULT_RAYCAST_RAYS,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    target_timing: Optional[MicroTargetTiming] = None,
+    planet_paths: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Discrete per-tick fleet forward model; returns ray angles and first-hit bookkeeping."""
 
     planets = np.asarray(state.planets)
     current_active = np.asarray(state.planet_active).astype(bool)
-    p0, p1, active_by_tick = _forecast_planet_paths_np(state, horizon=horizon)
+    if planet_paths is None:
+        t_paths = perf_counter()
+        p0, p1, active_by_tick = _forecast_planet_paths_np(state, horizon=horizon)
+        if target_timing is not None:
+            target_timing.rays_planet_paths_s += perf_counter() - t_paths
+    else:
+        p0, p1, active_by_tick = planet_paths
+    t_sim = perf_counter()
     # Terminal events use per-tick collision flags (same as Kaggle fleet movement),
     # not the static visibility mask used only when marking valid policy targets.
     radii = planets[:, PLANET_RADIUS].astype(np.float32)
@@ -1085,6 +1262,7 @@ def _simulate_discrete_ray_policy_hits_np(
     done_true = np.zeros((n_rays,), dtype=np.bool_)
     policy_code = np.full((n_rays,), -1, dtype=np.int32)
     policy_tick = np.full((n_rays,), 10_000, dtype=np.int32)
+    policy_kind = np.zeros((n_rays,), dtype=np.int8)
     true_code = np.full((n_rays,), -1, dtype=np.int32)
     true_tick = np.full((n_rays,), 10_000, dtype=np.int32)
 
@@ -1110,14 +1288,9 @@ def _simulate_discrete_ray_policy_hits_np(
         hit_raw = np.where(qa < 1e-12, static_hit, moving_hit)
         hit_true = hit_raw & active_by_tick[t][None, :]
         hit_policy = hit_true
-        t_enter = np.where(
-            qa < 1e-12,
-            np.where(static_hit, 0.0, np.float32(1e9)),
-            np.where(moving_hit, np.clip(t1, 0.0, 1.0), np.float32(1e9)),
-        ).astype(np.float32)
 
-        idx_true, any_true = _earliest_hit_planet_index(hit_true, t_enter, collision_rank)
-        idx_policy, any_policy = _earliest_hit_planet_index(hit_policy, t_enter, collision_rank)
+        idx_true, any_true = _first_hit_planet_index(hit_true, collision_rank)
+        idx_policy, any_policy = _first_hit_planet_index(hit_policy, collision_rank)
 
         delta = a1 - a0
         l2 = np.sum(delta * delta, axis=1)
@@ -1138,6 +1311,11 @@ def _simulate_discrete_ray_policy_hits_np(
             -1,
         )
         policy_tick[new_policy] = t
+        policy_kind[new_policy] = np.where(
+            any_policy[new_policy],
+            np.int8(1),
+            np.where(sun_hit[new_policy], np.int8(2), np.int8(3)),
+        )
         done_policy |= had_policy
 
         had_true = any_true | sun_hit | oob
@@ -1152,7 +1330,10 @@ def _simulate_discrete_ray_policy_hits_np(
 
         pos = a1
 
-    return angles, policy_code, policy_tick, true_code, true_tick, done_policy
+    if target_timing is not None:
+        target_timing.rays_sim_s += perf_counter() - t_sim
+
+    return angles, policy_code, policy_tick, policy_kind, true_code, true_tick, done_policy
 
 
 def discrete_policy_rays_hit_planet_mask(
@@ -1170,7 +1351,7 @@ def discrete_policy_rays_hit_planet_mask(
     (``policy_code[i] >= 0``), as opposed to sun or out-of-bounds alone.
     """
 
-    angles, policy_code, _, _, _, done_policy = _simulate_discrete_ray_policy_hits_np(
+    angles, policy_code, _, _, _, _, done_policy = _simulate_discrete_ray_policy_hits_np(
         state, origin_idx, frac_idx, ship_speed=ship_speed, horizon=horizon, n_rays=n_rays
     )
     hits = (policy_code >= 0) & done_policy
@@ -1185,11 +1366,23 @@ def _raycast_targets_np(
     ship_speed: float = 6.0,
     horizon: int = INCOMING_TA_BINS,
     n_rays: int = DEFAULT_RAYCAST_RAYS,
+    target_timing: Optional[MicroTargetTiming] = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """NumPy version of the rollout discrete first-hit ray target sampler."""
 
-    angles, policy_code, policy_tick, true_code, true_tick, done_policy = _simulate_discrete_ray_policy_hits_np(
-        state, origin_idx, frac_idx, ship_speed=ship_speed, horizon=horizon, n_rays=n_rays
+    if target_timing is not None:
+        target_timing.rays_calls += 1
+
+    angles, policy_code, policy_tick, _, true_code, true_tick, done_policy = (
+        _simulate_discrete_ray_policy_hits_np(
+            state,
+            origin_idx,
+            frac_idx,
+            ship_speed=ship_speed,
+            horizon=horizon,
+            n_rays=n_rays,
+            target_timing=target_timing,
+        )
     )
     planets = np.asarray(state.planets)
     current_active = np.asarray(state.planet_active).astype(bool)
@@ -1199,6 +1392,7 @@ def _raycast_targets_np(
     hit_tick = np.zeros((MAX_PLANETS,), dtype=np.float32)
     true_planet = np.full((MAX_PLANETS,), -1, dtype=np.int32)
     true_hit_tick = np.full((MAX_PLANETS,), 500.0, dtype=np.float32)
+    t_agg = perf_counter()
     for target in range(MAX_PLANETS):
         ray_idx = np.flatnonzero((policy_code == target) & done_policy)
         if ray_idx.size == 0:
@@ -1211,11 +1405,541 @@ def _raycast_targets_np(
         if 0 <= int(true_code[ray]) < MAX_PLANETS:
             true_planet[target] = int(true_code[ray])
             true_hit_tick[target] = float(true_tick[ray])
+    if target_timing is not None:
+        target_timing.rays_aggregate_s += perf_counter() - t_agg
+    valid &= current_active
+    true_planet = np.where(valid, true_planet, -1).astype(np.int32)
+    true_hit_tick = np.where(valid, true_hit_tick, 500.0).astype(np.float32)
+    return out_angle, valid, hit_tick, true_planet, true_hit_tick
+
+
+def _collision_object_order(collision_rank: np.ndarray) -> list[int]:
+    """Planet slot order for same-tick occlusion (matches Kaggle list iteration)."""
+
+    rank = np.asarray(collision_rank, dtype=np.int32)
+    return [int(i) for i in np.argsort(rank) if int(rank[i]) < MAX_PLANETS]
+
+
+@dataclass
+class IntervalMicroGeometry:
+    """Shared interval occlusion inputs for sweep + per-ray checks."""
+
+    geometry: str
+    origin_idx: int
+    origin_xy: np.ndarray
+    origin_radius: float
+    speed: float
+    horizon: int
+    samples_per_span: int
+    object_order: list[int]
+    p0_by_tick: np.ndarray
+    p1_by_tick: np.ndarray
+    active_by_tick: np.ndarray
+    radii: np.ndarray
+    events: list[Any] | None = None
+    precomputed_hits: list[Any] | None = None
+    occlusion_cache: Any | None = None
+
+
+@dataclass
+class DiscreteRaycastSim:
+    """One ``_simulate_discrete_ray_policy_hits_np`` run (stored for interval checks)."""
+
+    angles: np.ndarray
+    policy_code: np.ndarray
+    policy_tick: np.ndarray
+    policy_kind: np.ndarray
+    true_code: np.ndarray
+    true_tick: np.ndarray
+    done_policy: np.ndarray
+
+
+def _first_hit_signature(kind: str, code: int, tick: int) -> tuple[str, int]:
+    """Compare what is hit, not when (tick ignored)."""
+
+    del tick
+    return (str(kind), int(code))
+
+
+def _discrete_first_hit_at_angle_np(
+    angle: float,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    p0_by_tick: np.ndarray,
+    p1_by_tick: np.ndarray,
+    radii: np.ndarray,
+    active_by_tick: np.ndarray,
+    collision_rank: np.ndarray,
+    *,
+    horizon: int = INCOMING_TA_BINS,
+    include_sun: bool = True,
+    include_board: bool = True,
+) -> tuple[str, int, int]:
+    """Discrete per-tick first hit at ``angle`` (Kaggle fleet rules)."""
+
+    from orbit_wars_pt.geometry import TAU
+
+    origin = np.asarray(origin_xy, dtype=np.float64)
+    theta = float(angle) % TAU
+    direction = np.array([math.cos(theta), math.sin(theta)], dtype=np.float64)
+    launch_off = float(origin_radius) + 0.1
+    pos = origin + launch_off * direction
+    sun = np.asarray([CENTER, CENTER], dtype=np.float64)
+    ticks = int(active_by_tick.shape[0])
+    planets = int(radii.shape[0])
+    order = _collision_object_order(collision_rank)
+
+    for tick in range(min(ticks, int(horizon))):
+        a0 = pos
+        a1 = pos + float(speed) * direction
+
+        for slot in order:
+            if slot < 0 or slot >= planets or not active_by_tick[tick, slot]:
+                continue
+            p0 = p0_by_tick[tick, slot]
+            p1 = p1_by_tick[tick, slot]
+            d0 = a0 - p0
+            dv = (a1 - a0) - (p1 - p0)
+            qa = float(np.dot(dv, dv))
+            qb = float(2.0 * np.dot(d0, dv))
+            qc = float(np.dot(d0, d0) - float(radii[slot]) ** 2)
+            if qa < 1e-12:
+                if qc <= 0.0:
+                    return ("planet", int(slot), int(tick))
+                continue
+            disc = qb * qb - 4.0 * qa * qc
+            if disc < 0.0:
+                continue
+            sd = math.sqrt(max(disc, 0.0))
+            t1 = (-qb - sd) / (2.0 * qa)
+            t2 = (-qb + sd) / (2.0 * qa)
+            if t2 >= 0.0 and t1 <= 1.0:
+                return ("planet", int(slot), int(tick))
+
+        if include_sun:
+            delta = a1 - a0
+            l2 = float(np.dot(delta, delta))
+            if l2 > 1e-12:
+                proj = float(np.clip(np.dot(sun - a0, delta) / l2, 0.0, 1.0))
+                closest = a0 + proj * delta
+            else:
+                closest = a0
+            if float(np.linalg.norm(closest - sun)) < float(SUN_RADIUS):
+                return ("sun", -1, int(tick))
+
+        if include_board:
+            if not (
+                0.0 <= a1[0] <= BOARD_SIZE
+                and 0.0 <= a1[1] <= BOARD_SIZE
+            ):
+                return ("board", -1, int(tick))
+
+        pos = a1
+
+    return ("none", -1, -1)
+
+
+def _build_interval_micro_geometry(
+    state: OrbitWarsState,
+    origin_idx: int,
+    frac_idx: int,
+    *,
+    ship_speed: float,
+    horizon: int,
+    samples_per_span: int,
+    target_timing: Optional[MicroTargetTiming],
+) -> IntervalMicroGeometry:
+    from orbit_wars_pt.interval_geometry_np import (
+        collect_hit_events,
+        precompute_tick_planet_hits,
+    )
+
+    planets = np.asarray(state.planets)
+    origin_xy = np.asarray(planets[origin_idx, PLANET_X : PLANET_Y + 1], dtype=np.float64)
+    origin_radius = float(planets[origin_idx, PLANET_RADIUS])
+    ships_avail = float(planets[origin_idx, 5])
+    send = _planned_send(ships_avail, frac_idx)
+    speed = _fleet_speed(float(max(send, 1)), ship_speed)
+    collision_rank = np.asarray(state.planet_collision_rank, dtype=np.int32)
+    object_order = _collision_object_order(collision_rank)
+    geometry = _interval_geometry_mode()
+
+    t_paths = perf_counter()
+    p0, p1, active_by_tick = _forecast_planet_paths_np(state, horizon=horizon)
+    if target_timing is not None:
+        target_timing.interval_planet_paths_s += perf_counter() - t_paths
+
+    events = None
+    pre = None
+    t_collect = perf_counter()
+    if geometry in ("orthogonal", "tangent"):
+        events = collect_hit_events(
+            origin_xy,
+            origin_radius,
+            speed,
+            planets.astype(np.float64),
+            np.asarray(state.planet_active, dtype=bool),
+            np.asarray(state.initial_planets, dtype=np.float64),
+            np.asarray(state.initial_active, dtype=bool),
+            np.asarray(state.comet_paths, dtype=np.float64),
+            np.asarray(state.comet_path_lengths, dtype=np.int32),
+            np.asarray(state.comet_group_active, dtype=bool),
+            np.asarray(state.comet_path_index, dtype=np.int32),
+            np.asarray(state.comet_slots, dtype=np.int32),
+            np.asarray(state.comet_planet_ids, dtype=np.int32),
+            float(np.asarray(state.angular_velocity)),
+            int(np.asarray(state.step_count)),
+            horizon=float(horizon),
+        )
+    else:
+        pre = precompute_tick_planet_hits(
+            origin_xy,
+            origin_radius,
+            speed,
+            p0.astype(np.float64),
+            p1.astype(np.float64),
+            planets[:, PLANET_RADIUS].astype(np.float64),
+            active_by_tick,
+            samples_per_span=int(samples_per_span),
+        )
+    if target_timing is not None:
+        target_timing.interval_precompute_s += perf_counter() - t_collect
+
+    occlusion_cache = None
+    if geometry in ("orthogonal", "tangent") and events is not None:
+        from orbit_wars_pt.interval_geometry_np import build_occlusion_walk_cache
+
+        occlusion_cache = build_occlusion_walk_cache(
+            events,
+            object_order,
+            origin_xy=origin_xy,
+            origin_radius=origin_radius,
+            speed=float(speed),
+            horizon=int(horizon),
+        )
+
+    return IntervalMicroGeometry(
+        geometry=geometry,
+        origin_idx=int(origin_idx),
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=float(speed),
+        horizon=int(horizon),
+        samples_per_span=int(samples_per_span),
+        object_order=object_order,
+        p0_by_tick=p0.astype(np.float64),
+        p1_by_tick=p1.astype(np.float64),
+        active_by_tick=active_by_tick,
+        radii=planets[:, PLANET_RADIUS].astype(np.float64),
+        events=events,
+        precomputed_hits=pre,
+        occlusion_cache=occlusion_cache,
+    )
+
+
+def _sweep_interval_from_geometry(
+    geom: IntervalMicroGeometry,
+    num_planets: int,
+    *,
+    target_timing: Optional[MicroTargetTiming],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    from orbit_wars_pt.interval_geometry_np import (
+        sweep_interval_best_targets,
+        sweep_interval_best_targets_from_events,
+    )
+
+    t_sweep = perf_counter()
+    if geom.geometry in ("orthogonal", "tangent"):
+        out_angle, width, valid, _overflow, hit_tick_i = (
+            sweep_interval_best_targets_from_events(
+                geom.events or [],
+                num_planets,
+                object_order=geom.object_order,
+                origin_xy=geom.origin_xy,
+                origin_radius=geom.origin_radius,
+                speed=geom.speed,
+                horizon=geom.horizon,
+                p0_by_tick=geom.p0_by_tick,
+                p1_by_tick=geom.p1_by_tick,
+                radii=geom.radii,
+                active_by_tick=geom.active_by_tick,
+            )
+        )
+    else:
+        out_angle, width, valid, _overflow, hit_tick_i = sweep_interval_best_targets(
+            geom.precomputed_hits or [],
+            object_order=geom.object_order,
+            origin_xy=geom.origin_xy,
+            origin_radius=geom.origin_radius,
+            speed=geom.speed,
+            samples_per_span=geom.samples_per_span,
+        )
+    if target_timing is not None:
+        target_timing.interval_sweep_s += perf_counter() - t_sweep
+    del width
+    return (
+        np.asarray(out_angle, dtype=np.float32),
+        np.asarray(valid, dtype=np.bool_),
+        hit_tick_i,
+    )
+
+
+def _run_discrete_raycast_sim(
+    state: OrbitWarsState,
+    origin_idx: int,
+    frac_idx: int,
+    *,
+    ship_speed: float,
+    horizon: int,
+    n_rays: int,
+    target_timing: Optional[MicroTargetTiming],
+    planet_paths: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+) -> DiscreteRaycastSim:
+    if target_timing is not None:
+        target_timing.rays_calls += 1
+    angles, policy_code, policy_tick, policy_kind, true_code, true_tick, done_policy = (
+        _simulate_discrete_ray_policy_hits_np(
+            state,
+            origin_idx,
+            frac_idx,
+            ship_speed=ship_speed,
+            horizon=horizon,
+            n_rays=n_rays,
+            target_timing=target_timing,
+            planet_paths=planet_paths,
+        )
+    )
+    return DiscreteRaycastSim(
+        angles=np.asarray(angles),
+        policy_code=np.asarray(policy_code),
+        policy_tick=np.asarray(policy_tick),
+        policy_kind=np.asarray(policy_kind),
+        true_code=np.asarray(true_code),
+        true_tick=np.asarray(true_tick),
+        done_policy=np.asarray(done_policy, dtype=bool),
+    )
+
+
+def _raycast_signature_from_sim(sim: DiscreteRaycastSim, ray_i: int) -> tuple[str, int]:
+    """First-hit kind/code from the stored vectorized sim (no per-ray re-simulation)."""
+
+    if not bool(sim.done_policy[ray_i]):
+        return ("none", -1)
+    kind_code = int(sim.policy_kind[ray_i])
+    if kind_code == 1:
+        return ("planet", int(sim.policy_code[ray_i]))
+    if kind_code == 2:
+        return ("sun", -1)
+    if kind_code == 3:
+        return ("board", -1)
+    return ("none", -1)
+
+
+def _interval_first_hit_signature(
+    geom: IntervalMicroGeometry,
+    angle: float,
+) -> tuple[str, int]:
+    if geom.geometry in ("orthogonal", "tangent"):
+        if geom.occlusion_cache is None:
+            raise ValueError("occlusion_cache required for orthogonal/tangent check")
+        from orbit_wars_pt.interval_geometry_np import first_hit_signature_occlusion_walk
+
+        return first_hit_signature_occlusion_walk(float(angle), geom.occlusion_cache)
+    if geom.precomputed_hits is None:
+        raise ValueError("precomputed_hits required for sampled interval geometry")
+    from orbit_wars_pt.interval_geometry_np import first_hit_at_angle_interval
+
+    kind, code, _tick = first_hit_at_angle_interval(
+        float(angle),
+        geom.precomputed_hits,
+        object_order=geom.object_order,
+        origin_xy=geom.origin_xy,
+        origin_radius=geom.origin_radius,
+        speed=geom.speed,
+        samples_per_span=geom.samples_per_span,
+    )
+    return (str(kind), int(code))
+
+
+def _check_interval_raycast_micro_consistency(
+    geom: IntervalMicroGeometry,
+    interval_valid: np.ndarray,
+    sim: DiscreteRaycastSim,
+    *,
+    target_timing: Optional[MicroTargetTiming] = None,
+    game_step: int = -1,
+    micro_idx: int = -1,
+) -> None:
+    """Warn if per-ray post-occlusion first hits or hittable sets disagree."""
+
+    n_rays = int(sim.angles.shape[0])
+    ray_mismatches: list[str] = []
+    n_mismatch = 0
+    ray_planet_slots: set[int] = set()
+    done = np.flatnonzero(sim.done_policy)
+
+    for i in done:
+        i = int(i)
+        rv = _raycast_signature_from_sim(sim, i)
+        iv = _interval_first_hit_signature(geom, float(sim.angles[i]))
+        if rv[0] == "planet":
+            ray_planet_slots.add(int(rv[1]))
+        if rv != iv:
+            n_mismatch += 1
+            if len(ray_mismatches) < 8:
+                ray_mismatches.append(
+                    f"ray={i} angle={float(sim.angles[i]):.6f} "
+                    f"interval=({iv[0]}, {iv[1]}) raycast=({rv[0]}, {rv[1]})"
+                )
+
+    interval_hittable = {
+        int(s)
+        for s in np.flatnonzero(np.asarray(interval_valid, dtype=bool))
+        if 0 <= int(s) < MAX_PLANETS and int(s) != int(geom.origin_idx)
+    }
+    missing = sorted((ray_planet_slots - {int(geom.origin_idx)}) - interval_hittable)
+    superset_ok = not missing
+
+    if target_timing is not None:
+        target_timing.interval_check_calls += 1
+        target_timing.interval_check_ray_mismatches += n_mismatch
+        if not superset_ok:
+            target_timing.interval_check_superset_failures += 1
+
+    if not n_mismatch and superset_ok:
+        return
+
+    parts = [
+        "[orbit_wars] interval vs discrete raycast micro-step check failed"
+        + (f" game_step={game_step}" if game_step >= 0 else "")
+        + (f" micro={micro_idx}" if micro_idx >= 0 else "")
+        + f" origin_slot={geom.origin_idx} geometry={geom.geometry}",
+        f"\n  per-ray first-hit mismatches: {n_mismatch}/{n_rays}",
+    ]
+    for line in ray_mismatches:
+        parts.append(f"\n    {line}")
+    if not superset_ok:
+        parts.append(
+            f"\n  interval hittable slots not a superset of raycast planet hits;"
+            f" missing={missing}"
+        )
+        parts.append(
+            f"\n  interval_hittable={sorted(interval_hittable)}"
+            f" raycast_planet_slots={sorted(ray_planet_slots)}"
+        )
+    print("".join(parts), file=sys.stderr, flush=True)
+
+
+def _interval_targets_np(
+    state: OrbitWarsState,
+    origin_idx: int,
+    frac_idx: int,
+    *,
+    ship_speed: float = 6.0,
+    horizon: int = INCOMING_TA_BINS,
+    samples_per_span: int = DEFAULT_INTERVAL_SAMPLES_PER_SPAN,
+    n_rays: int = DEFAULT_RAYCAST_RAYS,
+    target_timing: Optional[MicroTargetTiming] = None,
+    run_raycast_check: bool = False,
+    game_step: int = -1,
+    micro_idx: int = -1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Interval first-hit targets (``first_hit_interval_best_targets_apply_jax`` semantics)."""
+
+    if target_timing is not None:
+        target_timing.interval_calls += 1
+
+    planets = np.asarray(state.planets)
+    current_active = np.asarray(state.planet_active).astype(bool)
+    geom = _build_interval_micro_geometry(
+        state,
+        origin_idx,
+        frac_idx,
+        ship_speed=ship_speed,
+        horizon=horizon,
+        samples_per_span=samples_per_span,
+        target_timing=target_timing,
+    )
+    out_angle, valid, hit_tick_i = _sweep_interval_from_geometry(
+        geom,
+        int(planets.shape[0]),
+        target_timing=target_timing,
+    )
+
+    hit_tick = np.where(valid, hit_tick_i.astype(np.float32), 0.0).astype(np.float32)
+    true_planet = np.where(valid, np.arange(MAX_PLANETS, dtype=np.int32), -1)
+    true_hit_tick = np.where(valid, hit_tick, 500.0).astype(np.float32)
     valid &= current_active
     valid[origin_idx] = False
     true_planet = np.where(valid, true_planet, -1).astype(np.int32)
     true_hit_tick = np.where(valid, true_hit_tick, 500.0).astype(np.float32)
+
+    if run_raycast_check:
+        t_check = perf_counter()
+        sim = _run_discrete_raycast_sim(
+            state,
+            origin_idx,
+            frac_idx,
+            ship_speed=ship_speed,
+            horizon=horizon,
+            n_rays=n_rays,
+            target_timing=target_timing,
+            planet_paths=(geom.p0_by_tick, geom.p1_by_tick, geom.active_by_tick),
+        )
+        _check_interval_raycast_micro_consistency(
+            geom,
+            valid,
+            sim,
+            target_timing=target_timing,
+            game_step=game_step,
+            micro_idx=micro_idx,
+        )
+        if target_timing is not None:
+            target_timing.interval_check_s += perf_counter() - t_check
+
     return out_angle, valid, hit_tick, true_planet, true_hit_tick
+
+
+def _first_hit_targets_np(
+    state: OrbitWarsState,
+    origin_idx: int,
+    frac_idx: int,
+    *,
+    ship_speed: float = 6.0,
+    horizon: int = INCOMING_TA_BINS,
+    n_rays: int = DEFAULT_RAYCAST_RAYS,
+    samples_per_span: int = DEFAULT_INTERVAL_SAMPLES_PER_SPAN,
+    target_method: str = DEFAULT_TARGET_METHOD,
+    target_timing: Optional[MicroTargetTiming] = None,
+    game_step: int = -1,
+    micro_idx: int = -1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if target_timing is not None:
+        target_timing.calls += 1
+    if target_method == "interval":
+        return _interval_targets_np(
+            state,
+            origin_idx,
+            frac_idx,
+            ship_speed=ship_speed,
+            horizon=horizon,
+            samples_per_span=samples_per_span,
+            n_rays=n_rays,
+            target_timing=target_timing,
+            run_raycast_check=_check_interval_raycast_enabled(),
+            game_step=game_step,
+            micro_idx=micro_idx,
+        )
+    return _raycast_targets_np(
+        state,
+        origin_idx,
+        frac_idx,
+        ship_speed=ship_speed,
+        horizon=horizon,
+        n_rays=n_rays,
+        target_timing=target_timing,
+    )
 
 
 def _obs_tensors_for_state(
@@ -1324,6 +2048,8 @@ def _build_turn_actions_torch_only(
     greedy: bool = False,
     rng: Optional[torch.Generator] = None,
     n_rays: int = DEFAULT_RAYCAST_RAYS,
+    samples_per_span: int = DEFAULT_INTERVAL_SAMPLES_PER_SPAN,
+    target_method: str = DEFAULT_TARGET_METHOD,
     timing: Optional[KaggleAgentCallTiming] = None,
     launch_tracker: Optional[FleetLaunchDebugTracker] = None,
     game_step: int = 0,
@@ -1382,13 +2108,19 @@ def _build_turn_actions_torch_only(
             timing.micro_post_forward_s += perf_counter() - t0
 
         t0 = perf_counter()
-        ray_angle, ray_valid, ray_hit_tick, true_planet, true_hit_tick = _raycast_targets_np(
+        target_timing = timing.micro_target if timing is not None else None
+        ray_angle, ray_valid, ray_hit_tick, true_planet, true_hit_tick = _first_hit_targets_np(
             virt,
             int(o_idx),
             int(frac_idx),
             ship_speed=ship_speed,
             horizon=INCOMING_TA_BINS,
             n_rays=n_rays,
+            samples_per_span=samples_per_span,
+            target_method=target_method,
+            target_timing=target_timing,
+            game_step=int(game_step),
+            micro_idx=int(micro_idx),
         )
         if timing is not None:
             timing.micro_raycast_s += perf_counter() - t0
@@ -1705,16 +2437,18 @@ class KaggleOrbitWarsAgent:
         checkpoint_path: str | os.PathLike[str] = DEFAULT_CHECKPOINT,
         *,
         device: Optional[str | torch.device] = None,
-        greedy: bool = False,
+        greedy: bool | Mapping[int, bool] = False,
         max_micro_steps: Optional[int] = None,
         max_fleets: int = 512,
         seed: Optional[int] = None,
         raycast_rays: Optional[int] = None,
+        target_method: Optional[str] = None,
+        interval_samples_per_span: Optional[int] = None,
     ):
         _configure_cpu_threads()
         self.checkpoint_path = resolve_checkpoint_path(checkpoint_path)
         self.policy, self.device, training_args = load_policy(self.checkpoint_path, device=device)
-        self.greedy = bool(greedy)
+        self._greedy_by_player = _normalize_greedy(greedy)
         self.max_micro_steps = int(
             max_micro_steps
             if max_micro_steps is not None
@@ -1725,6 +2459,19 @@ class KaggleOrbitWarsAgent:
             raycast_rays
             if raycast_rays is not None
             else training_args.get("first_hit_n_rays", DEFAULT_RAYCAST_RAYS)
+        )
+        self.target_method = str(
+            target_method
+            if target_method is not None
+            else os.environ.get("ORBIT_WARS_TARGET_METHOD", DEFAULT_TARGET_METHOD)
+        ).lower()
+        self.interval_samples_per_span = int(
+            interval_samples_per_span
+            if interval_samples_per_span is not None
+            else os.environ.get(
+                "ORBIT_WARS_INTERVAL_SAMPLES",
+                str(DEFAULT_INTERVAL_SAMPLES_PER_SPAN),
+            )
         )
         self.rng = torch.Generator(device=self.device)
         self.rng.manual_seed(int(seed if seed is not None else os.environ.get("ORBIT_WARS_AGENT_SEED", "0")))
@@ -1740,6 +2487,7 @@ class KaggleOrbitWarsAgent:
         self.launch_tracker = FleetLaunchDebugTracker(
             warn_oob=warn_oob,
             warn_forecast_mismatch=_warn_forecast_mismatch_enabled(),
+            warn_unmatched_fleet=_warn_unmatched_fleet_enabled(),
         )
 
     def _obs_game_key(self, obs: Mapping[str, Any]) -> str:
@@ -1832,9 +2580,11 @@ class KaggleOrbitWarsAgent:
             self.device,
             ship_speed=ship_speed,
             max_micro_steps=self.max_micro_steps,
-            greedy=self.greedy,
+            greedy=self._greedy_by_player.get(ego_player, False),
             rng=self.rng,
             n_rays=self.raycast_rays,
+            samples_per_span=self.interval_samples_per_span,
+            target_method=self.target_method,
             timing=timing,
             launch_tracker=self.launch_tracker,
             game_step=step_count,
@@ -1865,18 +2615,20 @@ class KaggleOrbitWarsDualPolicyAgent:
         checkpoint_2p: str | os.PathLike[str],
         *,
         device: Optional[str | torch.device] = None,
-        greedy: bool = False,
+        greedy: bool | Mapping[int, bool] = False,
         max_micro_steps: Optional[int] = None,
         max_fleets: int = 512,
         seed: Optional[int] = None,
         raycast_rays: Optional[int] = None,
+        target_method: Optional[str] = None,
+        interval_samples_per_span: Optional[int] = None,
     ):
         _configure_cpu_threads()
         self.checkpoint_4p = resolve_checkpoint_path(checkpoint_4p)
         self.checkpoint_2p = resolve_checkpoint_path(checkpoint_2p)
         self.policy_4p, self.device, training_args_4p = load_policy(self.checkpoint_4p, device=device)
         self.policy_2p, _, training_args_2p = load_policy(self.checkpoint_2p, device=self.device)
-        self.greedy = bool(greedy)
+        self._greedy_by_player = _normalize_greedy(greedy)
         micro_4p = int(training_args_4p.get("max_micro_steps", DEFAULT_MAX_ACTIONS))
         micro_2p = int(training_args_2p.get("max_micro_steps", DEFAULT_MAX_ACTIONS))
         self.max_micro_steps = int(
@@ -1887,6 +2639,19 @@ class KaggleOrbitWarsDualPolicyAgent:
         rays_2p = int(training_args_2p.get("first_hit_n_rays", DEFAULT_RAYCAST_RAYS))
         self.raycast_rays = int(
             raycast_rays if raycast_rays is not None else max(rays_4p, rays_2p)
+        )
+        self.target_method = str(
+            target_method
+            if target_method is not None
+            else os.environ.get("ORBIT_WARS_TARGET_METHOD", DEFAULT_TARGET_METHOD)
+        ).lower()
+        self.interval_samples_per_span = int(
+            interval_samples_per_span
+            if interval_samples_per_span is not None
+            else os.environ.get(
+                "ORBIT_WARS_INTERVAL_SAMPLES",
+                str(DEFAULT_INTERVAL_SAMPLES_PER_SPAN),
+            )
         )
         self.rng = torch.Generator(device=self.device)
         self.rng.manual_seed(int(seed if seed is not None else os.environ.get("ORBIT_WARS_AGENT_SEED", "0")))
@@ -1899,6 +2664,7 @@ class KaggleOrbitWarsDualPolicyAgent:
         self.launch_tracker = FleetLaunchDebugTracker(
             warn_oob=warn_oob,
             warn_forecast_mismatch=_warn_forecast_mismatch_enabled(),
+            warn_unmatched_fleet=_warn_unmatched_fleet_enabled(),
         )
 
     def _obs_game_key(self, obs: Mapping[str, Any]) -> str:
@@ -1989,9 +2755,11 @@ class KaggleOrbitWarsDualPolicyAgent:
             self.device,
             ship_speed=ship_speed,
             max_micro_steps=self.max_micro_steps,
-            greedy=self.greedy,
+            greedy=self._greedy_by_player.get(ego_player, False),
             rng=self.rng,
             n_rays=self.raycast_rays,
+            samples_per_span=self.interval_samples_per_span,
+            target_method=self.target_method,
             timing=timing,
             launch_tracker=self.launch_tracker,
             game_step=step_count,
@@ -2010,6 +2778,35 @@ class KaggleOrbitWarsDualPolicyAgent:
                 + (f" (+{len(actions) - 8} more)" if len(actions) > 8 else "")
             )
         return actions
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_greedy(greedy: bool | Mapping[int, bool]) -> dict[int, bool]:
+    if isinstance(greedy, Mapping):
+        out = {0: False, 1: False}
+        for k, v in greedy.items():
+            out[int(k)] = bool(v)
+        return out
+    g = bool(greedy)
+    return {0: g, 1: g}
+
+
+def _greedy_from_env() -> bool | dict[int, bool]:
+    p0_set = "ORBIT_WARS_GREEDY_P0" in os.environ
+    p1_set = "ORBIT_WARS_GREEDY_P1" in os.environ
+    if p0_set or p1_set:
+        fallback = _env_bool("ORBIT_WARS_GREEDY", False)
+        return {
+            0: _env_bool("ORBIT_WARS_GREEDY_P0", fallback) if p0_set else fallback,
+            1: _env_bool("ORBIT_WARS_GREEDY_P1", fallback) if p1_set else fallback,
+        }
+    return _env_bool("ORBIT_WARS_GREEDY", False)
 
 
 _AGENT: Optional[KaggleOrbitWarsAgent | KaggleOrbitWarsDualPolicyAgent] = None
@@ -2044,11 +2841,14 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
     global _AGENT
     if _AGENT is None:
         device = os.environ.get("ORBIT_WARS_DEVICE")
-        greedy = os.environ.get("ORBIT_WARS_GREEDY", "0").lower() in {"1", "true", "yes", "on"}
+        greedy = _greedy_from_env()
         seed_raw = os.environ.get("ORBIT_WARS_AGENT_SEED")
         seed = int(seed_raw) if seed_raw is not None else None
         rays_raw = os.environ.get("ORBIT_WARS_RAYCAST_RAYS")
         rays = int(rays_raw) if rays_raw is not None else None
+        target_method = os.environ.get("ORBIT_WARS_TARGET_METHOD")
+        interval_samples_raw = os.environ.get("ORBIT_WARS_INTERVAL_SAMPLES")
+        interval_samples = int(interval_samples_raw) if interval_samples_raw is not None else None
         max_micro_raw = os.environ.get("ORBIT_WARS_MAX_MICRO_STEPS")
         max_micro_steps = int(max_micro_raw) if max_micro_raw is not None else None
         ckpt_4p = os.environ.get("ORBIT_WARS_CHECKPOINT_4P")
@@ -2063,6 +2863,8 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
                     max_micro_steps=max_micro_steps,
                     seed=seed,
                     raycast_rays=rays,
+                    target_method=target_method,
+                    interval_samples_per_span=interval_samples,
                 )
             else:
                 ckpt = resolve_checkpoint_path(
@@ -2075,6 +2877,8 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
                     max_micro_steps=max_micro_steps,
                     seed=seed,
                     raycast_rays=rays,
+                    target_method=target_method,
+                    interval_samples_per_span=interval_samples,
                 )
         except Exception as exc:
             _report_once(exc)

@@ -1,0 +1,1368 @@
+"""CPU NumPy port of ``first_hit_interval_best_targets_apply_jax`` (no JAX).
+
+Uses continuous angular intervals (union / subtract on the circle), sampled
+intra-tick hulls matching ``tick_hit_intervals_jax`` (``samples_per_span`` on
+radial tau windows — not a fixed ray grid).  Per-planet targets pick the
+**widest** feasible launch cone after occlusion, as in the JAX interval sweep.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import Sequence
+
+import numpy as np
+
+from orbit_wars_pt.constants import BOARD_SIZE, CENTER, ROTATION_RADIUS_LIMIT, SUN_RADIUS
+from orbit_wars_pt.geometry import (
+    AngleInterval,
+    TAU,
+    _circle_disk_angle_interval,
+    _merge_pieces,
+    _norm_angle,
+    _radial_active_windows,
+    board_exit_angle_intervals,
+    subtract_angle_intervals,
+    union_angle_intervals,
+)
+
+
+GEOM_EPS = 1e-5
+ANGLE_PAD = 1e-4
+LAUNCH_RIM_OFFSET = 0.1
+
+# Shelved: ``orthogonal_hit_circular_orbit`` (exact cos/sin motion). The env linearises
+# each turn as a chord; chord polylines match swept collision more closely.
+_USE_EXACT_CIRCULAR_ORBIT_ORTHOGONAL = False
+
+
+
+@dataclass(frozen=True, slots=True)
+class OrthogonalHitEvent:
+    """One orthogonal hit: launch cone; ``t`` is for occlusion ordering only (not ETA)."""
+
+    t: float
+    angle_lo: float
+    angle_hi: float
+    slot: int
+    kind: str  # planet | sun
+
+
+def angle_in_intervals(
+    angle: float,
+    intervals: Sequence[AngleInterval],
+    *,
+    eps: float = 0.0,
+) -> bool:
+    """Whether ``angle`` lies in the union of (possibly wrapping) intervals."""
+
+    a = _norm_angle(float(angle))
+    for iv in union_angle_intervals(intervals):
+        lo = _norm_angle(iv.lo)
+        hi = _norm_angle(iv.hi)
+        raw_width = float(iv.hi - iv.lo)
+        width = raw_width % TAU
+        if raw_width >= TAU - eps or (width <= eps and raw_width > TAU - eps):
+            return True
+        if lo <= hi:
+            if lo - eps <= a <= hi + eps:
+                return True
+        elif a >= lo - eps or a <= hi + eps:
+            return True
+    return False
+
+
+def _intervals_to_pieces(intervals: Sequence[AngleInterval]) -> list[tuple[float, float]]:
+    pieces: list[tuple[float, float]] = []
+    for iv in union_angle_intervals(intervals):
+        lo = _norm_angle(iv.lo)
+        hi = _norm_angle(iv.hi)
+        raw_width = float(iv.hi - iv.lo)
+        width = raw_width % TAU
+        if raw_width >= TAU - GEOM_EPS or (width < GEOM_EPS and raw_width > TAU - GEOM_EPS):
+            pieces.append((0.0, TAU))
+        elif lo <= hi:
+            if hi - lo > GEOM_EPS:
+                pieces.append((lo, hi))
+        else:
+            if hi > GEOM_EPS:
+                pieces.append((0.0, hi))
+            if TAU - lo > GEOM_EPS:
+                pieces.append((lo, TAU))
+    return _merge_pieces(pieces, eps=GEOM_EPS)
+
+
+def set_subtract_cells(
+    hit: Sequence[AngleInterval],
+    blocked: Sequence[AngleInterval],
+    *,
+    eps: float = GEOM_EPS,
+) -> list[tuple[float, float]]:
+    """Elementary non-wrapping cells in ``hit - blocked`` (mirrors ``geometry_jax._set_subtract_cells``)."""
+
+    hit_p = _intervals_to_pieces(hit)
+    block_p = _intervals_to_pieces(blocked)
+    if not hit_p:
+        return []
+    endpoints = [0.0, TAU]
+    for lo, hi in hit_p:
+        endpoints.extend([lo, hi])
+    for lo, hi in block_p:
+        endpoints.extend([lo, hi])
+    endpoints = sorted(set(max(0.0, min(TAU, float(x))) for x in endpoints))
+    cells: list[tuple[float, float]] = []
+    for lo, hi in zip(endpoints, endpoints[1:]):
+        if hi - lo <= eps:
+            continue
+        mid = 0.5 * (lo + hi)
+        in_hit = any(lo_h <= mid <= hi_h for lo_h, hi_h in hit_p)
+        in_block = any(lo_b <= mid <= hi_b for lo_b, hi_b in block_p)
+        if in_hit and not in_block:
+            cells.append((lo, hi))
+    return cells
+
+
+def _angle_diff(a: float, ref: float) -> float:
+    return ref + ((a - ref + math.pi) % TAU - math.pi)
+
+
+def _angular_hull_sampled(intervals: Sequence[AngleInterval]) -> list[AngleInterval]:
+    """Hull sampled disk intervals on one radial span (matches JAX tick_hit hull step)."""
+
+    present = [iv for iv in intervals if iv is not None]
+    if not present:
+        return []
+    any_full = False
+    mids: list[float] = []
+    shifted_pts: list[float] = []
+    for iv in present:
+        raw_width = float(iv.hi - iv.lo)
+        width = raw_width % TAU
+        if raw_width >= TAU - GEOM_EPS or (width <= GEOM_EPS and raw_width > TAU - GEOM_EPS):
+            any_full = True
+        mid = _norm_angle(iv.lo + 0.5 * width)
+        mids.append(mid)
+    if any_full:
+        return [AngleInterval(0.0, TAU)]
+    ref = mids[0]
+    for iv in present:
+        width = (iv.hi - iv.lo) % TAU
+        mid = _norm_angle(iv.lo + 0.5 * width)
+        shifted_pts.extend(
+            [_angle_diff(iv.lo, ref), _angle_diff(mid, ref), _angle_diff(iv.hi, ref)]
+        )
+    hull_lo = min(shifted_pts) - ANGLE_PAD
+    hull_hi = max(shifted_pts) + ANGLE_PAD
+    return union_angle_intervals(
+        [AngleInterval(_norm_angle(hull_lo), _norm_angle(hull_hi))]
+    )
+
+
+def tick_hit_intervals_sampled(
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    tick: int,
+    object_p0: np.ndarray,
+    object_p1: np.ndarray,
+    object_radius: float,
+    *,
+    object_active: bool = True,
+    samples_per_span: int = 9,
+) -> list[AngleInterval]:
+    """Non-wrapping hit-angle pieces for one object/tick (matches ``tick_hit_intervals_jax``)."""
+
+    if not object_active:
+        return []
+    origin = np.asarray(origin_xy, dtype=np.float64)
+    p0 = np.asarray(object_p0, dtype=np.float64)
+    p1 = np.asarray(object_p1, dtype=np.float64)
+    launch_offset = float(origin_radius) + LAUNCH_RIM_OFFSET
+    radius = float(object_radius)
+    windows = _radial_active_windows(
+        origin, launch_offset, float(speed), int(tick), p0, p1, radius
+    )
+    if not windows:
+        return []
+
+    n_s = max(2, int(samples_per_span))
+    span_hits: list[AngleInterval] = []
+    for tau_lo, tau_hi in windows:
+        samples: list[AngleInterval] = []
+        for k in range(n_s):
+            frac = float(k) / float(n_s - 1)
+            tau = tau_lo + (tau_hi - tau_lo) * frac
+            target_xy = p0 + tau * (p1 - p0)
+            iv = _circle_disk_angle_interval(
+                origin,
+                launch_offset,
+                float(speed),
+                int(tick),
+                target_xy,
+                radius,
+                tau,
+            )
+            if iv is not None:
+                samples.append(iv)
+        span_hits.extend(_angular_hull_sampled(samples))
+    return union_angle_intervals(span_hits)
+
+
+def precompute_tick_planet_hits(
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    object_p0_by_tick: np.ndarray,
+    object_p1_by_tick: np.ndarray,
+    object_radii: np.ndarray,
+    object_active_by_tick: np.ndarray,
+    *,
+    samples_per_span: int = 9,
+) -> list[list[list[AngleInterval]]]:
+    """``hits[tick][planet]`` interval lists (no occlusion)."""
+
+    p0 = np.asarray(object_p0_by_tick, dtype=np.float64)
+    p1 = np.asarray(object_p1_by_tick, dtype=np.float64)
+    radii = np.asarray(object_radii, dtype=np.float64)
+    active = np.asarray(object_active_by_tick, dtype=bool)
+    ticks, planets = active.shape
+    out: list[list[list[AngleInterval]]] = []
+    for t in range(ticks):
+        row: list[list[AngleInterval]] = []
+        for j in range(planets):
+            row.append(
+                tick_hit_intervals_sampled(
+                    origin_xy,
+                    origin_radius,
+                    speed,
+                    t,
+                    p0[t, j],
+                    p1[t, j],
+                    float(radii[j]),
+                    object_active=bool(active[t, j]),
+                    samples_per_span=samples_per_span,
+                )
+            )
+        out.append(row)
+    return out
+
+
+def _widest_cell_midpoint_and_width(
+    cells: Sequence[tuple[float, float]],
+) -> tuple[float | None, float]:
+    best_w = -1.0
+    best_mid: float | None = None
+    for lo, hi in cells:
+        w = hi - lo
+        if w > best_w:
+            best_w = w
+            best_mid = _norm_angle(0.5 * (lo + hi))
+    return best_mid, best_w
+
+
+def sweep_interval_best_targets(
+    precomputed_hits: Sequence[Sequence[Sequence[AngleInterval]]],
+    *,
+    object_order: Sequence[int] | None = None,
+    include_board: bool = True,
+    include_sun: bool = True,
+    origin_xy: np.ndarray | None = None,
+    origin_radius: float = 0.0,
+    speed: float = 0.0,
+    board_size: float = BOARD_SIZE,
+    sun_radius: float = SUN_RADIUS,
+    samples_per_span: int = 9,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, np.ndarray]:
+    """Occlusion sweep; returns ``(angle[P], width[P], valid[P], overflow, hit_tick[P])``."""
+
+    ticks = len(precomputed_hits)
+    planets = len(precomputed_hits[0]) if ticks else 0
+    order = list(range(planets)) if object_order is None else list(object_order)
+    blocked: list[AngleInterval] = []
+    best_angle = np.zeros((planets,), dtype=np.float64)
+    best_width = np.zeros((planets,), dtype=np.float64)
+    best_tick = np.full((planets,), -1, dtype=np.int32)
+    overflow = False
+
+    origin = None if origin_xy is None else np.asarray(origin_xy, dtype=np.float64)
+
+    for tick in range(ticks):
+        row = precomputed_hits[tick]
+        for obj_idx in order:
+            if obj_idx < 0 or obj_idx >= planets:
+                continue
+            hit = row[obj_idx]
+            if not hit:
+                continue
+            cells = set_subtract_cells(hit, blocked)
+            mid, width = _widest_cell_midpoint_and_width(cells)
+            if mid is not None and width > best_width[obj_idx]:
+                best_width[obj_idx] = width
+                best_angle[obj_idx] = mid
+                best_tick[obj_idx] = tick
+            blocked = union_angle_intervals([*blocked, *hit])
+
+        if include_board and origin is not None:
+            b_hit = board_exit_angle_intervals(
+                origin, origin_radius, speed, tick, board_size=board_size
+            )
+            blocked = union_angle_intervals([*blocked, *b_hit])
+
+        if include_sun and origin is not None:
+            sun_xy = np.asarray([CENTER, CENTER], dtype=np.float64)
+            s_hit = tick_hit_intervals_sampled(
+                origin,
+                origin_radius,
+                speed,
+                tick,
+                sun_xy,
+                sun_xy,
+                max(0.0, float(sun_radius) - 1e-9),
+                object_active=True,
+                samples_per_span=samples_per_span,
+            )
+            blocked = union_angle_intervals([*blocked, *s_hit])
+
+    valid = best_width > GEOM_EPS
+    return (
+        best_angle.astype(np.float32),
+        best_width.astype(np.float32),
+        valid,
+        overflow,
+        best_tick,
+    )
+
+
+def first_hit_at_angle_interval(
+    angle: float,
+    precomputed_hits: Sequence[Sequence[Sequence[AngleInterval]]],
+    *,
+    object_order: Sequence[int] | None = None,
+    include_board: bool = True,
+    include_sun: bool = True,
+    origin_xy: np.ndarray | None = None,
+    origin_radius: float = 0.0,
+    speed: float = 0.0,
+    board_size: float = BOARD_SIZE,
+    sun_radius: float = SUN_RADIUS,
+    samples_per_span: int = 9,
+) -> tuple[str, int, int]:
+    """First terminal event at ``angle`` under interval occlusion (matches sweep rules).
+
+    Returns ``(kind, code, tick)`` with ``kind`` in ``planet``, ``sun``, ``board``, ``none``.
+    ``code`` is the planet slot for ``planet``, else ``-1``.
+    """
+
+    ticks = len(precomputed_hits)
+    planets = len(precomputed_hits[0]) if ticks else 0
+    order = list(range(planets)) if object_order is None else list(object_order)
+    blocked: list[AngleInterval] = []
+    origin = None if origin_xy is None else np.asarray(origin_xy, dtype=np.float64)
+    theta = float(angle)
+
+    for tick in range(ticks):
+        row = precomputed_hits[tick]
+        for obj_idx in order:
+            if obj_idx < 0 or obj_idx >= planets:
+                continue
+            hit = row[obj_idx]
+            if not hit:
+                continue
+            available = subtract_angle_intervals(hit, blocked)
+            if angle_in_intervals(theta, available):
+                return ("planet", int(obj_idx), int(tick))
+            blocked = union_angle_intervals([*blocked, *hit])
+
+        if include_board and origin is not None:
+            b_hit = board_exit_angle_intervals(
+                origin, origin_radius, speed, tick, board_size=board_size
+            )
+            if angle_in_intervals(theta, b_hit):
+                return ("board", -1, int(tick))
+            blocked = union_angle_intervals([*blocked, *b_hit])
+
+        if include_sun and origin is not None:
+            sun_xy = np.asarray([CENTER, CENTER], dtype=np.float64)
+            s_hit = tick_hit_intervals_sampled(
+                origin,
+                origin_radius,
+                speed,
+                tick,
+                sun_xy,
+                sun_xy,
+                max(0.0, float(sun_radius) - 1e-9),
+                object_active=True,
+                samples_per_span=samples_per_span,
+            )
+            if angle_in_intervals(theta, s_hit):
+                return ("sun", -1, int(tick))
+            blocked = union_angle_intervals([*blocked, *s_hit])
+
+    return ("none", -1, -1)
+
+
+def first_hit_tick_single_planet_raycast(
+    angle: float,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    p0_by_tick: np.ndarray,
+    p1_by_tick: np.ndarray,
+    radius: float,
+    active_by_tick: np.ndarray,
+    *,
+    rim_offset: float = LAUNCH_RIM_OFFSET,
+) -> int:
+    """Earliest discrete tick where fleet at ``angle`` hits one planet (swept segment test)."""
+
+    origin = np.asarray(origin_xy, dtype=np.float64)
+    theta = float(angle) % TAU
+    direction = np.array([math.cos(theta), math.sin(theta)], dtype=np.float64)
+    launch_off = float(origin_radius) + float(rim_offset)
+    pos = origin + launch_off * direction
+    ticks = int(active_by_tick.shape[0])
+    r = float(radius)
+    v = float(speed)
+
+    for tick in range(ticks):
+        a1 = pos + v * direction
+        if bool(active_by_tick[tick]):
+            p0 = np.asarray(p0_by_tick[tick], dtype=np.float64)
+            p1 = np.asarray(p1_by_tick[tick], dtype=np.float64)
+            d0 = pos - p0
+            dv = (a1 - pos) - (p1 - p0)
+            qa = float(np.dot(dv, dv))
+            qb = float(2.0 * np.dot(d0, dv))
+            qc = float(np.dot(d0, d0) - r * r)
+            if qa < 1e-12:
+                if qc <= 0.0:
+                    return tick
+            else:
+                disc = qb * qb - 4.0 * qa * qc
+                if disc >= 0.0:
+                    sd = math.sqrt(max(disc, 0.0))
+                    t1 = (-qb - sd) / (2.0 * qa)
+                    t2 = (-qb + sd) / (2.0 * qa)
+                    if t2 >= 0.0 and t1 <= 1.0:
+                        return tick
+        pos = a1
+
+    return -1
+
+
+def _refine_planet_hit_ticks_single_rays(
+    best_angle: np.ndarray,
+    best_tick: np.ndarray,
+    valid: np.ndarray,
+    *,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    p0_by_tick: np.ndarray,
+    p1_by_tick: np.ndarray,
+    radii: np.ndarray,
+    active_by_tick: np.ndarray,
+) -> None:
+    """Replace ``best_tick`` for valid planets with per-target swept raycast ETAs."""
+
+    for slot in range(int(best_angle.shape[0])):
+        if not valid[slot]:
+            continue
+        tick = first_hit_tick_single_planet_raycast(
+            float(best_angle[slot]),
+            origin_xy,
+            origin_radius,
+            speed,
+            p0_by_tick[:, slot, :],
+            p1_by_tick[:, slot, :],
+            float(radii[slot]),
+            active_by_tick[:, slot],
+        )
+        if tick >= 0:
+            best_tick[slot] = tick
+        else:
+            valid[slot] = False
+            best_tick[slot] = -1
+
+
+def first_hit_at_angle_orthogonal(
+    angle: float,
+    events: Sequence[OrthogonalHitEvent],
+    *,
+    object_order: Sequence[int] | None = None,
+    include_board: bool = True,
+    include_sun: bool = True,
+    origin_xy: np.ndarray | None = None,
+    origin_radius: float = 0.0,
+    speed: float = 0.0,
+    horizon: int = 24,
+    board_size: float = BOARD_SIZE,
+    p0_by_tick: np.ndarray | None = None,
+    p1_by_tick: np.ndarray | None = None,
+    radii: np.ndarray | None = None,
+    active_by_tick: np.ndarray | None = None,
+) -> tuple[str, int, int]:
+    """First terminal event at ``angle`` under occlusion (``floor(t)``, collision rank)."""
+
+    from orbit_wars_pt.orthogonal_geometry_np import cone_to_angle_intervals
+
+    planets = max(
+        (int(e.slot) for e in events if e.kind == "planet" and e.slot >= 0),
+        default=-1,
+    ) + 1
+    order = list(range(planets)) if object_order is None else list(object_order)
+    order_rank = {int(s): i for i, s in enumerate(order)}
+    sorted_events = sorted(events, key=lambda e: _event_sort_key(e, order_rank))
+    blocked: list[AngleInterval] = []
+    origin = None if origin_xy is None else np.asarray(origin_xy, dtype=np.float64)
+    theta = float(angle)
+    use_ray_eta = (
+        p0_by_tick is not None
+        and p1_by_tick is not None
+        and radii is not None
+        and active_by_tick is not None
+    )
+
+    for event in sorted_events:
+        hit = cone_to_angle_intervals(event.angle_lo, event.angle_hi)
+        if event.kind == "planet" and 0 <= event.slot < planets:
+            available = subtract_angle_intervals(hit, blocked)
+            if angle_in_intervals(theta, available):
+                slot = int(event.slot)
+                if use_ray_eta:
+                    tick = first_hit_tick_single_planet_raycast(
+                        theta,
+                        origin,
+                        origin_radius,
+                        speed,
+                        p0_by_tick[:, slot, :],
+                        p1_by_tick[:, slot, :],
+                        float(radii[slot]),
+                        active_by_tick[:, slot],
+                    )
+                    if tick < 0:
+                        blocked = union_angle_intervals([*blocked, *hit])
+                        continue
+                    return ("planet", slot, tick)
+                tick = int(min(max(math.floor(event.t), 0), max(horizon - 1, 0)))
+                return ("planet", slot, tick)
+        elif event.kind == "sun" and include_sun:
+            available = subtract_angle_intervals(hit, blocked)
+            if angle_in_intervals(theta, available):
+                tick = int(min(max(math.floor(event.t), 0), max(horizon - 1, 0)))
+                return ("sun", -1, tick)
+        blocked = union_angle_intervals([*blocked, *hit])
+
+    if origin is not None:
+        for tick in range(int(horizon)):
+            if include_board:
+                b_hit = board_exit_angle_intervals(
+                    origin, origin_radius, speed, tick, board_size=board_size
+                )
+                if angle_in_intervals(theta, b_hit):
+                    return ("board", -1, tick)
+                blocked = union_angle_intervals([*blocked, *b_hit])
+
+    return ("none", -1, -1)
+
+
+def _rotating_planet_chord_polyline(
+    centre_xy: np.ndarray,
+    orbital_radius: float,
+    angular_velocity: float,
+    *,
+    horizon: int,
+    step_count: int = 0,
+    orbit_center: np.ndarray | None = None,
+) -> np.ndarray:
+    """Planet-centre polyline with one chord per tick (env-style linearised orbit)."""
+
+    o = np.asarray(
+        [CENTER, CENTER] if orbit_center is None else orbit_center,
+        dtype=np.float64,
+    )
+    p0 = np.asarray(centre_xy, dtype=np.float64)
+    rho = float(orbital_radius)
+    w = float(angular_velocity)
+    th0 = math.atan2(p0[1] - o[1], p0[0] - o[0])
+    rows: list[np.ndarray] = [p0.copy()]
+    for dt in range(1, int(horizon) + 1):
+        advance = int(dt) - 1 if int(step_count) <= 0 else int(dt)
+        th = th0 + w * float(advance)
+        rows.append(
+            o
+            + rho
+            * np.array([math.cos(th), math.sin(th)], dtype=np.float64)
+        )
+    return np.stack(rows, axis=0)
+
+
+def _comet_chord_polyline_points(
+    pos: np.ndarray,
+    slot: int,
+    *,
+    comet_paths: np.ndarray,
+    comet_path_lengths: np.ndarray,
+    comet_group_active: np.ndarray,
+    comet_path_index: np.ndarray,
+    comet_slots: np.ndarray,
+    horizon: float,
+) -> np.ndarray:
+    """Chord polyline for a comet; duplicate the terminal knot when the path ends.
+
+    Matches per-tick swept hits after the last path point: one tick with zero comet
+    motion at the endpoint (see ``_forecast_incoming_fleets`` when ``c0 == c1``).
+    """
+
+    pts_list = [np.asarray(pos, dtype=np.float64).copy()]
+    path_exhausted = False
+    for g in range(int(comet_group_active.shape[0])):
+        if not comet_group_active[g]:
+            continue
+        for k in range(int(comet_slots.shape[1])):
+            if int(comet_slots[g, k]) != slot:
+                continue
+            idx = int(comet_path_index[g])
+            length = int(comet_path_lengths[g, k])
+            path = comet_paths[g, k]
+            for dt in range(1, int(horizon) + 2):
+                pi = idx + dt
+                if pi >= length:
+                    path_exhausted = True
+                    break
+                pts_list.append(np.asarray(path[pi], dtype=np.float64))
+            break
+        else:
+            continue
+        break
+
+    if len(pts_list) < 2:
+        return np.stack([pts_list[0], pts_list[0]], axis=0)
+
+    pts = np.stack(pts_list, axis=0)
+    if path_exhausted:
+        pts = np.vstack([pts, pts[-1:]])
+    return pts
+
+
+def collect_tangent_hit_events(
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    planets: np.ndarray,
+    planet_active: np.ndarray,
+    initial_planets: np.ndarray,
+    initial_active: np.ndarray,
+    comet_paths: np.ndarray,
+    comet_path_lengths: np.ndarray,
+    comet_group_active: np.ndarray,
+    comet_path_index: np.ndarray,
+    comet_slots: np.ndarray,
+    comet_planet_ids: np.ndarray,
+    angular_velocity: float,
+    step_count: int,
+    *,
+    horizon: float,
+    include_sun: bool = True,
+    sun_radius: float = SUN_RADIUS,
+) -> list[OrthogonalHitEvent]:
+    """Tangent growing-circle hits: overlap windows with min/max intersection bearings.
+
+    Reuses ``OrthogonalHitEvent`` for the occlusion sweep (``angle_lo``/``angle_hi`` span).
+    """
+
+    from orbit_wars_pt.tangent_geometry_np import (
+        angular_intersection_extrema_polyline,
+        angular_intersection_extrema_stationary,
+        intersection_windows,
+        make_polyline_motion,
+    )
+
+    origin = np.asarray(origin_xy, dtype=np.float64)
+    launch_off = float(origin_radius) + LAUNCH_RIM_OFFSET
+    v = float(speed)
+    t_hor = float(horizon)
+    pa = np.asarray(planet_active, dtype=bool)
+    ia = np.asarray(initial_active, dtype=bool)
+    planets = np.asarray(planets, dtype=np.float64)
+    init_pos = np.asarray(initial_planets, dtype=np.float64)[:, 2:4]
+    delta = init_pos - np.asarray([CENTER, CENTER], dtype=np.float64)
+    orbital_r = np.linalg.norm(delta, axis=1)
+    rotating = pa & ia & (orbital_r + planets[:, 4] < ROTATION_RADIUS_LIMIT)
+
+    comet_slot_set: set[int] = set()
+    for g in range(int(comet_group_active.shape[0])):
+        if not comet_group_active[g]:
+            continue
+        for k in range(4):
+            slot = int(comet_slots[g, k])
+            if 0 <= slot < len(pa):
+                comet_slot_set.add(slot)
+
+    events: list[OrthogonalHitEvent] = []
+    o_center = np.array([CENTER, CENTER], dtype=np.float64)
+
+    def add_planet_windows(
+        slot: int,
+        center_at,
+        velocity_at,
+        knot_times: Sequence[float],
+        r: float,
+        *,
+        kind: str = "planet",
+        polyline_points: np.ndarray | None = None,
+        stationary_center: np.ndarray | None = None,
+    ) -> None:
+        windows = intersection_windows(
+            center_at,
+            origin,
+            r,
+            launch_off,
+            v,
+            t_hor,
+            polyline_points=polyline_points,
+            stationary_center=stationary_center,
+        )
+        for t_enter, t_exit in windows:
+            if polyline_points is not None:
+                ext = angular_intersection_extrema_polyline(
+                    polyline_points,
+                    r,
+                    origin,
+                    v,
+                    launch_off,
+                    t_enter,
+                    t_exit,
+                )
+            else:
+                ext = angular_intersection_extrema_stationary(
+                    stationary_center,
+                    r,
+                    origin,
+                    v,
+                    launch_off,
+                    t_enter,
+                    t_exit,
+                )
+            if ext is None:
+                continue
+            a_lo = float(ext["min"]["angle"])
+            a_hi = float(ext["max"]["angle"])
+            events.append(
+                OrthogonalHitEvent(
+                    float(t_enter),
+                    _norm_angle(a_lo),
+                    _norm_angle(a_hi),
+                    slot,
+                    kind,
+                )
+            )
+
+    for slot in range(int(planets.shape[0])):
+        if not pa[slot]:
+            continue
+        r = float(planets[slot, 4])
+        pos = planets[slot, 2:4]
+
+        if slot in comet_slot_set:
+            pts = _comet_chord_polyline_points(
+                pos,
+                slot,
+                comet_paths=comet_paths,
+                comet_path_lengths=comet_path_lengths,
+                comet_group_active=comet_group_active,
+                comet_path_index=comet_path_index,
+                comet_slots=comet_slots,
+                horizon=t_hor,
+            )
+            center_at, velocity_at, knot_times = make_polyline_motion(pts)
+            add_planet_windows(
+                slot,
+                center_at,
+                velocity_at,
+                knot_times,
+                r,
+                polyline_points=pts,
+            )
+            continue
+
+        if rotating[slot]:
+            pts = _rotating_planet_chord_polyline(
+                pos,
+                float(orbital_r[slot]),
+                float(angular_velocity),
+                horizon=int(t_hor),
+                step_count=int(step_count),
+                orbit_center=o_center,
+            )
+            center_at, velocity_at, knot_times = make_polyline_motion(pts)
+            add_planet_windows(
+                slot,
+                center_at,
+                velocity_at,
+                knot_times,
+                r,
+                polyline_points=pts,
+            )
+        else:
+            center_at = lambda t, p=pos.copy(): p  # noqa: E731
+            velocity_at = lambda t: np.zeros(2, dtype=np.float64)  # noqa: E731
+            add_planet_windows(
+                slot,
+                center_at,
+                velocity_at,
+                [],
+                r,
+                stationary_center=pos,
+            )
+
+    if include_sun:
+        center_at = lambda t, c=o_center.copy(): c  # noqa: E731
+        velocity_at = lambda t: np.zeros(2, dtype=np.float64)  # noqa: E731
+        add_planet_windows(
+            -1,
+            center_at,
+            velocity_at,
+            [],
+            float(sun_radius),
+            kind="sun",
+            stationary_center=o_center,
+        )
+
+    return events
+
+
+def _interval_use_tangent_geometry() -> bool:
+    import os
+
+    raw = os.environ.get("ORBIT_WARS_INTERVAL_GEOMETRY", "tangent").strip().lower()
+    return raw not in {"orthogonal", "cone", "sampled", "0", "false", "off", "no"}
+
+
+def collect_hit_events(
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    planets: np.ndarray,
+    planet_active: np.ndarray,
+    initial_planets: np.ndarray,
+    initial_active: np.ndarray,
+    comet_paths: np.ndarray,
+    comet_path_lengths: np.ndarray,
+    comet_group_active: np.ndarray,
+    comet_path_index: np.ndarray,
+    comet_slots: np.ndarray,
+    comet_planet_ids: np.ndarray,
+    angular_velocity: float,
+    step_count: int,
+    *,
+    horizon: float,
+    include_sun: bool = True,
+    sun_radius: float = SUN_RADIUS,
+) -> list[OrthogonalHitEvent]:
+    """Dispatch orthogonal (shelved) vs external/internal tangent geometry."""
+
+    if _interval_use_tangent_geometry():
+        return collect_tangent_hit_events(
+            origin_xy,
+            origin_radius,
+            speed,
+            planets,
+            planet_active,
+            initial_planets,
+            initial_active,
+            comet_paths,
+            comet_path_lengths,
+            comet_group_active,
+            comet_path_index,
+            comet_slots,
+            comet_planet_ids,
+            angular_velocity,
+            step_count,
+            horizon=horizon,
+            include_sun=include_sun,
+            sun_radius=sun_radius,
+        )
+    return collect_orthogonal_hit_events(
+        origin_xy,
+        origin_radius,
+        speed,
+        planets,
+        planet_active,
+        initial_planets,
+        initial_active,
+        comet_paths,
+        comet_path_lengths,
+        comet_group_active,
+        comet_path_index,
+        comet_slots,
+        comet_planet_ids,
+        angular_velocity,
+        step_count,
+        horizon=horizon,
+        include_sun=include_sun,
+        sun_radius=sun_radius,
+    )
+
+
+def collect_orthogonal_hit_events(
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    planets: np.ndarray,
+    planet_active: np.ndarray,
+    initial_planets: np.ndarray,
+    initial_active: np.ndarray,
+    comet_paths: np.ndarray,
+    comet_path_lengths: np.ndarray,
+    comet_group_active: np.ndarray,
+    comet_path_index: np.ndarray,
+    comet_slots: np.ndarray,
+    comet_planet_ids: np.ndarray,
+    angular_velocity: float,
+    step_count: int,
+    *,
+    horizon: float,
+    include_sun: bool = True,
+    sun_radius: float = SUN_RADIUS,
+) -> list[OrthogonalHitEvent]:
+    """Orthogonal growing-circle hits for orbiting/static planets, polyline comets, and sun.
+
+    Rotating planets and comets use chord polylines (all roots in ``[0, horizon]``).
+    Set ``_USE_EXACT_CIRCULAR_ORBIT_ORTHOGONAL`` to use exact circular-orbit tangency instead.
+    """
+
+    from orbit_wars_pt.orthogonal_geometry_np import (
+        orthogonal_hit_circular_orbit,
+        orthogonal_hit_stationary,
+        orthogonal_hits_polyline,
+    )
+
+    origin = np.asarray(origin_xy, dtype=np.float64)
+    launch_off = float(origin_radius) + LAUNCH_RIM_OFFSET
+    v = float(speed)
+    t_hor = float(horizon)
+    pa = np.asarray(planet_active, dtype=bool)
+    ia = np.asarray(initial_active, dtype=bool)
+    planets = np.asarray(planets, dtype=np.float64)
+    init_pos = np.asarray(initial_planets, dtype=np.float64)[:, 2:4]
+    delta = init_pos - np.asarray([CENTER, CENTER], dtype=np.float64)
+    orbital_r = np.linalg.norm(delta, axis=1)
+    initial_angle = np.arctan2(delta[:, 1], delta[:, 0])
+    rotating = pa & ia & (orbital_r + planets[:, 4] < ROTATION_RADIUS_LIMIT)
+
+    comet_slot_set: set[int] = set()
+    for g in range(int(comet_group_active.shape[0])):
+        if not comet_group_active[g]:
+            continue
+        for k in range(4):
+            slot = int(comet_slots[g, k])
+            if 0 <= slot < len(pa):
+                comet_slot_set.add(slot)
+
+    events: list[OrthogonalHitEvent] = []
+    o_center = np.array([CENTER, CENTER], dtype=np.float64)
+
+    for slot in range(int(planets.shape[0])):
+        if not pa[slot]:
+            continue
+        r = float(planets[slot, 4])
+        pos = planets[slot, 2:4]
+
+        if slot in comet_slot_set:
+            pts = _comet_chord_polyline_points(
+                pos,
+                slot,
+                comet_paths=comet_paths,
+                comet_path_lengths=comet_path_lengths,
+                comet_group_active=comet_group_active,
+                comet_path_index=comet_path_index,
+                comet_slots=comet_slots,
+                horizon=t_hor,
+            )
+            for t, lo, hi in orthogonal_hits_polyline(
+                pts, r, origin, v, launch_off, t_hor
+            ):
+                events.append(OrthogonalHitEvent(t, lo, hi, slot, "planet"))
+            continue
+
+        if rotating[slot]:
+            if _USE_EXACT_CIRCULAR_ORBIT_ORTHOGONAL:
+                delta_pos = np.asarray(pos, dtype=np.float64) - o_center
+                th0 = float(np.arctan2(delta_pos[1], delta_pos[0]))
+                hit = orthogonal_hit_circular_orbit(
+                    o_center,
+                    float(orbital_r[slot]),
+                    th0,
+                    float(angular_velocity),
+                    r,
+                    origin,
+                    v,
+                    launch_off,
+                    t_hor,
+                )
+                if hit is not None:
+                    t, lo, hi = hit
+                    events.append(OrthogonalHitEvent(t, lo, hi, slot, "planet"))
+                continue
+
+            pts = _rotating_planet_chord_polyline(
+                pos,
+                float(orbital_r[slot]),
+                float(angular_velocity),
+                horizon=int(t_hor),
+                orbit_center=o_center,
+            )
+            if pts.shape[0] < 2:
+                continue
+            for t, lo, hi in orthogonal_hits_polyline(
+                pts, r, origin, v, launch_off, t_hor
+            ):
+                events.append(OrthogonalHitEvent(t, lo, hi, slot, "planet"))
+            continue
+
+        hit = orthogonal_hit_stationary(pos, r, origin, v, launch_off, t_hor)
+        if hit is not None:
+            t, lo, hi = hit
+            events.append(OrthogonalHitEvent(t, lo, hi, slot, "planet"))
+
+    if include_sun:
+        hit = orthogonal_hit_stationary(
+            o_center,
+            float(sun_radius),
+            origin,
+            v,
+            launch_off,
+            t_hor,
+        )
+        if hit is not None:
+            t, lo, hi = hit
+            events.append(OrthogonalHitEvent(t, lo, hi, -1, "sun"))
+
+    return events
+
+
+@dataclass(frozen=True)
+class OcclusionWalkCache:
+    """Pre-sorted event cones + board ticks for fast per-ray occlusion first-hit."""
+
+    planet_count: int
+    event_steps: tuple[tuple[tuple[AngleInterval, ...], str, int], ...]
+    board_ticks: tuple[tuple[AngleInterval, ...], ...]
+
+
+def build_occlusion_walk_cache(
+    events: Sequence[OrthogonalHitEvent],
+    object_order: Sequence[int],
+    *,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    horizon: int,
+    board_size: float = BOARD_SIZE,
+) -> OcclusionWalkCache:
+    """Sort events once and pre-convert hit cones (matches ``first_hit_at_angle_orthogonal``)."""
+
+    from orbit_wars_pt.orthogonal_geometry_np import cone_to_angle_intervals
+
+    planets = (
+        max(
+            (int(e.slot) for e in events if e.kind == "planet" and e.slot >= 0),
+            default=-1,
+        )
+        + 1
+    )
+    order_rank = {int(s): i for i, s in enumerate(object_order)}
+    sorted_events = sorted(events, key=lambda e: _event_sort_key(e, order_rank))
+    steps = tuple(
+        (tuple(cone_to_angle_intervals(e.angle_lo, e.angle_hi)), e.kind, int(e.slot))
+        for e in sorted_events
+    )
+    origin = np.asarray(origin_xy, dtype=np.float64)
+    board_ticks = tuple(
+        tuple(
+            board_exit_angle_intervals(
+                origin, origin_radius, speed, tick, board_size=board_size
+            )
+        )
+        for tick in range(int(horizon))
+    )
+    return OcclusionWalkCache(
+        planet_count=planets,
+        event_steps=steps,
+        board_ticks=board_ticks,
+    )
+
+
+def first_hit_signature_occlusion_walk(
+    angle: float,
+    cache: OcclusionWalkCache,
+    *,
+    include_sun: bool = True,
+    include_board: bool = True,
+) -> tuple[str, int]:
+    """First-hit ``(kind, code)`` under event occlusion; tick omitted for comparisons."""
+
+    theta = float(angle)
+    blocked: list[AngleInterval] = []
+    planets = int(cache.planet_count)
+
+    for hit_t, kind, slot in cache.event_steps:
+        hit = list(hit_t)
+        if kind == "planet" and 0 <= slot < planets:
+            if angle_in_intervals(theta, subtract_angle_intervals(hit, blocked)):
+                return ("planet", int(slot))
+        elif include_sun and kind == "sun":
+            if angle_in_intervals(theta, subtract_angle_intervals(hit, blocked)):
+                return ("sun", -1)
+        blocked = union_angle_intervals([*blocked, *hit])
+
+    if include_board:
+        for b_hit_t in cache.board_ticks:
+            if angle_in_intervals(theta, list(b_hit_t)):
+                return ("board", -1)
+
+    return ("none", -1)
+
+
+def _event_sort_key(
+    event: OrthogonalHitEvent,
+    order_rank: dict[int, int],
+) -> tuple[int, int]:
+    """Sort key for occlusion sweep: integer tick, then Kaggle collision rank."""
+
+    rank = order_rank.get(event.slot, 10_000) if event.kind == "planet" else 10_001
+    tick = int(math.floor(event.t)) if math.isfinite(event.t) else 0
+    return (tick, rank)
+
+
+def sweep_interval_best_targets_from_events(
+    events: Sequence[OrthogonalHitEvent],
+    num_planets: int,
+    *,
+    object_order: Sequence[int] | None = None,
+    include_board: bool = True,
+    origin_xy: np.ndarray | None = None,
+    origin_radius: float = 0.0,
+    speed: float = 0.0,
+    horizon: int = 24,
+    board_size: float = BOARD_SIZE,
+    p0_by_tick: np.ndarray | None = None,
+    p1_by_tick: np.ndarray | None = None,
+    radii: np.ndarray | None = None,
+    active_by_tick: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, np.ndarray]:
+    """Occlusion sweep over events sorted by ``floor(t)`` then collision rank."""
+
+    from orbit_wars_pt.orthogonal_geometry_np import cone_to_angle_intervals
+
+    order = list(range(num_planets)) if object_order is None else list(object_order)
+    order_rank = {int(s): i for i, s in enumerate(order)}
+    sorted_events = sorted(events, key=lambda e: _event_sort_key(e, order_rank))
+
+    blocked: list[AngleInterval] = []
+    best_angle = np.zeros((num_planets,), dtype=np.float64)
+    best_width = np.zeros((num_planets,), dtype=np.float64)
+    best_tick = np.full((num_planets,), -1, dtype=np.int32)
+    overflow = False
+    origin = None if origin_xy is None else np.asarray(origin_xy, dtype=np.float64)
+
+    for event in sorted_events:
+        hit = cone_to_angle_intervals(event.angle_lo, event.angle_hi)
+        if event.kind == "planet" and 0 <= event.slot < num_planets:
+            cells = set_subtract_cells(hit, blocked)
+            mid, width = _widest_cell_midpoint_and_width(cells)
+            if mid is not None and width > best_width[event.slot]:
+                best_width[event.slot] = width
+                best_angle[event.slot] = mid
+                best_tick[event.slot] = 0
+        blocked = union_angle_intervals([*blocked, *hit])
+
+    if include_board and origin is not None:
+        for tick in range(int(horizon)):
+            b_hit = board_exit_angle_intervals(
+                origin, origin_radius, speed, tick, board_size=board_size
+            )
+            blocked = union_angle_intervals([*blocked, *b_hit])
+
+    valid = best_width > GEOM_EPS
+    if (
+        origin is not None
+        and p0_by_tick is not None
+        and p1_by_tick is not None
+        and radii is not None
+        and active_by_tick is not None
+    ):
+        _refine_planet_hit_ticks_single_rays(
+            best_angle,
+            best_tick,
+            valid,
+            origin_xy=origin,
+            origin_radius=origin_radius,
+            speed=speed,
+            p0_by_tick=p0_by_tick,
+            p1_by_tick=p1_by_tick,
+            radii=radii,
+            active_by_tick=active_by_tick,
+        )
+    return (
+        best_angle.astype(np.float32),
+        best_width.astype(np.float32),
+        valid,
+        overflow,
+        best_tick,
+    )
+
+
+def first_hit_interval_best_targets_orthogonal_np(
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    planets: np.ndarray,
+    planet_active: np.ndarray,
+    initial_planets: np.ndarray,
+    initial_active: np.ndarray,
+    comet_paths: np.ndarray,
+    comet_path_lengths: np.ndarray,
+    comet_group_active: np.ndarray,
+    comet_path_index: np.ndarray,
+    comet_slots: np.ndarray,
+    comet_planet_ids: np.ndarray,
+    angular_velocity: float,
+    step_count: int,
+    object_p0_by_tick: np.ndarray,
+    object_p1_by_tick: np.ndarray,
+    object_active_by_tick: np.ndarray,
+    *,
+    object_order: Sequence[int] | None = None,
+    include_board: bool = True,
+    include_sun: bool = True,
+    horizon: int = 24,
+    board_size: float = BOARD_SIZE,
+    sun_radius: float = SUN_RADIUS,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, np.ndarray]:
+    """Interval targets via orthogonal cones; per-planet ETA from single-target raycast."""
+
+    events = collect_hit_events(
+        origin_xy,
+        origin_radius,
+        speed,
+        planets,
+        planet_active,
+        initial_planets,
+        initial_active,
+        comet_paths,
+        comet_path_lengths,
+        comet_group_active,
+        comet_path_index,
+        comet_slots,
+        comet_planet_ids,
+        angular_velocity,
+        step_count,
+        horizon=float(horizon),
+        include_sun=include_sun,
+        sun_radius=sun_radius,
+    )
+    radii = np.asarray(planets, dtype=np.float64)[:, 4]
+    return sweep_interval_best_targets_from_events(
+        events,
+        int(planets.shape[0]),
+        object_order=object_order,
+        include_board=include_board,
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        horizon=horizon,
+        board_size=board_size,
+        p0_by_tick=object_p0_by_tick,
+        p1_by_tick=object_p1_by_tick,
+        radii=radii,
+        active_by_tick=object_active_by_tick,
+    )
+
+
+def first_hit_interval_best_targets_np(
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    object_p0_by_tick: np.ndarray,
+    object_p1_by_tick: np.ndarray,
+    object_radii: np.ndarray,
+    object_active_by_tick: np.ndarray,
+    *,
+    object_order: Sequence[int] | None = None,
+    include_board: bool = True,
+    include_sun: bool = True,
+    board_size: float = BOARD_SIZE,
+    sun_radius: float = SUN_RADIUS,
+    samples_per_span: int = 9,
+    geometry: str = "sampled",
+    planets: np.ndarray | None = None,
+    planet_active: np.ndarray | None = None,
+    initial_planets: np.ndarray | None = None,
+    initial_active: np.ndarray | None = None,
+    comet_paths: np.ndarray | None = None,
+    comet_path_lengths: np.ndarray | None = None,
+    comet_group_active: np.ndarray | None = None,
+    comet_path_index: np.ndarray | None = None,
+    comet_slots: np.ndarray | None = None,
+    comet_planet_ids: np.ndarray | None = None,
+    angular_velocity: float = 0.0,
+    step_count: int = 0,
+    horizon: int = 24,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, np.ndarray]:
+    """CPU equivalent of ``geometry_jax.first_hit_interval_best_targets_apply_jax``."""
+
+    if geometry == "orthogonal":
+        if planets is None or planet_active is None:
+            raise ValueError("orthogonal geometry requires full planet/comet state arrays")
+        return first_hit_interval_best_targets_orthogonal_np(
+            origin_xy,
+            origin_radius,
+            speed,
+            planets,
+            planet_active,
+            initial_planets if initial_planets is not None else planets,
+            initial_active if initial_active is not None else planet_active,
+            comet_paths if comet_paths is not None else np.zeros((0, 4, 0, 2)),
+            comet_path_lengths if comet_path_lengths is not None else np.zeros((0, 4)),
+            comet_group_active if comet_group_active is not None else np.zeros((0,), dtype=bool),
+            comet_path_index if comet_path_index is not None else np.zeros((0,), dtype=np.int32),
+            comet_slots if comet_slots is not None else np.zeros((0, 4), dtype=np.int32),
+            comet_planet_ids if comet_planet_ids is not None else np.zeros((0, 4), dtype=np.int32),
+            angular_velocity,
+            step_count,
+            object_p0_by_tick,
+            object_p1_by_tick,
+            object_active_by_tick,
+            object_order=object_order,
+            include_board=include_board,
+            include_sun=include_sun,
+            horizon=horizon,
+            board_size=board_size,
+            sun_radius=sun_radius,
+        )
+
+    pre = precompute_tick_planet_hits(
+        origin_xy,
+        origin_radius,
+        speed,
+        object_p0_by_tick,
+        object_p1_by_tick,
+        object_radii,
+        object_active_by_tick,
+        samples_per_span=samples_per_span,
+    )
+    return sweep_interval_best_targets(
+        pre,
+        object_order=object_order,
+        include_board=include_board,
+        include_sun=include_sun,
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        board_size=board_size,
+        sun_radius=sun_radius,
+        samples_per_span=samples_per_span,
+    )

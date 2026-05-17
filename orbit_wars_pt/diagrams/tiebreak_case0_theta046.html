@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Orthogonal vs raycast — case 0, θ ≈ 0.46</title>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Mono:wght@400&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --text: #e7ecf3;
+      --muted: #8b9cb3;
+      --origin: #f4c542;
+      --fleet: #5eead4;
+      --p14: #60a5fa;
+      --p31: #f472b6;
+      --sun: #fb923c;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: "IBM Plex Sans", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 320px 1fr;
+    }
+    aside {
+      background: var(--panel);
+      padding: 1.25rem 1.5rem;
+      border-right: 1px solid #2d3a4f;
+      font-size: 0.9rem;
+      line-height: 1.55;
+    }
+    h1 { font-size: 1.05rem; font-weight: 600; margin-bottom: 0.75rem; }
+    h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 1rem 0 0.4rem; }
+    p { color: var(--muted); margin-bottom: 0.5rem; }
+    .legend { list-style: none; margin-top: 0.5rem; }
+    .legend li { display: flex; align-items: center; gap: 0.5rem; margin: 0.35rem 0; }
+    .swatch { width: 14px; height: 14px; border-radius: 3px; flex-shrink: 0; }
+    .callout {
+      margin-top: 1rem;
+      padding: 0.75rem;
+      border-radius: 8px;
+      background: #243044;
+      border-left: 3px solid var(--p31);
+    }
+    .callout.ray { border-left-color: var(--p14); }
+    code, .mono { font-family: "IBM Plex Mono", monospace; font-size: 0.82em; color: #b8d4ff; }
+    main { padding: 1rem; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+    canvas {
+      background: #121820;
+      border-radius: 12px;
+      border: 1px solid #2d3a4f;
+      max-width: 100%;
+      cursor: crosshair;
+    }
+    .hint { font-size: 0.75rem; color: var(--muted); margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <aside>
+    <h1>Same tick, two winners</h1>
+    <p>Case 0, θ = 0.4625 rad (~26.5°). Both methods agree: <strong>hit tick 5</strong>. They disagree on <em>which</em> planet.</p>
+
+    <h2>Legend</h2>
+    <ul class="legend">
+      <li><span class="swatch" style="background:var(--origin)"></span> Origin planet + launch rim</li>
+      <li><span class="swatch" style="background:var(--fleet)"></span> Fleet path (tick 5 segment bold)</li>
+      <li><span class="swatch" style="background:var(--p14)"></span> Planet 14 (rank 14) — raycast wins</li>
+      <li><span class="swatch" style="background:var(--p31)"></span> Planet 31 (rank 31) — orthogonal wins</li>
+    </ul>
+
+    <div class="callout">
+      <strong>Orthogonal</strong> sorts by tangent time <code>orth_t</code>: 31 @ 5.34 before 14 @ 6.34 → picks <strong>31</strong>.
+    </div>
+    <div class="callout ray">
+      <strong>Raycast / env</strong> on tick 5 both segments hit; lower <code>collision_rank</code> → picks <strong>14</strong>.
+    </div>
+
+    <p class="hint" style="margin-top:1rem">Dashed arcs: approximate launch cones at θ (not to scale for width). Zoom is local around the encounter.</p>
+  </aside>
+  <main>
+    <canvas id="c" width="720" height="520"></canvas>
+    <p class="hint">Board coords (100×100). Sun at (50,50) off-chart left-down.</p>
+  </main>
+  <script>
+    const W = 720, H = 520;
+    const canvas = document.getElementById("c");
+    const ctx = canvas.getContext("2d");
+
+    // Game data (case 0, theta=0.46251)
+    const origin = [57.67, 37.11];
+    const originR = 1.60;
+    const launchOff = originR + 0.1;
+    const theta = 0.46251;
+    const speed = 2.357;
+    const u = [Math.cos(theta), Math.sin(theta)];
+    const launch = [origin[0] + launchOff * u[0], origin[1] + launchOff * u[1]];
+    const tick5a0 = [launch[0] + 5 * speed * u[0], launch[1] + 5 * speed * u[1]];
+    const tick5a1 = [tick5a0[0] + speed * u[0], tick5a0[1] + speed * u[1]];
+    const p14c = [72.42, 44.99];
+    const p14r = 2.19;
+    const p31c = [71.51, 41.72];
+    const p31r = 2.22;
+
+    const xmin = 55, xmax = 76, ymin = 35, ymax = 48;
+    const pad = 40;
+    const sx = (W - 2 * pad) / (xmax - xmin);
+    const sy = (H - 2 * pad) / (ymax - ymin);
+
+    function world(x, y) {
+      return [pad + (x - xmin) * sx, H - pad - (y - ymin) * sy];
+    }
+
+    function circle(wx, wy, r, stroke, fill, lw = 2) {
+      const [cx, cy] = world(wx, wy);
+      ctx.beginPath();
+      ctx.arc(cx, cy, r * sx, 0, Math.PI * 2);
+      if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = lw;
+      ctx.stroke();
+    }
+
+    function line(x0, y0, x1, y1, color, lw = 2, dash = []) {
+      const [a, b] = world(x0, y0);
+      const [c, d] = world(x1, y1);
+      ctx.beginPath();
+      ctx.setLineDash(dash);
+      ctx.moveTo(a, b);
+      ctx.lineTo(c, d);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = lw;
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    function label(x, y, text, color = "#e7ecf3", align = "left") {
+      const [px, py] = world(x, y);
+      ctx.font = "600 13px IBM Plex Sans, sans-serif";
+      ctx.fillStyle = color;
+      ctx.textAlign = align;
+      ctx.textBaseline = "middle";
+      ctx.fillText(text, px, py);
+    }
+
+    function draw() {
+      ctx.fillStyle = "#121820";
+      ctx.fillRect(0, 0, W, H);
+
+      // Grid
+      ctx.strokeStyle = "#1e2a3a";
+      ctx.lineWidth = 1;
+      for (let x = Math.ceil(xmin); x <= xmax; x++) {
+        line(x, ymin, x, ymax, "#1e2a3a", 1);
+      }
+      for (let y = Math.ceil(ymin); y <= ymax; y++) {
+        line(xmin, y, xmax, y, "#1e2a3a", 1);
+      }
+
+      // Fleet path from launch through tick 5
+      const far = [launch[0] + 8 * speed * u[0], launch[1] + 8 * speed * u[1]];
+      line(launch[0], launch[1], far[0], far[1], "#2d4a44", 1.5, [4, 6]);
+      line(launch[0], launch[1], tick5a1[0], tick5a1[1], "#5eead4", 2, [6, 4]);
+      line(tick5a0[0], tick5a0[1], tick5a1[0], tick5a1[1], "#5eead4", 4);
+
+      // Origin planet
+      circle(origin[0], origin[1], originR, "#f4c542", "rgba(244,197,66,0.15)", 2);
+      const [lx, ly] = world(launch[0], launch[1]);
+      ctx.beginPath();
+      ctx.arc(lx, ly, 5, 0, Math.PI * 2);
+      ctx.fillStyle = "#5eead4";
+      ctx.fill();
+      label(origin[0], origin[1] - 2.2, "origin", "#f4c542", "center");
+
+      // Planets at ~tick 5
+      circle(p14c[0], p14c[1], p14r, "#60a5fa", "rgba(96,165,250,0.2)", 2.5);
+      circle(p31c[0], p31c[1], p31r, "#f472b6", "rgba(244,114,182,0.2)", 2.5);
+      label(p14c[0] + 1.5, p14c[1] + 2.8, "14 · raycast", "#60a5fa");
+      label(p31c[0] - 1, p31c[1] - 3.2, "31 · orthogonal", "#f472b6", "right");
+
+      // Tangents from origin to planets (schematic cones)
+      function tangentLines(cx, cy, r, color) {
+        const ox = origin[0], oy = origin[1];
+        const dx = cx - ox, dy = cy - oy;
+        const d = Math.hypot(dx, dy);
+        if (d <= r) return;
+        const alpha = Math.atan2(dy, dx);
+        const delta = Math.asin(Math.min(1, r / d));
+        const len = 14;
+        for (const sign of [-1, 1]) {
+          const ang = alpha + sign * delta;
+          line(ox, oy, ox + len * Math.cos(ang), oy + len * Math.sin(ang), color, 1, [3, 5]);
+        }
+      }
+      tangentLines(p14c[0], p14c[1], p14r, "rgba(96,165,250,0.5)");
+      tangentLines(p31c[0], p31c[1], p31r, "rgba(244,114,182,0.5)");
+
+      // θ arrow from origin
+      const arrLen = 6;
+      line(origin[0], origin[1], origin[0] + arrLen * u[0], origin[1] + arrLen * u[1], "#8b9cb3", 1.5);
+      label(origin[0] + arrLen * u[0] + 0.5, origin[1] + arrLen * u[1], "θ", "#8b9cb3");
+
+      // Annotation: both hit tick 5
+      const mid = [(tick5a0[0] + tick5a1[0]) / 2, (tick5a0[1] + tick5a1[1]) / 2];
+      label(mid[0], mid[1] + 1.2, "tick 5 fleet segment", "#5eead4", "center");
+
+      // Rank bracket
+      ctx.font = "12px IBM Plex Mono, monospace";
+      const [bx, by] = world(73.5, 46.5);
+      ctx.fillStyle = "#8b9cb3";
+      ctx.fillText("same tick → rank 14 < 31", bx - 120, by);
+    }
+
+    draw();
+  </script>
+</body>
+</html>
