@@ -184,6 +184,7 @@ def main() -> None:
     from kaggle_environments import make
 
     from agent import agent
+    from orbit_wars_pt.interval_geometry_np import format_interval_aim_stats, reset_interval_aim_stats
     from orbit_wars_pt.kaggle_adapter import get_last_agent_call_timing
 
     def _agent_internal_timing_suffix(dt_wall: float) -> str:
@@ -272,6 +273,7 @@ def main() -> None:
     run_agent = _swapped_view_agent if args.swap_player_view else agent
     if args.timings:
         run_agent = _timed_agent(run_agent, show_internal=True)
+    reset_interval_aim_stats()
     env.run([run_agent, run_agent])
 
     record = {
@@ -283,6 +285,9 @@ def main() -> None:
     out_path = Path(args.out).expanduser()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(record, separators=(",", ":")), encoding="utf-8")
+    aim_report = format_interval_aim_stats()
+    if aim_report:
+        print(aim_report)
     print(f"saved {out_path} ({len(env.steps)} steps)")
 
 

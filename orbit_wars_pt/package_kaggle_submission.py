@@ -32,6 +32,7 @@ _SUBMISSION_PACKAGE_FILES = (
     "geometry.py",
     "interval_geometry_np.py",
     "orthogonal_geometry_np.py",
+    "tangent_geometry_np.py",
     "model.py",
     "kaggle_adapter.py",
 )
@@ -139,6 +140,8 @@ def package_submission(
     extra_env: dict[str, str] | None = None,
     source_pkg: Path | None = None,
     slim: bool = True,
+    target_method: str | None = None,
+    interval_geometry: str | None = None,
 ) -> Path:
     """Write a submission bundle directory; return its path."""
 
@@ -164,11 +167,17 @@ def package_submission(
         shutil.copy2(checkpoint_4p, bundle_dir / "checkpoint_4p.pt")
         shutil.copy2(checkpoint_2p, bundle_dir / "checkpoint_2p.pt")
     _copy_inference_package(bundle_dir / "orbit_wars_pt", source_pkg=source_pkg)
+    submission_env = dict(extra_env or {})
+    if target_method is not None:
+        submission_env["ORBIT_WARS_TARGET_METHOD"] = str(target_method)
+    if interval_geometry is not None:
+        submission_env["ORBIT_WARS_INTERVAL_GEOMETRY"] = str(interval_geometry)
+
     _write_main_py(
         bundle_dir / "main.py",
         device=device,
         greedy=greedy,
-        extra_env=extra_env or {},
+        extra_env=submission_env,
     )
 
     readme = textwrap.dedent(
@@ -180,6 +189,8 @@ def package_submission(
         2-player checkpoint: {checkpoint_2p.name} (copied to checkpoint_2p.pt)
         Greedy: {greedy}
         Device: {device}
+        Target method: {target_method or 'checkpoint/default'}
+        Interval geometry: {interval_geometry or 'checkpoint/default'}
 
         Policy selection: 4-player policy while two or more opponents are alive;
         switches to the 2-player policy as soon as only one opponent remains.
@@ -242,6 +253,24 @@ def main() -> None:
         help="Torch device written into main.py (default: cpu for Kaggle).",
     )
     parser.add_argument(
+        "--target-method",
+        choices=("rays", "interval"),
+        default=None,
+        help=(
+            "Bake ORBIT_WARS_TARGET_METHOD into main.py. "
+            "Use 'interval' for interval first-hit targeting; default leaves checkpoint/env behavior unchanged."
+        ),
+    )
+    parser.add_argument(
+        "--interval-geometry",
+        choices=("sampled", "orthogonal", "tangent"),
+        default=None,
+        help=(
+            "Bake ORBIT_WARS_INTERVAL_GEOMETRY into main.py. "
+            "Useful with --target-method interval; default leaves checkpoint/env behavior unchanged."
+        ),
+    )
+    parser.add_argument(
         "--keep-dir",
         action="store_true",
         help="When --out ends with .tar.gz, keep the extracted bundle directory beside the archive.",
@@ -261,6 +290,8 @@ def main() -> None:
         greedy=bool(args.greedy),
         device=str(args.device),
         slim=not args.no_slim,
+        target_method=args.target_method,
+        interval_geometry=args.interval_geometry,
     )
 
     bundle_dir, archive_path = _submission_paths(args.out.expanduser().resolve())

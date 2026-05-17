@@ -2,14 +2,16 @@
 
 Uses continuous angular intervals (union / subtract on the circle), sampled
 intra-tick hulls matching ``tick_hit_intervals_jax`` (``samples_per_span`` on
-radial tau windows — not a fixed ray grid).  Per-planet targets pick the
-**widest** feasible launch cone after occlusion, as in the JAX interval sweep.
+radial tau windows — not a fixed ray grid).  Per-planet targets (tangent /
+event sweep) aim at earliest-arrival headings from first-contact bearings,
+with an edge-hugging alternative when it shares the same hit tick.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from typing import Sequence
 
 import numpy as np
@@ -30,6 +32,7 @@ from orbit_wars_pt.geometry import (
 
 GEOM_EPS = 1e-5
 ANGLE_PAD = 1e-4
+AIM_INSIDE_EDGE_EPS = 1e-6
 LAUNCH_RIM_OFFSET = 0.1
 
 # Shelved: ``orthogonal_hit_circular_orbit`` (exact cos/sin motion). The env linearises
@@ -47,6 +50,52 @@ class OrthogonalHitEvent:
     angle_hi: float
     slot: int
     kind: str  # planet | sun
+    first_contact_angle: float = float("nan")
+
+
+@dataclass(slots=True)
+class IntervalAimStats:
+    planet_evals: int = 0
+    selected: Counter[str] = field(default_factory=Counter)
+    rejected: Counter[str] = field(default_factory=Counter)
+    all_rejected: Counter[str] = field(default_factory=Counter)
+
+    def note_rejected(self, label: str, reason: str) -> None:
+        self.rejected[f"{label}:{reason}"] += 1
+
+    def format_report(self) -> str:
+        if self.planet_evals <= 0:
+            return ""
+        lines = [
+            "[orbit_wars] interval aim breakdown",
+            f"  planet evaluations: {self.planet_evals}",
+        ]
+        if self.selected:
+            lines.append("  selected:")
+            for key, value in sorted(self.selected.items()):
+                lines.append(f"    {key}: {value}")
+        if self.rejected:
+            lines.append("  rejections:")
+            for key, value in sorted(self.rejected.items()):
+                lines.append(f"    {key}: {value}")
+        if self.all_rejected:
+            total_all = int(sum(self.all_rejected.values()))
+            lines.append(f"  all three rejected: {total_all}")
+            for key, value in sorted(self.all_rejected.items()):
+                lines.append(f"    {key}: {value}")
+        return "\n".join(lines)
+
+
+_INTERVAL_AIM_STATS = IntervalAimStats()
+
+
+def reset_interval_aim_stats() -> None:
+    global _INTERVAL_AIM_STATS
+    _INTERVAL_AIM_STATS = IntervalAimStats()
+
+
+def format_interval_aim_stats() -> str:
+    return _INTERVAL_AIM_STATS.format_report()
 
 
 def angle_in_intervals(
@@ -123,8 +172,12 @@ def set_subtract_cells(
     return cells
 
 
-def _angle_diff(a: float, ref: float) -> float:
-    return ref + ((a - ref + math.pi) % TAU - math.pi)
+def _signed_angle_delta(a: float, ref: float) -> float:
+    return ((a - ref + math.pi) % TAU) - math.pi
+
+
+def _unwrap_angle_near(a: float, ref: float) -> float:
+    return ref + _signed_angle_delta(a, ref)
 
 
 def _angular_hull_sampled(intervals: Sequence[AngleInterval]) -> list[AngleInterval]:
@@ -150,7 +203,11 @@ def _angular_hull_sampled(intervals: Sequence[AngleInterval]) -> list[AngleInter
         width = (iv.hi - iv.lo) % TAU
         mid = _norm_angle(iv.lo + 0.5 * width)
         shifted_pts.extend(
-            [_angle_diff(iv.lo, ref), _angle_diff(mid, ref), _angle_diff(iv.hi, ref)]
+            [
+                _unwrap_angle_near(iv.lo, ref),
+                _unwrap_angle_near(mid, ref),
+                _unwrap_angle_near(iv.hi, ref),
+            ]
         )
     hull_lo = min(shifted_pts) - ANGLE_PAD
     hull_hi = max(shifted_pts) + ANGLE_PAD
@@ -259,6 +316,256 @@ def _widest_cell_midpoint_and_width(
             best_w = w
             best_mid = _norm_angle(0.5 * (lo + hi))
     return best_mid, best_w
+
+
+def _cells_total_width(cells: Sequence[tuple[float, float]]) -> float:
+    return float(sum(max(0.0, hi - lo) for lo, hi in cells))
+
+
+def _event_first_contact_angle(event: OrthogonalHitEvent) -> float:
+    if math.isfinite(event.first_contact_angle):
+        return _norm_angle(float(event.first_contact_angle))
+    mid = _norm_angle(0.5 * (float(event.angle_lo) + float(event.angle_hi)))
+    return mid
+
+
+def _candidate_tick_single_planet(
+    theta: float | None,
+    *,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    p0_by_tick: np.ndarray,
+    p1_by_tick: np.ndarray,
+    radii: np.ndarray,
+    active_by_tick: np.ndarray,
+    slot: int,
+) -> tuple[float | None, int, str]:
+    if theta is None:
+        return None, -1, "absent"
+    tick = first_hit_tick_single_planet_raycast(
+        float(theta),
+        origin_xy,
+        origin_radius,
+        speed,
+        p0_by_tick[:, slot, :],
+        p1_by_tick[:, slot, :],
+        float(radii[slot]),
+        active_by_tick[:, slot],
+    )
+    if tick < 0:
+        return float(theta), -1, "tick_reject"
+    return float(theta), int(tick), "ok"
+
+
+def _closest_angle_in_cells(
+    theta: float,
+    cells: Sequence[tuple[float, float]],
+    *,
+    inside_eps: float = AIM_INSIDE_EDGE_EPS,
+) -> float | None:
+    """Nearest heading just inside the union of non-wrapping visible cells."""
+
+    if not cells:
+        return None
+    target = _norm_angle(theta)
+    best: float | None = None
+    best_d = float("inf")
+    for lo, hi in cells:
+        if hi - lo <= GEOM_EPS:
+            continue
+        inner_lo = lo + inside_eps
+        inner_hi = hi - inside_eps
+        if inner_lo <= inner_hi:
+            clamped = min(max(target, inner_lo), inner_hi)
+        else:
+            clamped = 0.5 * (lo + hi)
+        d = abs(_signed_angle_delta(clamped, target))
+        if d < best_d:
+            best_d = d
+            best = _norm_angle(clamped)
+    return best
+
+
+def _boundary_angle_inside(
+    lo: float,
+    hi: float,
+    bound: float,
+    *,
+    inside_eps: float = AIM_INSIDE_EDGE_EPS,
+) -> float:
+    if abs(bound - lo) <= abs(bound - hi):
+        inner = lo + inside_eps
+        if inner >= hi - inside_eps:
+            return _norm_angle(0.5 * (lo + hi))
+        return _norm_angle(inner)
+    inner = hi - inside_eps
+    if inner <= lo + inside_eps:
+        return _norm_angle(0.5 * (lo + hi))
+    return _norm_angle(inner)
+
+
+def _edge_angle_inside_furthest_on_side(
+    theta_fc: float,
+    cells: Sequence[tuple[float, float]],
+    *,
+    side: int,
+    inside_eps: float = AIM_INSIDE_EDGE_EPS,
+) -> float | None:
+    """Heading just inside the visible boundary farthest on one side of ``theta_fc``."""
+
+    if side not in (-1, 1):
+        raise ValueError("side must be -1 (right/cw) or +1 (left/ccw)")
+    if not cells:
+        return None
+
+    ref = _norm_angle(theta_fc)
+    best_bound: float | None = None
+    best_dist = -1.0
+    owner: tuple[float, float] | None = None
+    for lo, hi in cells:
+        if hi - lo <= inside_eps:
+            continue
+        for bound in (lo, hi):
+            delta = _signed_angle_delta(bound, ref)
+            if side * delta <= 0.0:
+                continue
+            dist = abs(delta)
+            if dist > best_dist:
+                best_dist = dist
+                best_bound = bound
+                owner = (lo, hi)
+    if best_bound is None or owner is None:
+        return None
+    lo, hi = owner
+    return _boundary_angle_inside(lo, hi, best_bound, inside_eps=inside_eps)
+
+
+def _pick_planet_aim_from_visible_cells(
+    cells: Sequence[tuple[float, float]],
+    first_contact_angle: float,
+    *,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    p0_by_tick: np.ndarray,
+    p1_by_tick: np.ndarray,
+    radii: np.ndarray,
+    active_by_tick: np.ndarray,
+    slot: int,
+) -> tuple[float | None, int, float]:
+    """Pick launch angle prioritising earliest planet hit tick, then edge precision."""
+
+    global _INTERVAL_AIM_STATS
+    _INTERVAL_AIM_STATS.planet_evals += 1
+    width = _cells_total_width(cells)
+    if width <= GEOM_EPS:
+        for label in ("primary", "edge_same_side", "edge_other_side"):
+            _INTERVAL_AIM_STATS.note_rejected(label, "no_visible_cells")
+        _INTERVAL_AIM_STATS.selected["none_all_three_rejected"] += 1
+        _INTERVAL_AIM_STATS.all_rejected["no_visible_cells"] += 1
+        return None, -1, 0.0
+
+    theta_fc = _norm_angle(first_contact_angle)
+    theta_primary = _closest_angle_in_cells(theta_fc, cells)
+    primary_angle, tick_primary, reason_primary = _candidate_tick_single_planet(
+        theta_primary,
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        p0_by_tick=p0_by_tick,
+        p1_by_tick=p1_by_tick,
+        radii=radii,
+        active_by_tick=active_by_tick,
+        slot=slot,
+    )
+    if reason_primary != "ok":
+        _INTERVAL_AIM_STATS.note_rejected("primary", reason_primary)
+
+    if theta_primary is None:
+        primary_side = 1
+    else:
+        primary_side = 1 if _signed_angle_delta(theta_primary, theta_fc) >= 0.0 else -1
+    secondary_side = -primary_side
+
+    edge_angles_by_label = {
+        "edge_same_side": _edge_angle_inside_furthest_on_side(theta_fc, cells, side=primary_side),
+        "edge_other_side": _edge_angle_inside_furthest_on_side(theta_fc, cells, side=secondary_side),
+    }
+
+    seen_angles: list[float] = []
+    candidate_results: dict[str, tuple[float | None, int, str]] = {"primary": (primary_angle, tick_primary, reason_primary)}
+    if primary_angle is not None:
+        seen_angles.append(float(primary_angle))
+    for label in ("edge_same_side", "edge_other_side"):
+        theta_edge = edge_angles_by_label[label]
+        if theta_edge is None:
+            candidate_results[label] = (None, -1, "absent")
+            _INTERVAL_AIM_STATS.note_rejected(label, "absent")
+            continue
+        if any(abs(_signed_angle_delta(theta_edge, prev)) <= AIM_INSIDE_EDGE_EPS for prev in seen_angles):
+            candidate_results[label] = (float(theta_edge), -1, "duplicate_angle")
+            _INTERVAL_AIM_STATS.note_rejected(label, "duplicate_angle")
+            continue
+        edge_angle, tick_edge, reason_edge = _candidate_tick_single_planet(
+            theta_edge,
+            origin_xy=origin_xy,
+            origin_radius=origin_radius,
+            speed=speed,
+            p0_by_tick=p0_by_tick,
+            p1_by_tick=p1_by_tick,
+            radii=radii,
+            active_by_tick=active_by_tick,
+            slot=slot,
+        )
+        candidate_results[label] = (edge_angle, tick_edge, reason_edge)
+        seen_angles.append(float(theta_edge))
+        if reason_edge != "ok":
+            _INTERVAL_AIM_STATS.note_rejected(label, reason_edge)
+
+    if reason_primary == "ok":
+        for label in ("edge_same_side", "edge_other_side"):
+            edge_angle, tick_edge, reason_edge = candidate_results[label]
+            if reason_edge == "ok" and tick_edge == tick_primary:
+                _INTERVAL_AIM_STATS.selected[label] += 1
+                return float(edge_angle), int(tick_edge), width
+        _INTERVAL_AIM_STATS.selected["primary"] += 1
+        return float(primary_angle), int(tick_primary), width
+
+    edge_valid = [
+        label
+        for label in ("edge_same_side", "edge_other_side")
+        if candidate_results[label][2] == "ok"
+    ]
+    reason_all = "primary_invalid_with_edge_valid" if edge_valid else "all_three_rejected"
+    if not edge_valid:
+        reasons = []
+        for label in ("primary", "edge_same_side", "edge_other_side"):
+            reasons.append(f"{label}={candidate_results[label][2]}")
+        _INTERVAL_AIM_STATS.all_rejected[" ".join(reasons)] += 1
+    _INTERVAL_AIM_STATS.selected[f"none_{reason_all}"] += 1
+    return None, -1, 0.0
+
+
+def _first_contact_bearing_at_enter(
+    origin: np.ndarray,
+    launch_off: float,
+    grow_rate: float,
+    t_enter: float,
+    circle_center: np.ndarray,
+    circle_radius: float,
+) -> float:
+    """External tangent bearing at window entry (tangent first-contact time)."""
+
+    from orbit_wars_pt.tangent_geometry_np import intersection_angles_from_grow_center
+
+    gr = float(launch_off) + float(grow_rate) * float(t_enter)
+    c = np.asarray(circle_center, dtype=np.float64)
+    q = c - np.asarray(origin, dtype=np.float64)
+    angs = intersection_angles_from_grow_center(q, float(circle_radius), gr)
+    if angs is not None:
+        return _norm_angle(float(angs[0]))
+    return _norm_angle(math.atan2(q[1], q[0]))
 
 
 def sweep_interval_best_targets(
@@ -749,6 +1056,13 @@ def collect_tangent_hit_events(
                 continue
             a_lo = float(ext["min"]["angle"])
             a_hi = float(ext["max"]["angle"])
+            if stationary_center is not None:
+                c_enter = np.asarray(stationary_center, dtype=np.float64)
+            else:
+                c_enter = np.asarray(center_at(t_enter), dtype=np.float64)
+            fc = _first_contact_bearing_at_enter(
+                origin, launch_off, v, t_enter, c_enter, r
+            )
             events.append(
                 OrthogonalHitEvent(
                     float(t_enter),
@@ -756,6 +1070,7 @@ def collect_tangent_hit_events(
                     _norm_angle(a_hi),
                     slot,
                     kind,
+                    fc,
                 )
             )
 
@@ -1153,7 +1468,11 @@ def sweep_interval_best_targets_from_events(
     radii: np.ndarray | None = None,
     active_by_tick: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, np.ndarray]:
-    """Occlusion sweep over events sorted by ``floor(t)`` then collision rank."""
+    """Occlusion sweep over events sorted by ``floor(t)`` then collision rank.
+
+    Per-planet aim uses first-contact bearing (clamped to post-occlusion cells), then
+    optional edge-hugging heading when it hits on the same discrete tick.
+    """
 
     from orbit_wars_pt.orthogonal_geometry_np import cone_to_angle_intervals
 
@@ -1167,16 +1486,47 @@ def sweep_interval_best_targets_from_events(
     best_tick = np.full((num_planets,), -1, dtype=np.int32)
     overflow = False
     origin = None if origin_xy is None else np.asarray(origin_xy, dtype=np.float64)
+    can_aim = (
+        origin is not None
+        and p0_by_tick is not None
+        and p1_by_tick is not None
+        and radii is not None
+        and active_by_tick is not None
+    )
 
     for event in sorted_events:
         hit = cone_to_angle_intervals(event.angle_lo, event.angle_hi)
         if event.kind == "planet" and 0 <= event.slot < num_planets:
             cells = set_subtract_cells(hit, blocked)
-            mid, width = _widest_cell_midpoint_and_width(cells)
-            if mid is not None and width > best_width[event.slot]:
-                best_width[event.slot] = width
-                best_angle[event.slot] = mid
-                best_tick[event.slot] = 0
+            if can_aim:
+                aim, tick, width = _pick_planet_aim_from_visible_cells(
+                    cells,
+                    _event_first_contact_angle(event),
+                    origin_xy=origin,
+                    origin_radius=origin_radius,
+                    speed=speed,
+                    p0_by_tick=p0_by_tick,
+                    p1_by_tick=p1_by_tick,
+                    radii=radii,
+                    active_by_tick=active_by_tick,
+                    slot=int(event.slot),
+                )
+            else:
+                aim, tick, width = None, -1, 0.0
+                mid, w = _widest_cell_midpoint_and_width(cells)
+                if mid is not None:
+                    aim, tick, width = float(mid), 0, w
+            if aim is not None and tick >= 0:
+                slot = int(event.slot)
+                prev = int(best_tick[slot])
+                if (
+                    prev < 0
+                    or tick < prev
+                    or (tick == prev and width > best_width[slot])
+                ):
+                    best_width[slot] = width
+                    best_angle[slot] = aim
+                    best_tick[slot] = tick
         blocked = union_angle_intervals([*blocked, *hit])
 
     if include_board and origin is not None:
@@ -1186,26 +1536,7 @@ def sweep_interval_best_targets_from_events(
             )
             blocked = union_angle_intervals([*blocked, *b_hit])
 
-    valid = best_width > GEOM_EPS
-    if (
-        origin is not None
-        and p0_by_tick is not None
-        and p1_by_tick is not None
-        and radii is not None
-        and active_by_tick is not None
-    ):
-        _refine_planet_hit_ticks_single_rays(
-            best_angle,
-            best_tick,
-            valid,
-            origin_xy=origin,
-            origin_radius=origin_radius,
-            speed=speed,
-            p0_by_tick=p0_by_tick,
-            p1_by_tick=p1_by_tick,
-            radii=radii,
-            active_by_tick=active_by_tick,
-        )
+    valid = (best_width > GEOM_EPS) & (best_tick >= 0)
     return (
         best_angle.astype(np.float32),
         best_width.astype(np.float32),

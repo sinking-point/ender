@@ -794,8 +794,13 @@ def _as_array(rows: Any, width: int) -> np.ndarray:
     return arr.astype(np.float32, copy=False)
 
 
-def _place_rows_by_id(rows: np.ndarray, width: int) -> tuple[np.ndarray, np.ndarray, dict[int, int]]:
-    table = np.zeros((MAX_PLANETS, width), dtype=np.float32)
+def _place_rows_by_id(
+    rows: np.ndarray,
+    width: int,
+    *,
+    dtype: np.dtype | type[np.floating] = np.float32,
+) -> tuple[np.ndarray, np.ndarray, dict[int, int]]:
+    table = np.zeros((MAX_PLANETS, width), dtype=dtype)
     active = np.zeros((MAX_PLANETS,), dtype=np.bool_)
     id_to_slot: dict[int, int] = {}
     next_free = 0
@@ -1023,7 +1028,7 @@ def _next_planet_positions(
     new_pos = old_pos.copy()
 
     init_pos = initial_planets[:, PLANET_X : PLANET_Y + 1]
-    delta = init_pos - np.asarray([CENTER, CENTER], dtype=np.float32)
+    delta = init_pos - np.asarray([CENTER, CENTER], dtype=np.float64)
     orbital_r = np.linalg.norm(delta, axis=1)
     initial_angle = np.arctan2(delta[:, 1], delta[:, 0])
     rotating = planet_active & initial_active & (orbital_r + planets[:, PLANET_RADIUS] < ROTATION_RADIUS_LIMIT)
@@ -1098,13 +1103,14 @@ def _forecast_incoming_fleets(
     if per_fleet_arrival is not None:
         per_fleet_arrival[...] = -1
 
-    positions = fleets_in[:, 2:4].astype(np.float32, copy=True)
+    # float64 matches Kaggle orbit_wars.py fleet[2/3] += cos/sin * speed (Python float).
+    positions = fleets_in[:, 2:4].astype(np.float64, copy=True)
     alive = np.ones((len(fleets_in),), dtype=np.bool_)
-    angles = fleets_in[:, 4].astype(np.float32, copy=False)
+    angles = fleets_in[:, 4].astype(np.float64, copy=False)
     owners = fleets_in[:, 1].astype(np.int32, copy=False)
-    ships = np.floor(fleets_in[:, 6].astype(np.float32, copy=False))
-    dirs = np.stack([np.cos(angles), np.sin(angles)], axis=1).astype(np.float32)
-    speeds = np.asarray([_fleet_speed(float(s), ship_speed) for s in ships], dtype=np.float32)
+    ships = np.floor(fleets_in[:, 6].astype(np.float64, copy=False))
+    dirs = np.stack([np.cos(angles), np.sin(angles)], axis=1).astype(np.float64)
+    speeds = np.asarray([_fleet_speed(float(s), ship_speed) for s in ships], dtype=np.float64)
 
     p = planets.copy()
     pa = planet_active.copy()
@@ -1152,7 +1158,7 @@ def _forecast_incoming_fleets(
                     per_fleet_arrival[f, 1] = t
                 alive[f] = False
             else:
-                if _point_to_segment_distance(np.asarray([CENTER, CENTER], dtype=np.float32), a0, a1) < SUN_RADIUS:
+                if _point_to_segment_distance(np.asarray([CENTER, CENTER], dtype=np.float64), a0, a1) < SUN_RADIUS:
                     alive[f] = False
                     continue
                 if a1[0] < 0.0 or a1[0] > BOARD_SIZE or a1[1] < 0.0 or a1[1] > BOARD_SIZE:
@@ -2224,10 +2230,26 @@ def observation_to_state(
     """
 
     planets_in = _as_array(obs.get("planets", []), 7)
+    planets_forecast_in = np.asarray(obs.get("planets", []), dtype=np.float64)
+    if planets_forecast_in.size == 0:
+        planets_forecast_in = np.zeros((0, 7), dtype=np.float64)
+    else:
+        planets_forecast_in = planets_forecast_in.reshape((-1, 7))
     planets, planet_active, id_to_slot = _place_rows_by_id(planets_in, 7)
+    planets_forecast, _planet_active_forecast, _ = _place_rows_by_id(
+        planets_forecast_in,
+        7,
+        dtype=np.float64,
+    )
 
     initial_in = _as_array(obs.get("initial_planets", []), 7)
+    initial_forecast_in = np.asarray(obs.get("initial_planets", []), dtype=np.float64)
+    if initial_forecast_in.size == 0:
+        initial_forecast_in = np.zeros((0, 7), dtype=np.float64)
+    else:
+        initial_forecast_in = initial_forecast_in.reshape((-1, 7))
     initial_planets = np.zeros((MAX_PLANETS, 7), dtype=np.float32)
+    initial_planets_forecast = np.zeros((MAX_PLANETS, 7), dtype=np.float64)
     initial_active = np.zeros((MAX_PLANETS,), dtype=np.bool_)
     for row in initial_in[:MAX_PLANETS]:
         pid = int(row[0])
@@ -2235,13 +2257,24 @@ def observation_to_state(
         if 0 <= slot < MAX_PLANETS:
             initial_planets[slot, :7] = row[:7]
             initial_active[slot] = True
+    for row in initial_forecast_in[:MAX_PLANETS]:
+        pid = int(row[0])
+        slot = id_to_slot.get(pid, pid if 0 <= pid < MAX_PLANETS else -1)
+        if 0 <= slot < MAX_PLANETS:
+            initial_planets_forecast[slot, :7] = row[:7]
 
     # Comets can be present in planets without being present in initial_planets.
     missing_initial = planet_active & ~initial_active
     initial_planets[missing_initial] = planets[missing_initial]
+    initial_planets_forecast[missing_initial] = planets_forecast[missing_initial]
     initial_active[missing_initial] = True
 
     fleets_in = _as_array(obs.get("fleets", []), 7)
+    fleets_forecast_in = np.asarray(obs.get("fleets", []), dtype=np.float64)
+    if fleets_forecast_in.size == 0:
+        fleets_forecast_in = np.zeros((0, 7), dtype=np.float64)
+    else:
+        fleets_forecast_in = fleets_forecast_in.reshape((-1, 7))
     max_fleets = max(int(max_fleets), len(fleets_in) + DEFAULT_MAX_ACTIONS)
     fleets = np.zeros((max_fleets, FLEET_ROW_WIDTH), dtype=np.float32)
     fleet_active = np.zeros((max_fleets,), dtype=np.bool_)
@@ -2259,6 +2292,7 @@ def observation_to_state(
     num_agents = max(num_agents, int(obs.get("player", 0)) + 1, 2)
 
     comet_paths = np.zeros((MAX_COMET_GROUPS, 4, MAX_COMET_PATH, 2), dtype=np.float32)
+    comet_paths_forecast = np.zeros((MAX_COMET_GROUPS, 4, MAX_COMET_PATH, 2), dtype=np.float64)
     comet_path_lengths = np.zeros((MAX_COMET_GROUPS, 4), dtype=np.int32)
     comet_ships = np.zeros((MAX_COMET_GROUPS,), dtype=np.float32)
     comet_group_active = np.zeros((MAX_COMET_GROUPS,), dtype=np.bool_)
@@ -2277,8 +2311,10 @@ def observation_to_state(
             comet_slots[g, k] = id_to_slot.get(pid, -1)
         for k, path in enumerate(paths):
             p = np.asarray(path, dtype=np.float32).reshape((-1, 2))
+            p_forecast = np.asarray(path, dtype=np.float64).reshape((-1, 2))
             n = min(len(p), MAX_COMET_PATH)
             comet_paths[g, k, :n] = p[:n]
+            comet_paths_forecast[g, k, :n] = p_forecast[:n]
             comet_path_lengths[g, k] = n
         slot0 = comet_slots[g, 0]
         if 0 <= slot0 < MAX_PLANETS:
@@ -2288,12 +2324,12 @@ def observation_to_state(
     step_count = int(step_count_override if step_count_override is not None else obs.get("step", obs.get("step_count", 0)))
     planet_collision_rank = _planet_collision_rank_from_obs(planets_in, id_to_slot)
     incoming_fleets = _forecast_incoming_fleets(
-        planets,
+        planets_forecast,
         planet_active,
-        initial_planets,
+        initial_planets_forecast,
         initial_active,
-        fleets_in,
-        comet_paths,
+        fleets_forecast_in,
+        comet_paths_forecast,
         comet_path_lengths,
         comet_group_active,
         comet_path_index,
