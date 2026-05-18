@@ -1921,6 +1921,12 @@ def _sweep_interval_from_geometry(
     *,
     target_timing: Optional[MicroTargetTiming],
     refine_boundaries: bool,
+    game_step: int = -1,
+    micro_idx: int = -1,
+    ego_player: int = -1,
+    frac_idx: int = -1,
+    phase: str | None = None,
+    selected_target_slot: int = -1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     from orbit_wars_pt.interval_geometry_np import (
         sweep_interval_best_targets,
@@ -1944,6 +1950,15 @@ def _sweep_interval_from_geometry(
                 active_by_tick=geom.active_by_tick,
                 occlusion_cache=geom.occlusion_cache,
                 refine_boundaries=refine_boundaries,
+                debug_context={
+                    "phase": phase,
+                    "game_step": int(game_step),
+                    "ego_player": int(ego_player),
+                    "origin_slot": int(geom.origin_idx),
+                    "frac_idx": int(frac_idx),
+                    "micro_idx": int(micro_idx),
+                    "selected_target_slot": int(selected_target_slot),
+                },
             )
         )
     else:
@@ -2126,8 +2141,11 @@ def _interval_targets_np(
     run_raycast_check: bool = False,
     game_step: int = -1,
     micro_idx: int = -1,
+    ego_player: int = -1,
     launch_geometry: LaunchGeometryInputs | None = None,
     refine_boundaries: bool = True,
+    phase: str | None = None,
+    selected_target_slot: int = -1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Interval first-hit targets (``first_hit_interval_best_targets_apply_jax`` semantics)."""
 
@@ -2151,6 +2169,12 @@ def _interval_targets_np(
         int(planets.shape[0]),
         target_timing=target_timing,
         refine_boundaries=refine_boundaries,
+        game_step=game_step,
+        micro_idx=micro_idx,
+        ego_player=ego_player,
+        frac_idx=frac_idx,
+        phase=phase,
+        selected_target_slot=selected_target_slot,
     )
 
     hit_tick = np.where(valid, hit_tick_i.astype(np.float32), 0.0).astype(np.float32)
@@ -2201,8 +2225,11 @@ def _first_hit_targets_np(
     target_timing: Optional[MicroTargetTiming] = None,
     game_step: int = -1,
     micro_idx: int = -1,
+    ego_player: int = -1,
     launch_geometry: LaunchGeometryInputs | None = None,
     refine_boundaries: bool = True,
+    phase: str | None = None,
+    selected_target_slot: int = -1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if target_timing is not None:
         target_timing.calls += 1
@@ -2219,8 +2246,11 @@ def _first_hit_targets_np(
             run_raycast_check=_check_interval_raycast_enabled(),
             game_step=game_step,
             micro_idx=micro_idx,
+            ego_player=ego_player,
             launch_geometry=launch_geometry,
             refine_boundaries=refine_boundaries,
+            phase=phase,
+            selected_target_slot=selected_target_slot,
         )
     return _raycast_targets_np(
         state,
@@ -2271,8 +2301,11 @@ def _refine_interval_launches_in_place(
                 target_timing=None,
                 game_step=int(game_step),
                 micro_idx=int(planned.micro_idx),
+                ego_player=int(ego_player),
                 launch_geometry=launch_geometry,
                 refine_boundaries=True,
+                phase="submit_refine",
+                selected_target_slot=int(planned.target_slot),
             )
 
             if bool(ray_valid[planned.target_slot]):
@@ -2499,8 +2532,10 @@ def _build_turn_actions_torch_only(
             target_timing=target_timing,
             game_step=int(game_step),
             micro_idx=int(micro_idx),
+            ego_player=int(ego_player),
             launch_geometry=launch_geometry,
             refine_boundaries=False,
+            phase="microstep",
         )
         if timing is not None:
             timing.micro_raycast_s += perf_counter() - t0

@@ -10,6 +10,7 @@ with an edge-hugging alternative when it shares the same hit tick.
 from __future__ import annotations
 
 import math
+import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Sequence
@@ -1136,7 +1137,7 @@ def _polish_boundary_ground_truth(
         ):
             keep = float(probe)
         reject: float | None = None
-        step = max(abs(owner_cell[1] - owner_cell[0]), np.spacing(max(1.0, abs(probe))))
+        step = 1e-3
         for _ in range(80):
             cand = float(probe + outward_dir * step)
             if not _target_hit_with_hint_at_angle(
@@ -1230,7 +1231,7 @@ def _polish_boundary_ground_truth(
     if probe_sig != target_sig:
         reject = float(probe)
     else:
-        step = max(abs(owner_cell[1] - owner_cell[0]), np.spacing(max(1.0, abs(probe))))
+        step = 1e-3
         for _ in range(80):
             cand = float(probe + outward_dir * step)
             cand_sig = _local_first_hit_signature_at_angle(
@@ -1449,6 +1450,7 @@ def _pick_planet_aim_from_visible_cells(
     active_by_tick: np.ndarray,
     slot: int,
     object_order: Sequence[int],
+    debug_context: dict[str, Any] | None = None,
 ) -> tuple[float | None, int, float]:
     """Pick launch angle prioritising earliest planet hit tick, then edge precision."""
 
@@ -1567,6 +1569,42 @@ def _pick_planet_aim_from_visible_cells(
         seen_angles.append(float(theta_edge))
         if reason_edge != "ok":
             _INTERVAL_AIM_STATS.note_rejected(label, reason_edge)
+
+    if reason_primary != "ok":
+        edge_debug = []
+        for label in ("edge_same_side", "edge_other_side"):
+            edge_angle, tick_edge, reason_edge = candidate_results[label]
+            edge_debug.append(
+                f"{label}=(angle={edge_angle!r}, tick={tick_edge}, reason={reason_edge})"
+            )
+        ctx = debug_context or {}
+        ctx_parts: list[str] = []
+        for key in (
+            "phase",
+            "game_step",
+            "ego_player",
+            "origin_slot",
+            "frac_idx",
+            "micro_idx",
+            "selected_target_slot",
+        ):
+            if key not in ctx:
+                continue
+            value = ctx[key]
+            if isinstance(value, int) and value < 0:
+                continue
+            if value is None:
+                continue
+            ctx_parts.append(f"{key}={value!r}")
+        msg = (
+            "[orbit_wars] primary interval aim invalid"
+            + (f"\n  context: {' '.join(ctx_parts)}" if ctx_parts else "")
+            + f"\n  slot={slot} first_contact_angle={theta_fc!r}"
+            + f"\n  cells={list(cells)!r}"
+            + f"\n  primary=(angle={primary_angle!r}, tick={tick_primary}, reason={reason_primary})"
+            + f"\n  {' '.join(edge_debug)}"
+        )
+        print(msg, file=sys.stderr, flush=True)
 
     if reason_primary == "ok":
         for label in ("edge_same_side", "edge_other_side"):
@@ -2514,6 +2552,7 @@ def sweep_interval_best_targets_from_events(
     active_by_tick: np.ndarray | None = None,
     occlusion_cache: "OcclusionWalkCache" | None = None,
     refine_boundaries: bool = True,
+    debug_context: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, np.ndarray]:
     """Occlusion sweep over events sorted by ``floor(t)`` then collision rank.
 
@@ -2560,6 +2599,7 @@ def sweep_interval_best_targets_from_events(
                     active_by_tick=active_by_tick,
                     slot=int(event.slot),
                     object_order=order,
+                    debug_context=debug_context,
                 )
             else:
                 aim, tick, width = None, -1, 0.0
