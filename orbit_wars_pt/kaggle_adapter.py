@@ -712,6 +712,49 @@ def _warn_unmatched_fleet_enabled() -> bool:
     return os.environ.get("ORBIT_WARS_WARN_OOB_LAUNCHES", "1").lower() not in {"0", "false", "no", "off"}
 
 
+def _adapter_sanity_warnings_enabled() -> bool:
+    return os.environ.get("ORBIT_WARS_WARN_ADAPTER_SANITY", "1").lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _adapter_warn_once(seen: set[str], key: str, msg: str) -> None:
+    if not _adapter_sanity_warnings_enabled() or key in seen:
+        return
+    seen.add(key)
+    print(f"[orbit_wars:adapter-warning] {msg}", file=sys.stderr, flush=True)
+
+
+def _policy_feature_dim(policy: OrbitWarsPolicy) -> int:
+    return int(policy.feat_proj.in_features)
+
+
+def _raw_rows(obs: Mapping[str, Any], name: str, width: int) -> np.ndarray:
+    raw = obs.get(name, [])
+    arr = np.asarray(raw, dtype=np.float64)
+    if arr.size == 0:
+        return np.zeros((0, width), dtype=np.float64)
+    try:
+        return arr.reshape((-1, width))
+    except ValueError:
+        return np.zeros((0, width), dtype=np.float64)
+
+
+def _warn_greedy_bool_4p(greedy: bool | Mapping[int, bool], seen: set[str], context: str) -> None:
+    if isinstance(greedy, Mapping) or not bool(greedy):
+        return
+    _adapter_warn_once(
+        seen,
+        f"{context}:greedy-bool-p23",
+        "greedy=True currently normalizes only players 0 and 1; "
+        f"context={context} players 2 and 3 will use the adapter fallback unless set explicitly "
+        "with a per-player mapping or ORBIT_WARS_GREEDY_P2/P3",
+    )
+
+
 @dataclass
 class MicroTargetTiming:
     """Breakdown of ``micro_raycast`` (first-hit target selection: rays vs interval)."""
@@ -825,6 +868,125 @@ def _cfg_get(config: Any, name: str, default: Any) -> Any:
     if isinstance(config, Mapping):
         return config.get(name, default)
     return getattr(config, name, default)
+
+
+def _check_4p_adapter_sanity(
+    *,
+    obs: Mapping[str, Any],
+    config: Any,
+    state: OrbitWarsState,
+    ego_player: int,
+    step_count: int,
+    policy: OrbitWarsPolicy,
+    policy_player_count: int,
+    seen: set[str],
+    context: str,
+    use_4p_policy: Optional[bool] = None,
+    live_opponents: Optional[int] = None,
+) -> None:
+    """Warn about 4p-only adapter mismatches without changing inference behavior."""
+
+    num_agents = int(np.asarray(state.num_agents))
+    cfg_agents = int(_cfg_get(config, "agentCount", num_agents))
+    if max(num_agents, cfg_agents, policy_player_count) <= 2:
+        return
+
+    policy_fd = _policy_feature_dim(policy)
+    expected_fd = obs_feature_dim_for_num_agents(policy_player_count)
+    if policy_fd != expected_fd:
+        _adapter_warn_once(
+            seen,
+            f"{context}:feature-dim:{policy_fd}:{expected_fd}:{policy_player_count}",
+            "policy feature width does not match adapter observation width "
+            f"context={context} ego={ego_player} step={step_count} "
+            f"policy_feature_dim={policy_fd} expected_feature_dim={expected_fd} "
+            f"policy_player_count={policy_player_count} state_num_agents={num_agents}",
+        )
+
+    if cfg_agents != num_agents:
+        _adapter_warn_once(
+            seen,
+            f"{context}:agent-count:{cfg_agents}:{num_agents}",
+            "config agentCount differs from reconstructed state.num_agents "
+            f"context={context} ego={ego_player} step={step_count} "
+            f"config_agentCount={cfg_agents} state_num_agents={num_agents}",
+        )
+
+    if policy_player_count != num_agents and use_4p_policy is not False:
+        _adapter_warn_once(
+            seen,
+            f"{context}:policy-player-count:{policy_player_count}:{num_agents}",
+            "4p adapter is using a policy_player_count different from reconstructed state.num_agents "
+            f"context={context} ego={ego_player} step={step_count} "
+            f"policy_player_count={policy_player_count} state_num_agents={num_agents}",
+        )
+
+    incoming = np.asarray(state.incoming_fleets)
+    if incoming.shape[0] != num_agents:
+        _adapter_warn_once(
+            seen,
+            f"{context}:incoming-shape:{incoming.shape[0]}:{num_agents}",
+            "incoming_fleets owner plane count differs from reconstructed state.num_agents "
+            f"context={context} ego={ego_player} step={step_count} "
+            f"incoming_planes={incoming.shape[0]} state_num_agents={num_agents}",
+        )
+
+    planets_in = _raw_rows(obs, "planets", 7)
+    if planets_in.size:
+        owners = planets_in[:, 1].astype(np.int32)
+        bad = owners[(owners >= num_agents) | (owners < -1)]
+        if bad.size:
+            _adapter_warn_once(
+                seen,
+                f"{context}:bad-planet-owner:{int(bad[0])}:{num_agents}",
+                "Kaggle planet owner id is outside expected player range "
+                f"context={context} ego={ego_player} step={step_count} "
+                f"owner={int(bad[0])} state_num_agents={num_agents}",
+            )
+
+    fleets_in = _raw_rows(obs, "fleets", 7)
+    if fleets_in.size:
+        fleet_owners = fleets_in[:, FLEET_OWNER].astype(np.int32)
+        bad_fleet = fleet_owners[(fleet_owners < 0) | (fleet_owners >= num_agents)]
+        if bad_fleet.size:
+            _adapter_warn_once(
+                seen,
+                f"{context}:bad-fleet-owner:{int(bad_fleet[0])}:{num_agents}",
+                "Kaggle fleet owner id is outside expected player range "
+                f"context={context} ego={ego_player} step={step_count} "
+                f"owner={int(bad_fleet[0])} state_num_agents={num_agents}",
+            )
+        visible_valid_owners = set(int(x) for x in fleet_owners if 0 <= int(x) < num_agents)
+        missing_planes = [
+            owner
+            for owner in visible_valid_owners
+            if owner < incoming.shape[0] and float(np.asarray(incoming[owner]).sum()) <= 0.0
+        ]
+        if len(visible_valid_owners) >= 2 and len(missing_planes) == len(visible_valid_owners):
+            _adapter_warn_once(
+                seen,
+                f"{context}:all-visible-fleet-owners-no-incoming:{num_agents}",
+                "visible 4p fleets produced no forecast incoming bins for any visible fleet owner "
+                f"context={context} ego={ego_player} step={step_count} "
+                f"visible_fleet_owners={sorted(visible_valid_owners)} "
+                f"state_num_agents={num_agents}",
+            )
+
+    if use_4p_policy is not None and live_opponents is not None:
+        if live_opponents >= 2 and not use_4p_policy:
+            _adapter_warn_once(
+                seen,
+                f"{context}:unexpected-2p-switch:{live_opponents}",
+                "dual-policy adapter selected 2p policy while two or more opponents appear live "
+                f"context={context} ego={ego_player} step={step_count} live_opponents={live_opponents}",
+            )
+        if live_opponents < 2 and use_4p_policy:
+            _adapter_warn_once(
+                seen,
+                f"{context}:unexpected-4p-switch:{live_opponents}",
+                "dual-policy adapter selected 4p policy with fewer than two live opponents "
+                f"context={context} ego={ego_player} step={step_count} live_opponents={live_opponents}",
+            )
 
 
 def _configure_cpu_threads() -> None:
@@ -2994,6 +3156,8 @@ class KaggleOrbitWarsAgent:
         # so a single shared ``KaggleOrbitWarsAgent`` (``agent()``) still builds the correct state.
         self._last_env_step: Optional[int] = None
         self._last_call_timing: Optional[KaggleAgentCallTiming] = None
+        self._sanity_warnings: set[str] = set()
+        self._greedy_bool_true = (not isinstance(greedy, Mapping)) and bool(greedy)
         warn_oob = os.environ.get("ORBIT_WARS_WARN_OOB_LAUNCHES", "1").lower() not in {"0", "false", "no", "off"}
         self.launch_tracker = FleetLaunchDebugTracker(
             warn_oob=warn_oob,
@@ -3043,9 +3207,25 @@ class KaggleOrbitWarsAgent:
             self._last_env_step = None
 
         if self._last_env_step is not None:
+            ego = int(obs.get("player", 0))
+            if ego >= 2:
+                _adapter_warn_once(
+                    self._sanity_warnings,
+                    f"single:missing-step-mirrored:ego{ego}",
+                    "Kaggle observation omitted step for player >=2; reusing last observed env step "
+                    f"context=single ego={ego} reused_step={int(self._last_env_step)}",
+                )
             return int(self._last_env_step)
 
         step_count = self._next_step_count
+        ego = int(obs.get("player", 0))
+        if ego >= 2:
+            _adapter_warn_once(
+                self._sanity_warnings,
+                f"single:missing-step-inferred:ego{ego}",
+                "Kaggle observation omitted step for player >=2 and no prior step was available; "
+                f"context=single ego={ego} inferred_step={step_count}",
+            )
         self._next_step_count += 1
         return step_count
 
@@ -3086,6 +3266,19 @@ class KaggleOrbitWarsAgent:
             game_step=step_count,
             ego_player=ego_player,
         )
+        _check_4p_adapter_sanity(
+            obs=obs,
+            config=config,
+            state=state,
+            ego_player=ego_player,
+            step_count=step_count,
+            policy=self.policy,
+            policy_player_count=int(np.asarray(state.num_agents)),
+            seen=self._sanity_warnings,
+            context="single",
+        )
+        if self._greedy_bool_true and int(np.asarray(state.num_agents)) > 2:
+            _warn_greedy_bool_4p(True, self._sanity_warnings, "single")
         actions = _build_turn_actions_torch_only(
             self.policy,
             state,
@@ -3179,6 +3372,8 @@ class KaggleOrbitWarsDualPolicyAgent:
         self._next_step_count = 0
         self._last_env_step: Optional[int] = None
         self._last_call_timing: Optional[KaggleAgentCallTiming] = None
+        self._sanity_warnings: set[str] = set()
+        self._greedy_bool_true = (not isinstance(greedy, Mapping)) and bool(greedy)
         warn_oob = os.environ.get("ORBIT_WARS_WARN_OOB_LAUNCHES", "1").lower() not in {"0", "false", "no", "off"}
         self.launch_tracker = FleetLaunchDebugTracker(
             warn_oob=warn_oob,
@@ -3222,9 +3417,25 @@ class KaggleOrbitWarsDualPolicyAgent:
             self._last_env_step = None
 
         if self._last_env_step is not None:
+            ego = int(obs.get("player", 0))
+            if ego >= 2:
+                _adapter_warn_once(
+                    self._sanity_warnings,
+                    f"dual:missing-step-mirrored:ego{ego}",
+                    "Kaggle observation omitted step for player >=2; reusing last observed env step "
+                    f"context=dual ego={ego} reused_step={int(self._last_env_step)}",
+                )
             return int(self._last_env_step)
 
         step_count = self._next_step_count
+        ego = int(obs.get("player", 0))
+        if ego >= 2:
+            _adapter_warn_once(
+                self._sanity_warnings,
+                f"dual:missing-step-inferred:ego{ego}",
+                "Kaggle observation omitted step for player >=2 and no prior step was available; "
+                f"context=dual ego={ego} inferred_step={step_count}",
+            )
         self._next_step_count += 1
         return step_count
 
@@ -3269,6 +3480,21 @@ class KaggleOrbitWarsDualPolicyAgent:
         use_4p_policy = live_opponents >= 2
         policy = self.policy_4p if use_4p_policy else self.policy_2p
         policy_player_count = int(np.asarray(state.num_agents)) if use_4p_policy else 2
+        _check_4p_adapter_sanity(
+            obs=obs,
+            config=config,
+            state=state,
+            ego_player=ego_player,
+            step_count=step_count,
+            policy=policy,
+            policy_player_count=policy_player_count,
+            seen=self._sanity_warnings,
+            context="dual",
+            use_4p_policy=use_4p_policy,
+            live_opponents=live_opponents,
+        )
+        if self._greedy_bool_true and int(np.asarray(state.num_agents)) > 2:
+            _warn_greedy_bool_4p(True, self._sanity_warnings, "dual")
         actions = _build_turn_actions_torch_only(
             policy,
             state,
