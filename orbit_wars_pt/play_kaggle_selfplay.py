@@ -37,6 +37,13 @@ def main() -> None:
         help="Policy checkpoint path used by orbit_wars_pt.kaggle_adapter.agent.",
     )
     parser.add_argument(
+        "--num-agents",
+        type=int,
+        default=2,
+        choices=(2, 4),
+        help="Run a 2-player duel or 4-player FFA self-play episode.",
+    )
+    parser.add_argument(
         "--out",
         type=str,
         default="kaggle_selfplay_record.json",
@@ -54,8 +61,8 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "Use argmax action selection for both players (unless overridden by "
-            "--greedy-p0 / --greedy-p1)."
+            "Use argmax action selection for all players unless overridden by "
+            "--greedy-p0 / --greedy-p1 / --greedy-p2 / --greedy-p3."
         ),
     )
     parser.add_argument(
@@ -69,6 +76,18 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Greedy (argmax) for player 1. Default: same as --greedy.",
+    )
+    parser.add_argument(
+        "--greedy-p2",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Greedy (argmax) for player 2 in 4-player mode. Default: same as --greedy.",
+    )
+    parser.add_argument(
+        "--greedy-p3",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Greedy (argmax) for player 3 in 4-player mode. Default: same as --greedy.",
     )
     parser.add_argument(
         "--agent-seed",
@@ -160,9 +179,13 @@ def main() -> None:
     os.environ["ORBIT_WARS_DEVICE"] = str(args.device)
     greedy_p0 = args.greedy if args.greedy_p0 is None else args.greedy_p0
     greedy_p1 = args.greedy if args.greedy_p1 is None else args.greedy_p1
+    greedy_p2 = args.greedy if args.greedy_p2 is None else args.greedy_p2
+    greedy_p3 = args.greedy if args.greedy_p3 is None else args.greedy_p3
     os.environ["ORBIT_WARS_GREEDY"] = "1" if args.greedy else "0"
     os.environ["ORBIT_WARS_GREEDY_P0"] = "1" if greedy_p0 else "0"
     os.environ["ORBIT_WARS_GREEDY_P1"] = "1" if greedy_p1 else "0"
+    os.environ["ORBIT_WARS_GREEDY_P2"] = "1" if greedy_p2 else "0"
+    os.environ["ORBIT_WARS_GREEDY_P3"] = "1" if greedy_p3 else "0"
     os.environ["ORBIT_WARS_AGENT_SEED"] = str(int(args.agent_seed))
     if args.raycast_rays is not None:
         os.environ["ORBIT_WARS_RAYCAST_RAYS"] = str(int(args.raycast_rays))
@@ -266,6 +289,7 @@ def main() -> None:
         return wrapped
 
     configuration: dict[str, Any] = {}
+    configuration["agentCount"] = int(args.num_agents)
     if args.seed is not None:
         configuration["seed"] = int(args.seed)
 
@@ -274,7 +298,7 @@ def main() -> None:
     if args.timings:
         run_agent = _timed_agent(run_agent, show_internal=True)
     reset_interval_aim_stats()
-    env.run([run_agent, run_agent])
+    env.run([run_agent] * int(args.num_agents))
 
     record = {
         "name": "orbit_wars",

@@ -3325,13 +3325,12 @@ def _normalize_greedy(greedy: bool | Mapping[int, bool]) -> dict[int, bool]:
 
 
 def _greedy_from_env() -> bool | dict[int, bool]:
-    p0_set = "ORBIT_WARS_GREEDY_P0" in os.environ
-    p1_set = "ORBIT_WARS_GREEDY_P1" in os.environ
-    if p0_set or p1_set:
+    per_player_set = [f"ORBIT_WARS_GREEDY_P{i}" in os.environ for i in range(4)]
+    if any(per_player_set):
         fallback = _env_bool("ORBIT_WARS_GREEDY", False)
         return {
-            0: _env_bool("ORBIT_WARS_GREEDY_P0", fallback) if p0_set else fallback,
-            1: _env_bool("ORBIT_WARS_GREEDY_P1", fallback) if p1_set else fallback,
+            i: _env_bool(f"ORBIT_WARS_GREEDY_P{i}", fallback) if per_player_set[i] else fallback
+            for i in range(4)
         }
     return _env_bool("ORBIT_WARS_GREEDY", False)
 
