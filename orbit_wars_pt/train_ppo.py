@@ -1442,6 +1442,7 @@ def _train_loop(
                     first_hit_n_rays=max(8, int(args.first_hit_n_rays)),
                     first_hit_ray_chunk_size=max(0, int(args.first_hit_ray_chunk_size)),
                     micro_step_penalty=float(args.micro_step_penalty),
+                    sync_policy_timing=bool(args.sync_rollout_timing),
                 )
                 rollout_env_seed += seeds_used
                 cfg.max_fleets = rollout_carry.cfg.max_fleets
@@ -1504,6 +1505,7 @@ def _train_loop(
                 first_hit_n_rays=max(8, int(args.first_hit_n_rays)),
                 first_hit_ray_chunk_size=max(0, int(args.first_hit_ray_chunk_size)),
                 micro_step_penalty=float(args.micro_step_penalty),
+                sync_policy_timing=bool(args.sync_rollout_timing),
             )
             rollout_env_seed += seeds_used
             t_samples0 = time.perf_counter()
@@ -1830,6 +1832,15 @@ def parse_args() -> argparse.Namespace:
         default=0,
         choices=(0, 1, 2),
         help="GPU memory instrumentation: 0=off, 1=segment deltas + rollout pins on iter 0, 2=also torch memory_summary after iter 0 step.",
+    )
+    p.add_argument(
+        "--sync-rollout-timing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Fence Torch/JAX accelerator work around rollout policy subphase timers. "
+            "Slower, but gives more honest model/org/rays/target/scatter attribution."
+        ),
     )
     p.add_argument(
         "--reset-prefetch-depth",

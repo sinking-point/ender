@@ -307,6 +307,16 @@ def _accum_micro_apply_breakdown(
     timing.micro_apply_numpy_s += t7 - t6
 
 
+def _sync_rollout_policy_timing(device: torch.device, *jax_values: Any) -> None:
+    """Fence async accelerator work for diagnostic rollout subphase timings."""
+
+    for value in jax_values:
+        if value is not None:
+            jax.block_until_ready(value)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
 def _build_batched_actions(
     actions0: List[List[Tuple[float, float, float]]],
     actions1: List[List[Tuple[float, float, float]]],
@@ -497,6 +507,7 @@ def _run_async_micro_step_multi(
     micro_step_penalty: float = 0.0,
     first_hit_ray_chunk_size: int = 0,
     obs_feature_dim: int = FEATURE_DIM,
+    sync_policy_timing: bool = False,
 ) -> tuple[OrbitWarsState, List[TorchTransitionBuffer], List[CompressedObservationBuffer]]:
     """Run one micro decision for every pending egocentric row in a ``n_ego * num_envs`` JAX batch."""
 
@@ -532,8 +543,12 @@ def _run_async_micro_step_multi(
     must_halt_a = must_halt_t.index_select(0, active_idx_t.to(must_halt_t.device)).to(device)
     timing.policy_batch_s += perf_counter() - t0
 
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
     t0 = perf_counter()
     out = policy.forward_dense_rollout(**active_obs)
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
     t_model = perf_counter()
     timing.policy_model_s += t_model - t0
 
@@ -567,9 +582,14 @@ def _run_async_micro_step_multi(
     o_idx = origin_frac_flat // len(FRACTIONS)
     frac_idx = origin_frac_flat % len(FRACTIONS)
     origin_frac_used = (halt_action == 0) & any_valid_origin_frac
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
     t_origin = perf_counter()
     timing.policy_sample_origin_s += t_origin - t_model
 
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
+    t_ray_start = perf_counter()
     o_idx_all = torch.zeros(total_env_rows, dtype=torch.int32, device=device)
     frac_idx_geom_all = torch.zeros(total_env_rows, dtype=torch.int32, device=device)
     o_idx_all.index_copy_(0, active_idx_t, o_idx.to(torch.int32))
@@ -594,15 +614,32 @@ def _run_async_micro_step_multi(
         n_rays=first_hit_n_rays,
         ray_chunk_size=first_hit_ray_chunk_size,
     )
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(
+            device,
+            (
+                target_angle_j,
+                target_valid_j,
+                target_overflow_j,
+                target_hit_tick_j,
+                target_true_planet_j,
+                target_true_hit_tick_j,
+            ),
+        )
     target_angle_t = torch.from_dlpack(target_angle_j).index_select(0, active_idx_t)
     target_valid_t = torch.from_dlpack(target_valid_j).index_select(0, active_idx_t)
     target_overflow_t = torch.from_dlpack(target_overflow_j).index_select(0, active_idx_t)
     target_hit_tick_t = torch.from_dlpack(target_hit_tick_j).index_select(0, active_idx_t)
     target_true_planet_t = torch.from_dlpack(target_true_planet_j).index_select(0, active_idx_t)
     target_true_hit_tick_t = torch.from_dlpack(target_true_hit_tick_j).index_select(0, active_idx_t)
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
     t_raycast = perf_counter()
-    timing.policy_raycast_s += t_raycast - t_origin
+    timing.policy_raycast_s += t_raycast - (t_ray_start if sync_policy_timing else t_origin)
 
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
+    t_target_start = perf_counter()
     n_a_idx = torch.arange(n_active, device=device)
     planet_ships = active_obs["features"][:, 1 : 1 + MAX_PLANETS, 1] * 1000.0
     origin_ships = active_obs["features"][n_a_idx, 1 + o_idx, 1] * 1000.0
@@ -636,9 +673,14 @@ def _run_async_micro_step_multi(
     total_logp = halt_logp + origin_frac_used.float() * origin_frac_logp + dispatch_used.float() * target_logp
     values_active = out["value"].float()
     halt_now = ~dispatch_used
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
     t_target = perf_counter()
-    timing.policy_target_s += t_target - t_raycast
+    timing.policy_target_s += t_target - (t_target_start if sync_policy_timing else t_raycast)
 
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
+    t_scatter_start = perf_counter()
     halt_now_all = torch.ones(total_env_rows, dtype=torch.bool, device=device)
     pair_flat_all = torch.zeros(total_env_rows, dtype=torch.int32, device=device)
     frac_idx_all = torch.zeros(total_env_rows, dtype=torch.int32, device=device)
@@ -650,8 +692,10 @@ def _run_async_micro_step_multi(
     frac_idx_all.index_copy_(0, active_idx_t, frac_idx.to(torch.int32))
     angle_all.index_copy_(0, active_idx_t, angle.to(torch.float32))
     fleet_eta_all.index_copy_(0, active_idx_t, policy_fleet_eta.to(torch.float32))
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
     t_scatter = perf_counter()
-    timing.policy_scatter_s += t_scatter - t_target
+    timing.policy_scatter_s += t_scatter - (t_scatter_start if sync_policy_timing else t_target)
     timing.policy_forward_s += t_scatter - t0
 
     t0 = perf_counter()
@@ -835,6 +879,7 @@ def collect_parallel_micro_rollouts(
     first_hit_n_rays: int = 2048,
     first_hit_ray_chunk_size: int = 0,
     micro_step_penalty: float = 1e-4,
+    sync_policy_timing: bool = False,
 ) -> Tuple[RolloutSegment, RolloutTiming, RolloutCarry, int, RolloutGameStats]:
     """Collect one rollout segment using device-resident transition buffers.
 
@@ -1115,6 +1160,7 @@ def collect_parallel_micro_rollouts(
                 micro_step_penalty=micro_step_penalty,
                 first_hit_ray_chunk_size=first_hit_ray_chunk_size,
                 obs_feature_dim=obs_feature_dim,
+                sync_policy_timing=sync_policy_timing,
             )
             if profile_rollout and device.type == "cuda" and not logged_first_policy_fwd:
                 log_cuda_mem("rollout after first batched policy forward", device)
