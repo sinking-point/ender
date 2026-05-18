@@ -1161,6 +1161,24 @@ def _incoming_interfleet_np(
     return signed / 1000.0, survivor_slot
 
 
+def _hide_enemy_far_right_after_resolution(
+    incoming_net: np.ndarray,
+    survivor_slot: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Hide OOD enemy survivors in the final incoming bucket for model input."""
+
+    if incoming_net.shape[1] == 0:
+        return incoming_net, survivor_slot
+    enemy_final = incoming_net[:, -1] < 0.0
+    if not np.any(enemy_final):
+        return incoming_net, survivor_slot
+    incoming_net = incoming_net.copy()
+    survivor_slot = survivor_slot.copy()
+    incoming_net[enemy_final, -1] = 0.0
+    survivor_slot[enemy_final, -1] = 0
+    return incoming_net, survivor_slot
+
+
 def _remap_owner(owner: float, ego: int, num_agents: int) -> int:
     o = int(owner)
     if o < 0:
@@ -2579,6 +2597,7 @@ def _obs_tensors_for_state(
     incoming_net, survivor_slot = _incoming_interfleet_np(
         incoming_fleets.astype(np.float32), int(ego_player), player_count
     )
+    incoming_net, survivor_slot = _hide_enemy_far_right_after_resolution(incoming_net, survivor_slot)
 
     for i in range(MAX_PLANETS):
         j = 1 + i
