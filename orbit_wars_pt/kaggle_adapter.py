@@ -97,6 +97,39 @@ def _launch_debug(msg: str) -> None:
         print(f"[orbit_wars:launch] {msg}", file=sys.stderr, flush=True)
 
 
+def _trace_fleet_ids() -> set[int]:
+    raw = os.environ.get("ORBIT_WARS_TRACE_FLEETS", "").strip()
+    if not raw:
+        return set()
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            continue
+    return out
+
+
+def _trace_launches_enabled() -> bool:
+    return os.environ.get("ORBIT_WARS_TRACE_LAUNCHES", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _should_trace_fleet(fid: int) -> bool:
+    ids = _trace_fleet_ids()
+    return fid >= 0 and fid in ids
+
+
+def _launch_trace(msg: str, *, fleet_id: int | None = None) -> None:
+    if fleet_id is not None and _should_trace_fleet(int(fleet_id)):
+        print(f"[orbit_wars:trace] {msg}", file=sys.stderr, flush=True)
+        return
+    if _trace_launches_enabled():
+        print(f"[orbit_wars:trace] {msg}", file=sys.stderr, flush=True)
+
+
 def _active_comet_planet_ids(
     comet_group_active: np.ndarray,
     comet_planet_ids: np.ndarray,
@@ -391,6 +424,16 @@ class FleetLaunchDebugTracker:
             if rec is not None:
                 rec.fleet_id = fid
                 self._by_fleet_id[fid] = rec
+                _launch_trace(
+                    "attach"
+                    f" fid={fid} game_step={game_step} ego={ego_player}"
+                    f" obs_pos=({x:.6f},{y:.6f}) angle={ang:.12f} from={from_id:.0f} ships={ships:.0f}"
+                    f" <- serial={rec.debug_serial} launch_step={rec.game_step} micro={rec.micro_idx}"
+                    f" origin={rec.origin_planet_id:.0f} launch_angle={rec.launch_angle:.12f}"
+                    f" policy_slot={rec.policy_target_slot} true_slot={rec.true_target_slot}"
+                    f" policy_tick={rec.policy_hit_tick:.0f} true_tick={rec.true_hit_tick:.0f}",
+                    fleet_id=fid,
+                )
                 if _launch_debug_enabled():
                     _launch_debug(f"attached fleet_id={fid} <- {rec.debug_summary()}")
             else:
@@ -498,6 +541,14 @@ class FleetLaunchDebugTracker:
         self._next_launch_serial += 1
         rec.debug_serial = self._next_launch_serial
         self._pending.append(rec)
+        _launch_trace(
+            "record"
+            f" serial={rec.debug_serial} launch_step={rec.game_step} ego={rec.ego_player} micro={rec.micro_idx}"
+            f" origin={rec.origin_planet_id:.0f} frac_idx={rec.frac_idx} send={rec.planned_send}"
+            f" angle={rec.launch_angle:.12f}"
+            f" policy_slot={rec.policy_target_slot} true_slot={rec.true_target_slot}"
+            f" policy_tick={rec.policy_hit_tick:.0f} true_tick={rec.true_hit_tick:.0f}"
+        )
         if _launch_debug_enabled():
             _launch_debug(f"record_launch {rec.debug_summary()}")
 
@@ -555,6 +606,15 @@ class FleetLaunchDebugTracker:
                 fc_tick,
                 launch_step=int(rec.game_step),
                 observe_step=int(game_step),
+            )
+            _launch_trace(
+                "compare"
+                f" fid={fid} game_step={game_step} ego={ego_player} launch_step={rec.game_step}"
+                f" obs_angle={float(row[4]):.12f} obs_from={float(row[5]):.0f} obs_ships={float(row[6]):.0f}"
+                f" policy_slot={rec.policy_target_slot} true_slot={ray_slot} forecast_slot={fc_slot}"
+                f" policy_tick={rec.policy_hit_tick:.0f} true_tick={ray_tick} forecast_tick={fc_tick}"
+                f" elapsed={elapsed} ticks_aligned={int(ticks_aligned)}",
+                fleet_id=fid,
             )
             if (
                 ray_slot == fc_slot
@@ -1228,6 +1288,132 @@ def _forecast_planet_paths_np(state: OrbitWarsState, horizon: int = INCOMING_TA_
     )
 
 
+def _launch_geometry_from_obs(
+    obs: Mapping[str, Any],
+    config: Any = None,
+) -> LaunchGeometryInputs:
+    """Raw float64 geometry aligned to slots, for launch-time targeting only."""
+
+    planets_in = np.asarray(obs.get("planets", []), dtype=np.float64)
+    if planets_in.size == 0:
+        planets_in = np.zeros((0, 7), dtype=np.float64)
+    else:
+        planets_in = planets_in.reshape((-1, 7))
+    planets, planet_active, id_to_slot = _place_rows_by_id(planets_in, 7, dtype=np.float64)
+
+    initial_in = np.asarray(obs.get("initial_planets", []), dtype=np.float64)
+    if initial_in.size == 0:
+        initial_in = np.zeros((0, 7), dtype=np.float64)
+    else:
+        initial_in = initial_in.reshape((-1, 7))
+    initial_planets = np.zeros((MAX_PLANETS, 7), dtype=np.float64)
+    initial_active = np.zeros((MAX_PLANETS,), dtype=np.bool_)
+    for row in initial_in[:MAX_PLANETS]:
+        pid = int(row[0])
+        slot = id_to_slot.get(pid, pid if 0 <= pid < MAX_PLANETS else -1)
+        if 0 <= slot < MAX_PLANETS:
+            initial_planets[slot, :7] = row[:7]
+            initial_active[slot] = True
+
+    missing_initial = planet_active & ~initial_active
+    initial_planets[missing_initial] = planets[missing_initial]
+    initial_active[missing_initial] = True
+
+    comet_paths = np.zeros((MAX_COMET_GROUPS, 4, MAX_COMET_PATH, 2), dtype=np.float64)
+    comet_path_lengths = np.zeros((MAX_COMET_GROUPS, 4), dtype=np.int32)
+    comet_group_active = np.zeros((MAX_COMET_GROUPS,), dtype=np.bool_)
+    comet_path_index = np.full((MAX_COMET_GROUPS,), -1, dtype=np.int32)
+    comet_slots = np.full((MAX_COMET_GROUPS, 4), -1, dtype=np.int32)
+    for g, comet in enumerate((obs.get("comets") or [])[:MAX_COMET_GROUPS]):
+        ids = list(comet.get("planet_ids", []))[:4]
+        paths = list(comet.get("paths", []))[:4]
+        comet_group_active[g] = True
+        comet_path_index[g] = int(comet.get("path_index", -1))
+        for k, pid_raw in enumerate(ids):
+            pid = int(pid_raw)
+            comet_slots[g, k] = id_to_slot.get(pid, -1)
+        for k, path in enumerate(paths):
+            p = np.asarray(path, dtype=np.float64).reshape((-1, 2))
+            n = min(len(p), MAX_COMET_PATH)
+            comet_paths[g, k, :n] = p[:n]
+            comet_path_lengths[g, k] = n
+
+    return LaunchGeometryInputs(
+        planets=planets,
+        planet_active=planet_active,
+        initial_planets=initial_planets,
+        initial_active=initial_active,
+        comet_paths=comet_paths,
+        comet_path_lengths=comet_path_lengths,
+        comet_group_active=comet_group_active,
+        comet_path_index=comet_path_index,
+        comet_slots=comet_slots,
+        angular_velocity=float(obs.get("angular_velocity", 0.0)),
+    )
+
+
+def _forecast_planet_paths_with_geometry_np(
+    state: OrbitWarsState,
+    geometry: LaunchGeometryInputs | None,
+    *,
+    horizon: int = INCOMING_TA_BINS,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if geometry is None:
+        return _forecast_planet_paths_np(state, horizon=horizon)
+
+    planets = np.asarray(geometry.planets, dtype=np.float64).copy()
+    planet_active = np.asarray(geometry.planet_active, dtype=bool).copy()
+    initial_planets = np.asarray(geometry.initial_planets, dtype=np.float64)
+    initial_active = np.asarray(geometry.initial_active, dtype=bool).copy()
+    comet_paths = np.asarray(geometry.comet_paths, dtype=np.float64)
+    comet_path_lengths = np.asarray(geometry.comet_path_lengths, dtype=np.int32)
+    comet_group_active = np.asarray(geometry.comet_group_active, dtype=bool)
+    comet_path_index = np.asarray(geometry.comet_path_index, dtype=np.int32).copy()
+    comet_slots = np.asarray(geometry.comet_slots, dtype=np.int32)
+    comet_planet_ids = np.asarray(state.comet_planet_ids, dtype=np.int32)
+    planet_active, initial_active, comet_group_active, comet_planet_ids, comet_slots = _expire_comets_for_forecast(
+        planet_active,
+        initial_active,
+        comet_group_active,
+        comet_path_index,
+        comet_path_lengths,
+        comet_slots,
+        comet_planet_ids,
+    )
+    angular_velocity = float(geometry.angular_velocity)
+    step_count = int(np.asarray(state.step_count))
+
+    p0_rows: list[np.ndarray] = []
+    p1_rows: list[np.ndarray] = []
+    active_rows: list[np.ndarray] = []
+    for t in range(horizon):
+        old_pos, new_pos, collision_enabled, cpi_next, pa_next, ia_next = _next_planet_positions(
+            planets,
+            planet_active,
+            initial_planets,
+            initial_active,
+            comet_paths,
+            comet_path_lengths,
+            comet_group_active,
+            comet_path_index,
+            comet_slots,
+            angular_velocity,
+            step_count + t,
+        )
+        p0_rows.append(old_pos)
+        p1_rows.append(new_pos)
+        active_rows.append(collision_enabled)
+        planets[:, PLANET_X : PLANET_Y + 1] = new_pos
+        planet_active = pa_next
+        initial_active = ia_next
+        comet_path_index = cpi_next
+    return (
+        np.stack(p0_rows, axis=0).astype(np.float64),
+        np.stack(p1_rows, axis=0).astype(np.float64),
+        np.stack(active_rows, axis=0).astype(np.bool_),
+    )
+
+
 def _simulate_discrete_ray_policy_hits_np(
     state: OrbitWarsState,
     origin_idx: int,
@@ -1238,14 +1424,23 @@ def _simulate_discrete_ray_policy_hits_np(
     n_rays: int = DEFAULT_RAYCAST_RAYS,
     target_timing: Optional[MicroTargetTiming] = None,
     planet_paths: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    launch_geometry: LaunchGeometryInputs | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Discrete per-tick fleet forward model; returns ray angles and first-hit bookkeeping."""
 
-    planets = np.asarray(state.planets)
-    current_active = np.asarray(state.planet_active).astype(bool)
+    if launch_geometry is None:
+        planets = np.asarray(state.planets)
+        current_active = np.asarray(state.planet_active).astype(bool)
+    else:
+        planets = np.asarray(launch_geometry.planets, dtype=np.float64)
+        current_active = np.asarray(launch_geometry.planet_active, dtype=bool)
     if planet_paths is None:
         t_paths = perf_counter()
-        p0, p1, active_by_tick = _forecast_planet_paths_np(state, horizon=horizon)
+        p0, p1, active_by_tick = _forecast_planet_paths_with_geometry_np(
+            state,
+            launch_geometry,
+            horizon=horizon,
+        )
         if target_timing is not None:
             target_timing.rays_planet_paths_s += perf_counter() - t_paths
     else:
@@ -1253,16 +1448,16 @@ def _simulate_discrete_ray_policy_hits_np(
     t_sim = perf_counter()
     # Terminal events use per-tick collision flags (same as Kaggle fleet movement),
     # not the static visibility mask used only when marking valid policy targets.
-    radii = planets[:, PLANET_RADIUS].astype(np.float32)
-    origin_xy = planets[origin_idx, PLANET_X : PLANET_Y + 1].astype(np.float32)
+    radii = planets[:, PLANET_RADIUS].astype(np.float64)
+    origin_xy = planets[origin_idx, PLANET_X : PLANET_Y + 1].astype(np.float64)
     origin_radius = float(planets[origin_idx, PLANET_RADIUS])
-    ships_avail = float(planets[origin_idx, 5])
+    ships_avail = float(np.asarray(state.planets)[origin_idx, 5])
     send = _planned_send(ships_avail, frac_idx)
     speed = _fleet_speed(float(max(send, 1)), ship_speed)
     collision_rank = np.asarray(state.planet_collision_rank, dtype=np.int32)
 
-    angles = np.arange(n_rays, dtype=np.float32) * (2.0 * math.pi / float(n_rays))
-    dirs = np.stack([np.cos(angles), np.sin(angles)], axis=1).astype(np.float32)
+    angles = np.arange(n_rays, dtype=np.float64) * (2.0 * math.pi / float(n_rays))
+    dirs = np.stack([np.cos(angles), np.sin(angles)], axis=1).astype(np.float64)
     pos = origin_xy[None, :] + (origin_radius + 0.1) * dirs
     done_policy = np.zeros((n_rays,), dtype=np.bool_)
     done_true = np.zeros((n_rays,), dtype=np.bool_)
@@ -1272,7 +1467,7 @@ def _simulate_discrete_ray_policy_hits_np(
     true_code = np.full((n_rays,), -1, dtype=np.int32)
     true_tick = np.full((n_rays,), 10_000, dtype=np.int32)
 
-    sun = np.asarray([CENTER, CENTER], dtype=np.float32)
+    sun = np.asarray([CENTER, CENTER], dtype=np.float64)
     for t in range(horizon):
         if bool(np.all(done_policy & done_true)):
             break
@@ -1300,7 +1495,7 @@ def _simulate_discrete_ray_policy_hits_np(
 
         delta = a1 - a0
         l2 = np.sum(delta * delta, axis=1)
-        proj = np.zeros((n_rays,), dtype=np.float32)
+        proj = np.zeros((n_rays,), dtype=np.float64)
         nonzero = l2 > 1e-12
         proj[nonzero] = np.sum((sun[None, :] - a0[nonzero]) * delta[nonzero], axis=1) / l2[nonzero]
         proj = np.clip(proj, 0.0, 1.0)
@@ -1373,6 +1568,7 @@ def _raycast_targets_np(
     horizon: int = INCOMING_TA_BINS,
     n_rays: int = DEFAULT_RAYCAST_RAYS,
     target_timing: Optional[MicroTargetTiming] = None,
+    launch_geometry: LaunchGeometryInputs | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """NumPy version of the rollout discrete first-hit ray target sampler."""
 
@@ -1388,12 +1584,13 @@ def _raycast_targets_np(
             horizon=horizon,
             n_rays=n_rays,
             target_timing=target_timing,
+            launch_geometry=launch_geometry,
         )
     )
     planets = np.asarray(state.planets)
     current_active = np.asarray(state.planet_active).astype(bool)
 
-    out_angle = np.zeros((MAX_PLANETS,), dtype=np.float32)
+    out_angle = np.zeros((MAX_PLANETS,), dtype=np.float64)
     valid = np.zeros((MAX_PLANETS,), dtype=np.bool_)
     hit_tick = np.zeros((MAX_PLANETS,), dtype=np.float32)
     true_planet = np.full((MAX_PLANETS,), -1, dtype=np.int32)
@@ -1458,6 +1655,35 @@ class DiscreteRaycastSim:
     true_code: np.ndarray
     true_tick: np.ndarray
     done_policy: np.ndarray
+
+
+@dataclass
+class LaunchGeometryInputs:
+    """Float64 geometry view from the raw observation for launch-time targeting."""
+
+    planets: np.ndarray
+    planet_active: np.ndarray
+    initial_planets: np.ndarray
+    initial_active: np.ndarray
+    comet_paths: np.ndarray
+    comet_path_lengths: np.ndarray
+    comet_group_active: np.ndarray
+    comet_path_index: np.ndarray
+    comet_slots: np.ndarray
+    angular_velocity: float
+
+
+@dataclass
+class PlannedLaunchAction:
+    action_index: int
+    micro_idx: int
+    origin_slot: int
+    frac_idx: int
+    target_slot: int
+    planned_send: int
+    policy_hit_tick: float
+    coarse_angle: float
+    planets_snapshot: np.ndarray
 
 
 def _first_hit_signature(kind: str, code: int, tick: int) -> tuple[str, int]:
@@ -1555,16 +1781,21 @@ def _build_interval_micro_geometry(
     horizon: int,
     samples_per_span: int,
     target_timing: Optional[MicroTargetTiming],
+    launch_geometry: LaunchGeometryInputs | None = None,
 ) -> IntervalMicroGeometry:
     from orbit_wars_pt.interval_geometry_np import (
         collect_hit_events,
         precompute_tick_planet_hits,
     )
 
-    planets = np.asarray(state.planets)
+    planets = (
+        np.asarray(launch_geometry.planets, dtype=np.float64)
+        if launch_geometry is not None
+        else np.asarray(state.planets)
+    )
     origin_xy = np.asarray(planets[origin_idx, PLANET_X : PLANET_Y + 1], dtype=np.float64)
     origin_radius = float(planets[origin_idx, PLANET_RADIUS])
-    ships_avail = float(planets[origin_idx, 5])
+    ships_avail = float(np.asarray(state.planets)[origin_idx, 5])
     send = _planned_send(ships_avail, frac_idx)
     speed = _fleet_speed(float(max(send, 1)), ship_speed)
     collision_rank = np.asarray(state.planet_collision_rank, dtype=np.int32)
@@ -1572,7 +1803,11 @@ def _build_interval_micro_geometry(
     geometry = _interval_geometry_mode()
 
     t_paths = perf_counter()
-    p0, p1, active_by_tick = _forecast_planet_paths_np(state, horizon=horizon)
+    p0, p1, active_by_tick = _forecast_planet_paths_with_geometry_np(
+        state,
+        launch_geometry,
+        horizon=horizon,
+    )
     if target_timing is not None:
         target_timing.interval_planet_paths_s += perf_counter() - t_paths
 
@@ -1585,16 +1820,52 @@ def _build_interval_micro_geometry(
             origin_radius,
             speed,
             planets.astype(np.float64),
-            np.asarray(state.planet_active, dtype=bool),
-            np.asarray(state.initial_planets, dtype=np.float64),
-            np.asarray(state.initial_active, dtype=bool),
-            np.asarray(state.comet_paths, dtype=np.float64),
-            np.asarray(state.comet_path_lengths, dtype=np.int32),
-            np.asarray(state.comet_group_active, dtype=bool),
-            np.asarray(state.comet_path_index, dtype=np.int32),
-            np.asarray(state.comet_slots, dtype=np.int32),
+            (
+                np.asarray(launch_geometry.planet_active, dtype=bool)
+                if launch_geometry is not None
+                else np.asarray(state.planet_active, dtype=bool)
+            ),
+            (
+                np.asarray(launch_geometry.initial_planets, dtype=np.float64)
+                if launch_geometry is not None
+                else np.asarray(state.initial_planets, dtype=np.float64)
+            ),
+            (
+                np.asarray(launch_geometry.initial_active, dtype=bool)
+                if launch_geometry is not None
+                else np.asarray(state.initial_active, dtype=bool)
+            ),
+            (
+                np.asarray(launch_geometry.comet_paths, dtype=np.float64)
+                if launch_geometry is not None
+                else np.asarray(state.comet_paths, dtype=np.float64)
+            ),
+            (
+                np.asarray(launch_geometry.comet_path_lengths, dtype=np.int32)
+                if launch_geometry is not None
+                else np.asarray(state.comet_path_lengths, dtype=np.int32)
+            ),
+            (
+                np.asarray(launch_geometry.comet_group_active, dtype=bool)
+                if launch_geometry is not None
+                else np.asarray(state.comet_group_active, dtype=bool)
+            ),
+            (
+                np.asarray(launch_geometry.comet_path_index, dtype=np.int32)
+                if launch_geometry is not None
+                else np.asarray(state.comet_path_index, dtype=np.int32)
+            ),
+            (
+                np.asarray(launch_geometry.comet_slots, dtype=np.int32)
+                if launch_geometry is not None
+                else np.asarray(state.comet_slots, dtype=np.int32)
+            ),
             np.asarray(state.comet_planet_ids, dtype=np.int32),
-            float(np.asarray(state.angular_velocity)),
+            (
+                float(launch_geometry.angular_velocity)
+                if launch_geometry is not None
+                else float(np.asarray(state.angular_velocity))
+            ),
             int(np.asarray(state.step_count)),
             horizon=float(horizon),
         )
@@ -1649,6 +1920,7 @@ def _sweep_interval_from_geometry(
     num_planets: int,
     *,
     target_timing: Optional[MicroTargetTiming],
+    refine_boundaries: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     from orbit_wars_pt.interval_geometry_np import (
         sweep_interval_best_targets,
@@ -1670,6 +1942,8 @@ def _sweep_interval_from_geometry(
                 p1_by_tick=geom.p1_by_tick,
                 radii=geom.radii,
                 active_by_tick=geom.active_by_tick,
+                occlusion_cache=geom.occlusion_cache,
+                refine_boundaries=refine_boundaries,
             )
         )
     else:
@@ -1685,7 +1959,7 @@ def _sweep_interval_from_geometry(
         target_timing.interval_sweep_s += perf_counter() - t_sweep
     del width
     return (
-        np.asarray(out_angle, dtype=np.float32),
+        np.asarray(out_angle, dtype=np.float64),
         np.asarray(valid, dtype=np.bool_),
         hit_tick_i,
     )
@@ -1701,6 +1975,7 @@ def _run_discrete_raycast_sim(
     n_rays: int,
     target_timing: Optional[MicroTargetTiming],
     planet_paths: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
+    launch_geometry: LaunchGeometryInputs | None = None,
 ) -> DiscreteRaycastSim:
     if target_timing is not None:
         target_timing.rays_calls += 1
@@ -1714,6 +1989,7 @@ def _run_discrete_raycast_sim(
             n_rays=n_rays,
             target_timing=target_timing,
             planet_paths=planet_paths,
+            launch_geometry=launch_geometry,
         )
     )
     return DiscreteRaycastSim(
@@ -1850,6 +2126,8 @@ def _interval_targets_np(
     run_raycast_check: bool = False,
     game_step: int = -1,
     micro_idx: int = -1,
+    launch_geometry: LaunchGeometryInputs | None = None,
+    refine_boundaries: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Interval first-hit targets (``first_hit_interval_best_targets_apply_jax`` semantics)."""
 
@@ -1866,11 +2144,13 @@ def _interval_targets_np(
         horizon=horizon,
         samples_per_span=samples_per_span,
         target_timing=target_timing,
+        launch_geometry=launch_geometry,
     )
     out_angle, valid, hit_tick_i = _sweep_interval_from_geometry(
         geom,
         int(planets.shape[0]),
         target_timing=target_timing,
+        refine_boundaries=refine_boundaries,
     )
 
     hit_tick = np.where(valid, hit_tick_i.astype(np.float32), 0.0).astype(np.float32)
@@ -1892,6 +2172,7 @@ def _interval_targets_np(
             n_rays=n_rays,
             target_timing=target_timing,
             planet_paths=(geom.p0_by_tick, geom.p1_by_tick, geom.active_by_tick),
+            launch_geometry=launch_geometry,
         )
         _check_interval_raycast_micro_consistency(
             geom,
@@ -1920,6 +2201,8 @@ def _first_hit_targets_np(
     target_timing: Optional[MicroTargetTiming] = None,
     game_step: int = -1,
     micro_idx: int = -1,
+    launch_geometry: LaunchGeometryInputs | None = None,
+    refine_boundaries: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     if target_timing is not None:
         target_timing.calls += 1
@@ -1936,6 +2219,8 @@ def _first_hit_targets_np(
             run_raycast_check=_check_interval_raycast_enabled(),
             game_step=game_step,
             micro_idx=micro_idx,
+            launch_geometry=launch_geometry,
+            refine_boundaries=refine_boundaries,
         )
     return _raycast_targets_np(
         state,
@@ -1945,7 +2230,91 @@ def _first_hit_targets_np(
         horizon=horizon,
         n_rays=n_rays,
         target_timing=target_timing,
+        launch_geometry=launch_geometry,
     )
+
+
+def _refine_interval_launches_in_place(
+    actions: list[list[float]],
+    planned_launches: list[PlannedLaunchAction],
+    base_state: OrbitWarsState,
+    launch_geometry: LaunchGeometryInputs | None,
+    *,
+    ship_speed: float,
+    horizon: int,
+    n_rays: int,
+    samples_per_span: int,
+    launch_tracker: Optional[FleetLaunchDebugTracker],
+    game_step: int,
+    ego_player: int,
+    deadline_s: float | None,
+) -> None:
+    """Refine only submitted interval launches, stopping when the turn budget is tight."""
+
+    for planned in planned_launches:
+        angle = float(planned.coarse_angle)
+        policy_tick = float(planned.policy_hit_tick)
+        true_slot = int(planned.target_slot)
+        env_hit_tick = float(planned.policy_hit_tick)
+        virt_state = base_state._replace(planets=np.array(planned.planets_snapshot, copy=True))
+
+        if deadline_s is None or perf_counter() < deadline_s:
+            ray_angle, ray_valid, ray_hit_tick, true_planet, true_hit_tick = _first_hit_targets_np(
+                virt_state,
+                planned.origin_slot,
+                planned.frac_idx,
+                ship_speed=ship_speed,
+                horizon=horizon,
+                n_rays=n_rays,
+                samples_per_span=samples_per_span,
+                target_method="interval",
+                target_timing=None,
+                game_step=int(game_step),
+                micro_idx=int(planned.micro_idx),
+                launch_geometry=launch_geometry,
+                refine_boundaries=True,
+            )
+
+            if bool(ray_valid[planned.target_slot]):
+                angle = float(ray_angle[planned.target_slot])
+                policy_tick = float(ray_hit_tick[planned.target_slot])
+                true_slot = int(true_planet[planned.target_slot])
+                env_hit_tick = float(true_hit_tick[planned.target_slot])
+
+        actions[planned.action_index][1] = float(angle)
+
+        if launch_tracker is not None:
+            launch_tracker.record_launch(
+                LaunchRaycastRecord(
+                    game_step=int(game_step),
+                    ego_player=int(ego_player),
+                    micro_idx=int(planned.micro_idx),
+                    origin_slot=int(planned.origin_slot),
+                    origin_planet_id=float(planned.planets_snapshot[planned.origin_slot, 0]),
+                    origin_xy=(
+                        float(planned.planets_snapshot[planned.origin_slot, PLANET_X]),
+                        float(planned.planets_snapshot[planned.origin_slot, PLANET_Y]),
+                    ),
+                    origin_radius=float(planned.planets_snapshot[planned.origin_slot, PLANET_RADIUS]),
+                    frac_idx=int(planned.frac_idx),
+                    fraction=float(FRACTIONS[planned.frac_idx]),
+                    ships_avail=float(planned.planets_snapshot[planned.origin_slot, 5]),
+                    planned_send=int(planned.planned_send),
+                    n_rays=int(n_rays),
+                    ship_speed=float(ship_speed),
+                    launch_angle=float(angle),
+                    policy_target_slot=int(planned.target_slot),
+                    policy_target_planet_id=float(planned.planets_snapshot[planned.target_slot, 0]),
+                    true_target_slot=int(true_slot),
+                    true_target_planet_id=float(planned.planets_snapshot[true_slot, 0]) if 0 <= true_slot < MAX_PLANETS else -1.0,
+                    policy_hit_tick=float(policy_tick),
+                    true_hit_tick=float(env_hit_tick),
+                    comet_planet_ids_at_launch=_active_comet_planet_ids(
+                        np.asarray(virt_state.comet_group_active),
+                        np.asarray(virt_state.comet_planet_ids),
+                    ),
+                )
+            )
 
 
 def _obs_tensors_for_state(
@@ -2060,11 +2429,14 @@ def _build_turn_actions_torch_only(
     launch_tracker: Optional[FleetLaunchDebugTracker] = None,
     game_step: int = 0,
     policy_player_count: Optional[int] = None,
+    launch_geometry: LaunchGeometryInputs | None = None,
+    deadline_s: float | None = None,
 ) -> list[list[float]]:
     planets = np.array(np.asarray(state.planets), copy=True)
     incoming_fleets = np.array(np.asarray(state.incoming_fleets), copy=True)
     planet_active = np.asarray(state.planet_active).astype(bool)
     actions: list[list[float]] = []
+    planned_launches: list[PlannedLaunchAction] = []
     micro_idx = 0
 
     for _ in range(max_micro_steps):
@@ -2127,6 +2499,8 @@ def _build_turn_actions_torch_only(
             target_timing=target_timing,
             game_step=int(game_step),
             micro_idx=int(micro_idx),
+            launch_geometry=launch_geometry,
+            refine_boundaries=False,
         )
         if timing is not None:
             timing.micro_raycast_s += perf_counter() - t0
@@ -2164,38 +2538,21 @@ def _build_turn_actions_torch_only(
                 timing.micro_book_s += perf_counter() - t0
             break
         angle = float(ray_angle[d_idx])
-        if launch_tracker is not None:
-            true_slot = int(true_planet[d_idx])
-            launch_tracker.record_launch(
-                LaunchRaycastRecord(
-                    game_step=int(game_step),
-                    ego_player=int(ego_player),
-                    micro_idx=micro_idx,
-                    origin_slot=int(o_idx),
-                    origin_planet_id=float(planets[o_idx, 0]),
-                    origin_xy=(float(planets[o_idx, PLANET_X]), float(planets[o_idx, PLANET_Y])),
-                    origin_radius=float(planets[o_idx, PLANET_RADIUS]),
-                    frac_idx=int(frac_idx),
-                    fraction=float(FRACTIONS[frac_idx]),
-                    ships_avail=float(ships_avail),
-                    planned_send=int(send),
-                    n_rays=int(n_rays),
-                    ship_speed=float(ship_speed),
-                    launch_angle=angle,
-                    policy_target_slot=int(d_idx),
-                    policy_target_planet_id=float(planets[d_idx, 0]),
-                    true_target_slot=true_slot,
-                    true_target_planet_id=float(planets[true_slot, 0]) if 0 <= true_slot < MAX_PLANETS else -1.0,
-                    policy_hit_tick=float(ray_hit_tick[d_idx]),
-                    true_hit_tick=float(true_hit_tick[d_idx]),
-                    comet_planet_ids_at_launch=_active_comet_planet_ids(
-                        np.asarray(virt.comet_group_active),
-                        np.asarray(virt.comet_planet_ids),
-                    ),
-                )
-            )
-            micro_idx += 1
         actions.append([float(planets[o_idx, 0]), float(angle), int(send)])
+        planned_launches.append(
+            PlannedLaunchAction(
+                action_index=len(actions) - 1,
+                micro_idx=int(micro_idx),
+                origin_slot=int(o_idx),
+                frac_idx=int(frac_idx),
+                target_slot=int(d_idx),
+                planned_send=int(send),
+                policy_hit_tick=float(ray_hit_tick[d_idx]),
+                coarse_angle=float(angle),
+                planets_snapshot=np.array(planets, copy=True),
+            )
+        )
+        micro_idx += 1
         planets[o_idx, 5] -= float(send)
         env_target = int(true_planet[d_idx])
         if 0 <= env_target < MAX_PLANETS:
@@ -2210,6 +2567,56 @@ def _build_turn_actions_torch_only(
             continue
         if timing is not None:
             timing.micro_book_s += perf_counter() - t0
+
+    if target_method == "interval" and planned_launches:
+        _refine_interval_launches_in_place(
+            actions,
+            planned_launches,
+            state,
+            launch_geometry,
+            ship_speed=ship_speed,
+            horizon=INCOMING_TA_BINS,
+            n_rays=n_rays,
+            samples_per_span=samples_per_span,
+            launch_tracker=launch_tracker,
+            game_step=int(game_step),
+            ego_player=int(ego_player),
+            deadline_s=deadline_s,
+        )
+    elif launch_tracker is not None:
+        for planned in planned_launches:
+            true_slot = int(planned.target_slot)
+            launch_tracker.record_launch(
+                LaunchRaycastRecord(
+                    game_step=int(game_step),
+                    ego_player=int(ego_player),
+                    micro_idx=int(planned.micro_idx),
+                    origin_slot=int(planned.origin_slot),
+                    origin_planet_id=float(planned.planets_snapshot[planned.origin_slot, 0]),
+                    origin_xy=(
+                        float(planned.planets_snapshot[planned.origin_slot, PLANET_X]),
+                        float(planned.planets_snapshot[planned.origin_slot, PLANET_Y]),
+                    ),
+                    origin_radius=float(planned.planets_snapshot[planned.origin_slot, PLANET_RADIUS]),
+                    frac_idx=int(planned.frac_idx),
+                    fraction=float(FRACTIONS[planned.frac_idx]),
+                    ships_avail=float(planned.planets_snapshot[planned.origin_slot, 5]),
+                    planned_send=int(planned.planned_send),
+                    n_rays=int(n_rays),
+                    ship_speed=float(ship_speed),
+                    launch_angle=float(actions[planned.action_index][1]),
+                    policy_target_slot=int(planned.target_slot),
+                    policy_target_planet_id=float(planned.planets_snapshot[planned.target_slot, 0]),
+                    true_target_slot=true_slot,
+                    true_target_planet_id=float(planned.planets_snapshot[true_slot, 0]) if 0 <= true_slot < MAX_PLANETS else -1.0,
+                    policy_hit_tick=float(planned.policy_hit_tick),
+                    true_hit_tick=float(planned.policy_hit_tick),
+                    comet_planet_ids_at_launch=_active_comet_planet_ids(
+                        np.asarray(state.comet_group_active),
+                        np.asarray(state.comet_planet_ids),
+                    ),
+                )
+            )
 
     return actions
 
@@ -2576,6 +2983,7 @@ class KaggleOrbitWarsAgent:
 
     @torch.inference_mode()
     def __call__(self, obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
+        call_t0 = perf_counter()
         self._last_call_timing = None
         timing = KaggleAgentCallTiming()
         ego_player = int(obs.get("player", 0))
@@ -2600,6 +3008,7 @@ class KaggleOrbitWarsAgent:
             step_count_override=step_count,
             fleet_forecast_arrival=fleet_arrivals,
         )
+        launch_geometry = _launch_geometry_from_obs(obs, config)
         timing.obs_to_state_s = perf_counter() - t0
         self.launch_tracker.check_forecast_vs_raycast(
             obs,
@@ -2624,6 +3033,12 @@ class KaggleOrbitWarsAgent:
             timing=timing,
             launch_tracker=self.launch_tracker,
             game_step=step_count,
+            launch_geometry=launch_geometry,
+            deadline_s=(
+                call_t0 + max(0.0, float(_cfg_get(config, "actTimeout", 1.0)) - 0.1)
+                if _cfg_get(config, "actTimeout", None) is not None
+                else None
+            ),
         )
         self._last_call_timing = timing
         if _launch_debug_enabled():
@@ -2747,6 +3162,7 @@ class KaggleOrbitWarsDualPolicyAgent:
 
     @torch.inference_mode()
     def __call__(self, obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
+        call_t0 = perf_counter()
         self._last_call_timing = None
         timing = KaggleAgentCallTiming()
         ego_player = int(obs.get("player", 0))
@@ -2771,6 +3187,7 @@ class KaggleOrbitWarsDualPolicyAgent:
             step_count_override=step_count,
             fleet_forecast_arrival=fleet_arrivals,
         )
+        launch_geometry = _launch_geometry_from_obs(obs, config)
         timing.obs_to_state_s = perf_counter() - t0
         self.launch_tracker.check_forecast_vs_raycast(
             obs,
@@ -2800,6 +3217,12 @@ class KaggleOrbitWarsDualPolicyAgent:
             launch_tracker=self.launch_tracker,
             game_step=step_count,
             policy_player_count=policy_player_count,
+            launch_geometry=launch_geometry,
+            deadline_s=(
+                call_t0 + max(0.0, float(_cfg_get(config, "actTimeout", 1.0)) - 0.1)
+                if _cfg_get(config, "actTimeout", None) is not None
+                else None
+            ),
         )
         self._last_call_timing = timing
         if _launch_debug_enabled():

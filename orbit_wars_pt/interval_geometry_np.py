@@ -59,9 +59,35 @@ class IntervalAimStats:
     selected: Counter[str] = field(default_factory=Counter)
     rejected: Counter[str] = field(default_factory=Counter)
     all_rejected: Counter[str] = field(default_factory=Counter)
+    polish: Counter[str] = field(default_factory=Counter)
 
     def note_rejected(self, label: str, reason: str) -> None:
         self.rejected[f"{label}:{reason}"] += 1
+
+    def note_polish(self, key: str, amount: int = 1) -> None:
+        self.polish[key] += int(amount)
+
+    def note_polish_gap(self, keep: float, reject: float) -> None:
+        gap = abs(float(reject) - float(keep))
+        if gap == 0.0:
+            self.polish["gap:zero"] += 1
+            return
+        toward = float(reject)
+        step = abs(float(np.nextafter(float(keep), toward)) - float(keep))
+        if step <= 0.0:
+            self.polish["gap:unknown"] += 1
+            return
+        ulps = gap / step
+        if ulps <= 1.5:
+            self.polish["gap:<=1ulp"] += 1
+        elif ulps <= 2.5:
+            self.polish["gap:<=2ulp"] += 1
+        elif ulps <= 4.5:
+            self.polish["gap:<=4ulp"] += 1
+        elif ulps <= 8.5:
+            self.polish["gap:<=8ulp"] += 1
+        else:
+            self.polish["gap:>8ulp"] += 1
 
     def format_report(self) -> str:
         if self.planet_evals <= 0:
@@ -82,6 +108,10 @@ class IntervalAimStats:
             total_all = int(sum(self.all_rejected.values()))
             lines.append(f"  all three rejected: {total_all}")
             for key, value in sorted(self.all_rejected.items()):
+                lines.append(f"    {key}: {value}")
+        if self.polish:
+            lines.append("  polish:")
+            for key, value in sorted(self.polish.items()):
                 lines.append(f"    {key}: {value}")
         return "\n".join(lines)
 
@@ -358,11 +388,927 @@ def _candidate_tick_single_planet(
     return float(theta), int(tick), "ok"
 
 
+def _sun_hit_tick(
+    angle: float,
+    *,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    active_by_tick: np.ndarray,
+) -> int:
+    origin = np.asarray(origin_xy, dtype=np.float64)
+    theta = float(angle) % TAU
+    direction = np.array([math.cos(theta), math.sin(theta)], dtype=np.float64)
+    launch_off = float(origin_radius) + LAUNCH_RIM_OFFSET
+    pos = origin + launch_off * direction
+    sun = np.asarray([CENTER, CENTER], dtype=np.float64)
+    ticks = int(active_by_tick.shape[0])
+
+    for tick in range(ticks):
+        a0 = pos
+        a1 = pos + float(speed) * direction
+        delta = a1 - a0
+        l2 = float(np.dot(delta, delta))
+        if l2 > 1e-12:
+            proj = float(np.clip(np.dot(sun - a0, delta) / l2, 0.0, 1.0))
+            closest = a0 + proj * delta
+        else:
+            closest = a0
+        if float(np.linalg.norm(closest - sun)) < float(SUN_RADIUS):
+            return int(tick)
+        pos = a1
+    return -1
+
+
+def _launch_segment_at_tick(
+    angle: float,
+    *,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    tick: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    origin = np.asarray(origin_xy, dtype=np.float64)
+    theta = float(angle) % TAU
+    direction = np.array([math.cos(theta), math.sin(theta)], dtype=np.float64)
+    a0 = origin + (float(origin_radius) + LAUNCH_RIM_OFFSET) * direction
+    step = float(speed) * direction
+    for _ in range(int(tick)):
+        a0 = a0 + step
+    a1 = a0 + float(speed) * direction
+    return a0, a1
+
+
+def _swept_hit_on_tick(
+    angle: float,
+    *,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    tick: int,
+    p0: np.ndarray,
+    p1: np.ndarray,
+    radius: float,
+) -> bool:
+    a0, a1 = _launch_segment_at_tick(
+        angle,
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        tick=int(tick),
+    )
+    d0 = a0 - np.asarray(p0, dtype=np.float64)
+    dv = (a1 - a0) - (np.asarray(p1, dtype=np.float64) - np.asarray(p0, dtype=np.float64))
+    qa = float(np.dot(dv, dv))
+    qb = float(2.0 * np.dot(d0, dv))
+    qc = float(np.dot(d0, d0) - float(radius) * float(radius))
+    if qa < 1e-12:
+        return qc <= 0.0
+    disc = qb * qb - 4.0 * qa * qc
+    if disc < 0.0:
+        return False
+    sd = math.sqrt(max(disc, 0.0))
+    t1 = (-qb - sd) / (2.0 * qa)
+    t2 = (-qb + sd) / (2.0 * qa)
+    return t2 >= 0.0 and t1 <= 1.0
+
+
+def _planet_hit_on_tick(
+    angle: float,
+    *,
+    slot: int,
+    tick: int,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    p0_by_tick: np.ndarray,
+    p1_by_tick: np.ndarray,
+    radii: np.ndarray,
+    active_by_tick: np.ndarray,
+) -> bool:
+    if tick < 0 or tick >= int(active_by_tick.shape[0]) or not bool(active_by_tick[tick, slot]):
+        return False
+    return _swept_hit_on_tick(
+        angle,
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        tick=int(tick),
+        p0=p0_by_tick[tick, slot],
+        p1=p1_by_tick[tick, slot],
+        radius=float(radii[slot]),
+    )
+
+
+def _planet_hit_near_tick(
+    angle: float,
+    *,
+    slot: int,
+    tick: int,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    p0_by_tick: np.ndarray,
+    p1_by_tick: np.ndarray,
+    radii: np.ndarray,
+    active_by_tick: np.ndarray,
+    tick_margin: int = 1,
+) -> bool:
+    for t in range(max(0, int(tick) - int(tick_margin)), min(int(active_by_tick.shape[0]), int(tick) + int(tick_margin) + 1)):
+        if _planet_hit_on_tick(
+            angle,
+            slot=slot,
+            tick=t,
+            origin_xy=origin_xy,
+            origin_radius=origin_radius,
+            speed=speed,
+            p0_by_tick=p0_by_tick,
+            p1_by_tick=p1_by_tick,
+            radii=radii,
+            active_by_tick=active_by_tick,
+        ):
+            return True
+    return False
+
+
+def _sun_hit_on_tick(
+    angle: float,
+    *,
+    tick: int,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+) -> bool:
+    a0, a1 = _launch_segment_at_tick(
+        angle,
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        tick=int(tick),
+    )
+    delta = a1 - a0
+    l2 = float(np.dot(delta, delta))
+    sun = np.asarray([CENTER, CENTER], dtype=np.float64)
+    if l2 > 1e-12:
+        proj = float(np.clip(np.dot(sun - a0, delta) / l2, 0.0, 1.0))
+        closest = a0 + proj * delta
+    else:
+        closest = a0
+    return float(np.linalg.norm(closest - sun)) < float(SUN_RADIUS)
+
+
+def _sun_hit_near_tick(
+    angle: float,
+    *,
+    tick: int,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    tick_margin: int = 1,
+) -> bool:
+    for t in range(max(0, int(tick) - int(tick_margin)), int(tick) + int(tick_margin) + 1):
+        if _sun_hit_on_tick(
+            angle,
+            tick=t,
+            origin_xy=origin_xy,
+            origin_radius=origin_radius,
+            speed=speed,
+        ):
+            return True
+    return False
+
+
+def _board_hit_on_tick(
+    angle: float,
+    *,
+    tick: int,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+) -> bool:
+    _a0, a1 = _launch_segment_at_tick(
+        angle,
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        tick=int(tick),
+    )
+    return not (0.0 <= a1[0] <= BOARD_SIZE and 0.0 <= a1[1] <= BOARD_SIZE)
+
+
+def _board_hit_near_tick(
+    angle: float,
+    *,
+    tick: int,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    tick_margin: int = 1,
+) -> bool:
+    for t in range(max(0, int(tick) - int(tick_margin)), int(tick) + int(tick_margin) + 1):
+        if _board_hit_on_tick(
+            angle,
+            tick=t,
+            origin_xy=origin_xy,
+            origin_radius=origin_radius,
+            speed=speed,
+        ):
+            return True
+    return False
+
+
+def _board_hit_tick(
+    angle: float,
+    *,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    active_by_tick: np.ndarray,
+) -> int:
+    origin = np.asarray(origin_xy, dtype=np.float64)
+    theta = float(angle) % TAU
+    direction = np.array([math.cos(theta), math.sin(theta)], dtype=np.float64)
+    launch_off = float(origin_radius) + LAUNCH_RIM_OFFSET
+    pos = origin + launch_off * direction
+    ticks = int(active_by_tick.shape[0])
+    for tick in range(ticks):
+        a1 = pos + float(speed) * direction
+        if not (0.0 <= a1[0] <= BOARD_SIZE and 0.0 <= a1[1] <= BOARD_SIZE):
+            return int(tick)
+        pos = a1
+    return -1
+
+
+def _body_hit_tick(
+    angle: float,
+    *,
+    body_sig: tuple[str, int],
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    p0_by_tick: np.ndarray,
+    p1_by_tick: np.ndarray,
+    radii: np.ndarray,
+    active_by_tick: np.ndarray,
+) -> int:
+    kind, code = body_sig
+    if kind == "planet" and 0 <= int(code) < int(radii.shape[0]):
+        slot = int(code)
+        return first_hit_tick_single_planet_raycast(
+            angle,
+            origin_xy,
+            origin_radius,
+            speed,
+            p0_by_tick[:, slot, :],
+            p1_by_tick[:, slot, :],
+            float(radii[slot]),
+            active_by_tick[:, slot],
+        )
+    if kind == "sun":
+        return _sun_hit_tick(
+            angle,
+            origin_xy=origin_xy,
+            origin_radius=origin_radius,
+            speed=speed,
+            active_by_tick=active_by_tick,
+        )
+    if kind == "board":
+        return _board_hit_tick(
+            angle,
+            origin_xy=origin_xy,
+            origin_radius=origin_radius,
+            speed=speed,
+            active_by_tick=active_by_tick,
+        )
+    return -1
+
+
+def _find_body_tick_hint_from_boundary(
+    bound: float,
+    *,
+    inward_dir: float,
+    body_sig: tuple[str, int],
+    search_span: float,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    p0_by_tick: np.ndarray,
+    p1_by_tick: np.ndarray,
+    radii: np.ndarray,
+    active_by_tick: np.ndarray,
+) -> int:
+    """Find a hit tick for one body by probing at/near a contested boundary."""
+
+    tick = _body_hit_tick(
+        float(bound),
+        body_sig=body_sig,
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        p0_by_tick=p0_by_tick,
+        p1_by_tick=p1_by_tick,
+        radii=radii,
+        active_by_tick=active_by_tick,
+    )
+    if tick >= 0:
+        return int(tick)
+
+    probe = np.nextafter(float(bound), float("inf") if inward_dir > 0.0 else float("-inf"))
+    tick = _body_hit_tick(
+        float(probe),
+        body_sig=body_sig,
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        p0_by_tick=p0_by_tick,
+        p1_by_tick=p1_by_tick,
+        radii=radii,
+        active_by_tick=active_by_tick,
+    )
+    if tick >= 0:
+        return int(tick)
+
+    step = max(np.spacing(max(1.0, abs(bound))), min(max(search_span, 0.0), 1e-3))
+    max_span = max(search_span, step)
+    for _ in range(64):
+        probe = float(bound + inward_dir * step)
+        tick = _body_hit_tick(
+            float(probe),
+            body_sig=body_sig,
+            origin_xy=origin_xy,
+            origin_radius=origin_radius,
+            speed=speed,
+            p0_by_tick=p0_by_tick,
+            p1_by_tick=p1_by_tick,
+            radii=radii,
+            active_by_tick=active_by_tick,
+        )
+        if tick >= 0:
+            return int(tick)
+        if step >= max_span:
+            break
+        step = min(max_span, step * 2.0)
+    return -1
+
+
+def _local_first_hit_signature_at_angle(
+    angle: float,
+    *,
+    target_slot: int,
+    competitor_sig: tuple[str, int],
+    target_tick_hint: int | None = None,
+    competitor_tick_hint: int | None = None,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    p0_by_tick: np.ndarray,
+    p1_by_tick: np.ndarray,
+    radii: np.ndarray,
+    active_by_tick: np.ndarray,
+    object_order: Sequence[int],
+    order_rank: dict[int, int] | None = None,
+) -> tuple[str, int]:
+    if target_tick_hint is None or competitor_tick_hint is None:
+        target_tick = first_hit_tick_single_planet_raycast(
+            angle,
+            origin_xy,
+            origin_radius,
+            speed,
+            p0_by_tick[:, target_slot, :],
+            p1_by_tick[:, target_slot, :],
+            float(radii[target_slot]),
+            active_by_tick[:, target_slot],
+        )
+        comp_kind, comp_code = competitor_sig
+        comp_tick = -1
+        if comp_kind == "planet" and 0 <= int(comp_code) < int(radii.shape[0]):
+            cslot = int(comp_code)
+            comp_tick = first_hit_tick_single_planet_raycast(
+                angle,
+                origin_xy,
+                origin_radius,
+                speed,
+                p0_by_tick[:, cslot, :],
+                p1_by_tick[:, cslot, :],
+                float(radii[cslot]),
+                active_by_tick[:, cslot],
+            )
+        elif comp_kind == "sun":
+            comp_tick = _sun_hit_tick(
+                angle,
+                origin_xy=origin_xy,
+                origin_radius=origin_radius,
+                speed=speed,
+                active_by_tick=active_by_tick,
+            )
+        elif comp_kind == "board":
+            comp_tick = _board_hit_tick(
+                angle,
+                origin_xy=origin_xy,
+                origin_radius=origin_radius,
+                speed=speed,
+                active_by_tick=active_by_tick,
+            )
+    else:
+        target_tick = int(target_tick_hint)
+        comp_tick = int(competitor_tick_hint)
+
+    comp_kind, comp_code = competitor_sig
+    if target_tick < 0 and comp_tick < 0:
+        return ("none", -1)
+
+    if comp_tick < 0 or (target_tick >= 0 and target_tick < comp_tick):
+        if target_tick >= 0 and _planet_hit_near_tick(
+            angle,
+            slot=int(target_slot),
+            tick=int(target_tick),
+            origin_xy=origin_xy,
+            origin_radius=origin_radius,
+            speed=speed,
+            p0_by_tick=p0_by_tick,
+            p1_by_tick=p1_by_tick,
+            radii=radii,
+            active_by_tick=active_by_tick,
+        ):
+            return ("planet", int(target_slot))
+        return ("none", -1)
+
+    if target_tick < 0 or comp_tick < target_tick:
+        comp_hit = False
+        if comp_kind == "planet" and 0 <= int(comp_code) < int(radii.shape[0]):
+            comp_hit = _planet_hit_near_tick(
+                angle,
+                slot=int(comp_code),
+                tick=int(comp_tick),
+                origin_xy=origin_xy,
+                origin_radius=origin_radius,
+                speed=speed,
+                p0_by_tick=p0_by_tick,
+                p1_by_tick=p1_by_tick,
+                radii=radii,
+                active_by_tick=active_by_tick,
+            )
+        elif comp_kind == "sun":
+            comp_hit = _sun_hit_near_tick(
+                angle,
+                tick=int(comp_tick),
+                origin_xy=origin_xy,
+                origin_radius=origin_radius,
+                speed=speed,
+            )
+        elif comp_kind == "board":
+            comp_hit = _board_hit_near_tick(
+                angle,
+                tick=int(comp_tick),
+                origin_xy=origin_xy,
+                origin_radius=origin_radius,
+                speed=speed,
+            )
+        if comp_hit:
+            return (str(comp_kind), int(comp_code))
+        return ("planet", int(target_slot))
+
+    target_hit = _planet_hit_on_tick(
+        angle,
+        slot=int(target_slot),
+        tick=int(target_tick),
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        p0_by_tick=p0_by_tick,
+        p1_by_tick=p1_by_tick,
+        radii=radii,
+        active_by_tick=active_by_tick,
+    )
+    target_hit = _planet_hit_near_tick(
+        angle,
+        slot=int(target_slot),
+        tick=int(target_tick),
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        p0_by_tick=p0_by_tick,
+        p1_by_tick=p1_by_tick,
+        radii=radii,
+        active_by_tick=active_by_tick,
+    )
+    comp_hit = False
+    if comp_kind == "planet" and 0 <= int(comp_code) < int(radii.shape[0]):
+        comp_hit = _planet_hit_near_tick(
+            angle,
+            slot=int(comp_code),
+            tick=int(comp_tick),
+            origin_xy=origin_xy,
+            origin_radius=origin_radius,
+            speed=speed,
+            p0_by_tick=p0_by_tick,
+            p1_by_tick=p1_by_tick,
+            radii=radii,
+            active_by_tick=active_by_tick,
+        )
+    elif comp_kind == "sun":
+        comp_hit = _sun_hit_near_tick(
+            angle,
+            tick=int(comp_tick),
+            origin_xy=origin_xy,
+            origin_radius=origin_radius,
+            speed=speed,
+        )
+    elif comp_kind == "board":
+        comp_hit = _board_hit_near_tick(
+            angle,
+            tick=int(comp_tick),
+            origin_xy=origin_xy,
+            origin_radius=origin_radius,
+            speed=speed,
+        )
+    if target_hit:
+        if comp_hit and comp_kind == "planet":
+            rank = order_rank or {int(s): i for i, s in enumerate(object_order)}
+            if rank.get(int(target_slot), 10_000) <= rank.get(int(comp_code), 10_000):
+                return ("planet", int(target_slot))
+            return ("planet", int(comp_code))
+        return ("planet", int(target_slot))
+    if comp_hit:
+        return (str(comp_kind), int(comp_code))
+    return ("none", -1)
+
+
+def _approx_boundary_competitor_signature(
+    bound: float,
+    *,
+    outward_dir: float,
+    target_sig: tuple[str, int],
+    cache: "OcclusionWalkCache" | None,
+) -> tuple[str, int]:
+    if cache is None:
+        return ("none", -1)
+    dest = float("-inf") if outward_dir < 0.0 else float("inf")
+    probe = np.nextafter(float(bound), dest)
+    for _ in range(64):
+        sig = first_hit_signature_occlusion_walk(_norm_angle(probe), cache)
+        if sig != target_sig:
+            return (str(sig[0]), int(sig[1]))
+        nxt = np.nextafter(probe, dest)
+        if nxt == probe:
+            break
+        probe = nxt
+    return ("none", -1)
+
+
+def _find_target_seed_in_cell(
+    owner_cell: tuple[float, float],
+    *,
+    target_sig: tuple[str, int],
+    competitor_sig: tuple[str, int],
+    outward_dir: float,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    p0_by_tick: np.ndarray,
+    p1_by_tick: np.ndarray,
+    radii: np.ndarray,
+    active_by_tick: np.ndarray,
+    object_order: Sequence[int],
+    order_rank: dict[int, int] | None = None,
+) -> float | None:
+    lo, hi = owner_cell
+    width = hi - lo
+    inward_dir = -1.0 if outward_dir > 0.0 else 1.0
+    near_bound = lo if outward_dir < 0.0 else hi
+    near_inside = np.nextafter(float(near_bound), float("inf") if inward_dir > 0.0 else float("-inf"))
+    probes = [
+        near_inside,
+        0.5 * (lo + hi),
+        lo + 0.25 * width,
+        hi - 0.25 * width,
+        lo + 0.125 * width,
+        hi - 0.125 * width,
+    ]
+    for probe in probes:
+        if not (lo <= probe <= hi):
+            continue
+        if (
+            _local_first_hit_signature_at_angle(
+                _norm_angle(probe),
+                target_slot=int(target_sig[1]),
+                competitor_sig=competitor_sig,
+                target_tick_hint=None,
+                competitor_tick_hint=None,
+                origin_xy=origin_xy,
+                origin_radius=origin_radius,
+                speed=speed,
+                p0_by_tick=p0_by_tick,
+                p1_by_tick=p1_by_tick,
+                radii=radii,
+                active_by_tick=active_by_tick,
+                object_order=object_order,
+                order_rank=order_rank,
+            )
+            == target_sig
+        ):
+            return float(probe)
+    return None
+
+
+def _target_hit_with_hint_at_angle(
+    angle: float,
+    *,
+    target_slot: int,
+    target_tick_hint: int | None,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    p0_by_tick: np.ndarray,
+    p1_by_tick: np.ndarray,
+    radii: np.ndarray,
+    active_by_tick: np.ndarray,
+) -> bool:
+    if target_tick_hint is None or int(target_tick_hint) < 0:
+        tick = first_hit_tick_single_planet_raycast(
+            angle,
+            origin_xy,
+            origin_radius,
+            speed,
+            p0_by_tick[:, int(target_slot), :],
+            p1_by_tick[:, int(target_slot), :],
+            float(radii[int(target_slot)]),
+            active_by_tick[:, int(target_slot)],
+        )
+        return tick >= 0
+    return _planet_hit_near_tick(
+        angle,
+        slot=int(target_slot),
+        tick=int(target_tick_hint),
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        p0_by_tick=p0_by_tick,
+        p1_by_tick=p1_by_tick,
+        radii=radii,
+        active_by_tick=active_by_tick,
+    )
+
+
+def _polish_boundary_ground_truth(
+    bound: float,
+    *,
+    owner_cell: tuple[float, float],
+    target_sig: tuple[str, int],
+    outward_dir: float,
+    cache: "OcclusionWalkCache" | None,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    p0_by_tick: np.ndarray,
+    p1_by_tick: np.ndarray,
+    radii: np.ndarray,
+    active_by_tick: np.ndarray,
+    object_order: Sequence[int],
+    order_rank: dict[int, int] | None = None,
+) -> float:
+    """Return the extreme target angle near ``bound`` using local raycast ground truth."""
+
+    _INTERVAL_AIM_STATS.note_polish("attempts")
+    competitor_sig = _approx_boundary_competitor_signature(
+        bound,
+        outward_dir=outward_dir,
+        target_sig=target_sig,
+        cache=cache,
+    )
+    target_seed = _find_target_seed_in_cell(
+        owner_cell,
+        target_sig=target_sig,
+        competitor_sig=competitor_sig,
+        outward_dir=outward_dir,
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        p0_by_tick=p0_by_tick,
+        p1_by_tick=p1_by_tick,
+        radii=radii,
+        active_by_tick=active_by_tick,
+        object_order=object_order,
+        order_rank=order_rank,
+    )
+    if target_seed is None:
+        _INTERVAL_AIM_STATS.note_polish("fallback:no_target_seed")
+        lo, hi = owner_cell
+        return _boundary_angle_inside(lo, hi, bound)
+
+    lo, hi = owner_cell
+    width = max(hi - lo, np.spacing(max(1.0, abs(bound))))
+    target_tick_hint = _find_body_tick_hint_from_boundary(
+        float(bound),
+        inward_dir=(-outward_dir),
+        body_sig=target_sig,
+        search_span=width,
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        p0_by_tick=p0_by_tick,
+        p1_by_tick=p1_by_tick,
+        radii=radii,
+        active_by_tick=active_by_tick,
+    )
+    if target_tick_hint < 0:
+        _INTERVAL_AIM_STATS.note_polish("fallback:missing_tick_hint")
+        return _boundary_angle_inside(lo, hi, bound)
+
+    if competitor_sig == ("none", -1):
+        keep = float(target_seed)
+        probe = float(bound)
+        if outward_dir > 0.0:
+            probe = max(probe, keep)
+        else:
+            probe = min(probe, keep)
+        if _target_hit_with_hint_at_angle(
+            _norm_angle(probe),
+            target_slot=int(target_sig[1]),
+            target_tick_hint=int(target_tick_hint),
+            origin_xy=origin_xy,
+            origin_radius=origin_radius,
+            speed=speed,
+            p0_by_tick=p0_by_tick,
+            p1_by_tick=p1_by_tick,
+            radii=radii,
+            active_by_tick=active_by_tick,
+        ):
+            keep = float(probe)
+        reject: float | None = None
+        step = max(abs(owner_cell[1] - owner_cell[0]), np.spacing(max(1.0, abs(probe))))
+        for _ in range(80):
+            cand = float(probe + outward_dir * step)
+            if not _target_hit_with_hint_at_angle(
+                _norm_angle(cand),
+                target_slot=int(target_sig[1]),
+                target_tick_hint=int(target_tick_hint),
+                origin_xy=origin_xy,
+                origin_radius=origin_radius,
+                speed=speed,
+                p0_by_tick=p0_by_tick,
+                p1_by_tick=p1_by_tick,
+                radii=radii,
+                active_by_tick=active_by_tick,
+            ):
+                reject = cand
+                break
+            keep = cand
+            probe = cand
+            step *= 2.0
+        if reject is None:
+            _INTERVAL_AIM_STATS.note_polish("success:no_competitor_expand_only")
+            return _norm_angle(keep)
+        bisect_iters = 0
+        for _ in range(80):
+            mid = 0.5 * (keep + reject)
+            if mid == keep or mid == reject:
+                break
+            bisect_iters += 1
+            if _target_hit_with_hint_at_angle(
+                _norm_angle(mid),
+                target_slot=int(target_sig[1]),
+                target_tick_hint=int(target_tick_hint),
+                origin_xy=origin_xy,
+                origin_radius=origin_radius,
+                speed=speed,
+                p0_by_tick=p0_by_tick,
+                p1_by_tick=p1_by_tick,
+                radii=radii,
+                active_by_tick=active_by_tick,
+            ):
+                keep = float(mid)
+            else:
+                reject = float(mid)
+        _INTERVAL_AIM_STATS.note_polish("success:no_competitor_bisected")
+        _INTERVAL_AIM_STATS.note_polish("bisect_iters_total", bisect_iters)
+        _INTERVAL_AIM_STATS.note_polish_gap(keep, reject)
+        return _norm_angle(keep)
+
+    competitor_tick_hint = _find_body_tick_hint_from_boundary(
+        float(bound),
+        inward_dir=outward_dir,
+        body_sig=competitor_sig,
+        search_span=width,
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        p0_by_tick=p0_by_tick,
+        p1_by_tick=p1_by_tick,
+        radii=radii,
+        active_by_tick=active_by_tick,
+    )
+    if competitor_tick_hint < 0:
+        _INTERVAL_AIM_STATS.note_polish("fallback:missing_tick_hint")
+        return _boundary_angle_inside(lo, hi, bound)
+
+    keep = float(target_seed)
+    probe = float(bound)
+    if outward_dir > 0.0:
+        probe = max(probe, keep)
+    else:
+        probe = min(probe, keep)
+    probe_sig = _local_first_hit_signature_at_angle(
+        _norm_angle(probe),
+        target_slot=int(target_sig[1]),
+        competitor_sig=competitor_sig,
+        target_tick_hint=int(target_tick_hint),
+        competitor_tick_hint=int(competitor_tick_hint),
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        p0_by_tick=p0_by_tick,
+        p1_by_tick=p1_by_tick,
+        radii=radii,
+        active_by_tick=active_by_tick,
+        object_order=object_order,
+        order_rank=order_rank,
+    )
+    if probe_sig == target_sig:
+        keep = float(probe)
+    reject: float | None = None
+    if probe_sig != target_sig:
+        reject = float(probe)
+    else:
+        step = max(abs(owner_cell[1] - owner_cell[0]), np.spacing(max(1.0, abs(probe))))
+        for _ in range(80):
+            cand = float(probe + outward_dir * step)
+            cand_sig = _local_first_hit_signature_at_angle(
+                _norm_angle(cand),
+                target_slot=int(target_sig[1]),
+                competitor_sig=competitor_sig,
+                target_tick_hint=int(target_tick_hint),
+                competitor_tick_hint=int(competitor_tick_hint),
+                origin_xy=origin_xy,
+                origin_radius=origin_radius,
+                speed=speed,
+                p0_by_tick=p0_by_tick,
+                p1_by_tick=p1_by_tick,
+                radii=radii,
+                active_by_tick=active_by_tick,
+                object_order=object_order,
+                order_rank=order_rank,
+            )
+            if cand_sig != target_sig:
+                reject = cand
+                break
+            keep = cand
+            probe = cand
+            step *= 2.0
+    if reject is None:
+        _INTERVAL_AIM_STATS.note_polish("success:expand_only")
+        return _norm_angle(keep)
+
+    bisect_iters = 0
+    for _ in range(80):
+        mid = 0.5 * (keep + reject)
+        if mid == keep or mid == reject:
+            break
+        bisect_iters += 1
+        if (
+            _local_first_hit_signature_at_angle(
+                _norm_angle(mid),
+                target_slot=int(target_sig[1]),
+                competitor_sig=competitor_sig,
+                target_tick_hint=int(target_tick_hint),
+                competitor_tick_hint=int(competitor_tick_hint),
+                origin_xy=origin_xy,
+                origin_radius=origin_radius,
+                speed=speed,
+                p0_by_tick=p0_by_tick,
+                p1_by_tick=p1_by_tick,
+                radii=radii,
+                active_by_tick=active_by_tick,
+                object_order=object_order,
+                order_rank=order_rank,
+            )
+            == target_sig
+        ):
+            keep = float(mid)
+        else:
+            reject = float(mid)
+    _INTERVAL_AIM_STATS.note_polish("success:bisected")
+    _INTERVAL_AIM_STATS.note_polish("bisect_iters_total", bisect_iters)
+    _INTERVAL_AIM_STATS.note_polish_gap(keep, reject)
+    return _norm_angle(keep)
+
+
 def _closest_angle_in_cells(
     theta: float,
     cells: Sequence[tuple[float, float]],
     *,
-    inside_eps: float = AIM_INSIDE_EDGE_EPS,
+    refine_boundaries: bool = True,
+    target_sig: tuple[str, int] | None = None,
+    cache: "OcclusionWalkCache" | None = None,
+    origin_xy: np.ndarray | None = None,
+    origin_radius: float = 0.0,
+    speed: float = 0.0,
+    p0_by_tick: np.ndarray | None = None,
+    p1_by_tick: np.ndarray | None = None,
+    radii: np.ndarray | None = None,
+    active_by_tick: np.ndarray | None = None,
+    object_order: Sequence[int] | None = None,
+    order_rank: dict[int, int] | None = None,
 ) -> float | None:
     """Nearest heading just inside the union of non-wrapping visible cells."""
 
@@ -374,12 +1320,30 @@ def _closest_angle_in_cells(
     for lo, hi in cells:
         if hi - lo <= GEOM_EPS:
             continue
-        inner_lo = lo + inside_eps
-        inner_hi = hi - inside_eps
-        if inner_lo <= inner_hi:
-            clamped = min(max(target, inner_lo), inner_hi)
+        if lo <= target <= hi:
+            clamped = target
         else:
-            clamped = 0.5 * (lo + hi)
+            raw_bound = lo if abs(_signed_angle_delta(lo, target)) <= abs(_signed_angle_delta(hi, target)) else hi
+            if refine_boundaries and target_sig is not None:
+                outward_dir = -1.0 if abs(raw_bound - lo) <= abs(raw_bound - hi) else 1.0
+                clamped = _polish_boundary_ground_truth(
+                    raw_bound,
+                    owner_cell=(lo, hi),
+                    target_sig=target_sig,
+                    outward_dir=outward_dir,
+                    cache=cache,
+                    origin_xy=np.asarray(origin_xy, dtype=np.float64),
+                    origin_radius=origin_radius,
+                    speed=speed,
+                    p0_by_tick=np.asarray(p0_by_tick, dtype=np.float64),
+                    p1_by_tick=np.asarray(p1_by_tick, dtype=np.float64),
+                    radii=np.asarray(radii, dtype=np.float64),
+                    active_by_tick=np.asarray(active_by_tick, dtype=bool),
+                    object_order=list(object_order or []),
+                    order_rank=order_rank,
+                )
+            else:
+                clamped = _boundary_angle_inside(lo, hi, raw_bound)
         d = abs(_signed_angle_delta(clamped, target))
         if d < best_d:
             best_d = d
@@ -410,7 +1374,18 @@ def _edge_angle_inside_furthest_on_side(
     cells: Sequence[tuple[float, float]],
     *,
     side: int,
-    inside_eps: float = AIM_INSIDE_EDGE_EPS,
+    refine_boundaries: bool = True,
+    target_sig: tuple[str, int] | None = None,
+    cache: "OcclusionWalkCache" | None = None,
+    origin_xy: np.ndarray | None = None,
+    origin_radius: float = 0.0,
+    speed: float = 0.0,
+    p0_by_tick: np.ndarray | None = None,
+    p1_by_tick: np.ndarray | None = None,
+    radii: np.ndarray | None = None,
+    active_by_tick: np.ndarray | None = None,
+    object_order: Sequence[int] | None = None,
+    order_rank: dict[int, int] | None = None,
 ) -> float | None:
     """Heading just inside the visible boundary farthest on one side of ``theta_fc``."""
 
@@ -424,7 +1399,7 @@ def _edge_angle_inside_furthest_on_side(
     best_dist = -1.0
     owner: tuple[float, float] | None = None
     for lo, hi in cells:
-        if hi - lo <= inside_eps:
+        if hi - lo <= GEOM_EPS:
             continue
         for bound in (lo, hi):
             delta = _signed_angle_delta(bound, ref)
@@ -438,13 +1413,33 @@ def _edge_angle_inside_furthest_on_side(
     if best_bound is None or owner is None:
         return None
     lo, hi = owner
-    return _boundary_angle_inside(lo, hi, best_bound, inside_eps=inside_eps)
+    if refine_boundaries and target_sig is not None:
+        outward_dir = -1.0 if abs(best_bound - lo) <= abs(best_bound - hi) else 1.0
+        return _polish_boundary_ground_truth(
+            best_bound,
+            owner_cell=(lo, hi),
+            target_sig=target_sig,
+            outward_dir=outward_dir,
+            cache=cache,
+            origin_xy=np.asarray(origin_xy, dtype=np.float64),
+            origin_radius=origin_radius,
+            speed=speed,
+            p0_by_tick=np.asarray(p0_by_tick, dtype=np.float64),
+            p1_by_tick=np.asarray(p1_by_tick, dtype=np.float64),
+            radii=np.asarray(radii, dtype=np.float64),
+            active_by_tick=np.asarray(active_by_tick, dtype=bool),
+            object_order=list(object_order or []),
+            order_rank=order_rank,
+        )
+    return _boundary_angle_inside(lo, hi, best_bound)
 
 
 def _pick_planet_aim_from_visible_cells(
     cells: Sequence[tuple[float, float]],
     first_contact_angle: float,
     *,
+    refine_boundaries: bool,
+    cache: "OcclusionWalkCache" | None,
     origin_xy: np.ndarray,
     origin_radius: float,
     speed: float,
@@ -453,6 +1448,7 @@ def _pick_planet_aim_from_visible_cells(
     radii: np.ndarray,
     active_by_tick: np.ndarray,
     slot: int,
+    object_order: Sequence[int],
 ) -> tuple[float | None, int, float]:
     """Pick launch angle prioritising earliest planet hit tick, then edge precision."""
 
@@ -467,7 +1463,24 @@ def _pick_planet_aim_from_visible_cells(
         return None, -1, 0.0
 
     theta_fc = _norm_angle(first_contact_angle)
-    theta_primary = _closest_angle_in_cells(theta_fc, cells)
+    target_sig = ("planet", int(slot))
+    order_rank = {int(s): i for i, s in enumerate(object_order)}
+    theta_primary = _closest_angle_in_cells(
+        theta_fc,
+        cells,
+        refine_boundaries=refine_boundaries,
+        target_sig=target_sig,
+        cache=cache,
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        p0_by_tick=p0_by_tick,
+        p1_by_tick=p1_by_tick,
+        radii=radii,
+        active_by_tick=active_by_tick,
+        object_order=object_order,
+        order_rank=order_rank,
+    )
     primary_angle, tick_primary, reason_primary = _candidate_tick_single_planet(
         theta_primary,
         origin_xy=origin_xy,
@@ -489,8 +1502,40 @@ def _pick_planet_aim_from_visible_cells(
     secondary_side = -primary_side
 
     edge_angles_by_label = {
-        "edge_same_side": _edge_angle_inside_furthest_on_side(theta_fc, cells, side=primary_side),
-        "edge_other_side": _edge_angle_inside_furthest_on_side(theta_fc, cells, side=secondary_side),
+        "edge_same_side": _edge_angle_inside_furthest_on_side(
+            theta_fc,
+            cells,
+            side=primary_side,
+            refine_boundaries=refine_boundaries,
+            target_sig=target_sig,
+            cache=cache,
+            origin_xy=origin_xy,
+            origin_radius=origin_radius,
+            speed=speed,
+            p0_by_tick=p0_by_tick,
+            p1_by_tick=p1_by_tick,
+            radii=radii,
+            active_by_tick=active_by_tick,
+            object_order=object_order,
+            order_rank=order_rank,
+        ),
+        "edge_other_side": _edge_angle_inside_furthest_on_side(
+            theta_fc,
+            cells,
+            side=secondary_side,
+            refine_boundaries=refine_boundaries,
+            target_sig=target_sig,
+            cache=cache,
+            origin_xy=origin_xy,
+            origin_radius=origin_radius,
+            speed=speed,
+            p0_by_tick=p0_by_tick,
+            p1_by_tick=p1_by_tick,
+            radii=radii,
+            active_by_tick=active_by_tick,
+            object_order=object_order,
+            order_rank=order_rank,
+        ),
     }
 
     seen_angles: list[float] = []
@@ -633,7 +1678,7 @@ def sweep_interval_best_targets(
 
     valid = best_width > GEOM_EPS
     return (
-        best_angle.astype(np.float32),
+        best_angle.astype(np.float64),
         best_width.astype(np.float32),
         valid,
         overflow,
@@ -1467,6 +2512,8 @@ def sweep_interval_best_targets_from_events(
     p1_by_tick: np.ndarray | None = None,
     radii: np.ndarray | None = None,
     active_by_tick: np.ndarray | None = None,
+    occlusion_cache: "OcclusionWalkCache" | None = None,
+    refine_boundaries: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, np.ndarray]:
     """Occlusion sweep over events sorted by ``floor(t)`` then collision rank.
 
@@ -1502,6 +2549,8 @@ def sweep_interval_best_targets_from_events(
                 aim, tick, width = _pick_planet_aim_from_visible_cells(
                     cells,
                     _event_first_contact_angle(event),
+                    refine_boundaries=refine_boundaries,
+                    cache=occlusion_cache,
                     origin_xy=origin,
                     origin_radius=origin_radius,
                     speed=speed,
@@ -1510,6 +2559,7 @@ def sweep_interval_best_targets_from_events(
                     radii=radii,
                     active_by_tick=active_by_tick,
                     slot=int(event.slot),
+                    object_order=order,
                 )
             else:
                 aim, tick, width = None, -1, 0.0
@@ -1538,7 +2588,7 @@ def sweep_interval_best_targets_from_events(
 
     valid = (best_width > GEOM_EPS) & (best_tick >= 0)
     return (
-        best_angle.astype(np.float32),
+        best_angle.astype(np.float64),
         best_width.astype(np.float32),
         valid,
         overflow,
