@@ -629,6 +629,78 @@ def _board_hit_near_tick(
     return False
 
 
+def _body_first_hit_near_tick(
+    angle: float,
+    *,
+    body_sig: tuple[str, int],
+    tick: int,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    p0_by_tick: np.ndarray,
+    p1_by_tick: np.ndarray,
+    radii: np.ndarray,
+    active_by_tick: np.ndarray,
+    tick_margin: int = 1,
+) -> int:
+    kind, code = body_sig
+    lo = max(0, int(tick) - int(tick_margin))
+    hi = min(int(active_by_tick.shape[0]) - 1, int(tick) + int(tick_margin))
+    if hi < lo:
+        return -1
+    for t in range(lo, hi + 1):
+        if kind == "planet" and 0 <= int(code) < int(radii.shape[0]):
+            if _planet_hit_on_tick(
+                angle,
+                slot=int(code),
+                tick=t,
+                origin_xy=origin_xy,
+                origin_radius=origin_radius,
+                speed=speed,
+                p0_by_tick=p0_by_tick,
+                p1_by_tick=p1_by_tick,
+                radii=radii,
+                active_by_tick=active_by_tick,
+            ):
+                return int(t)
+        elif kind == "sun":
+            if _sun_hit_on_tick(
+                angle,
+                tick=t,
+                origin_xy=origin_xy,
+                origin_radius=origin_radius,
+                speed=speed,
+            ):
+                return int(t)
+        elif kind == "board":
+            if _board_hit_on_tick(
+                angle,
+                tick=t,
+                origin_xy=origin_xy,
+                origin_radius=origin_radius,
+                speed=speed,
+            ):
+                return int(t)
+    return -1
+
+
+def _hit_signature_priority(
+    sig: tuple[str, int],
+    *,
+    object_order: Sequence[int],
+    order_rank: dict[int, int] | None = None,
+) -> int:
+    kind, code = sig
+    if kind == "planet":
+        rank = order_rank or {int(s): i for i, s in enumerate(object_order)}
+        return int(rank.get(int(code), 10_000))
+    if kind == "sun":
+        return 10_001
+    if kind == "board":
+        return 10_002
+    return 10_003
+
+
 def _board_hit_tick(
     angle: float,
     *,
@@ -825,14 +897,12 @@ def _local_first_hit_signature_at_angle(
         target_tick = int(target_tick_hint)
         comp_tick = int(competitor_tick_hint)
 
-    comp_kind, comp_code = competitor_sig
-    if target_tick < 0 and comp_tick < 0:
-        return ("none", -1)
-
-    if comp_tick < 0 or (target_tick >= 0 and target_tick < comp_tick):
-        if target_tick >= 0 and _planet_hit_near_tick(
+    target_sig = ("planet", int(target_slot))
+    target_near = -1
+    if target_tick >= 0:
+        target_near = _body_first_hit_near_tick(
             angle,
-            slot=int(target_slot),
+            body_sig=target_sig,
             tick=int(target_tick),
             origin_xy=origin_xy,
             origin_radius=origin_radius,
@@ -841,74 +911,13 @@ def _local_first_hit_signature_at_angle(
             p1_by_tick=p1_by_tick,
             radii=radii,
             active_by_tick=active_by_tick,
-        ):
-            return ("planet", int(target_slot))
-        return ("none", -1)
+        )
 
-    if target_tick < 0 or comp_tick < target_tick:
-        comp_hit = False
-        if comp_kind == "planet" and 0 <= int(comp_code) < int(radii.shape[0]):
-            comp_hit = _planet_hit_near_tick(
-                angle,
-                slot=int(comp_code),
-                tick=int(comp_tick),
-                origin_xy=origin_xy,
-                origin_radius=origin_radius,
-                speed=speed,
-                p0_by_tick=p0_by_tick,
-                p1_by_tick=p1_by_tick,
-                radii=radii,
-                active_by_tick=active_by_tick,
-            )
-        elif comp_kind == "sun":
-            comp_hit = _sun_hit_near_tick(
-                angle,
-                tick=int(comp_tick),
-                origin_xy=origin_xy,
-                origin_radius=origin_radius,
-                speed=speed,
-            )
-        elif comp_kind == "board":
-            comp_hit = _board_hit_near_tick(
-                angle,
-                tick=int(comp_tick),
-                origin_xy=origin_xy,
-                origin_radius=origin_radius,
-                speed=speed,
-            )
-        if comp_hit:
-            return (str(comp_kind), int(comp_code))
-        return ("planet", int(target_slot))
-
-    target_hit = _planet_hit_on_tick(
-        angle,
-        slot=int(target_slot),
-        tick=int(target_tick),
-        origin_xy=origin_xy,
-        origin_radius=origin_radius,
-        speed=speed,
-        p0_by_tick=p0_by_tick,
-        p1_by_tick=p1_by_tick,
-        radii=radii,
-        active_by_tick=active_by_tick,
-    )
-    target_hit = _planet_hit_near_tick(
-        angle,
-        slot=int(target_slot),
-        tick=int(target_tick),
-        origin_xy=origin_xy,
-        origin_radius=origin_radius,
-        speed=speed,
-        p0_by_tick=p0_by_tick,
-        p1_by_tick=p1_by_tick,
-        radii=radii,
-        active_by_tick=active_by_tick,
-    )
-    comp_hit = False
-    if comp_kind == "planet" and 0 <= int(comp_code) < int(radii.shape[0]):
-        comp_hit = _planet_hit_near_tick(
+    comp_near = -1
+    if comp_tick >= 0:
+        comp_near = _body_first_hit_near_tick(
             angle,
-            slot=int(comp_code),
+            body_sig=competitor_sig,
             tick=int(comp_tick),
             origin_xy=origin_xy,
             origin_radius=origin_radius,
@@ -918,32 +927,30 @@ def _local_first_hit_signature_at_angle(
             radii=radii,
             active_by_tick=active_by_tick,
         )
-    elif comp_kind == "sun":
-        comp_hit = _sun_hit_near_tick(
-            angle,
-            tick=int(comp_tick),
-            origin_xy=origin_xy,
-            origin_radius=origin_radius,
-            speed=speed,
-        )
-    elif comp_kind == "board":
-        comp_hit = _board_hit_near_tick(
-            angle,
-            tick=int(comp_tick),
-            origin_xy=origin_xy,
-            origin_radius=origin_radius,
-            speed=speed,
-        )
-    if target_hit:
-        if comp_hit and comp_kind == "planet":
-            rank = order_rank or {int(s): i for i, s in enumerate(object_order)}
-            if rank.get(int(target_slot), 10_000) <= rank.get(int(comp_code), 10_000):
-                return ("planet", int(target_slot))
-            return ("planet", int(comp_code))
-        return ("planet", int(target_slot))
-    if comp_hit:
-        return (str(comp_kind), int(comp_code))
-    return ("none", -1)
+
+    if target_near < 0 and comp_near < 0:
+        return ("none", -1)
+    if target_near < 0:
+        return (str(competitor_sig[0]), int(competitor_sig[1]))
+    if comp_near < 0:
+        return target_sig
+    if target_near < comp_near:
+        return target_sig
+    if comp_near < target_near:
+        return (str(competitor_sig[0]), int(competitor_sig[1]))
+    target_pri = _hit_signature_priority(
+        target_sig,
+        object_order=object_order,
+        order_rank=order_rank,
+    )
+    comp_pri = _hit_signature_priority(
+        competitor_sig,
+        object_order=object_order,
+        order_rank=order_rank,
+    )
+    if target_pri <= comp_pri:
+        return target_sig
+    return (str(competitor_sig[0]), int(competitor_sig[1]))
 
 
 def _approx_boundary_competitor_signature(
