@@ -25,6 +25,7 @@ from jax_orbit_wars import OrbitWarsConfig, OrbitWarsState
 
 from orbit_wars_pt.env_wrapper import OrbitWarsEnvConfig
 from orbit_wars_pt.scores_jax import (
+    _player_alive_four_core,
     _ship_mass_ratios_four_core,
     _ship_ratio_scores_core,
     _ship_totals_p01_core,
@@ -227,8 +228,8 @@ def ship_totals_batched(state: OrbitWarsState) -> Tuple[jnp.ndarray, jnp.ndarray
 def step_env_with_scores_batched(
     state: OrbitWarsState,
     actions: jnp.ndarray,
-) -> Tuple[OrbitWarsState, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Step a bucket; return next state, Δ(own_i/total_mass) per player ``[N, 4]``, ships p0/p1 post."""
+) -> Tuple[OrbitWarsState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Step a bucket; return next state, reward deltas, post-step alive mask, ships p0/p1."""
 
     ratios_pre = jax.vmap(_ship_mass_ratios_four_core)(
         state.planets, state.planet_active, state.incoming_fleets
@@ -241,7 +242,10 @@ def step_env_with_scores_batched(
     s0_post, s1_post = jax.vmap(_ship_totals_p01_core)(
         next_state.planets, next_state.planet_active, next_state.incoming_fleets
     )
-    return next_state, dr, s0_post, s1_post
+    alive_post = jax.vmap(_player_alive_four_core)(
+        next_state.planets, next_state.planet_active, next_state.incoming_fleets
+    )
+    return next_state, dr, alive_post, s0_post, s1_post
 
 
 @jax.jit

@@ -58,6 +58,31 @@ def _ship_mass_ratios_four_core(
 
 
 @jax.jit
+def _player_alive_four_core(
+    planets: jnp.ndarray,
+    planet_active: jnp.ndarray,
+    incoming_fleets: jnp.ndarray,
+) -> jnp.ndarray:
+    """Whether each player still owns any planet or has inbound fleets, shape ``(4,)``.
+
+    This matches the official interpreter's elimination logic: a player with
+    one or more owned planets is alive even if those planets currently have
+    zero ships.
+    """
+
+    owners_p = planets[:, 1].astype(jnp.int32)
+    safe_owners = jnp.clip(owners_p, 0, 3)
+    owned_planet = planet_active.astype(jnp.bool_) & (owners_p >= 0)
+    alive_from_planets = (
+        jnp.zeros((4,), dtype=jnp.int32).at[safe_owners].max(owned_planet.astype(jnp.int32))
+        > 0
+    )
+    alive_from_fleets_a = jnp.sum(incoming_fleets, axis=(1, 2)) > 0
+    alive_from_fleets = jnp.pad(alive_from_fleets_a, (0, 4 - incoming_fleets.shape[0]))
+    return alive_from_planets | alive_from_fleets
+
+
+@jax.jit
 def _ship_totals_p01_core(
     planets: jnp.ndarray,
     planet_active: jnp.ndarray,

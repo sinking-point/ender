@@ -105,6 +105,9 @@ def _serialize_rollout_carry(carry: RolloutCarry) -> Dict[str, Any]:
         "state_b": state_np,
         "cfg": asdict(carry.cfg),
         "episode_turns": list(carry.episode_turns),
+        "player_done": (
+            None if carry.player_done is None else np.asarray(carry.player_done, dtype=np.bool_)
+        ),
     }
 
 
@@ -119,10 +122,17 @@ def _deserialize_rollout_carry(obj: Dict[str, Any]) -> RolloutCarry:
     episode_turns = list(obj.get("episode_turns", [0] * ne))
     if len(episode_turns) != ne:
         episode_turns = [0] * ne
+    player_done_obj = obj.get("player_done", None)
+    player_done = None
+    if player_done_obj is not None:
+        pd = np.asarray(player_done_obj, dtype=np.bool_)
+        if pd.shape == (int(cfg.num_agents), ne):
+            player_done = pd
     return RolloutCarry(
         state_b=state_b,
         cfg=cfg,
         episode_turns=episode_turns,
+        player_done=player_done,
     )
 
 
@@ -1325,6 +1335,7 @@ def train(args: argparse.Namespace) -> None:
                 state_b=heal_sb,
                 cfg=rollout_carry.cfg,
                 episode_turns=heal_et,
+                player_done=rollout_carry.player_done,
             )
             rollout_env_seed += heal_seeds
             if int(rollout_carry.cfg.num_agents) != int(args.num_agents):

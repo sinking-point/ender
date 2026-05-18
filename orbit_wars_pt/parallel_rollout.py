@@ -156,6 +156,9 @@ class RolloutCarry:
     cfg: OrbitWarsEnvConfig
     #: Env-turn counter for the current episode per env (for stats across rollout segments).
     episode_turns: List[int]
+    #: Per-player local terminal flags for unfinished 4p games. The env may continue
+    #: after a player is eliminated; that player's PPO stream should not.
+    player_done: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -869,11 +872,19 @@ def collect_parallel_micro_rollouts(
         )
         seeds_consumed += num_envs
         episode_turns = [0] * num_envs
+        player_done = np.zeros((int(cfg.num_agents), num_envs), dtype=np.bool_)
     else:
         state_b, cfg = carry_in.state_b, carry_in.cfg
         episode_turns = list(carry_in.episode_turns)
         if len(episode_turns) != num_envs:
             episode_turns = [0] * num_envs
+        pd = carry_in.player_done
+        if pd is None:
+            player_done = np.zeros((int(cfg.num_agents), num_envs), dtype=np.bool_)
+        else:
+            player_done = np.asarray(pd, dtype=np.bool_)
+            if player_done.shape != (int(cfg.num_agents), num_envs):
+                player_done = np.zeros((int(cfg.num_agents), num_envs), dtype=np.bool_)
 
     obs_feature_dim = obs_feature_dim_for_num_agents(int(cfg.num_agents))
     n_ego = int(cfg.num_agents)
@@ -941,8 +952,8 @@ def collect_parallel_micro_rollouts(
             if horizon_fired and np.all(segment_done):
                 break
 
-            ready_mask = (~segment_done) & np.all(halted, axis=0)
-            pending = (~segment_done)[None, :] & (~halted)
+            ready_mask = (~segment_done) & np.all(halted | player_done, axis=0)
+            pending = (~segment_done)[None, :] & (~halted) & (~player_done)
             ready_count = int(np.sum(ready_mask))
             pending_total = int(np.sum(pending))
 
@@ -969,12 +980,13 @@ def collect_parallel_micro_rollouts(
 
                 t_core0 = perf_counter()
                 state_bucket = jax.tree.map(lambda leaf: leaf[idx_j], state_b)
-                next_bucket, dr_jax, s0_post, s1_post = step_env_with_scores_batched(
+                next_bucket, dr_jax, alive_post_jax, s0_post, s1_post = step_env_with_scores_batched(
                     state_bucket, actions_bucket
                 )
-                dr_np, done_np, step_count_np, rewards_np, s0_fin_np, s1_fin_np = jax.device_get(
+                dr_np, alive_post_np, done_np, step_count_np, rewards_np, s0_fin_np, s1_fin_np = jax.device_get(
                     (
                         dr_jax,
+                        alive_post_jax,
                         next_bucket.done,
                         next_bucket.step_count,
                         next_bucket.rewards,
@@ -983,6 +995,7 @@ def collect_parallel_micro_rollouts(
                     )
                 )
                 dr_np = np.asarray(dr_np)
+                alive_post_np = np.asarray(alive_post_np, dtype=np.bool_)
                 done_np = np.asarray(done_np)
                 step_count_np = np.asarray(step_count_np)
                 rewards_np = np.asarray(rewards_np)
@@ -1001,10 +1014,13 @@ def collect_parallel_micro_rollouts(
                     episode_turns[env_i] += 1
                     for p in range(n_ego):
                         if reward_idx[p, env_i] >= 0:
+                            local_done = bool(done_np[local_i]) or not bool(alive_post_np[local_i, p])
                             reward[p][reward_idx[p, env_i], env_i] += float(dr_np[local_i, p])
-                            done[p][reward_idx[p, env_i], env_i] = bool(done_np[local_i]) or bool(
+                            done[p][reward_idx[p, env_i], env_i] = local_done or bool(
                                 done[p][reward_idx[p, env_i], env_i]
                             )
+                        if not bool(alive_post_np[local_i, p]):
+                            player_done[p, env_i] = True
                     if bool(done_np[local_i]):
                         sc_i = int(step_count_np[local_i])
                         game_stats.record_completion(
@@ -1028,7 +1044,9 @@ def collect_parallel_micro_rollouts(
                         t_py0 += reset_dt
                         seeds_consumed += 1
 
-                    halted[:, env_i] = False
+                    if bool(done_np[local_i]):
+                        player_done[:, env_i] = False
+                    halted[:, env_i] = player_done[:, env_i]
                     micro_k[:, env_i] = 0
                     pending_actions[env_i] = 0.0
                     pending_actions[env_i, :, :, 3] = -1.0
@@ -1151,5 +1169,6 @@ def collect_parallel_micro_rollouts(
         state_b=state_b,
         cfg=cfg,
         episode_turns=episode_turns,
+        player_done=player_done,
     )
     return segment, timing, next_carry, seeds_consumed, game_stats
