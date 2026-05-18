@@ -39,6 +39,7 @@ from orbit_wars_pt.reset_prefetch import RolloutResetPrefetch
 
 from orbit_wars_pt.batched_env import (
     obs_jax_to_torch,
+    reward_mode_to_id,
     reset_env_at_index,
     stack_initial_states,
     step_env_with_scores_batched,
@@ -875,6 +876,7 @@ def collect_parallel_micro_rollouts(
         player_done = np.zeros((int(cfg.num_agents), num_envs), dtype=np.bool_)
     else:
         state_b, cfg = carry_in.state_b, carry_in.cfg
+        cfg.reward_mode = cfg_template.reward_mode
         episode_turns = list(carry_in.episode_turns)
         if len(episode_turns) != num_envs:
             episode_turns = [0] * num_envs
@@ -888,6 +890,7 @@ def collect_parallel_micro_rollouts(
 
     obs_feature_dim = obs_feature_dim_for_num_agents(int(cfg.num_agents))
     n_ego = int(cfg.num_agents)
+    reward_mode_id = reward_mode_to_id(str(cfg.reward_mode))
 
     _reset_prefetch_resync(reset_prefetch, seed_base, seeds_consumed, cfg)
 
@@ -980,8 +983,8 @@ def collect_parallel_micro_rollouts(
 
                 t_core0 = perf_counter()
                 state_bucket = jax.tree.map(lambda leaf: leaf[idx_j], state_b)
-                next_bucket, dr_jax, alive_post_jax, s0_post, s1_post = step_env_with_scores_batched(
-                    state_bucket, actions_bucket
+                next_bucket, dr_jax, alive_post_jax, s0_post, s1_post = (
+                    step_env_with_scores_batched(state_bucket, actions_bucket, reward_mode_id)
                 )
                 dr_np, alive_post_np, done_np, step_count_np, rewards_np, s0_fin_np, s1_fin_np = jax.device_get(
                     (

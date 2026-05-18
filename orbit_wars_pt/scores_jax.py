@@ -7,6 +7,8 @@ from typing import Any, Tuple
 import jax
 import jax.numpy as jnp
 
+from jax_orbit_wars import PLANET_OWNER, PLANET_PRODUCTION, PLANET_SHIPS
+
 
 @jax.jit
 def _per_player_ship_masses_core(
@@ -16,8 +18,8 @@ def _per_player_ship_masses_core(
 ) -> jnp.ndarray:
     """Per-player ship mass on planets plus inbound fleets, shape ``(4,)`` float32."""
 
-    owners_p = planets[:, 1].astype(jnp.int32)
-    ships_p = planets[:, 5]
+    owners_p = planets[:, PLANET_OWNER].astype(jnp.int32)
+    ships_p = planets[:, PLANET_SHIPS]
     mask_p = planet_active.astype(jnp.bool_) & (owners_p >= 0)
     oc = jnp.clip(owners_p, 0, 3)
     oh = jax.nn.one_hot(oc, 4)
@@ -27,6 +29,21 @@ def _per_player_ship_masses_core(
     scores_f = jnp.pad(scores_f_a, (0, 4 - incoming_fleets.shape[0]))
 
     return scores_p + scores_f
+
+
+@jax.jit
+def _per_player_production_core(
+    planets: jnp.ndarray,
+    planet_active: jnp.ndarray,
+) -> jnp.ndarray:
+    """Per-player production from active owned planets, shape ``(4,)`` float32."""
+
+    owners_p = planets[:, PLANET_OWNER].astype(jnp.int32)
+    production_p = planets[:, PLANET_PRODUCTION]
+    mask_p = planet_active.astype(jnp.bool_) & (owners_p >= 0)
+    oc = jnp.clip(owners_p, 0, 3)
+    oh = jax.nn.one_hot(oc, 4)
+    return jnp.sum(oh * mask_p[:, None] * production_p[:, None], axis=0)
 
 
 @jax.jit
@@ -58,6 +75,18 @@ def _ship_mass_ratios_four_core(
 
 
 @jax.jit
+def _production_ratios_four_core(
+    planets: jnp.ndarray,
+    planet_active: jnp.ndarray,
+) -> jnp.ndarray:
+    """Production shares ``own_i / sum_j own_j`` for active non-neutral planets."""
+
+    scores = _per_player_production_core(planets, planet_active)
+    total = jnp.sum(scores) + jnp.asarray(1e-6, dtype=scores.dtype)
+    return scores / total
+
+
+@jax.jit
 def _player_alive_four_core(
     planets: jnp.ndarray,
     planet_active: jnp.ndarray,
@@ -70,7 +99,7 @@ def _player_alive_four_core(
     zero ships.
     """
 
-    owners_p = planets[:, 1].astype(jnp.int32)
+    owners_p = planets[:, PLANET_OWNER].astype(jnp.int32)
     safe_owners = jnp.clip(owners_p, 0, 3)
     owned_planet = planet_active.astype(jnp.bool_) & (owners_p >= 0)
     alive_from_planets = (

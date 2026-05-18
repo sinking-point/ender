@@ -12,6 +12,7 @@ live on host — those move to JAX in later phases.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -26,6 +27,7 @@ from jax_orbit_wars import OrbitWarsConfig, OrbitWarsState
 from orbit_wars_pt.env_wrapper import OrbitWarsEnvConfig
 from orbit_wars_pt.scores_jax import (
     _player_alive_four_core,
+    _production_ratios_four_core,
     _ship_mass_ratios_four_core,
     _ship_ratio_scores_core,
     _ship_totals_p01_core,
@@ -33,6 +35,16 @@ from orbit_wars_pt.scores_jax import (
 
 
 _DEFAULT_STEP_CFG = OrbitWarsConfig()
+REWARD_MODE_SHIP_MASS_SHARE = 0
+REWARD_MODE_PRODUCTION_SHARE = 1
+
+
+def reward_mode_to_id(reward_mode: str) -> int:
+    if reward_mode == "ship-mass-share":
+        return REWARD_MODE_SHIP_MASS_SHARE
+    if reward_mode == "production-share":
+        return REWARD_MODE_PRODUCTION_SHARE
+    raise ValueError(f"unknown reward mode {reward_mode!r}")
 
 # vmap leading num_envs axis on (state, actions); broadcast the static config.
 _vmapped_step = jax.jit(jax.vmap(jow.step, in_axes=(0, 0, None), out_axes=0))
@@ -111,6 +123,7 @@ def stack_initial_states(
         num_agents=cfg_template.num_agents,
         max_fleets=cfg_template.max_fleets,
         episode_seed=cfg_template.episode_seed,
+        reward_mode=cfg_template.reward_mode,
     )
     states: List[OrbitWarsState] = []
     for i in range(num_envs):
@@ -224,20 +237,29 @@ def ship_totals_batched(state: OrbitWarsState) -> Tuple[jnp.ndarray, jnp.ndarray
     return s0, s1
 
 
-@jax.jit
+@partial(jax.jit, static_argnames=("reward_mode",))
 def step_env_with_scores_batched(
     state: OrbitWarsState,
     actions: jnp.ndarray,
+    reward_mode: int = REWARD_MODE_SHIP_MASS_SHARE,
 ) -> Tuple[OrbitWarsState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Step a bucket; return next state, reward deltas, post-step alive mask, ships p0/p1."""
 
-    ratios_pre = jax.vmap(_ship_mass_ratios_four_core)(
-        state.planets, state.planet_active, state.incoming_fleets
-    )
+    if reward_mode == REWARD_MODE_PRODUCTION_SHARE:
+        ratios_pre = jax.vmap(_production_ratios_four_core)(state.planets, state.planet_active)
+    else:
+        ratios_pre = jax.vmap(_ship_mass_ratios_four_core)(
+            state.planets, state.planet_active, state.incoming_fleets
+        )
     next_state = _vmapped_step(state, actions, _DEFAULT_STEP_CFG)
-    ratios_post = jax.vmap(_ship_mass_ratios_four_core)(
-        next_state.planets, next_state.planet_active, next_state.incoming_fleets
-    )
+    if reward_mode == REWARD_MODE_PRODUCTION_SHARE:
+        ratios_post = jax.vmap(_production_ratios_four_core)(
+            next_state.planets, next_state.planet_active
+        )
+    else:
+        ratios_post = jax.vmap(_ship_mass_ratios_four_core)(
+            next_state.planets, next_state.planet_active, next_state.incoming_fleets
+        )
     dr = ratios_post - ratios_pre
     s0_post, s1_post = jax.vmap(_ship_totals_p01_core)(
         next_state.planets, next_state.planet_active, next_state.incoming_fleets

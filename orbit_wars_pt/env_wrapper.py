@@ -17,6 +17,7 @@ class OrbitWarsEnvConfig:
     num_agents: int = 2
     max_fleets: int = 512
     episode_seed: int = 0
+    reward_mode: str = "ship-mass-share"
 
 
 def reset_env(cfg: OrbitWarsEnvConfig) -> OrbitWarsState:

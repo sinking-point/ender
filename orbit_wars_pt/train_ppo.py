@@ -171,6 +171,7 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "ppo_epochs",
         "minibatch_size",
         "ship_speed",
+        "reward_mode",
         "first_hit_n_rays",
         "first_hit_ray_chunk_size",
         "micro_step_penalty",
@@ -1242,7 +1243,12 @@ def train(args: argparse.Namespace) -> None:
         else:
             print("[orbit_wars_pt] no checkpoint in experiment dir — starting fresh", flush=True)
 
-    cfg = OrbitWarsEnvConfig(num_agents=args.num_agents, max_fleets=args.max_fleets, episode_seed=args.seed)
+    cfg = OrbitWarsEnvConfig(
+        num_agents=args.num_agents,
+        max_fleets=args.max_fleets,
+        episode_seed=args.seed,
+        reward_mode=args.reward_mode,
+    )
 
     policy = OrbitWarsPolicy(
         d_model=args.d_model,
@@ -1757,6 +1763,17 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Small reward penalty per dispatched micro-action/fleet launch. Halt-only "
             "micro-steps are not charged. Set 0 to disable."
+        ),
+    )
+    p.add_argument(
+        "--reward-mode",
+        type=str,
+        default="ship-mass-share",
+        choices=("ship-mass-share", "production-share"),
+        help=(
+            "Shaped reward delta to train on. 'ship-mass-share' is the existing default "
+            "(garrisons plus fleets); 'production-share' uses owned planet production over "
+            "all non-neutral owned planet production."
         ),
     )
     p.add_argument("--max-grad-norm", type=float, default=0.5)
