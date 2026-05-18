@@ -41,6 +41,17 @@ LAUNCH_RIM_OFFSET = 0.1
 _USE_EXACT_CIRCULAR_ORBIT_ORTHOGONAL = False
 
 
+@dataclass(frozen=True)
+class IntervalRefineJob:
+    variant: str
+    slot: int
+    coarse_angle: float
+    owner_lo: float
+    owner_hi: float
+    bound: float | None
+    outward_dir: float
+
+
 
 @dataclass(frozen=True, slots=True)
 class OrthogonalHitEvent:
@@ -1310,7 +1321,8 @@ def _closest_angle_in_cells(
     active_by_tick: np.ndarray | None = None,
     object_order: Sequence[int] | None = None,
     order_rank: dict[int, int] | None = None,
-) -> float | None:
+    return_meta: bool = False,
+) -> float | tuple[float | None, dict[str, float | bool | None]]:
     """Nearest heading just inside the union of non-wrapping visible cells."""
 
     if not cells:
@@ -1318,15 +1330,32 @@ def _closest_angle_in_cells(
     target = _norm_angle(theta)
     best: float | None = None
     best_d = float("inf")
+    best_meta: dict[str, float | bool | None] = {
+        "inside_cell": False,
+        "owner_lo": None,
+        "owner_hi": None,
+        "bound": None,
+        "outward_dir": 0.0,
+    }
     for lo, hi in cells:
         if hi - lo <= GEOM_EPS:
             continue
+        meta = {
+            "inside_cell": False,
+            "owner_lo": float(lo),
+            "owner_hi": float(hi),
+            "bound": None,
+            "outward_dir": 0.0,
+        }
         if lo <= target <= hi:
             clamped = target
+            meta["inside_cell"] = True
         else:
             raw_bound = lo if abs(_signed_angle_delta(lo, target)) <= abs(_signed_angle_delta(hi, target)) else hi
+            outward_dir = -1.0 if abs(raw_bound - lo) <= abs(raw_bound - hi) else 1.0
+            meta["bound"] = float(raw_bound)
+            meta["outward_dir"] = float(outward_dir)
             if refine_boundaries and target_sig is not None:
-                outward_dir = -1.0 if abs(raw_bound - lo) <= abs(raw_bound - hi) else 1.0
                 clamped = _polish_boundary_ground_truth(
                     raw_bound,
                     owner_cell=(lo, hi),
@@ -1349,6 +1378,9 @@ def _closest_angle_in_cells(
         if d < best_d:
             best_d = d
             best = _norm_angle(clamped)
+            best_meta = meta
+    if return_meta:
+        return best, best_meta
     return best
 
 
@@ -1387,7 +1419,8 @@ def _edge_angle_inside_furthest_on_side(
     active_by_tick: np.ndarray | None = None,
     object_order: Sequence[int] | None = None,
     order_rank: dict[int, int] | None = None,
-) -> float | None:
+    return_meta: bool = False,
+) -> float | tuple[float | None, dict[str, float | None]]:
     """Heading just inside the visible boundary farthest on one side of ``theta_fc``."""
 
     if side not in (-1, 1):
@@ -1412,11 +1445,19 @@ def _edge_angle_inside_furthest_on_side(
                 best_bound = bound
                 owner = (lo, hi)
     if best_bound is None or owner is None:
+        if return_meta:
+            return None, {"owner_lo": None, "owner_hi": None, "bound": None, "outward_dir": 0.0}
         return None
     lo, hi = owner
+    meta = {
+        "owner_lo": float(lo),
+        "owner_hi": float(hi),
+        "bound": float(best_bound),
+        "outward_dir": float(-1.0 if abs(best_bound - lo) <= abs(best_bound - hi) else 1.0),
+    }
     if refine_boundaries and target_sig is not None:
-        outward_dir = -1.0 if abs(best_bound - lo) <= abs(best_bound - hi) else 1.0
-        return _polish_boundary_ground_truth(
+        outward_dir = float(meta["outward_dir"])
+        angle = _polish_boundary_ground_truth(
             best_bound,
             owner_cell=(lo, hi),
             target_sig=target_sig,
@@ -1432,7 +1473,13 @@ def _edge_angle_inside_furthest_on_side(
             object_order=list(object_order or []),
             order_rank=order_rank,
         )
-    return _boundary_angle_inside(lo, hi, best_bound)
+        if return_meta:
+            return angle, meta
+        return angle
+    angle = _boundary_angle_inside(lo, hi, best_bound)
+    if return_meta:
+        return angle, meta
+    return angle
 
 
 def _pick_planet_aim_from_visible_cells(
@@ -1451,7 +1498,8 @@ def _pick_planet_aim_from_visible_cells(
     slot: int,
     object_order: Sequence[int],
     debug_context: dict[str, Any] | None = None,
-) -> tuple[float | None, int, float]:
+    return_job: bool = False,
+) -> tuple[float | None, int, float] | tuple[float | None, int, float, IntervalRefineJob | None]:
     """Pick launch angle prioritising earliest planet hit tick, then edge precision."""
 
     global _INTERVAL_AIM_STATS
@@ -1462,12 +1510,12 @@ def _pick_planet_aim_from_visible_cells(
             _INTERVAL_AIM_STATS.note_rejected(label, "no_visible_cells")
         _INTERVAL_AIM_STATS.selected["none_all_three_rejected"] += 1
         _INTERVAL_AIM_STATS.all_rejected["no_visible_cells"] += 1
-        return None, -1, 0.0
+        return (None, -1, 0.0, None) if return_job else (None, -1, 0.0)
 
     theta_fc = _norm_angle(first_contact_angle)
     target_sig = ("planet", int(slot))
     order_rank = {int(s): i for i, s in enumerate(object_order)}
-    theta_primary = _closest_angle_in_cells(
+    theta_primary, primary_meta = _closest_angle_in_cells(
         theta_fc,
         cells,
         refine_boundaries=refine_boundaries,
@@ -1482,6 +1530,7 @@ def _pick_planet_aim_from_visible_cells(
         active_by_tick=active_by_tick,
         object_order=object_order,
         order_rank=order_rank,
+        return_meta=True,
     )
     primary_angle, tick_primary, reason_primary = _candidate_tick_single_planet(
         theta_primary,
@@ -1503,8 +1552,9 @@ def _pick_planet_aim_from_visible_cells(
         primary_side = 1 if _signed_angle_delta(theta_primary, theta_fc) >= 0.0 else -1
     secondary_side = -primary_side
 
-    edge_angles_by_label = {
-        "edge_same_side": _edge_angle_inside_furthest_on_side(
+    edge_angles_by_label: dict[str, float | None] = {}
+    edge_meta_by_label: dict[str, dict[str, float | None]] = {}
+    edge_angles_by_label["edge_same_side"], edge_meta_by_label["edge_same_side"] = _edge_angle_inside_furthest_on_side(
             theta_fc,
             cells,
             side=primary_side,
@@ -1520,8 +1570,9 @@ def _pick_planet_aim_from_visible_cells(
             active_by_tick=active_by_tick,
             object_order=object_order,
             order_rank=order_rank,
-        ),
-        "edge_other_side": _edge_angle_inside_furthest_on_side(
+            return_meta=True,
+        )
+    edge_angles_by_label["edge_other_side"], edge_meta_by_label["edge_other_side"] = _edge_angle_inside_furthest_on_side(
             theta_fc,
             cells,
             side=secondary_side,
@@ -1537,8 +1588,8 @@ def _pick_planet_aim_from_visible_cells(
             active_by_tick=active_by_tick,
             object_order=object_order,
             order_rank=order_rank,
-        ),
-    }
+            return_meta=True,
+        )
 
     seen_angles: list[float] = []
     candidate_results: dict[str, tuple[float | None, int, str]] = {"primary": (primary_angle, tick_primary, reason_primary)}
@@ -1611,9 +1662,40 @@ def _pick_planet_aim_from_visible_cells(
             edge_angle, tick_edge, reason_edge = candidate_results[label]
             if reason_edge == "ok" and tick_edge == tick_primary:
                 _INTERVAL_AIM_STATS.selected[label] += 1
-                return float(edge_angle), int(tick_edge), width
+                job = IntervalRefineJob(
+                    variant=label,
+                    slot=int(slot),
+                    coarse_angle=float(edge_angle),
+                    owner_lo=float(edge_meta_by_label[label]["owner_lo"]),
+                    owner_hi=float(edge_meta_by_label[label]["owner_hi"]),
+                    bound=float(edge_meta_by_label[label]["bound"]),
+                    outward_dir=float(edge_meta_by_label[label]["outward_dir"]),
+                )
+                return (float(edge_angle), int(tick_edge), width, job) if return_job else (float(edge_angle), int(tick_edge), width)
         _INTERVAL_AIM_STATS.selected["primary"] += 1
-        return float(primary_angle), int(tick_primary), width
+        if primary_meta.get("inside_cell"):
+            job = IntervalRefineJob(
+                variant="primary",
+                slot=int(slot),
+                coarse_angle=float(primary_angle),
+                owner_lo=float(primary_meta["owner_lo"]),
+                owner_hi=float(primary_meta["owner_hi"]),
+                bound=None,
+                outward_dir=0.0,
+            )
+        else:
+            bound = primary_meta.get("bound")
+            outward_dir = primary_meta.get("outward_dir", 0.0)
+            job = IntervalRefineJob(
+                variant="primary",
+                slot=int(slot),
+                coarse_angle=float(primary_angle),
+                owner_lo=float(primary_meta["owner_lo"]),
+                owner_hi=float(primary_meta["owner_hi"]),
+                bound=None if bound is None else float(bound),
+                outward_dir=float(outward_dir),
+            )
+        return (float(primary_angle), int(tick_primary), width, job) if return_job else (float(primary_angle), int(tick_primary), width)
 
     edge_valid = [
         label
@@ -1627,7 +1709,63 @@ def _pick_planet_aim_from_visible_cells(
             reasons.append(f"{label}={candidate_results[label][2]}")
         _INTERVAL_AIM_STATS.all_rejected[" ".join(reasons)] += 1
     _INTERVAL_AIM_STATS.selected[f"none_{reason_all}"] += 1
-    return None, -1, 0.0
+    return (None, -1, 0.0, None) if return_job else (None, -1, 0.0)
+
+
+def refine_interval_refine_job(
+    job: IntervalRefineJob,
+    *,
+    cache: "OcclusionWalkCache" | None,
+    origin_xy: np.ndarray,
+    origin_radius: float,
+    speed: float,
+    p0_by_tick: np.ndarray,
+    p1_by_tick: np.ndarray,
+    radii: np.ndarray,
+    active_by_tick: np.ndarray,
+    object_order: Sequence[int],
+) -> tuple[float | None, int, str]:
+    angle = float(job.coarse_angle)
+    if job.bound is None or abs(float(job.outward_dir)) <= 0.0:
+        return _candidate_tick_single_planet(
+            angle,
+            origin_xy=origin_xy,
+            origin_radius=origin_radius,
+            speed=speed,
+            p0_by_tick=p0_by_tick,
+            p1_by_tick=p1_by_tick,
+            radii=radii,
+            active_by_tick=active_by_tick,
+            slot=int(job.slot),
+        )
+
+    refined = _polish_boundary_ground_truth(
+        float(job.bound),
+        owner_cell=(float(job.owner_lo), float(job.owner_hi)),
+        target_sig=("planet", int(job.slot)),
+        outward_dir=float(job.outward_dir),
+        cache=cache,
+        origin_xy=np.asarray(origin_xy, dtype=np.float64),
+        origin_radius=float(origin_radius),
+        speed=float(speed),
+        p0_by_tick=np.asarray(p0_by_tick, dtype=np.float64),
+        p1_by_tick=np.asarray(p1_by_tick, dtype=np.float64),
+        radii=np.asarray(radii, dtype=np.float64),
+        active_by_tick=np.asarray(active_by_tick, dtype=bool),
+        object_order=list(object_order),
+        order_rank={int(s): i for i, s in enumerate(object_order)},
+    )
+    return _candidate_tick_single_planet(
+        refined,
+        origin_xy=origin_xy,
+        origin_radius=origin_radius,
+        speed=speed,
+        p0_by_tick=p0_by_tick,
+        p1_by_tick=p1_by_tick,
+        radii=radii,
+        active_by_tick=active_by_tick,
+        slot=int(job.slot),
+    )
 
 
 def _first_contact_bearing_at_enter(
@@ -2553,7 +2691,9 @@ def sweep_interval_best_targets_from_events(
     occlusion_cache: "OcclusionWalkCache" | None = None,
     refine_boundaries: bool = True,
     debug_context: dict[str, Any] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, np.ndarray]:
+    selected_slots: set[int] | None = None,
+    return_jobs: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, bool, np.ndarray, list[IntervalRefineJob | None]]:
     """Occlusion sweep over events sorted by ``floor(t)`` then collision rank.
 
     Per-planet aim uses first-contact bearing (clamped to post-occlusion cells), then
@@ -2570,6 +2710,7 @@ def sweep_interval_best_targets_from_events(
     best_angle = np.zeros((num_planets,), dtype=np.float64)
     best_width = np.zeros((num_planets,), dtype=np.float64)
     best_tick = np.full((num_planets,), -1, dtype=np.int32)
+    best_jobs: list[IntervalRefineJob | None] = [None] * int(num_planets)
     overflow = False
     origin = None if origin_xy is None else np.asarray(origin_xy, dtype=np.float64)
     can_aim = (
@@ -2583,9 +2724,12 @@ def sweep_interval_best_targets_from_events(
     for event in sorted_events:
         hit = cone_to_angle_intervals(event.angle_lo, event.angle_hi)
         if event.kind == "planet" and 0 <= event.slot < num_planets:
+            if selected_slots is not None and int(event.slot) not in selected_slots:
+                blocked = union_angle_intervals([*blocked, *hit])
+                continue
             cells = set_subtract_cells(hit, blocked)
             if can_aim:
-                aim, tick, width = _pick_planet_aim_from_visible_cells(
+                picked = _pick_planet_aim_from_visible_cells(
                     cells,
                     _event_first_contact_angle(event),
                     refine_boundaries=refine_boundaries,
@@ -2600,9 +2744,16 @@ def sweep_interval_best_targets_from_events(
                     slot=int(event.slot),
                     object_order=order,
                     debug_context=debug_context,
+                    return_job=return_jobs,
                 )
+                if return_jobs:
+                    aim, tick, width, refine_job = picked
+                else:
+                    aim, tick, width = picked
+                    refine_job = None
             else:
                 aim, tick, width = None, -1, 0.0
+                refine_job = None
                 mid, w = _widest_cell_midpoint_and_width(cells)
                 if mid is not None:
                     aim, tick, width = float(mid), 0, w
@@ -2617,6 +2768,7 @@ def sweep_interval_best_targets_from_events(
                     best_width[slot] = width
                     best_angle[slot] = aim
                     best_tick[slot] = tick
+                    best_jobs[slot] = refine_job
         blocked = union_angle_intervals([*blocked, *hit])
 
     if include_board and origin is not None:
@@ -2627,13 +2779,16 @@ def sweep_interval_best_targets_from_events(
             blocked = union_angle_intervals([*blocked, *b_hit])
 
     valid = (best_width > GEOM_EPS) & (best_tick >= 0)
-    return (
+    result = (
         best_angle.astype(np.float64),
         best_width.astype(np.float32),
         valid,
         overflow,
         best_tick,
     )
+    if return_jobs:
+        return (*result, best_jobs)
+    return result
 
 
 def first_hit_interval_best_targets_orthogonal_np(

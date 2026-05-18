@@ -1684,6 +1684,7 @@ class PlannedLaunchAction:
     policy_hit_tick: float
     coarse_angle: float
     planets_snapshot: np.ndarray
+    refine_job: Any | None = None
 
 
 def _first_hit_signature(kind: str, code: int, tick: int) -> tuple[str, int]:
@@ -1927,7 +1928,8 @@ def _sweep_interval_from_geometry(
     frac_idx: int = -1,
     phase: str | None = None,
     selected_target_slot: int = -1,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return_jobs: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[Any | None]]:
     from orbit_wars_pt.interval_geometry_np import (
         sweep_interval_best_targets,
         sweep_interval_best_targets_from_events,
@@ -1935,7 +1937,7 @@ def _sweep_interval_from_geometry(
 
     t_sweep = perf_counter()
     if geom.geometry in ("orthogonal", "tangent"):
-        out_angle, width, valid, _overflow, hit_tick_i = (
+        sweep_result = (
             sweep_interval_best_targets_from_events(
                 geom.events or [],
                 num_planets,
@@ -1959,8 +1961,18 @@ def _sweep_interval_from_geometry(
                     "micro_idx": int(micro_idx),
                     "selected_target_slot": int(selected_target_slot),
                 },
+                selected_slots=(
+                    {int(selected_target_slot)}
+                    if phase == "submit_refine" and 0 <= int(selected_target_slot) < int(num_planets)
+                    else None
+                ),
+                return_jobs=return_jobs,
             )
         )
+        if return_jobs:
+            out_angle, width, valid, _overflow, hit_tick_i, refine_jobs = sweep_result
+        else:
+            out_angle, width, valid, _overflow, hit_tick_i = sweep_result
     else:
         out_angle, width, valid, _overflow, hit_tick_i = sweep_interval_best_targets(
             geom.precomputed_hits or [],
@@ -1973,11 +1985,14 @@ def _sweep_interval_from_geometry(
     if target_timing is not None:
         target_timing.interval_sweep_s += perf_counter() - t_sweep
     del width
-    return (
+    result = (
         np.asarray(out_angle, dtype=np.float64),
         np.asarray(valid, dtype=np.bool_),
         hit_tick_i,
     )
+    if return_jobs:
+        return (*result, refine_jobs)
+    return result
 
 
 def _run_discrete_raycast_sim(
@@ -2146,7 +2161,8 @@ def _interval_targets_np(
     refine_boundaries: bool = True,
     phase: str | None = None,
     selected_target_slot: int = -1,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return_jobs: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[Any | None]]:
     """Interval first-hit targets (``first_hit_interval_best_targets_apply_jax`` semantics)."""
 
     if target_timing is not None:
@@ -2164,7 +2180,7 @@ def _interval_targets_np(
         target_timing=target_timing,
         launch_geometry=launch_geometry,
     )
-    out_angle, valid, hit_tick_i = _sweep_interval_from_geometry(
+    sweep_result = _sweep_interval_from_geometry(
         geom,
         int(planets.shape[0]),
         target_timing=target_timing,
@@ -2175,7 +2191,12 @@ def _interval_targets_np(
         frac_idx=frac_idx,
         phase=phase,
         selected_target_slot=selected_target_slot,
+        return_jobs=return_jobs,
     )
+    if return_jobs:
+        out_angle, valid, hit_tick_i, refine_jobs = sweep_result
+    else:
+        out_angle, valid, hit_tick_i = sweep_result
 
     hit_tick = np.where(valid, hit_tick_i.astype(np.float32), 0.0).astype(np.float32)
     true_planet = np.where(valid, np.arange(MAX_PLANETS, dtype=np.int32), -1)
@@ -2209,7 +2230,10 @@ def _interval_targets_np(
         if target_timing is not None:
             target_timing.interval_check_s += perf_counter() - t_check
 
-    return out_angle, valid, hit_tick, true_planet, true_hit_tick
+    result = (out_angle, valid, hit_tick, true_planet, true_hit_tick)
+    if return_jobs:
+        return (*result, refine_jobs)
+    return result
 
 
 def _first_hit_targets_np(
@@ -2230,7 +2254,8 @@ def _first_hit_targets_np(
     refine_boundaries: bool = True,
     phase: str | None = None,
     selected_target_slot: int = -1,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return_jobs: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[Any | None]]:
     if target_timing is not None:
         target_timing.calls += 1
     if target_method == "interval":
@@ -2251,6 +2276,7 @@ def _first_hit_targets_np(
             refine_boundaries=refine_boundaries,
             phase=phase,
             selected_target_slot=selected_target_slot,
+            return_jobs=return_jobs,
         )
     return _raycast_targets_np(
         state,
@@ -2281,6 +2307,8 @@ def _refine_interval_launches_in_place(
 ) -> None:
     """Refine only submitted interval launches, stopping when the turn budget is tight."""
 
+    from orbit_wars_pt.interval_geometry_np import refine_interval_refine_job
+
     for planned in planned_launches:
         angle = float(planned.coarse_angle)
         policy_tick = float(planned.policy_hit_tick)
@@ -2288,31 +2316,34 @@ def _refine_interval_launches_in_place(
         env_hit_tick = float(planned.policy_hit_tick)
         virt_state = base_state._replace(planets=np.array(planned.planets_snapshot, copy=True))
 
-        if deadline_s is None or perf_counter() < deadline_s:
-            ray_angle, ray_valid, ray_hit_tick, true_planet, true_hit_tick = _first_hit_targets_np(
+        if (deadline_s is None or perf_counter() < deadline_s) and planned.refine_job is not None:
+            geom = _build_interval_micro_geometry(
                 virt_state,
                 planned.origin_slot,
                 planned.frac_idx,
                 ship_speed=ship_speed,
                 horizon=horizon,
-                n_rays=n_rays,
                 samples_per_span=samples_per_span,
-                target_method="interval",
                 target_timing=None,
-                game_step=int(game_step),
-                micro_idx=int(planned.micro_idx),
-                ego_player=int(ego_player),
                 launch_geometry=launch_geometry,
-                refine_boundaries=True,
-                phase="submit_refine",
-                selected_target_slot=int(planned.target_slot),
             )
-
-            if bool(ray_valid[planned.target_slot]):
-                angle = float(ray_angle[planned.target_slot])
-                policy_tick = float(ray_hit_tick[planned.target_slot])
-                true_slot = int(true_planet[planned.target_slot])
-                env_hit_tick = float(true_hit_tick[planned.target_slot])
+            refined_angle, refined_tick, refined_reason = refine_interval_refine_job(
+                planned.refine_job,
+                cache=geom.occlusion_cache,
+                origin_xy=geom.origin_xy,
+                origin_radius=geom.origin_radius,
+                speed=geom.speed,
+                p0_by_tick=geom.p0_by_tick,
+                p1_by_tick=geom.p1_by_tick,
+                radii=geom.radii,
+                active_by_tick=geom.active_by_tick,
+                object_order=geom.object_order,
+            )
+            if refined_reason == "ok":
+                angle = float(refined_angle)
+                policy_tick = float(refined_tick)
+                true_slot = int(planned.target_slot)
+                env_hit_tick = float(refined_tick)
 
         actions[planned.action_index][1] = float(angle)
 
@@ -2520,7 +2551,7 @@ def _build_turn_actions_torch_only(
 
         t0 = perf_counter()
         target_timing = timing.micro_target if timing is not None else None
-        ray_angle, ray_valid, ray_hit_tick, true_planet, true_hit_tick = _first_hit_targets_np(
+        ray_angle, ray_valid, ray_hit_tick, true_planet, true_hit_tick, refine_jobs = _first_hit_targets_np(
             virt,
             int(o_idx),
             int(frac_idx),
@@ -2536,6 +2567,7 @@ def _build_turn_actions_torch_only(
             launch_geometry=launch_geometry,
             refine_boundaries=False,
             phase="microstep",
+            return_jobs=True,
         )
         if timing is not None:
             timing.micro_raycast_s += perf_counter() - t0
@@ -2585,6 +2617,7 @@ def _build_turn_actions_torch_only(
                 policy_hit_tick=float(ray_hit_tick[d_idx]),
                 coarse_angle=float(angle),
                 planets_snapshot=np.array(planets, copy=True),
+                refine_job=refine_jobs[d_idx],
             )
         )
         micro_idx += 1
