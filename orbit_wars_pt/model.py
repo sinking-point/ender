@@ -279,6 +279,41 @@ class OrbitWarsPolicy(nn.Module):
             h.index_copy_(0, member_rows, tail.norm_f(x_m))
         return h, pop
 
+    def _population_group_size(self, batch_size: int) -> int:
+        if self.population_size <= 1:
+            return int(batch_size)
+        if batch_size % self.population_size != 0:
+            raise ValueError(
+                f"grouped population batch {batch_size} must be divisible by population_size {self.population_size}"
+            )
+        return batch_size // self.population_size
+
+    def _apply_encoder_grouped_population(
+        self,
+        x: torch.Tensor,
+        rope_pos: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.population_size == 1:
+            for blk in self.blocks:
+                x = self._run_block(blk, x, rope_pos, key_padding_mask)
+            return self.norm_f(x)
+
+        for blk in self.shared_blocks:
+            x = self._run_block(blk, x, rope_pos, key_padding_mask)
+
+        group_size = self._population_group_size(int(x.shape[0]))
+        chunks = []
+        for member_idx, tail in enumerate(self.population_tails):
+            start = member_idx * group_size
+            stop = start + group_size
+            x_m = x[start:stop]
+            rope_m = rope_pos[start:stop]
+            mask_m = None if key_padding_mask is None else key_padding_mask[start:stop]
+            x_m = self._run_block(tail.block, x_m, rope_m, mask_m)
+            chunks.append(tail.norm_f(x_m))
+        return torch.cat(chunks, dim=0)
+
     def _compute_outputs_single(
         self,
         h: torch.Tensor,
@@ -380,6 +415,68 @@ class OrbitWarsPolicy(nn.Module):
             outputs["planet_hidden"].index_copy_(0, member_rows, out_m["planet_hidden"])
 
         assert outputs is not None
+        return outputs
+
+    def _compute_outputs_grouped_population(
+        self,
+        h: torch.Tensor,
+        owner_idx: torch.Tensor,
+        features: torch.Tensor,
+        entity_mask: torch.Tensor,
+        planet_mask: torch.Tensor,
+    ) -> Dict[str, Any]:
+        if self.population_size == 1:
+            return self._compute_outputs_single(
+                h,
+                owner_idx,
+                features,
+                entity_mask,
+                planet_mask,
+                pair_q=self.pair_q,
+                pair_k=self.pair_k,
+                origin_frac_head=self.origin_frac_head,
+                halt_head=self.halt_head,
+                value_head=self.value_head,
+            )
+
+        group_size = self._population_group_size(int(h.shape[0]))
+        outputs: Dict[str, Any] = {"hidden": h}
+        halt_logits = []
+        value = []
+        pair_logits = []
+        pair_mask = []
+        origin_frac_logits = []
+        origin_frac_mask = []
+        planet_hidden = []
+        for member_idx, tail in enumerate(self.population_tails):
+            start = member_idx * group_size
+            stop = start + group_size
+            out_m = self._compute_outputs_single(
+                h[start:stop],
+                owner_idx[start:stop],
+                features[start:stop],
+                entity_mask[start:stop],
+                planet_mask[start:stop],
+                pair_q=tail.pair_q,
+                pair_k=tail.pair_k,
+                origin_frac_head=tail.origin_frac_head,
+                halt_head=tail.halt_head,
+                value_head=tail.value_head,
+            )
+            halt_logits.append(out_m["halt_logits"])
+            value.append(out_m["value"])
+            pair_logits.append(out_m["pair_logits"])
+            pair_mask.append(out_m["pair_mask"])
+            origin_frac_logits.append(out_m["origin_frac_logits"])
+            origin_frac_mask.append(out_m["origin_frac_mask"])
+            planet_hidden.append(out_m["planet_hidden"])
+        outputs["halt_logits"] = torch.cat(halt_logits, dim=0)
+        outputs["value"] = torch.cat(value, dim=0)
+        outputs["pair_logits"] = torch.cat(pair_logits, dim=0)
+        outputs["pair_mask"] = torch.cat(pair_mask, dim=0)
+        outputs["origin_frac_logits"] = torch.cat(origin_frac_logits, dim=0)
+        outputs["origin_frac_mask"] = torch.cat(origin_frac_mask, dim=0)
+        outputs["planet_hidden"] = torch.cat(planet_hidden, dim=0)
         return outputs
 
     def forward(
@@ -517,6 +614,22 @@ class OrbitWarsPolicy(nn.Module):
             population_idx=population_idx,
         )
 
+    def forward_dense_rollout_grouped_population(
+        self,
+        entity_type: torch.Tensor,
+        owner_idx: torch.Tensor,
+        features: torch.Tensor,
+        rope_pos: torch.Tensor,
+        entity_mask: torch.Tensor,
+        planet_mask: torch.Tensor,
+    ) -> Dict[str, Any]:
+        """Fixed-length rollout forward path for contiguous per-member batch chunks."""
+
+        x = self.embed(entity_type, owner_idx, features)
+        padding_mask = ~entity_mask
+        h = self._apply_encoder_grouped_population(x, rope_pos, padding_mask)
+        return self._compute_outputs_grouped_population(h, owner_idx, features, entity_mask, planet_mask)
+
     def target_logits_for_origin_fraction(
         self,
         planet_hidden: torch.Tensor,
@@ -569,6 +682,48 @@ class OrbitWarsPolicy(nn.Module):
             logits.index_copy_(0, member_rows, logits_m)
         assert logits is not None
         return logits
+
+    def target_logits_for_origin_fraction_grouped_population(
+        self,
+        planet_hidden: torch.Tensor,
+        origin_idx: torch.Tensor,
+        frac_idx: torch.Tensor,
+        fleet_size: Optional[torch.Tensor] = None,
+        target_eta: Optional[torch.Tensor] = None,
+        target_ships: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Grouped rollout target logits for contiguous per-member batch chunks."""
+
+        b = origin_idx.shape[0]
+        device = planet_hidden.device
+        del frac_idx
+        if fleet_size is None:
+            fleet_scalar = torch.zeros((b, 1, 1), device=device, dtype=planet_hidden.dtype)
+        else:
+            fleet_scalar = (fleet_size.to(device=device, dtype=planet_hidden.dtype) / 1000.0).reshape(b, 1, 1)
+        fleet_feat = fleet_scalar.expand(-1, planet_hidden.shape[1], -1)
+        if target_eta is None:
+            eta_feat = torch.zeros(
+                (b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype
+            )
+        else:
+            eta_feat = (target_eta.to(device=device, dtype=planet_hidden.dtype) / 500.0).unsqueeze(-1)
+        if target_ships is None:
+            is_bigger = torch.zeros((b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype)
+        else:
+            target_ships_t = target_ships.to(device=device, dtype=planet_hidden.dtype)
+            is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
+        target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
+        if self.population_size == 1:
+            return self.target_pick_head(target_in).squeeze(-1)
+
+        group_size = self._population_group_size(b)
+        logits = []
+        for member_idx, tail in enumerate(self.population_tails):
+            start = member_idx * group_size
+            stop = start + group_size
+            logits.append(tail.target_pick_head(target_in[start:stop]).squeeze(-1))
+        return torch.cat(logits, dim=0)
 
     def fraction_logits(
         self,

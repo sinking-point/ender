@@ -56,7 +56,7 @@ from orbit_wars_pt.compressed_observation import compressed_observation_to_host
 
 from jax_orbit_wars import OrbitWarsState
 
-CHECKPOINT_VERSION = 4
+CHECKPOINT_VERSION = 5
 
 
 @dataclass
@@ -113,6 +113,11 @@ def _serialize_rollout_carry(carry: RolloutCarry) -> Dict[str, Any]:
             if carry.population_assignments is None
             else np.asarray(carry.population_assignments, dtype=np.int32)
         ),
+        "policy_row_for_seat": (
+            None
+            if carry.policy_row_for_seat is None
+            else np.asarray(carry.policy_row_for_seat, dtype=np.int32)
+        ),
     }
 
 
@@ -139,12 +144,19 @@ def _deserialize_rollout_carry(obj: Dict[str, Any]) -> RolloutCarry:
         pop = np.asarray(population_assignments_obj, dtype=np.int32)
         if pop.shape == (int(cfg.num_agents), ne):
             population_assignments = pop
+    policy_row_for_seat_obj = obj.get("policy_row_for_seat", None)
+    policy_row_for_seat = None
+    if policy_row_for_seat_obj is not None:
+        prs = np.asarray(policy_row_for_seat_obj, dtype=np.int32)
+        if prs.shape == (int(cfg.num_agents), ne):
+            policy_row_for_seat = prs
     return RolloutCarry(
         state_b=state_b,
         cfg=cfg,
         episode_turns=episode_turns,
         player_done=player_done,
         population_assignments=population_assignments,
+        policy_row_for_seat=policy_row_for_seat,
     )
 
 
@@ -1382,9 +1394,19 @@ def train(args: argparse.Namespace) -> None:
         policy.forward_dense_rollout = torch.compile(  # type: ignore[assignment]
             policy.forward_dense_rollout, mode=helper_compile_mode, dynamic=True
         )
+        if hasattr(policy, "forward_dense_rollout_grouped_population"):
+            policy.forward_dense_rollout_grouped_population = torch.compile(  # type: ignore[assignment]
+                policy.forward_dense_rollout_grouped_population, mode=helper_compile_mode, dynamic=True
+            )
         policy.target_logits_for_origin_fraction = torch.compile(  # type: ignore[assignment]
             policy.target_logits_for_origin_fraction, mode=helper_compile_mode, dynamic=True
         )
+        if hasattr(policy, "target_logits_for_origin_fraction_grouped_population"):
+            policy.target_logits_for_origin_fraction_grouped_population = torch.compile(  # type: ignore[assignment]
+                policy.target_logits_for_origin_fraction_grouped_population,
+                mode=helper_compile_mode,
+                dynamic=True,
+            )
         policy.fraction_logits = torch.compile(  # type: ignore[assignment]
             policy.fraction_logits, mode=helper_compile_mode, dynamic=True
         )

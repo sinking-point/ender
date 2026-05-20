@@ -119,6 +119,76 @@ def _sample_population_assignments_for_env(seed: int, num_agents: int, populatio
     return rng.integers(0, int(population_size), size=(num_agents,), dtype=np.int32)
 
 
+def _population_rows_per_member(total_rows: int, population_size: int) -> int:
+    pop = int(population_size)
+    if pop <= 1:
+        return int(total_rows)
+    if int(total_rows) % pop != 0:
+        raise ValueError(
+            f"num_envs * num_agents must be divisible by population_size for grouped rollout batching "
+            f"(got total_rows={int(total_rows)}, population_size={pop})"
+        )
+    return int(total_rows) // pop
+
+
+def _population_assignments_from_policy_rows(
+    policy_row_for_seat: np.ndarray,
+    rows_per_member: int,
+    population_size: int,
+) -> np.ndarray:
+    if int(population_size) <= 1:
+        return np.zeros_like(policy_row_for_seat, dtype=np.int32)
+    return (np.asarray(policy_row_for_seat, dtype=np.int32) // int(rows_per_member)).astype(np.int32)
+
+
+def _init_policy_row_mapping(
+    *,
+    num_envs: int,
+    num_agents: int,
+    population_size: int,
+    seed: int,
+) -> np.ndarray:
+    total_rows = int(num_envs) * int(num_agents)
+    if int(population_size) <= 1:
+        return np.arange(total_rows, dtype=np.int32).reshape(int(num_agents), int(num_envs))
+    _population_rows_per_member(total_rows, int(population_size))
+    rng = np.random.default_rng(np.uint64(seed) + np.uint64(0xD1B54A32D192ED03))
+    rows = np.arange(total_rows, dtype=np.int32)
+    rng.shuffle(rows)
+    return rows.reshape(int(num_agents), int(num_envs))
+
+
+def _invert_policy_row_mapping(policy_row_for_seat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    mapping = np.asarray(policy_row_for_seat, dtype=np.int32)
+    num_agents, num_envs = mapping.shape
+    total_rows = int(num_agents) * int(num_envs)
+    row_env = np.empty((total_rows,), dtype=np.int32)
+    row_ego = np.empty((total_rows,), dtype=np.int32)
+    for ego in range(num_agents):
+        for env_i in range(num_envs):
+            row = int(mapping[ego, env_i])
+            row_env[row] = env_i
+            row_ego[row] = ego
+    return row_env, row_ego
+
+
+def _reassign_policy_rows_for_reset_envs(
+    *,
+    policy_row_for_seat: np.ndarray,
+    done_envs: np.ndarray,
+    seed: int,
+) -> np.ndarray:
+    mapping = np.asarray(policy_row_for_seat, dtype=np.int32).copy()
+    done_envs = np.asarray(done_envs, dtype=np.int32).reshape(-1)
+    if done_envs.size == 0:
+        return mapping
+    released_rows = mapping[:, done_envs].reshape(-1).copy()
+    rng = np.random.default_rng(np.uint64(seed) + np.uint64(0x94D049BB133111EB))
+    rng.shuffle(released_rows)
+    mapping[:, done_envs] = released_rows.reshape(mapping.shape[0], done_envs.size)
+    return mapping
+
+
 @jax.jit
 def _scatter_state_bucket(
     state_b: OrbitWarsState,
@@ -156,6 +226,14 @@ def _copy_state_slices_between(
     return jax.tree.map(lambda dst, src: dst.at[dst_idx].set(src[src_idx]), dst_b, src_b)
 
 
+@jax.jit
+def _gather_state_rows(
+    state_b: OrbitWarsState,
+    row_env_idx: jnp.ndarray,
+) -> OrbitWarsState:
+    return jax.tree.map(lambda leaf: leaf[row_env_idx], state_b)
+
+
 @dataclass
 class RolloutCarry:
     """Batched env state carried across PPO iterations (continues unfinished games)."""
@@ -169,6 +247,8 @@ class RolloutCarry:
     player_done: Optional[np.ndarray] = None
     #: Active population member per seat/env for the ongoing episode.
     population_assignments: Optional[np.ndarray] = None
+    #: Persistent policy-batch row owned by each seat/env for grouped population rollout.
+    policy_row_for_seat: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -927,6 +1007,355 @@ def _run_async_micro_step_multi(
     return virt_b, bufs, obs_bufs
 
 
+def _run_async_micro_step_multi_grouped_population(
+    *,
+    n_ego: int,
+    num_envs: int,
+    pending_rows: np.ndarray,
+    virt_b: OrbitWarsState,
+    bufs: List[TorchTransitionBuffer],
+    obs_bufs: List[CompressedObservationBuffer],
+    write_idx: List[np.ndarray],
+    write_idx_dev: List[torch.Tensor],
+    micro_k: np.ndarray,
+    micro_k_dev: torch.Tensor,
+    valid: List[np.ndarray],
+    old_logprob: List[np.ndarray],
+    old_value: List[np.ndarray],
+    reward: List[np.ndarray],
+    row_env: np.ndarray,
+    row_ego: np.ndarray,
+    rows_per_member: int,
+    pending_actions: np.ndarray,
+    pending_action_count: np.ndarray,
+    reward_idx: np.ndarray,
+    halted: np.ndarray,
+    policy: OrbitWarsPolicy,
+    device: torch.device,
+    rng: Optional[torch.Generator],
+    greedy: bool,
+    ship_speed: float,
+    max_micro_steps: int,
+    timing: RolloutTiming,
+    first_hit_n_rays: int,
+    micro_step_penalty: float = 0.0,
+    first_hit_ray_chunk_size: int = 0,
+    first_hit_env_chunk_size: int = 0,
+    first_hit_method: str = "category-rays",
+    obs_feature_dim: int = FEATURE_DIM,
+    normalize_obs_to_p0: bool = False,
+    sync_policy_timing: bool = False,
+) -> tuple[OrbitWarsState, List[TorchTransitionBuffer], List[CompressedObservationBuffer]]:
+    """Run one fixed-shape grouped-population microstep over all policy rows."""
+
+    total_rows = int(virt_b.planets.shape[0])
+    if total_rows == 0:
+        return virt_b, bufs, obs_bufs
+
+    pending_rows = np.asarray(pending_rows, dtype=np.bool_)
+    if pending_rows.shape != (total_rows,):
+        raise ValueError(f"pending_rows shape {pending_rows.shape} != {(total_rows,)}")
+    if not bool(np.any(pending_rows)):
+        return virt_b, bufs, obs_bufs
+
+    row_env_np = np.asarray(row_env, dtype=np.int32)
+    row_ego_np = np.asarray(row_ego, dtype=np.int32)
+    row_idx_np = np.arange(total_rows, dtype=np.int32)
+    row_idx_t = torch.as_tensor(row_idx_np, device=device, dtype=torch.long)
+    row_ego_j = jnp.asarray(row_ego_np, dtype=jnp.int32)
+    pending_t = torch.as_tensor(pending_rows, device=device, dtype=torch.bool)
+    population_idx_t = torch.div(row_idx_t, int(rows_per_member), rounding_mode="floor").to(torch.int32)
+
+    t0 = perf_counter()
+    obs_jax = build_observation_batched_jax_per_ego(
+        virt_b,
+        row_ego_j,
+        ship_speed,
+        obs_feature_dim,
+        normalize_to_p0=normalize_obs_to_p0,
+    )
+    must_halt_j = must_halt_no_owned_ships_per_ego(virt_b, row_ego_j)
+    timing.obs_build_s += perf_counter() - t0
+
+    t0 = perf_counter()
+    obs_torch = obs_jax_to_torch(obs_jax)
+    must_halt_t = torch.from_dlpack(must_halt_j)
+    obs_torch = decode_observation(compress_observation(obs_torch), feature_dim=obs_feature_dim)
+    full_obs = {key: v.to(device) for key, v in obs_torch.items()}
+    must_halt = must_halt_t.to(device=device, dtype=torch.bool)
+    timing.policy_batch_s += perf_counter() - t0
+
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
+    t0 = perf_counter()
+    out = policy.forward_dense_rollout_grouped_population(**full_obs)
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
+    t_model = perf_counter()
+    timing.policy_model_s += t_model - t0
+
+    halt_logits = out["halt_logits"]
+    halt_lp = torch.log_softmax(halt_logits, dim=-1)
+    if greedy:
+        halt_sampled = halt_logits.argmax(dim=-1)
+    else:
+        halt_sampled = torch.multinomial(halt_lp.exp(), 1, generator=rng).squeeze(-1)
+    halt_action = torch.where(must_halt, torch.ones_like(halt_sampled), halt_sampled)
+    halt_action = torch.where(pending_t, halt_action, torch.ones_like(halt_action))
+    halt_logp = halt_lp.gather(1, halt_action[:, None]).squeeze(-1)
+
+    origin_frac_mask = out["origin_frac_mask"]
+    flat_mask = origin_frac_mask.flatten(start_dim=1)
+    any_valid_origin_frac = flat_mask.any(dim=-1)
+    flat_logits = out["origin_frac_logits"].flatten(start_dim=1)
+    masked_origin_frac = flat_logits.masked_fill(~flat_mask, -1e4)
+    origin_frac_lp = torch.log_softmax(masked_origin_frac, dim=-1)
+    safe_origin_frac = torch.where(
+        any_valid_origin_frac[:, None],
+        masked_origin_frac,
+        torch.zeros_like(masked_origin_frac),
+    )
+    if greedy:
+        origin_frac_flat = safe_origin_frac.argmax(dim=-1)
+    else:
+        origin_frac_flat = torch.multinomial(torch.softmax(safe_origin_frac, dim=-1), 1, generator=rng).squeeze(-1)
+    origin_frac_logp = origin_frac_lp.gather(1, origin_frac_flat[:, None]).squeeze(-1)
+
+    o_idx = origin_frac_flat // len(FRACTIONS)
+    frac_idx = origin_frac_flat % len(FRACTIONS)
+    origin_frac_used = pending_t & (halt_action == 0) & any_valid_origin_frac
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
+    t_origin = perf_counter()
+    timing.policy_sample_origin_s += t_origin - t_model
+
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
+    t_ray_start = perf_counter()
+    origin_idx_j = jax.dlpack.from_dlpack(o_idx.to(torch.int32).contiguous().detach())
+    frac_idx_geom_j = jax.dlpack.from_dlpack(frac_idx.to(torch.int32).contiguous().detach())
+    (
+        _target_angle_j,
+        _target_width_j,
+        target_valid_j,
+        target_overflow_j,
+        target_hit_tick_j,
+        target_true_planet_j,
+        target_true_hit_tick_j,
+    ) = _selected_origin_fraction_targets_batched_maybe_chunked(
+        virt_b,
+        origin_idx_j,
+        frac_idx_geom_j,
+        horizon=24,
+        ship_speed=ship_speed,
+        samples_per_span=17,
+        n_rays=first_hit_n_rays,
+        ray_chunk_size=first_hit_ray_chunk_size,
+        first_hit_method=first_hit_method,
+        env_chunk_size=first_hit_env_chunk_size,
+    )
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(
+            device,
+            (
+                _target_angle_j,
+                target_valid_j,
+                target_overflow_j,
+                target_hit_tick_j,
+                target_true_planet_j,
+                target_true_hit_tick_j,
+            ),
+        )
+    target_valid_t = torch.from_dlpack(target_valid_j).to(device)
+    target_overflow_t = torch.from_dlpack(target_overflow_j).to(device)
+    target_hit_tick_t = torch.from_dlpack(target_hit_tick_j).to(device)
+    target_true_planet_t = torch.from_dlpack(target_true_planet_j).to(device)
+    target_true_hit_tick_t = torch.from_dlpack(target_true_hit_tick_j).to(device)
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
+    t_raycast = perf_counter()
+    timing.policy_raycast_s += t_raycast - (t_ray_start if sync_policy_timing else t_origin)
+
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
+    t_target_start = perf_counter()
+    n_idx = torch.arange(total_rows, device=device)
+    planet_ships = full_obs["features"][:, 1 : 1 + MAX_PLANETS, 1] * 1000.0
+    origin_ships = full_obs["features"][n_idx, 1 + o_idx, 1] * 1000.0
+    frac_values = origin_ships.new_tensor(FRACTIONS)
+    fleet_size_for_logits = torch.floor(frac_values[frac_idx] * origin_ships)
+    target_logits = policy.target_logits_for_origin_fraction_grouped_population(
+        out["planet_hidden"],
+        o_idx,
+        frac_idx,
+        fleet_size=fleet_size_for_logits,
+        target_eta=target_hit_tick_t,
+        target_ships=planet_ships,
+    )
+    target_mask = out["pair_mask"][n_idx, o_idx, :] & target_valid_t & ~target_overflow_t[:, None]
+    any_valid_target = target_mask.any(dim=-1)
+    masked_target = target_logits.masked_fill(~target_mask, -1e4)
+    target_lp = torch.log_softmax(masked_target, dim=-1)
+    safe_target = torch.where(any_valid_target[:, None], masked_target, torch.zeros_like(masked_target))
+    if greedy:
+        d_idx = safe_target.argmax(dim=-1)
+    else:
+        d_idx = torch.multinomial(torch.softmax(safe_target, dim=-1), 1, generator=rng).squeeze(-1)
+    target_logp = target_lp.gather(1, d_idx[:, None]).squeeze(-1)
+    pair_flat = o_idx * MAX_PLANETS + d_idx
+    policy_fleet_eta = target_hit_tick_t[n_idx, d_idx]
+    true_d_idx = target_true_planet_t[n_idx, d_idx].to(torch.long).clamp(0, MAX_PLANETS - 1)
+    true_fleet_eta = target_true_hit_tick_t[n_idx, d_idx]
+
+    dispatch_used = origin_frac_used & any_valid_target
+    total_logp = torch.where(
+        pending_t,
+        halt_logp + origin_frac_used.float() * origin_frac_logp + dispatch_used.float() * target_logp,
+        torch.zeros_like(halt_logp),
+    )
+    values_all = out["value"].float()
+    halt_now = ~dispatch_used
+    halt_now = torch.where(pending_t, halt_now, torch.ones_like(halt_now))
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
+    t_target = perf_counter()
+    timing.policy_target_s += t_target - (t_target_start if sync_policy_timing else t_raycast)
+
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
+    t_scatter_start = perf_counter()
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
+    t_scatter = perf_counter()
+    timing.policy_scatter_s += t_scatter - (t_scatter_start if sync_policy_timing else t_target)
+    timing.policy_forward_s += t_scatter - t0
+
+    t0 = perf_counter()
+    halt_now_j = jax.dlpack.from_dlpack(halt_now.to(torch.bool).contiguous().detach())
+    pair_flat_j = jax.dlpack.from_dlpack(pair_flat.to(torch.int32).contiguous().detach())
+    frac_idx_j = jax.dlpack.from_dlpack(frac_idx.to(torch.int32).contiguous().detach())
+    fleet_eta_j = jax.dlpack.from_dlpack(policy_fleet_eta.to(torch.float32).contiguous().detach())
+    t1 = perf_counter()
+
+    virt_b, oid_j, send_j, dispatched_j, slot_j = apply_micro_step_batched_per_ego(
+        virt_b, row_ego_j, halt_now_j, pair_flat_j, frac_idx_j, fleet_eta_j
+    )
+    t2 = perf_counter()
+
+    oid_t = torch.from_dlpack(oid_j)
+    send_t = torch.from_dlpack(send_j)
+    dispatched_t = torch.from_dlpack(dispatched_j)
+    slot_t = torch.from_dlpack(slot_j)
+    t3 = perf_counter()
+
+    t3a = perf_counter()
+    for p in range(n_ego):
+        envs_p = row_env_np[pending_rows & (row_ego_np == p)]
+        if envs_p.size:
+            rows_np = write_idx[p][envs_p]
+            micro_np = micro_k[p, envs_p]
+            _validate_numpy_index_range(f"rollout write_idx p{p}", rows_np, int(bufs[p].micro_halt_now.shape[0]))
+            _validate_numpy_index_range(f"rollout micro_k p{p}", micro_np, max_micro_steps)
+    t3b = perf_counter()
+    t4 = perf_counter()
+
+    for p in range(n_ego):
+        row_sel = np.flatnonzero(pending_rows & (row_ego_np == p)).astype(np.int32)
+        if row_sel.size == 0:
+            continue
+        env_sel = row_env_np[row_sel]
+        row_sel_t = torch.as_tensor(row_sel, device=device, dtype=torch.long)
+        env_sel_t = torch.as_tensor(env_sel, device=device, dtype=torch.long)
+        micro_kp_t = micro_k_dev[p].index_select(0, env_sel_t)
+        write_row_t = write_idx_dev[p].index_select(0, env_sel_t)
+        bufs[p] = append_active_to_torch_buffer(
+            bufs[p],
+            env_sel_t,
+            halt_now.index_select(0, row_sel_t),
+            send_t.index_select(0, row_sel_t),
+            policy_fleet_eta.index_select(0, row_sel_t),
+            slot_t.index_select(0, row_sel_t),
+            halt_action.index_select(0, row_sel_t).to(torch.int32),
+            pair_flat.index_select(0, row_sel_t).to(torch.int32),
+            frac_idx.index_select(0, row_sel_t).to(torch.int32),
+            (origin_frac_used & ~any_valid_target).index_select(0, row_sel_t),
+            (~any_valid_origin_frac & (halt_action == 0) & pending_t).index_select(0, row_sel_t),
+            must_halt.index_select(0, row_sel_t),
+            (target_valid_t & ~target_overflow_t[:, None]).index_select(0, row_sel_t).to(torch.bool),
+            target_hit_tick_t.index_select(0, row_sel_t).to(torch.float32),
+            population_idx_t.index_select(0, row_sel_t),
+            write_row_t,
+            micro_kp_t,
+            max_micro_steps,
+        )
+        obs_p_active = {key: v.index_select(0, row_sel_t) for key, v in full_obs.items()}
+        obs_bufs[p] = store_compressed_observation_rows(
+            obs_bufs[p], write_row_t.to(torch.long), env_sel_t, obs_p_active
+        )
+    t5 = perf_counter()
+
+    t6 = perf_counter()
+
+    oid_np = oid_t.detach().cpu().numpy()
+    send_np = send_t.detach().cpu().numpy()
+    dispatched_np = dispatched_t.detach().cpu().numpy()
+    t7 = perf_counter()
+    _accum_micro_apply_breakdown(timing, t0, t1, t2, t3, t3a, t3b, t4, t5, t6, t7)
+
+    total_logp_np = total_logp.detach().cpu().numpy()
+    values_np = values_all.detach().cpu().numpy()
+    halt_now_np = halt_now.detach().cpu().numpy()
+    d_idx_np = d_idx.detach().cpu().numpy()
+    true_d_idx_np = true_d_idx.detach().cpu().numpy()
+    true_fleet_eta_np = true_fleet_eta.detach().cpu().numpy()
+    policy_fleet_eta_np = policy_fleet_eta.detach().cpu().numpy()
+
+    for p in range(n_ego):
+        row_sel = np.flatnonzero(pending_rows & (row_ego_np == p)).astype(np.int32)
+        if row_sel.size == 0:
+            continue
+        env_sel = row_env_np[row_sel]
+        rows_np = write_idx[p][env_sel]
+        valid[p][rows_np, env_sel] = True
+        old_logprob[p][rows_np, env_sel] = total_logp_np[row_sel]
+        old_value[p][rows_np, env_sel] = values_np[row_sel]
+        if micro_step_penalty != 0.0:
+            reward[p][rows_np, env_sel] -= float(micro_step_penalty) * dispatched_np[row_sel].astype(np.float32)
+
+    for p in range(n_ego):
+        row_sel = np.flatnonzero(pending_rows & (row_ego_np == p)).astype(np.int32)
+        if row_sel.size == 0:
+            continue
+        env_sel = row_env_np[row_sel]
+        widx = write_idx[p]
+        micro_arr = micro_k[p]
+        for row in row_sel:
+            env_i = int(row_env_np[row])
+            reward_idx[p, env_i] = int(widx[env_i])
+            if bool(dispatched_np[row]):
+                ac = int(pending_action_count[p, env_i])
+                if ac < pending_actions.shape[2]:
+                    pending_actions[env_i, p, ac, 0] = float(oid_np[row])
+                    pending_actions[env_i, p, ac, 1] = float(send_np[row])
+                    pending_actions[env_i, p, ac, 2] = float(true_d_idx_np[row])
+                    pending_actions[env_i, p, ac, 3] = float(true_fleet_eta_np[row])
+                    pending_actions[env_i, p, ac, 4] = float(d_idx_np[row])
+                    pending_actions[env_i, p, ac, 5] = float(policy_fleet_eta_np[row])
+                pending_action_count[p, env_i] = ac + 1
+            if bool(halt_now_np[row]):
+                halted[p, env_i] = True
+            widx[env_i] += 1
+            micro_arr[env_i] += 1
+            if micro_arr[env_i] >= max_micro_steps:
+                halted[p, env_i] = True
+
+        env_sel_t = torch.as_tensor(env_sel, device=device, dtype=torch.long)
+        micro_k_dev[p, env_sel_t] = micro_k_dev[p, env_sel_t] + 1
+        write_idx_dev[p][env_sel_t] = write_idx_dev[p][env_sel_t] + 1
+
+    return virt_b, bufs, obs_bufs
+
+
 def _reset_prefetch_resync(
     reset_prefetch: Optional[RolloutResetPrefetch],
     seed_base: int,
@@ -994,6 +1423,7 @@ def collect_parallel_micro_rollouts(
     seeds_consumed = 0
     t_init0 = perf_counter()
     population_size = int(getattr(policy, "population_size", 1))
+    grouped_population_rollout = population_size > 1
     if reset_prefetch is not None:
         mf0 = int(carry_in.cfg.max_fleets) if carry_in is not None else int(cfg_template.max_fleets)
         na0 = int(cfg_template.num_agents)
@@ -1006,13 +1436,27 @@ def collect_parallel_micro_rollouts(
         seeds_consumed += num_envs
         episode_turns = [0] * num_envs
         player_done = np.zeros((int(cfg.num_agents), num_envs), dtype=np.bool_)
-        population_assignments = np.stack(
-            [
-                _sample_population_assignments_for_env(seed_base + env_i, int(cfg.num_agents), population_size)
-                for env_i in range(num_envs)
-            ],
-            axis=1,
-        )
+        total_rows = int(cfg.num_agents) * int(num_envs)
+        rows_per_member = _population_rows_per_member(total_rows, population_size)
+        if grouped_population_rollout:
+            policy_row_for_seat = _init_policy_row_mapping(
+                num_envs=num_envs,
+                num_agents=int(cfg.num_agents),
+                population_size=population_size,
+                seed=seed_base,
+            )
+            population_assignments = _population_assignments_from_policy_rows(
+                policy_row_for_seat, rows_per_member, population_size
+            )
+        else:
+            policy_row_for_seat = None
+            population_assignments = np.stack(
+                [
+                    _sample_population_assignments_for_env(seed_base + env_i, int(cfg.num_agents), population_size)
+                    for env_i in range(num_envs)
+                ],
+                axis=1,
+            )
     else:
         state_b, cfg = carry_in.state_b, carry_in.cfg
         cfg.reward_mode = cfg_template.reward_mode
@@ -1034,6 +1478,31 @@ def collect_parallel_micro_rollouts(
             population_assignments = np.asarray(pop, dtype=np.int32)
             if population_assignments.shape != (int(cfg.num_agents), num_envs):
                 population_assignments = np.zeros((int(cfg.num_agents), num_envs), dtype=np.int32)
+        total_rows = int(cfg.num_agents) * int(num_envs)
+        rows_per_member = _population_rows_per_member(total_rows, population_size)
+        prs = carry_in.policy_row_for_seat
+        if grouped_population_rollout:
+            if prs is None:
+                policy_row_for_seat = _init_policy_row_mapping(
+                    num_envs=num_envs,
+                    num_agents=int(cfg.num_agents),
+                    population_size=population_size,
+                    seed=seed_base,
+                )
+            else:
+                policy_row_for_seat = np.asarray(prs, dtype=np.int32)
+                if policy_row_for_seat.shape != (int(cfg.num_agents), num_envs):
+                    policy_row_for_seat = _init_policy_row_mapping(
+                        num_envs=num_envs,
+                        num_agents=int(cfg.num_agents),
+                        population_size=population_size,
+                        seed=seed_base,
+                    )
+            population_assignments = _population_assignments_from_policy_rows(
+                policy_row_for_seat, rows_per_member, population_size
+            )
+        else:
+            policy_row_for_seat = None
 
     obs_feature_dim = obs_feature_dim_for_num_agents(int(cfg.num_agents))
     n_ego = int(cfg.num_agents)
@@ -1081,10 +1550,19 @@ def collect_parallel_micro_rollouts(
     )
 
     t_state0 = perf_counter()
-    virt_b = jax.tree.map(
-        lambda leaf: jnp.concatenate([leaf] * n_ego, axis=0),
-        state_b,
-    )
+    if grouped_population_rollout:
+        assert policy_row_for_seat is not None
+        row_env, row_ego = _invert_policy_row_mapping(policy_row_for_seat)
+        row_env_j = jnp.asarray(row_env, dtype=jnp.int32)
+        virt_b = _gather_state_rows(state_b, row_env_j)
+    else:
+        row_env = None
+        row_ego = None
+        row_env_j = None
+        virt_b = jax.tree.map(
+            lambda leaf: jnp.concatenate([leaf] * n_ego, axis=0),
+            state_b,
+        )
     timing.state_unstack_s += perf_counter() - t_state0
     halted = np.zeros((n_ego, num_envs), dtype=np.bool_)
     micro_k = np.zeros((n_ego, num_envs), dtype=np.int32)
@@ -1107,6 +1585,11 @@ def collect_parallel_micro_rollouts(
 
             ready_mask = (~segment_done) & np.all(halted | player_done, axis=0)
             pending = (~segment_done)[None, :] & (~halted) & (~player_done)
+            if grouped_population_rollout:
+                assert row_env is not None and row_ego is not None
+                pending_rows = (~segment_done[row_env]) & (~halted[row_ego, row_env]) & (~player_done[row_ego, row_env])
+            else:
+                pending_rows = None
             ready_count = int(np.sum(ready_mask))
             pending_total = int(np.sum(pending))
 
@@ -1161,6 +1644,8 @@ def collect_parallel_micro_rollouts(
                 timing.env_bookkeeping_s += perf_counter() - t_book0
 
                 t_py0 = perf_counter()
+                done_envs: list[int] = []
+                done_env_seed: dict[int, int] = {}
                 for local_i, env_i in enumerate(step_envs):
                     env_i = int(env_i)
                     env_steps_per_env[env_i] += 1
@@ -1175,6 +1660,7 @@ def collect_parallel_micro_rollouts(
                         if not bool(alive_post_np[local_i, p]):
                             player_done[p, env_i] = True
                     if bool(done_np[local_i]):
+                        done_envs.append(env_i)
                         sc_i = int(step_count_np[local_i])
                         game_stats.record_completion(
                             step_limit=sc_i >= episode_timeout_step_count,
@@ -1198,12 +1684,8 @@ def collect_parallel_micro_rollouts(
                         timing.env_reset_s += reset_dt
                         t_py0 += reset_dt
                         seeds_consumed += 1
+                        done_env_seed[env_i] = sid
 
-                    if bool(done_np[local_i]):
-                        player_done[:, env_i] = False
-                        population_assignments[:, env_i] = _sample_population_assignments_for_env(
-                            sid, int(cfg.num_agents), population_size
-                        )
                     halted[:, env_i] = player_done[:, env_i]
                     micro_k[:, env_i] = 0
                     pending_actions[env_i] = 0.0
@@ -1215,24 +1697,49 @@ def collect_parallel_micro_rollouts(
                     reward_idx[:, env_i] = -1
                     if horizon_fired:
                         segment_done[env_i] = True
+                if grouped_population_rollout and done_envs:
+                    assert policy_row_for_seat is not None
+                    done_envs_np = np.asarray(done_envs, dtype=np.int32)
+                    policy_row_for_seat = _reassign_policy_rows_for_reset_envs(
+                        policy_row_for_seat=policy_row_for_seat,
+                        done_envs=done_envs_np,
+                        seed=seed_base + seeds_consumed,
+                    )
+                    population_assignments = _population_assignments_from_policy_rows(
+                        policy_row_for_seat, rows_per_member, population_size
+                    )
+                    player_done[:, done_envs_np] = False
+                    halted[:, done_envs_np] = False
+                elif done_envs:
+                    for env_i in done_envs:
+                        player_done[:, env_i] = False
+                        population_assignments[:, env_i] = _sample_population_assignments_for_env(
+                            done_env_seed[env_i], int(cfg.num_agents), population_size
+                        )
                 timing.env_python_s += perf_counter() - t_py0
 
                 t_book0 = perf_counter()
                 step_env_t = torch.as_tensor(step_envs, dtype=torch.long, device=device)
                 micro_k_dev[:, step_env_t] = 0
                 _reset_prefetch_resync(reset_prefetch, seed_base, seeds_consumed, cfg)
-                actual_idx_j = jnp.asarray(step_envs, dtype=jnp.int32)
-                virt_dst_idx_j = jnp.concatenate(
-                    [actual_idx_j + jnp.asarray(k * num_envs, dtype=jnp.int32) for k in range(n_ego)],
-                    axis=0,
-                )
-                virt_src_idx_j = jnp.concatenate([actual_idx_j] * n_ego, axis=0)
-                virt_b = _copy_state_slices_between(
-                    virt_b,
-                    virt_dst_idx_j,
-                    state_b,
-                    virt_src_idx_j,
-                )
+                if grouped_population_rollout:
+                    assert policy_row_for_seat is not None
+                    row_env, row_ego = _invert_policy_row_mapping(policy_row_for_seat)
+                    row_env_j = jnp.asarray(row_env, dtype=jnp.int32)
+                    virt_b = _gather_state_rows(state_b, row_env_j)
+                else:
+                    actual_idx_j = jnp.asarray(step_envs, dtype=jnp.int32)
+                    virt_dst_idx_j = jnp.concatenate(
+                        [actual_idx_j + jnp.asarray(k * num_envs, dtype=jnp.int32) for k in range(n_ego)],
+                        axis=0,
+                    )
+                    virt_src_idx_j = jnp.concatenate([actual_idx_j] * n_ego, axis=0)
+                    virt_b = _copy_state_slices_between(
+                        virt_b,
+                        virt_dst_idx_j,
+                        state_b,
+                        virt_src_idx_j,
+                    )
                 timing.env_bookkeeping_s += perf_counter() - t_book0
                 timing.env_step_s += perf_counter() - t0
                 continue
@@ -1240,42 +1747,83 @@ def collect_parallel_micro_rollouts(
             if pending_total == 0:
                 break
 
-            virt_b, bufs, obs_bufs = _run_async_micro_step_multi(
-                n_ego=n_ego,
-                num_envs=num_envs,
-                pending=pending,
-                virt_b=virt_b,
-                bufs=bufs,
-                obs_bufs=obs_bufs,
-                write_idx=write_idx,
-                write_idx_dev=write_idx_dev,
-                micro_k=micro_k,
-                micro_k_dev=micro_k_dev,
-                valid=valid,
-                old_logprob=old_logprob,
-                old_value=old_value,
-                reward=reward,
-                pending_actions=pending_actions,
-                pending_action_count=pending_action_count,
-                reward_idx=reward_idx,
-                halted=halted,
-                policy=policy,
-                device=device,
-                rng=rng,
-                greedy=greedy,
-                ship_speed=ship_speed,
-                max_micro_steps=max_micro_steps_per_player,
-                timing=timing,
-                first_hit_n_rays=first_hit_n_rays,
-                micro_step_penalty=micro_step_penalty,
-                first_hit_ray_chunk_size=first_hit_ray_chunk_size,
-                first_hit_env_chunk_size=first_hit_env_chunk_size,
-                first_hit_method=first_hit_method,
-                obs_feature_dim=obs_feature_dim,
-                normalize_obs_to_p0=cfg.normalize_obs_to_p0,
-                sync_policy_timing=sync_policy_timing,
-                population_assignments=population_assignments,
-            )
+            if grouped_population_rollout:
+                assert row_env is not None and row_ego is not None and pending_rows is not None
+                virt_b, bufs, obs_bufs = _run_async_micro_step_multi_grouped_population(
+                    n_ego=n_ego,
+                    num_envs=num_envs,
+                    pending_rows=pending_rows,
+                    virt_b=virt_b,
+                    bufs=bufs,
+                    obs_bufs=obs_bufs,
+                    write_idx=write_idx,
+                    write_idx_dev=write_idx_dev,
+                    micro_k=micro_k,
+                    micro_k_dev=micro_k_dev,
+                    valid=valid,
+                    old_logprob=old_logprob,
+                    old_value=old_value,
+                    reward=reward,
+                    row_env=row_env,
+                    row_ego=row_ego,
+                    rows_per_member=rows_per_member,
+                    pending_actions=pending_actions,
+                    pending_action_count=pending_action_count,
+                    reward_idx=reward_idx,
+                    halted=halted,
+                    policy=policy,
+                    device=device,
+                    rng=rng,
+                    greedy=greedy,
+                    ship_speed=ship_speed,
+                    max_micro_steps=max_micro_steps_per_player,
+                    timing=timing,
+                    first_hit_n_rays=first_hit_n_rays,
+                    micro_step_penalty=micro_step_penalty,
+                    first_hit_ray_chunk_size=first_hit_ray_chunk_size,
+                    first_hit_env_chunk_size=first_hit_env_chunk_size,
+                    first_hit_method=first_hit_method,
+                    obs_feature_dim=obs_feature_dim,
+                    normalize_obs_to_p0=cfg.normalize_obs_to_p0,
+                    sync_policy_timing=sync_policy_timing,
+                )
+            else:
+                virt_b, bufs, obs_bufs = _run_async_micro_step_multi(
+                    n_ego=n_ego,
+                    num_envs=num_envs,
+                    pending=pending,
+                    virt_b=virt_b,
+                    bufs=bufs,
+                    obs_bufs=obs_bufs,
+                    write_idx=write_idx,
+                    write_idx_dev=write_idx_dev,
+                    micro_k=micro_k,
+                    micro_k_dev=micro_k_dev,
+                    valid=valid,
+                    old_logprob=old_logprob,
+                    old_value=old_value,
+                    reward=reward,
+                    pending_actions=pending_actions,
+                    pending_action_count=pending_action_count,
+                    reward_idx=reward_idx,
+                    halted=halted,
+                    policy=policy,
+                    device=device,
+                    rng=rng,
+                    greedy=greedy,
+                    ship_speed=ship_speed,
+                    max_micro_steps=max_micro_steps_per_player,
+                    timing=timing,
+                    first_hit_n_rays=first_hit_n_rays,
+                    micro_step_penalty=micro_step_penalty,
+                    first_hit_ray_chunk_size=first_hit_ray_chunk_size,
+                    first_hit_env_chunk_size=first_hit_env_chunk_size,
+                    first_hit_method=first_hit_method,
+                    obs_feature_dim=obs_feature_dim,
+                    normalize_obs_to_p0=cfg.normalize_obs_to_p0,
+                    sync_policy_timing=sync_policy_timing,
+                    population_assignments=population_assignments,
+                )
             if profile_rollout and device.type == "cuda" and not logged_first_policy_fwd:
                 log_cuda_mem("rollout after first batched policy forward", device)
                 logged_first_policy_fwd = True
@@ -1293,12 +1841,13 @@ def collect_parallel_micro_rollouts(
     bootstrap = [np.zeros((num_envs,), dtype=np.float32) for _ in range(n_ego)]
     bootstrap_valid = [np.zeros((num_envs,), dtype=np.bool_) for _ in range(n_ego)]
     if horizon_fired:
-        value_np_per_ego: list[np.ndarray] = []
-        for ego in range(n_ego):
+        if grouped_population_rollout:
+            assert row_env is not None and row_ego is not None and row_env_j is not None
             t0 = perf_counter()
-            obs_j = build_observation_batched_jax(
-                state_b,
-                ego,
+            policy_state_b = _gather_state_rows(state_b, row_env_j)
+            obs_j = build_observation_batched_jax_per_ego(
+                policy_state_b,
+                jnp.asarray(row_ego, dtype=jnp.int32),
                 ship_speed,
                 obs_feature_dim,
                 normalize_to_p0=cfg.normalize_obs_to_p0,
@@ -1307,21 +1856,48 @@ def collect_parallel_micro_rollouts(
             tb0 = perf_counter()
             obs_t = decode_observation(compress_observation(obs_jax_to_torch(obs_j)), feature_dim=obs_feature_dim)
             with amp_ctx:
-                out_e = policy.forward_dense_rollout(
-                    **obs_t,
-                    population_idx=torch.as_tensor(population_assignments[ego], device=device, dtype=torch.long),
-                )
+                out_rows = policy.forward_dense_rollout_grouped_population(**{k: v.to(device) for k, v in obs_t.items()})
             timing.policy_batch_s += perf_counter() - tb0
             tf0 = perf_counter()
-            value_np_per_ego.append(out_e["value"].float().detach().cpu().numpy())
+            value_np_rows = out_rows["value"].float().detach().cpu().numpy()
             timing.policy_forward_s += perf_counter() - tf0
-
-        for i in range(num_envs):
+            for row in range(value_np_rows.shape[0]):
+                env_i = int(row_env[row])
+                ego = int(row_ego[row])
+                last_t = int(write_idx[ego][env_i]) - 1
+                if last_t >= 0 and not bool(done[ego][last_t, env_i]):
+                    bootstrap[ego][env_i] = float(value_np_rows[row])
+                    bootstrap_valid[ego][env_i] = True
+        else:
+            value_np_per_ego: list[np.ndarray] = []
             for ego in range(n_ego):
-                last_t = int(write_idx[ego][i]) - 1
-                if last_t >= 0 and not bool(done[ego][last_t, i]):
-                    bootstrap[ego][i] = float(value_np_per_ego[ego][i])
-                    bootstrap_valid[ego][i] = True
+                t0 = perf_counter()
+                obs_j = build_observation_batched_jax(
+                    state_b,
+                    ego,
+                    ship_speed,
+                    obs_feature_dim,
+                    normalize_to_p0=cfg.normalize_obs_to_p0,
+                )
+                timing.obs_build_s += perf_counter() - t0
+                tb0 = perf_counter()
+                obs_t = decode_observation(compress_observation(obs_jax_to_torch(obs_j)), feature_dim=obs_feature_dim)
+                with amp_ctx:
+                    out_e = policy.forward_dense_rollout(
+                        **obs_t,
+                        population_idx=torch.as_tensor(population_assignments[ego], device=device, dtype=torch.long),
+                    )
+                timing.policy_batch_s += perf_counter() - tb0
+                tf0 = perf_counter()
+                value_np_per_ego.append(out_e["value"].float().detach().cpu().numpy())
+                timing.policy_forward_s += perf_counter() - tf0
+
+            for i in range(num_envs):
+                for ego in range(n_ego):
+                    last_t = int(write_idx[ego][i]) - 1
+                    if last_t >= 0 and not bool(done[ego][last_t, i]):
+                        bootstrap[ego][i] = float(value_np_per_ego[ego][i])
+                        bootstrap_valid[ego][i] = True
 
     segment = RolloutSegment(
         bufs=bufs,
@@ -1343,5 +1919,6 @@ def collect_parallel_micro_rollouts(
         episode_turns=episode_turns,
         player_done=player_done,
         population_assignments=population_assignments,
+        policy_row_for_seat=policy_row_for_seat,
     )
     return segment, timing, next_carry, seeds_consumed, game_stats
