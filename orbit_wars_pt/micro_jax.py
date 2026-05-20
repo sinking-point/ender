@@ -50,9 +50,13 @@ from orbit_wars_pt.geometry_jax import (
     first_hit_best_targets_apply_jax,
     first_hit_union_scan_bins_best_targets_apply_jax,
     ray_segments_by_tick_jax,
+    reduce_ray_object_codes_to_targets_jax,
     reduce_ray_planet_hits_to_targets_jax,
+    rotating_hit_codes_jax,
     rotating_hits_by_tick_jax,
+    scheduled_comet_hit_codes_jax,
     scheduled_comet_hits_by_tick_jax,
+    stationary_hit_codes_jax,
     stationary_hits_by_tick_jax,
     swept_disk_hits_from_positions_jax,
 )
@@ -245,39 +249,56 @@ def _category_rays_best_targets_one_env(
     )
 
     stat_centers, stat_r, stat_valid2 = _stationary_target_state(s, stat_idx, stat_valid)
-    stat_hits = stationary_hits_by_tick_jax(a0, a1, stat_centers, stat_r, stat_valid2)
+    object_count = int(s.planets.shape[0]) + 1
+    stat_codes = stationary_hit_codes_jax(
+        a0,
+        a1,
+        stat_centers,
+        stat_r,
+        stat_valid2,
+        stat_idx,
+        object_count=object_count,
+    )
     sun_centers = jnp.asarray([[CENTER, CENTER]], dtype=origin_xy.dtype)
     sun_radii = jnp.asarray([SUN_RADIUS], dtype=origin_xy.dtype)
     sun_valid = jnp.asarray([True], dtype=jnp.bool_)
-    sun_hits = stationary_hits_by_tick_jax(a0, a1, sun_centers, sun_radii, sun_valid)
+    sun_idx = jnp.asarray([s.planets.shape[0]], dtype=jnp.int32)
+    sun_codes = stationary_hit_codes_jax(
+        a0,
+        a1,
+        sun_centers,
+        sun_radii,
+        sun_valid,
+        sun_idx,
+        object_count=object_count,
+    )
 
     rot_init_xy, rot_r, rot_valid2 = _rotating_target_state(s, rot_idx, rot_valid)
-    rot_hits = rotating_hits_by_tick_jax(
+    rot_codes = rotating_hit_codes_jax(
         a0,
         a1,
         rot_init_xy,
         rot_r,
         rot_valid2,
+        rot_idx,
         s.angular_velocity,
         s.step_count,
+        object_count=object_count,
     )
 
-    comet_hits = scheduled_comet_hits_by_tick_jax(
+    comet_codes = scheduled_comet_hit_codes_jax(
         a0,
         a1,
         s.comet_paths,
         s.comet_path_lengths,
         s.step_count,
         comet_valid,
+        comet_idx,
         spawn_steps=jow.COMET_SPAWN_STEPS,
+        object_count=object_count,
     )
 
-    planet_hits = (
-        _scatter_hits_to_planet_axis(stat_hits, stat_idx, stat_valid)
-        | _scatter_hits_to_planet_axis(rot_hits, rot_idx, rot_valid)
-        | _scatter_hits_to_planet_axis(comet_hits, comet_idx, comet_valid)
-    )
-    object_hits = jnp.concatenate([planet_hits, sun_hits], axis=2)
+    object_codes = jnp.concatenate([stat_codes, rot_codes, comet_codes, sun_codes], axis=1)
     hidden_object_mask = jnp.concatenate(
         [
             (~s.planet_active).astype(jnp.bool_),
@@ -286,8 +307,8 @@ def _category_rays_best_targets_one_env(
     )
 
     angle, width, valid, overflow, hit_tick, true_hit_planet, true_hit_tick = (
-        reduce_ray_planet_hits_to_targets_jax(
-            object_hits,
+        reduce_ray_object_codes_to_targets_jax(
+            object_codes,
             hidden_object_mask,
             n_rays=n_rays,
             num_targets=s.planets.shape[0],

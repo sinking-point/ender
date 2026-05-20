@@ -2352,6 +2352,50 @@ def stationary_hits_by_tick_jax(
     return hit_ok[None, :, :] & (tick_axis == tick_i[None, :, :])
 
 
+def stationary_hit_codes_jax(
+    a0: jnp.ndarray,
+    a1: jnp.ndarray,
+    centers: jnp.ndarray,
+    radii: jnp.ndarray,
+    valid: jnp.ndarray,
+    object_idx: jnp.ndarray,
+    *,
+    object_count: int,
+) -> jnp.ndarray:
+    """Earliest hit code ``[R, P]`` for stationary targets.
+
+    Codes are ``tick * object_count + object_id``; missing hits are ``int32 max``.
+    """
+
+    dtype = a0.dtype
+    ticks = a0.shape[0]
+    launch = a0[0]  # [R, 2]
+    ray_delta = a1[0] - a0[0]  # [R, 2]
+    speed = jnp.linalg.norm(ray_delta, axis=-1)  # [R]
+    speed_safe = jnp.maximum(speed, jnp.asarray(1e-12, dtype=dtype))
+    u = ray_delta / speed_safe[:, None]
+
+    m = launch[:, None, :] - centers[None, :, :]  # [R, P, 2]
+    b = 2.0 * jnp.sum(m * u[:, None, :], axis=-1)  # [R, P]
+    c = jnp.sum(m * m, axis=-1) - radii[None, :] ** 2  # [R, P]
+    disc = b * b - 4.0 * c
+    sqrt_disc = jnp.sqrt(jnp.maximum(disc, 0.0))
+    root_lo = (-b - sqrt_disc) * 0.5
+    root_hi = (-b + sqrt_disc) * 0.5
+
+    inside = c <= 0.0
+    has_forward = root_hi >= 0.0
+    s_hit = jnp.where(
+        inside,
+        jnp.asarray(0.0, dtype=dtype),
+        jnp.where(root_lo >= 0.0, root_lo, root_hi),
+    )
+    tick_i = jnp.floor(s_hit / speed_safe[:, None]).astype(jnp.int32)
+    hit_ok = valid[None, :] & (disc >= 0.0) & has_forward & (tick_i >= 0) & (tick_i < ticks)
+    code = tick_i * jnp.asarray(object_count, dtype=jnp.int32) + object_idx[None, :]
+    return jnp.where(hit_ok, code, jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32))
+
+
 def rotating_hits_by_tick_jax(
     a0: jnp.ndarray,
     a1: jnp.ndarray,
@@ -2398,6 +2442,62 @@ def rotating_hits_by_tick_jax(
     moving_hit = (disc >= 0.0) & (root_hi >= 0.0) & (root_lo <= 1.0)
     hit_raw = jnp.where(qa < qa_small, static_hit, moving_hit)
     return hit_raw & active[:, None, :]
+
+
+def rotating_hit_codes_jax(
+    a0: jnp.ndarray,
+    a1: jnp.ndarray,
+    init_xy: jnp.ndarray,
+    radii: jnp.ndarray,
+    valid: jnp.ndarray,
+    object_idx: jnp.ndarray,
+    angular_velocity: jnp.ndarray,
+    step_count: jnp.ndarray,
+    *,
+    object_count: int,
+) -> jnp.ndarray:
+    """Earliest hit code ``[R, P]`` for orbiting targets."""
+
+    tick_i = jnp.arange(a0.shape[0], dtype=jnp.int32)
+    tick = tick_i.astype(jnp.float32)[:, None]
+    delta = init_xy - CENTER
+    orbital_r = jnp.linalg.norm(delta, axis=1)
+    initial_angle = jnp.arctan2(delta[:, 1], delta[:, 0])
+    step_f = step_count.astype(jnp.float32)
+    t0 = jnp.maximum(step_f + tick - 1.0, 0.0)
+    t1 = step_f + tick
+    ang0 = initial_angle[None, :] + angular_velocity * t0
+    ang1 = initial_angle[None, :] + angular_velocity * t1
+    active = jnp.broadcast_to(valid[None, :], (a0.shape[0], valid.shape[0]))
+    p0x = CENTER + orbital_r[None, :] * jnp.cos(ang0)
+    p0y = CENTER + orbital_r[None, :] * jnp.sin(ang0)
+    p1x = CENTER + orbital_r[None, :] * jnp.cos(ang1)
+    p1y = CENTER + orbital_r[None, :] * jnp.sin(ang1)
+
+    d0x = a0[..., 0][:, :, None] - p0x[:, None, :]
+    d0y = a0[..., 1][:, :, None] - p0y[:, None, :]
+    dvx = (a1[..., 0] - a0[..., 0])[:, :, None] - (p1x - p0x)[:, None, :]
+    dvy = (a1[..., 1] - a0[..., 1])[:, :, None] - (p1y - p0y)[:, None, :]
+    qa = dvx * dvx + dvy * dvy
+    qb = 2.0 * (d0x * dvx + d0y * dvy)
+    qc = d0x * d0x + d0y * d0y - radii[None, None, :] ** 2
+    disc = qb * qb - 4.0 * qa * qc
+    static_hit = qc <= 0.0
+    sqrt_disc = jnp.sqrt(jnp.maximum(disc, 0.0))
+    qa_small = jnp.asarray(1e-12, dtype=a0.dtype)
+    qa_safe = jnp.where(qa < qa_small, 1.0, qa)
+    root_lo = (-qb - sqrt_disc) / (2.0 * qa_safe)
+    root_hi = (-qb + sqrt_disc) / (2.0 * qa_safe)
+    moving_hit = (disc >= 0.0) & (root_hi >= 0.0) & (root_lo <= 1.0)
+    hit_ok = jnp.where(qa < qa_small, static_hit, moving_hit) & active[:, None, :]
+    tick_codes = jnp.where(
+        hit_ok,
+        tick_i[:, None, None],
+        jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32),
+    )
+    first_tick = jnp.min(tick_codes, axis=0)
+    code = first_tick * jnp.asarray(object_count, dtype=jnp.int32) + object_idx[None, :]
+    return jnp.where(first_tick < jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32), code, first_tick)
 
 
 def comet_hits_by_tick_jax(
@@ -2515,6 +2615,72 @@ def scheduled_comet_hits_by_tick_jax(
     moving_hit = (disc >= 0.0) & (root_hi >= 0.0) & (root_lo <= 1.0)
     hit_raw = jnp.where(qa < qa_small, static_hit, moving_hit)
     return jnp.any(hit_raw & active[:, None, :, :], axis=2)
+
+
+def scheduled_comet_hit_codes_jax(
+    a0: jnp.ndarray,
+    a1: jnp.ndarray,
+    comet_paths: jnp.ndarray,
+    comet_path_lengths: jnp.ndarray,
+    step_count: jnp.ndarray,
+    reserve_valid: jnp.ndarray,
+    object_idx: jnp.ndarray,
+    *,
+    spawn_steps: tuple[int, ...],
+    object_count: int,
+) -> jnp.ndarray:
+    """Earliest scheduled-comet hit code ``[R, K]`` for reserve comet slots."""
+
+    dtype = a0.dtype
+    ticks = a0.shape[0]
+    tick_i = jnp.arange(ticks, dtype=jnp.int32)
+    groups = comet_paths.shape[0]
+    comet_k = comet_paths.shape[1]
+
+    tick = tick_i[:, None, None, None]  # [T,1,1,1]
+    spawn = jnp.asarray(spawn_steps, dtype=jnp.int32)[None, :, None, None]  # [1,G,1,1]
+    rel = step_count.astype(jnp.int32) + tick - spawn  # [T,G,1,1]
+    lengths = comet_path_lengths[None, :, :, None]  # [1,G,K,1]
+    valid = reserve_valid[None, None, :, None]  # [1,1,K,1]
+    active = (valid & (rel >= 0) & ((rel + 1) < lengths))[..., 0]  # [T,G,K]
+
+    rel0 = jnp.clip(rel[..., 0], 0, comet_paths.shape[2] - 1)  # [T,G,1]
+    rel1 = jnp.clip(rel[..., 0] + 1, 0, comet_paths.shape[2] - 1)
+    p0x = comet_paths[None, :, :, :, 0]
+    p0y = comet_paths[None, :, :, :, 1]
+    path0x = jnp.take_along_axis(p0x, rel0[:, :, None, :], axis=3)[..., 0]  # [T,G,K]
+    path0y = jnp.take_along_axis(p0y, rel0[:, :, None, :], axis=3)[..., 0]
+    path1x = jnp.take_along_axis(p0x, rel1[:, :, None, :], axis=3)[..., 0]
+    path1y = jnp.take_along_axis(p0y, rel1[:, :, None, :], axis=3)[..., 0]
+
+    ax0 = a0[..., 0][:, :, None, None]
+    ay0 = a0[..., 1][:, :, None, None]
+    dax = (a1[..., 0] - a0[..., 0])[:, :, None, None]
+    day = (a1[..., 1] - a0[..., 1])[:, :, None, None]
+    dvx = dax - (path1x[:, None, :, :] - path0x[:, None, :, :])
+    dvy = day - (path1y[:, None, :, :] - path0y[:, None, :, :])
+    d0x = ax0 - path0x[:, None, :, :]
+    d0y = ay0 - path0y[:, None, :, :]
+    qa = dvx * dvx + dvy * dvy
+    qb = 2.0 * (d0x * dvx + d0y * dvy)
+    qc = d0x * d0x + d0y * d0y - (jnp.asarray(1.0, dtype=dtype) ** 2)
+    disc = qb * qb - 4.0 * qa * qc
+    static_hit = qc <= 0.0
+    sqrt_disc = jnp.sqrt(jnp.maximum(disc, 0.0))
+    qa_small = jnp.asarray(1e-12, dtype=dtype)
+    qa_safe = jnp.where(qa < qa_small, 1.0, qa)
+    root_lo = (-qb - sqrt_disc) / (2.0 * qa_safe)
+    root_hi = (-qb + sqrt_disc) / (2.0 * qa_safe)
+    moving_hit = (disc >= 0.0) & (root_hi >= 0.0) & (root_lo <= 1.0)
+    hit_ok = jnp.where(qa < qa_small, static_hit, moving_hit) & active[:, None, :, :]
+    tick_codes = jnp.where(
+        hit_ok,
+        tick_i[:, None, None, None],
+        jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32),
+    )
+    first_tick = jnp.min(tick_codes, axis=(0, 2))
+    code = first_tick * jnp.asarray(object_count, dtype=jnp.int32) + object_idx[None, :]
+    return jnp.where(first_tick < jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32), code, first_tick)
 
 
 def swept_disk_hits_from_positions_jax(
@@ -2645,6 +2811,66 @@ def reduce_ray_planet_hits_to_targets_jax(
     hit_tick = jnp.where(valid, policy_first_tick[best_ray].astype(dtype), jnp.asarray(0.0, dtype=dtype))
     true_planet = jnp.where(
         valid & (true_first_object[best_ray] < num_targets),
+        true_first_object[best_ray],
+        jnp.asarray(-1, dtype=jnp.int32),
+    )
+    true_tick = jnp.where(
+        valid & (true_planet >= 0),
+        true_first_tick[best_ray].astype(dtype),
+        jnp.asarray(500.0, dtype=dtype),
+    )
+    overflow = jnp.asarray(False)
+    return angle, width, valid, overflow, hit_tick, true_planet, true_tick
+
+
+def reduce_ray_object_codes_to_targets_jax(
+    object_codes: jnp.ndarray,
+    hidden_object_mask: jnp.ndarray,
+    *,
+    n_rays: int,
+    num_targets: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Reduce per-ray object hit codes into per-target best headings.
+
+    ``object_codes`` is ``[R, C]`` with scores ``tick * object_count + object_id``
+    and ``int32 max`` for misses.
+    """
+
+    dtype = jnp.float32
+    score_inf = jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32)
+    object_count = int(hidden_object_mask.shape[0])
+    object_id = jnp.mod(object_codes, jnp.asarray(object_count, dtype=jnp.int32))
+    hidden = jnp.take(hidden_object_mask.astype(jnp.bool_), jnp.clip(object_id, 0, object_count - 1))
+
+    true_code = jnp.min(object_codes, axis=1)
+    policy_codes = jnp.where(hidden | (object_codes == score_inf), score_inf, object_codes)
+    policy_code = jnp.min(policy_codes, axis=1)
+
+    policy_first_tick = policy_code // jnp.asarray(object_count, dtype=jnp.int32)
+    policy_first_object = jnp.mod(policy_code, jnp.asarray(object_count, dtype=jnp.int32))
+    true_first_tick = true_code // jnp.asarray(object_count, dtype=jnp.int32)
+    true_first_object = jnp.mod(true_code, jnp.asarray(object_count, dtype=jnp.int32))
+
+    kvec = jnp.arange(n_rays, dtype=dtype)
+    dtheta = TAU / jnp.asarray(float(n_rays), dtype=dtype)
+    theta = kvec * dtheta
+    jp = jnp.arange(num_targets, dtype=jnp.int32)
+    hit_any = (policy_code < score_inf) & (policy_first_object < num_targets)
+    ray_idx = jnp.arange(n_rays, dtype=jnp.int32)
+    mask = hit_any[:, None] & (policy_first_object[:, None] == jp[None, :])
+    scores = jnp.where(
+        mask,
+        policy_first_tick[:, None] * jnp.asarray(n_rays + 1, dtype=jnp.int32) + ray_idx[:, None],
+        score_inf,
+    )
+    best_score = jnp.min(scores, axis=0)
+    best_ray = jnp.argmin(scores, axis=0).astype(jnp.int32)
+    valid = best_score < score_inf
+    angle = jnp.where(valid, _norm_angle(theta[best_ray]), jnp.asarray(0.0, dtype=dtype))
+    width = jnp.where(valid, dtheta, jnp.asarray(0.0, dtype=dtype))
+    hit_tick = jnp.where(valid, policy_first_tick[best_ray].astype(dtype), jnp.asarray(0.0, dtype=dtype))
+    true_planet = jnp.where(
+        valid & (true_code[best_ray] < score_inf) & (true_first_object[best_ray] < num_targets),
         true_first_object[best_ray],
         jnp.asarray(-1, dtype=jnp.int32),
     )
