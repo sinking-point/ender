@@ -71,6 +71,7 @@ def _run_one(args: argparse.Namespace) -> dict[str, Any]:
             samples_per_span=17,
             n_rays=int(args.n_rays),
             ray_chunk_size=int(args.chunk_size),
+            first_hit_method=str(args.first_hit_method),
         )
 
     t0 = time.perf_counter()
@@ -89,6 +90,7 @@ def _run_one(args: argparse.Namespace) -> dict[str, Any]:
     angle_np, valid_np, overflow_np = jax.device_get((angle, valid, overflow))
     return {
         "chunk_size": int(args.chunk_size),
+        "first_hit_method": str(args.first_hit_method),
         "num_envs": int(args.num_envs),
         "n_rays": int(args.n_rays),
         "compile_run_s": compile_run_s,
@@ -122,6 +124,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ship-speed", type=float, default=6.0)
     p.add_argument("--frac-idx", type=int, default=2)
     p.add_argument("--n-rays", type=int, default=256)
+    p.add_argument("--first-hit-method", type=str, default="rays", choices=("rays", "interval-bins"))
     p.add_argument("--chunks", type=_parse_chunks, default=_parse_chunks("0,32,64,128,256"))
     p.add_argument("--repeat", type=int, default=5)
     p.add_argument("--one-chunk", action="store_true", help=argparse.SUPPRESS)
@@ -158,6 +161,8 @@ def main() -> None:
             str(args.frac_idx),
             "--n-rays",
             str(args.n_rays),
+            "--first-hit-method",
+            str(args.first_hit_method),
             "--repeat",
             str(args.repeat),
         ]
@@ -167,10 +172,11 @@ def main() -> None:
         row = json.loads(line)
         rows.append(row)
 
-    print("chunk compile+run_s mean_run_s min_run_s peak_mib in_use_mib valid_frac angle_sum overflow")
+    print("method chunk compile+run_s mean_run_s min_run_s peak_mib in_use_mib valid_frac angle_sum overflow")
     for row in rows:
         mem = row.get("memory", {})
         print(
+            f"{row['first_hit_method']:>13} "
             f"{row['chunk_size']:>5d} "
             f"{row['compile_run_s']:>13.4f} "
             f"{row['mean_run_s']:>10.4f} "

@@ -174,6 +174,7 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "reward_mode",
         "first_hit_n_rays",
         "first_hit_ray_chunk_size",
+        "first_hit_method",
         "micro_step_penalty",
         "max_grad_norm",
         "d_model",
@@ -1441,6 +1442,8 @@ def _train_loop(
                     reset_prefetch=reset_prefetch,
                     first_hit_n_rays=max(8, int(args.first_hit_n_rays)),
                     first_hit_ray_chunk_size=max(0, int(args.first_hit_ray_chunk_size)),
+                    first_hit_env_chunk_size=max(0, int(args.first_hit_env_chunk_size)),
+                    first_hit_method=str(args.first_hit_method),
                     micro_step_penalty=float(args.micro_step_penalty),
                     sync_policy_timing=bool(args.sync_rollout_timing),
                 )
@@ -1504,6 +1507,8 @@ def _train_loop(
                 reset_prefetch=reset_prefetch,
                 first_hit_n_rays=max(8, int(args.first_hit_n_rays)),
                 first_hit_ray_chunk_size=max(0, int(args.first_hit_ray_chunk_size)),
+                first_hit_env_chunk_size=max(0, int(args.first_hit_env_chunk_size)),
+                first_hit_method=str(args.first_hit_method),
                 micro_step_penalty=float(args.micro_step_penalty),
                 sync_policy_timing=bool(args.sync_rollout_timing),
             )
@@ -1756,6 +1761,29 @@ def parse_args() -> argparse.Namespace:
             "If >0 and smaller than --first-hit-n-rays, process discrete first-hit geometry "
             "in JAX ray chunks of this size to lower peak XLA temporary memory. 0 keeps "
             "the current full-ray implementation."
+        ),
+    )
+    p.add_argument(
+        "--first-hit-env-chunk-size",
+        type=int,
+        default=0,
+        help=(
+            "If >0, split the batched JAX first-hit geometry call across env chunks of this "
+            "size in rollout. 0 keeps one full env batch."
+        ),
+    )
+    p.add_argument(
+        "--first-hit-method",
+        type=str,
+        default="category-rays",
+        choices=("rays", "category-rays", "interval-bins"),
+        help=(
+            "Target geometry used in JAX rollout first-hit selection. 'category-rays' "
+            "is the default hot-path raycaster with category-specialized geometry. "
+            "'rays' keeps the legacy discrete raycaster for reference. "
+            "'interval-bins' is an experimental rollout-only analytic interval "
+            "rasterizer; --first-hit-n-rays sets the angular bin count for the "
+            "ray-based modes."
         ),
     )
     p.add_argument(

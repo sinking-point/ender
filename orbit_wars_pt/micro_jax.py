@@ -45,7 +45,17 @@ from orbit_wars_pt.constants import (
     MAX_PLANETS,
     SUN_RADIUS,
 )
-from orbit_wars_pt.geometry_jax import _game_point_to_segment_distance, first_hit_best_targets_apply_jax
+from orbit_wars_pt.geometry_jax import (
+    _game_point_to_segment_distance,
+    first_hit_best_targets_apply_jax,
+    first_hit_union_scan_bins_best_targets_apply_jax,
+    ray_segments_by_tick_jax,
+    reduce_ray_planet_hits_to_targets_jax,
+    rotating_hits_by_tick_jax,
+    scheduled_comet_hits_by_tick_jax,
+    stationary_hits_by_tick_jax,
+    swept_disk_hits_from_positions_jax,
+)
 
 
 _FRACTIONS_JAX = jnp.asarray(FRACTIONS, dtype=jnp.float32)
@@ -100,7 +110,207 @@ def _forecast_planet_paths_one_tick(s: OrbitWarsState):
     return jax.lax.cond(s.done, no_tick, do_tick, s)
 
 
-@partial(jax.jit, static_argnames=("horizon", "ship_speed", "samples_per_span", "n_rays", "ray_chunk_size"))
+def _compact_category_indices(mask: jnp.ndarray, capacity: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Stable compacting index list with a sink slot for invalid entries."""
+
+    planets = int(mask.shape[0])
+    slot = jnp.arange(planets, dtype=jnp.int32)
+    rank = jnp.where(mask, slot, planets + slot)
+    order = jnp.argsort(rank)
+    idx = order[:capacity]
+    valid = jnp.take(mask, idx, axis=0)
+    return idx, valid
+
+
+def _forecast_object_radii(state: OrbitWarsState) -> jnp.ndarray:
+    """Forecast-time object radii for legacy scan-based ray paths.
+
+    Future comets are forecast into currently inactive reserve slots, but those slots still
+    carry radius 0 in the current state. Use the comet radius for all launch-inactive slots
+    so swept-hit tests see the same future comet body that the forecast path emits.
+    """
+
+    return jnp.where(
+        state.initial_active,
+        state.planets[:, PLANET_RADIUS],
+        jnp.asarray(jow.COMET_RADIUS, dtype=state.planets.dtype),
+    )
+
+
+def _gather_xy_rows(x: jnp.ndarray, idx: jnp.ndarray) -> jnp.ndarray:
+    return jnp.take(x, idx, axis=0)
+
+
+def _gather_scalar_rows(x: jnp.ndarray, idx: jnp.ndarray) -> jnp.ndarray:
+    return jnp.take(x, idx, axis=0)
+
+
+def _rotating_target_state(
+    state: OrbitWarsState,
+    idx: jnp.ndarray,
+    valid: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Return ``(init_xy[C,2], radii[C], valid[C])`` for rotating planets."""
+    init_xy = _gather_xy_rows(state.initial_planets[:, PLANET_X : PLANET_Y + 1], idx)
+    radii = _gather_scalar_rows(state.planets[:, PLANET_RADIUS], idx)
+    return init_xy, radii, valid
+
+
+def _stationary_target_state(
+    state: OrbitWarsState,
+    idx: jnp.ndarray,
+    valid: jnp.ndarray,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Return ``(centers[C,2], radii[C], valid[C])`` for stationary planets."""
+    centers = _gather_xy_rows(state.planets[:, PLANET_X : PLANET_Y + 1], idx)
+    radii = _gather_scalar_rows(state.planets[:, PLANET_RADIUS], idx)
+    return centers, radii, valid
+
+
+def _comet_reserve_slots(
+    state: OrbitWarsState,
+):
+    """Return the stable 4-slot comet reserve.
+
+    When a comet group is active, those live slots are the reserve we want to use for both
+    current and scheduled comet geometry. Otherwise, fall back to the lowest currently
+    inactive slots, which are exactly where the next comet group will spawn.
+    """
+
+    active_groups = state.comet_group_active.astype(jnp.bool_)
+    has_active = jnp.any(active_groups)
+    active_group_idx = jnp.argmax(active_groups.astype(jnp.int32))
+    active_slots = state.comet_slots[active_group_idx]
+    active_valid = has_active & (active_slots >= 0)
+
+    inactive_idx, inactive_valid = _compact_category_indices(~state.planet_active, 4)
+    idx = jnp.where(has_active, active_slots, inactive_idx)
+    valid = jnp.where(has_active, active_valid, inactive_valid)
+    return idx.astype(jnp.int32), valid.astype(jnp.bool_)
+
+
+def _scatter_hits_to_planet_axis(
+    hits: jnp.ndarray,
+    idx: jnp.ndarray,
+    valid: jnp.ndarray,
+) -> jnp.ndarray:
+    """Scatter ``[T,R,C]`` category hits into ``[T,R,MAX_PLANETS]`` with a sink slot."""
+
+    ticks, rays, _ = hits.shape
+    sink = jnp.asarray(MAX_PLANETS, dtype=jnp.int32)
+    idx_safe = jnp.where(valid, idx, sink)
+    out = jnp.zeros((ticks, rays, MAX_PLANETS + 1), dtype=jnp.bool_)
+    out = out.at[:, :, idx_safe].set(jnp.where(valid[None, None, :], hits, False))
+    return out[:, :, :MAX_PLANETS]
+
+
+def _category_rays_best_targets_one_env(
+    s: OrbitWarsState,
+    oi: jnp.ndarray,
+    fi: jnp.ndarray,
+    *,
+    horizon: int,
+    ship_speed: float,
+    n_rays: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    ships = s.planets[oi, PLANET_SHIPS]
+    send = jnp.floor(_FRACTIONS_JAX[fi] * ships)
+    speed = _fleet_speed_jax(send, ship_speed)
+    origin_xy = s.planets[oi, PLANET_X : PLANET_Y + 1]
+    origin_radius = s.planets[oi, PLANET_RADIUS]
+
+    comet_idx, comet_valid = _comet_reserve_slots(s)
+    comet_slot_mask = jnp.zeros((s.planets.shape[0],), dtype=jnp.bool_).at[comet_idx].set(comet_valid)
+
+    init_pos = s.initial_planets[:, PLANET_X : PLANET_Y + 1]
+    delta = init_pos - CENTER
+    orbital_r = jnp.linalg.norm(delta, axis=1)
+    base_mask = s.planet_active & (~comet_slot_mask)
+    rotating_mask = (
+        base_mask
+        & s.initial_active
+        & (orbital_r + s.planets[:, PLANET_RADIUS] < jow.ROTATION_RADIUS_LIMIT)
+    )
+    stationary_mask = base_mask & s.initial_active & (~rotating_mask)
+
+    stat_idx, stat_valid = _compact_category_indices(stationary_mask, jow.MAX_BASE_PLANETS)
+    rot_idx, rot_valid = _compact_category_indices(rotating_mask, jow.MAX_BASE_PLANETS)
+
+    _, _dtheta, a0, a1 = ray_segments_by_tick_jax(
+        origin_xy,
+        origin_radius,
+        speed,
+        ticks=horizon,
+        n_rays=n_rays,
+    )
+
+    stat_centers, stat_r, stat_valid2 = _stationary_target_state(s, stat_idx, stat_valid)
+    stat_hits = stationary_hits_by_tick_jax(a0, a1, stat_centers, stat_r, stat_valid2)
+    sun_centers = jnp.asarray([[CENTER, CENTER]], dtype=origin_xy.dtype)
+    sun_radii = jnp.asarray([SUN_RADIUS], dtype=origin_xy.dtype)
+    sun_valid = jnp.asarray([True], dtype=jnp.bool_)
+    sun_hits = stationary_hits_by_tick_jax(a0, a1, sun_centers, sun_radii, sun_valid)
+
+    rot_init_xy, rot_r, rot_valid2 = _rotating_target_state(s, rot_idx, rot_valid)
+    rot_hits = rotating_hits_by_tick_jax(
+        a0,
+        a1,
+        rot_init_xy,
+        rot_r,
+        rot_valid2,
+        s.angular_velocity,
+        s.step_count,
+    )
+
+    comet_hits = scheduled_comet_hits_by_tick_jax(
+        a0,
+        a1,
+        s.comet_paths,
+        s.comet_path_lengths,
+        s.step_count,
+        comet_valid,
+        spawn_steps=jow.COMET_SPAWN_STEPS,
+    )
+
+    planet_hits = (
+        _scatter_hits_to_planet_axis(stat_hits, stat_idx, stat_valid)
+        | _scatter_hits_to_planet_axis(rot_hits, rot_idx, rot_valid)
+        | _scatter_hits_to_planet_axis(comet_hits, comet_idx, comet_valid)
+    )
+    object_hits = jnp.concatenate([planet_hits, sun_hits], axis=2)
+    hidden_object_mask = jnp.concatenate(
+        [
+            (~s.planet_active).astype(jnp.bool_),
+            jnp.asarray([False], dtype=jnp.bool_),
+        ]
+    )
+
+    angle, width, valid, overflow, hit_tick, true_hit_planet, true_hit_tick = (
+        reduce_ray_planet_hits_to_targets_jax(
+            object_hits,
+            hidden_object_mask,
+            n_rays=n_rays,
+            num_targets=s.planets.shape[0],
+        )
+    )
+    not_self = jnp.arange(s.planets.shape[0], dtype=jnp.int32) != oi
+    valid = valid & not_self & s.planet_active
+    true_hit_planet = jnp.where(valid, true_hit_planet, jnp.asarray(-1, dtype=jnp.int32))
+    true_hit_tick = jnp.where(valid, true_hit_tick, jnp.asarray(500.0, dtype=true_hit_tick.dtype))
+    return angle, width, valid, overflow, hit_tick, true_hit_planet, true_hit_tick
+
+
+@partial(
+    jax.jit,
+    static_argnames=(
+        "horizon",
+        "ship_speed",
+        "samples_per_span",
+        "n_rays",
+        "ray_chunk_size",
+        "first_hit_method",
+    ),
+)
 def selected_origin_fraction_targets_batched(
     state: OrbitWarsState,
     origin_idx: jnp.ndarray,
@@ -111,6 +321,7 @@ def selected_origin_fraction_targets_batched(
     samples_per_span: int = 17,
     n_rays: int = 2048,
     ray_chunk_size: int = 0,
+    first_hit_method: str = "category-rays",
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """For each env's sampled origin/fraction, return best first-hit target angles.
 
@@ -124,24 +335,53 @@ def selected_origin_fraction_targets_batched(
     def one_env(s: OrbitWarsState, oi: jnp.ndarray, fi: jnp.ndarray):
         def scan_step(carry, _):
             return _forecast_planet_paths_one_tick(carry)
-
-        _, (p0, p1, active) = jax.lax.scan(scan_step, s, None, length=horizon)
         ships = s.planets[oi, PLANET_SHIPS]
         send = jnp.floor(_FRACTIONS_JAX[fi] * ships)
         speed = _fleet_speed_jax(send, ship_speed)
-        angle, width, valid, overflow, hit_tick, true_hit_planet, true_hit_tick = first_hit_best_targets_apply_jax(
-            s.planets[oi, PLANET_X : PLANET_Y + 1],
-            s.planets[oi, PLANET_RADIUS],
-            speed,
-            p0,
-            p1,
-            s.planets[:, PLANET_RADIUS],
-            active,
-            s.planet_active,
-            samples_per_span=samples_per_span,
-            n_rays=n_rays,
-            ray_chunk_size=ray_chunk_size,
-        )
+        if first_hit_method == "interval-bins":
+            _, (p0, p1, active) = jax.lax.scan(scan_step, s, None, length=horizon)
+            object_radii = _forecast_object_radii(s)
+            angle, width, valid, overflow, hit_tick, true_hit_planet, true_hit_tick = (
+                first_hit_union_scan_bins_best_targets_apply_jax(
+                    s.planets[oi, PLANET_X : PLANET_Y + 1],
+                    s.planets[oi, PLANET_RADIUS],
+                    speed,
+                    p0,
+                    p1,
+                    object_radii,
+                    active,
+                    s.planet_active,
+                    samples_per_span=samples_per_span,
+                    n_block_bins=n_rays,
+                )
+            )
+        elif first_hit_method == "category-rays":
+            angle, width, valid, overflow, hit_tick, true_hit_planet, true_hit_tick = (
+                _category_rays_best_targets_one_env(
+                    s,
+                    oi,
+                    fi,
+                    horizon=horizon,
+                    ship_speed=ship_speed,
+                    n_rays=n_rays,
+                )
+            )
+        else:
+            _, (p0, p1, active) = jax.lax.scan(scan_step, s, None, length=horizon)
+            object_radii = _forecast_object_radii(s)
+            angle, width, valid, overflow, hit_tick, true_hit_planet, true_hit_tick = first_hit_best_targets_apply_jax(
+                s.planets[oi, PLANET_X : PLANET_Y + 1],
+                s.planets[oi, PLANET_RADIUS],
+                speed,
+                p0,
+                p1,
+                object_radii,
+                active,
+                s.planet_active,
+                samples_per_span=samples_per_span,
+                n_rays=n_rays,
+                ray_chunk_size=ray_chunk_size,
+            )
         not_self = jnp.arange(s.planets.shape[0], dtype=jnp.int32) != oi
         valid = valid & not_self & s.planet_active
         true_hit_planet = jnp.where(valid, true_hit_planet, jnp.asarray(-1, dtype=jnp.int32))
@@ -433,13 +673,12 @@ def _per_env_apply_one(
     halt_now: jnp.ndarray,
     pair_flat: jnp.ndarray,
     frac_idx: jnp.ndarray,
-    launch_angle: jnp.ndarray,
     fleet_eta: jnp.ndarray,
 ):
     """Single env update; vmap'd over the leading axis.
 
-    Returns ``(new_state, oid, angle, send, dispatched, slot_out)``. When ``halt_now`` is
-    True the state is unchanged and ``dispatched`` is False; ``oid``/``angle``/
+    Returns ``(new_state, oid, send, dispatched, slot_out)``. When ``halt_now`` is
+    True the state is unchanged and ``dispatched`` is False; ``oid``/
     ``send`` are still finite (they fall through gated arithmetic) but should
     not be appended to the action buffer by the caller. ``slot_out`` is ``-1``
     when no fleet row is written.
@@ -455,16 +694,7 @@ def _per_env_apply_one(
     send = jnp.maximum(send, 1.0)
     send = jnp.minimum(send, ships_avail)
 
-    o_xy = state.planets[o_idx, PLANET_X:PLANET_Y + 1]
-    d_xy = state.planets[d_idx, PLANET_X:PLANET_Y + 1]
-    o_r = state.planets[o_idx, PLANET_RADIUS]
     oid = state.planets[o_idx, PLANET_ID]
-
-    diff = d_xy - o_xy
-    dist = jnp.sqrt(jnp.maximum(jnp.sum(diff * diff), 1e-12))
-    direction = diff / dist
-    angle = launch_angle
-    del direction, dist, diff, d_xy, o_xy, o_r
 
     update_state = ~halt_now
 
@@ -489,7 +719,7 @@ def _per_env_apply_one(
     )
 
     slot_out = jnp.full((), -1, dtype=jnp.int32)
-    return new_state, oid, angle, send, update_state, slot_out
+    return new_state, oid, send, update_state, slot_out
 
 
 @jax.jit
@@ -499,17 +729,16 @@ def apply_micro_step_batched(
     halt_now: jnp.ndarray,
     pair_flat: jnp.ndarray,
     frac_idx: jnp.ndarray,
-    launch_angle: jnp.ndarray,
     fleet_eta: jnp.ndarray,
 ):
     """Vmap'd over ``num_envs``.
 
-    Returns ``(new_state, oid[N], angle[N], send[N], dispatched[N], slot[N])``. ``ego``
+    Returns ``(new_state, oid[N], send[N], dispatched[N], slot[N])``. ``ego``
     is a scalar broadcast across envs. ``slot`` is the fleet row written, or ``-1``.
     """
 
-    return jax.vmap(_per_env_apply_one, in_axes=(0, None, 0, 0, 0, 0, 0))(
-        state, ego, halt_now, pair_flat, frac_idx, launch_angle, fleet_eta
+    return jax.vmap(_per_env_apply_one, in_axes=(0, None, 0, 0, 0, 0))(
+        state, ego, halt_now, pair_flat, frac_idx, fleet_eta
     )
 
 
@@ -520,16 +749,15 @@ def apply_micro_step_batched_per_ego(
     halt_now: jnp.ndarray,
     pair_flat: jnp.ndarray,
     frac_idx: jnp.ndarray,
-    launch_angle: jnp.ndarray,
     fleet_eta: jnp.ndarray,
 ):
     """Per-row ego variant of ``apply_micro_step_batched``.
 
-    Returns ``(new_state, oid[B], angle[B], send[B], dispatched[B], slot[B])``.
+    Returns ``(new_state, oid[B], send[B], dispatched[B], slot[B])``.
     """
 
-    return jax.vmap(_per_env_apply_one, in_axes=(0, 0, 0, 0, 0, 0, 0))(
-        state, ego_b, halt_now, pair_flat, frac_idx, launch_angle, fleet_eta
+    return jax.vmap(_per_env_apply_one, in_axes=(0, 0, 0, 0, 0, 0))(
+        state, ego_b, halt_now, pair_flat, frac_idx, fleet_eta
     )
 
 
@@ -540,7 +768,6 @@ def apply_micro_step_batched_masked(
     halt_now: jnp.ndarray,
     pair_flat: jnp.ndarray,
     frac_idx: jnp.ndarray,
-    launch_angle: jnp.ndarray,
     fleet_eta: jnp.ndarray,
     apply: jnp.ndarray,
 ):
@@ -550,8 +777,8 @@ def apply_micro_step_batched_masked(
     whether micro-step ``b`` runs; otherwise that slice is unchanged.
     """
 
-    new_state, _, _, _, _, _ = jax.vmap(_per_env_apply_one, in_axes=(0, 0, 0, 0, 0, 0, 0))(
-        state, ego_b, halt_now, pair_flat, frac_idx, launch_angle, fleet_eta
+    new_state, _, _, _, _ = jax.vmap(_per_env_apply_one, in_axes=(0, 0, 0, 0, 0, 0))(
+        state, ego_b, halt_now, pair_flat, frac_idx, fleet_eta
     )
 
     def _blend(new_leaf, old_leaf):
@@ -561,46 +788,6 @@ def apply_micro_step_batched_masked(
         return jnp.where(a, new_leaf, old_leaf)
 
     return jax.tree.map(_blend, new_state, state)
-
-
-def _fleet_rows_from_pair_batched(
-    planets_bp: jnp.ndarray,
-    ego_b: jnp.ndarray,
-    pair_flat_b: jnp.ndarray,
-    send_b: jnp.ndarray,
-    launch_angle_b: jnp.ndarray,
-    fleet_eta_b: jnp.ndarray,
-    dispatch_b: jnp.ndarray,
-    dtype: jnp.dtype,
-) -> jnp.ndarray:
-    """Build fleet row tensors matching ``_per_env_apply_one`` (launch geometry from planets)."""
-
-    bsz = planets_bp.shape[0]
-    p = MAX_PLANETS
-    o_idx = pair_flat_b // p
-    d_idx = pair_flat_b % p
-    b_lin = jnp.arange(bsz, dtype=jnp.int32)
-    o_xy = planets_bp[b_lin, o_idx, PLANET_X : PLANET_Y + 1]
-    o_r = planets_bp[b_lin, o_idx, PLANET_RADIUS]
-    oid = planets_bp[b_lin, o_idx, PLANET_ID]
-    angle = launch_angle_b
-    sx = o_xy[:, 0] + jnp.cos(angle) * (o_r + 0.1)
-    sy = o_xy[:, 1] + jnp.sin(angle) * (o_r + 0.1)
-    send_eff = jnp.where(dispatch_b, send_b, jnp.zeros_like(send_b))
-    return jnp.stack(
-        [
-            jnp.zeros(bsz, dtype=dtype),
-            ego_b.astype(dtype),
-            sx,
-            sy,
-            angle,
-            oid,
-            send_eff,
-            d_idx.astype(dtype),
-            fleet_eta_b.astype(dtype),
-        ],
-        axis=-1,
-    )
 
 
 @partial(jax.jit, static_argnames=("max_micro_steps",))
@@ -613,7 +800,6 @@ def apply_prefix_micro_deltas_batched(
     slot_m: jnp.ndarray,
     pair_flat_m: jnp.ndarray,
     frac_idx_m: jnp.ndarray,
-    angle_m: jnp.ndarray,
     fleet_eta_m: jnp.ndarray,
     apply_mask_m: jnp.ndarray,
 ) -> OrbitWarsState:
@@ -625,7 +811,7 @@ def apply_prefix_micro_deltas_batched(
     which prefix slots run (typically ``k < phase_micro_idx`` for pre-action replay).
     """
 
-    del frac_idx_m  # stored for replay parity; send_m is authoritative
+    del frac_idx_m, slot_m  # stored for replay parity; send/target are authoritative
     p = MAX_PLANETS
     dispatch_bm = apply_mask_m.astype(jnp.bool_) & (~micro_halt.astype(jnp.bool_))
     send_eff = jnp.where(dispatch_bm, send_m, jnp.zeros_like(send_m))

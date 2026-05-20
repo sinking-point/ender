@@ -50,7 +50,6 @@ def _run_steps(
             buf,
             tensors["micro_halt_now"],
             tensors["send_now"],
-            tensors["angle_now"],
             tensors["fleet_eta_now"],
             tensors["slot_now"],
             tensors["halt_action"],
@@ -100,7 +99,6 @@ def main() -> None:
     tensors = {
         "micro_halt_now": torch.zeros((N,), dtype=torch.bool, device=device),
         "send_now": torch.randn((N,), dtype=torch.float32, device=device).abs() + 1.0,
-        "angle_now": torch.randn((N,), dtype=torch.float32, device=device),
         "fleet_eta_now": torch.full((N,), 12.0, dtype=torch.float32, device=device),
         "slot_now": torch.zeros((N,), dtype=torch.int32, device=device),
         "halt_action": torch.zeros((N,), dtype=torch.int32, device=device),

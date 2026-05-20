@@ -92,13 +92,12 @@ def apply_prefix_micro_deltas_torch(
     send_m: torch.Tensor,
     slot_m: torch.Tensor,
     pair_flat_m: torch.Tensor,
-    angle_m: torch.Tensor,
     fleet_eta_m: torch.Tensor,
     phase_micro_idx: torch.Tensor,
 ) -> OrbitWarsState:
     """Torch equivalent of ``apply_prefix_micro_deltas_batched``."""
 
-    del slot_m, angle_m
+    del slot_m
     b, m = micro_halt.shape
     device = state.planets.device
     k = torch.arange(m, device=device)

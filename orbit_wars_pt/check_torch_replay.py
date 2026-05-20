@@ -90,19 +90,17 @@ def main() -> None:
         micro_halt[env_i, 0] = False
 
     # Use JAX's rollout micro-step once to get authoritative send/slot metadata.
-    state_after, _oid, angle0, send0, _dispatched, slot0 = apply_micro_step_batched(
+    state_after, _oid, send0, _dispatched, slot0 = apply_micro_step_batched(
         state_b,
         jnp.int32(0),
         jnp.asarray(micro_halt[:, 0]),
         jnp.asarray(pair_flat[:, 0]),
         jnp.asarray(frac_idx[:, 0]),
-        jnp.asarray(angle[:, 0]),
         jnp.asarray(fleet_eta[:, 0]),
     )
     del state_after
     send[:, 0] = np.asarray(jax.device_get(send0))
     slot[:, 0] = np.asarray(jax.device_get(slot0))
-    angle[:, 0] = np.asarray(jax.device_get(angle0))
 
     ego = np.asarray([0, 1], dtype=np.int32)
     phase = np.asarray([1, 1], dtype=np.int32)
@@ -117,7 +115,6 @@ def main() -> None:
         jnp.asarray(slot),
         jnp.asarray(pair_flat),
         jnp.asarray(frac_idx),
-        jnp.asarray(angle),
         jnp.asarray(fleet_eta),
         jnp.asarray(apply_mask),
     )
@@ -128,7 +125,6 @@ def main() -> None:
         torch.as_tensor(send, device=device),
         torch.as_tensor(slot, device=device),
         torch.as_tensor(pair_flat, device=device),
-        torch.as_tensor(angle, device=device),
         torch.as_tensor(fleet_eta, device=device),
         torch.as_tensor(phase, device=device),
     )

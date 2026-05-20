@@ -317,6 +317,55 @@ def _sync_rollout_policy_timing(device: torch.device, *jax_values: Any) -> None:
         torch.cuda.synchronize(device)
 
 
+def _selected_origin_fraction_targets_batched_maybe_chunked(
+    state_b: OrbitWarsState,
+    origin_idx_b: jnp.ndarray,
+    frac_idx_b: jnp.ndarray,
+    *,
+    horizon: int,
+    ship_speed: float,
+    samples_per_span: int,
+    n_rays: int,
+    ray_chunk_size: int,
+    first_hit_method: str,
+    env_chunk_size: int,
+):
+    """Call ``selected_origin_fraction_targets_batched`` on the full env batch or env chunks."""
+
+    total = int(origin_idx_b.shape[0])
+    if env_chunk_size <= 0 or env_chunk_size >= total:
+        return selected_origin_fraction_targets_batched(
+            state_b,
+            origin_idx_b,
+            frac_idx_b,
+            horizon=horizon,
+            ship_speed=ship_speed,
+            samples_per_span=samples_per_span,
+            n_rays=n_rays,
+            ray_chunk_size=ray_chunk_size,
+            first_hit_method=first_hit_method,
+        )
+
+    parts = []
+    for start in range(0, total, int(env_chunk_size)):
+        stop = min(total, start + int(env_chunk_size))
+        state_chunk = jax.tree.map(lambda x: x[start:stop], state_b)
+        parts.append(
+            selected_origin_fraction_targets_batched(
+                state_chunk,
+                origin_idx_b[start:stop],
+                frac_idx_b[start:stop],
+                horizon=horizon,
+                ship_speed=ship_speed,
+                samples_per_span=samples_per_span,
+                n_rays=n_rays,
+                ray_chunk_size=ray_chunk_size,
+                first_hit_method=first_hit_method,
+            )
+        )
+    return tuple(jnp.concatenate(xs, axis=0) for xs in zip(*parts))
+
+
 def _build_batched_actions(
     actions0: List[List[Tuple[float, float, float]]],
     actions1: List[List[Tuple[float, float, float]]],
@@ -506,6 +555,8 @@ def _run_async_micro_step_multi(
     first_hit_n_rays: int,
     micro_step_penalty: float = 0.0,
     first_hit_ray_chunk_size: int = 0,
+    first_hit_env_chunk_size: int = 0,
+    first_hit_method: str = "category-rays",
     obs_feature_dim: int = FEATURE_DIM,
     sync_policy_timing: bool = False,
 ) -> tuple[OrbitWarsState, List[TorchTransitionBuffer], List[CompressedObservationBuffer]]:
@@ -597,14 +648,14 @@ def _run_async_micro_step_multi(
     origin_idx_j = jax.dlpack.from_dlpack(o_idx_all.contiguous().detach())
     frac_idx_geom_j = jax.dlpack.from_dlpack(frac_idx_geom_all.contiguous().detach())
     (
-        target_angle_j,
+        _target_angle_j,
         _target_width_j,
         target_valid_j,
         target_overflow_j,
         target_hit_tick_j,
         target_true_planet_j,
         target_true_hit_tick_j,
-    ) = selected_origin_fraction_targets_batched(
+    ) = _selected_origin_fraction_targets_batched_maybe_chunked(
         virt_b,
         origin_idx_j,
         frac_idx_geom_j,
@@ -613,12 +664,14 @@ def _run_async_micro_step_multi(
         samples_per_span=17,
         n_rays=first_hit_n_rays,
         ray_chunk_size=first_hit_ray_chunk_size,
+        first_hit_method=first_hit_method,
+        env_chunk_size=first_hit_env_chunk_size,
     )
     if sync_policy_timing:
         _sync_rollout_policy_timing(
             device,
             (
-                target_angle_j,
+                _target_angle_j,
                 target_valid_j,
                 target_overflow_j,
                 target_hit_tick_j,
@@ -626,7 +679,6 @@ def _run_async_micro_step_multi(
                 target_true_hit_tick_j,
             ),
         )
-    target_angle_t = torch.from_dlpack(target_angle_j).index_select(0, active_idx_t)
     target_valid_t = torch.from_dlpack(target_valid_j).index_select(0, active_idx_t)
     target_overflow_t = torch.from_dlpack(target_overflow_j).index_select(0, active_idx_t)
     target_hit_tick_t = torch.from_dlpack(target_hit_tick_j).index_select(0, active_idx_t)
@@ -664,7 +716,6 @@ def _run_async_micro_step_multi(
         d_idx = torch.multinomial(torch.softmax(safe_target, dim=-1), 1, generator=rng).squeeze(-1)
     target_logp = target_lp.gather(1, d_idx[:, None]).squeeze(-1)
     pair_flat = o_idx * P + d_idx
-    angle = target_angle_t[n_a_idx, d_idx]
     policy_fleet_eta = target_hit_tick_t[n_a_idx, d_idx]
     true_d_idx = target_true_planet_t[n_a_idx, d_idx].to(torch.long).clamp(0, P - 1)
     true_fleet_eta = target_true_hit_tick_t[n_a_idx, d_idx]
@@ -684,13 +735,11 @@ def _run_async_micro_step_multi(
     halt_now_all = torch.ones(total_env_rows, dtype=torch.bool, device=device)
     pair_flat_all = torch.zeros(total_env_rows, dtype=torch.int32, device=device)
     frac_idx_all = torch.zeros(total_env_rows, dtype=torch.int32, device=device)
-    angle_all = torch.zeros(total_env_rows, dtype=torch.float32, device=device)
     fleet_eta_all = torch.zeros(total_env_rows, dtype=torch.float32, device=device)
 
     halt_now_all.index_copy_(0, active_idx_t, halt_now)
     pair_flat_all.index_copy_(0, active_idx_t, pair_flat.to(torch.int32))
     frac_idx_all.index_copy_(0, active_idx_t, frac_idx.to(torch.int32))
-    angle_all.index_copy_(0, active_idx_t, angle.to(torch.float32))
     fleet_eta_all.index_copy_(0, active_idx_t, policy_fleet_eta.to(torch.float32))
     if sync_policy_timing:
         _sync_rollout_policy_timing(device)
@@ -702,17 +751,15 @@ def _run_async_micro_step_multi(
     halt_now_j = jax.dlpack.from_dlpack(halt_now_all.contiguous().detach())
     pair_flat_j = jax.dlpack.from_dlpack(pair_flat_all.contiguous().detach())
     frac_idx_j = jax.dlpack.from_dlpack(frac_idx_all.contiguous().detach())
-    angle_j = jax.dlpack.from_dlpack(angle_all.contiguous().detach())
     fleet_eta_j = jax.dlpack.from_dlpack(fleet_eta_all.contiguous().detach())
     t1 = perf_counter()
 
-    virt_b, oid_j, angle_j, send_j, dispatched_j, slot_j = apply_micro_step_batched_per_ego(
-        virt_b, ego_b_j, halt_now_j, pair_flat_j, frac_idx_j, angle_j, fleet_eta_j
+    virt_b, oid_j, send_j, dispatched_j, slot_j = apply_micro_step_batched_per_ego(
+        virt_b, ego_b_j, halt_now_j, pair_flat_j, frac_idx_j, fleet_eta_j
     )
     t2 = perf_counter()
 
     oid_t = torch.from_dlpack(oid_j)
-    angle_applied_t = torch.from_dlpack(angle_j)
     send_t = torch.from_dlpack(send_j)
     dispatched_t = torch.from_dlpack(dispatched_j)
     slot_t = torch.from_dlpack(slot_j)
@@ -746,7 +793,6 @@ def _run_async_micro_step_multi(
             active_p_idx_t,
             halt_now.index_select(0, pos_p_t),
             send_t.index_select(0, active_p_rows_t),
-            angle_applied_t.index_select(0, active_p_rows_t),
             policy_fleet_eta.index_select(0, pos_p_t),
             slot_t.index_select(0, active_p_rows_t),
             halt_action.index_select(0, pos_p_t).to(torch.int32),
@@ -770,11 +816,9 @@ def _run_async_micro_step_multi(
     t6 = perf_counter()
 
     oid_active_t = oid_t.index_select(0, active_idx_t)
-    angle_active_t = angle_applied_t.index_select(0, active_idx_t)
     send_active_t = send_t.index_select(0, active_idx_t)
     dispatched_active_t = dispatched_t.index_select(0, active_idx_t)
     oid_np = oid_active_t.detach().cpu().numpy()
-    angle_np = angle_active_t.detach().cpu().numpy()
     send_np = send_active_t.detach().cpu().numpy()
     dispatched_np = dispatched_active_t.detach().cpu().numpy()
     t7 = perf_counter()
@@ -817,12 +861,11 @@ def _run_async_micro_step_multi(
                 ac = int(pending_action_count[p, env_i])
                 if ac < pending_actions.shape[2]:
                     pending_actions[env_i, p, ac, 0] = float(oid_np[j_arr])
-                    pending_actions[env_i, p, ac, 1] = float(angle_np[j_arr])
-                    pending_actions[env_i, p, ac, 2] = float(send_np[j_arr])
-                    pending_actions[env_i, p, ac, 3] = float(true_d_idx_np[j_arr])
-                    pending_actions[env_i, p, ac, 4] = float(true_fleet_eta_np[j_arr])
-                    pending_actions[env_i, p, ac, 5] = float(d_idx_np[j_arr])
-                    pending_actions[env_i, p, ac, 6] = float(policy_fleet_eta_np[j_arr])
+                    pending_actions[env_i, p, ac, 1] = float(send_np[j_arr])
+                    pending_actions[env_i, p, ac, 2] = float(true_d_idx_np[j_arr])
+                    pending_actions[env_i, p, ac, 3] = float(true_fleet_eta_np[j_arr])
+                    pending_actions[env_i, p, ac, 4] = float(d_idx_np[j_arr])
+                    pending_actions[env_i, p, ac, 5] = float(policy_fleet_eta_np[j_arr])
                 pending_action_count[p, env_i] = ac + 1
             if bool(halt_now_np[j_arr]):
                 halted[p, env_i] = True
@@ -878,6 +921,8 @@ def collect_parallel_micro_rollouts(
     reset_prefetch: Optional[RolloutResetPrefetch] = None,
     first_hit_n_rays: int = 2048,
     first_hit_ray_chunk_size: int = 0,
+    first_hit_env_chunk_size: int = 0,
+    first_hit_method: str = "category-rays",
     micro_step_penalty: float = 1e-4,
     sync_policy_timing: bool = False,
 ) -> Tuple[RolloutSegment, RolloutTiming, RolloutCarry, int, RolloutGameStats]:
@@ -984,11 +1029,11 @@ def collect_parallel_micro_rollouts(
     halted = np.zeros((n_ego, num_envs), dtype=np.bool_)
     micro_k = np.zeros((n_ego, num_envs), dtype=np.int32)
     micro_k_dev = torch.zeros((n_ego, num_envs), dtype=torch.int32, device=device)
-    pending_actions = np.zeros((num_envs, int(cfg.num_agents), DEFAULT_MAX_ACTIONS, 7), dtype=np.float32)
-    pending_actions[..., 3] = -1.0
-    pending_actions[..., 4] = 500.0
-    pending_actions[..., 5] = -1.0
-    pending_actions[..., 6] = 500.0
+    pending_actions = np.zeros((num_envs, int(cfg.num_agents), DEFAULT_MAX_ACTIONS, 6), dtype=np.float32)
+    pending_actions[..., 2] = -1.0
+    pending_actions[..., 3] = 500.0
+    pending_actions[..., 4] = -1.0
+    pending_actions[..., 5] = 500.0
     pending_action_count = np.zeros((n_ego, num_envs), dtype=np.int32)
     reward_idx = np.full((n_ego, num_envs), -1, dtype=np.int32)
     segment_done = np.zeros((num_envs,), dtype=np.bool_)
@@ -1020,10 +1065,10 @@ def collect_parallel_micro_rollouts(
                 mask_j = jnp.asarray(bucket_mask, dtype=jnp.bool_)
                 actions_bucket = pending_actions[bucket_idx].copy()
                 actions_bucket[~bucket_mask] = 0.0
-                actions_bucket[~bucket_mask, :, :, 3] = -1.0
-                actions_bucket[~bucket_mask, :, :, 4] = 500.0
-                actions_bucket[~bucket_mask, :, :, 5] = -1.0
-                actions_bucket[~bucket_mask, :, :, 6] = 500.0
+                actions_bucket[~bucket_mask, :, :, 2] = -1.0
+                actions_bucket[~bucket_mask, :, :, 3] = 500.0
+                actions_bucket[~bucket_mask, :, :, 4] = -1.0
+                actions_bucket[~bucket_mask, :, :, 5] = 500.0
                 timing.env_prep_s += perf_counter() - t_prep0
 
                 t_core0 = perf_counter()
@@ -1097,10 +1142,10 @@ def collect_parallel_micro_rollouts(
                     halted[:, env_i] = player_done[:, env_i]
                     micro_k[:, env_i] = 0
                     pending_actions[env_i] = 0.0
-                    pending_actions[env_i, :, :, 3] = -1.0
-                    pending_actions[env_i, :, :, 4] = 500.0
-                    pending_actions[env_i, :, :, 5] = -1.0
-                    pending_actions[env_i, :, :, 6] = 500.0
+                    pending_actions[env_i, :, :, 2] = -1.0
+                    pending_actions[env_i, :, :, 3] = 500.0
+                    pending_actions[env_i, :, :, 4] = -1.0
+                    pending_actions[env_i, :, :, 5] = 500.0
                     pending_action_count[:, env_i] = 0
                     reward_idx[:, env_i] = -1
                     if horizon_fired:
@@ -1159,6 +1204,8 @@ def collect_parallel_micro_rollouts(
                 first_hit_n_rays=first_hit_n_rays,
                 micro_step_penalty=micro_step_penalty,
                 first_hit_ray_chunk_size=first_hit_ray_chunk_size,
+                first_hit_env_chunk_size=first_hit_env_chunk_size,
+                first_hit_method=first_hit_method,
                 obs_feature_dim=obs_feature_dim,
                 sync_policy_timing=sync_policy_timing,
             )

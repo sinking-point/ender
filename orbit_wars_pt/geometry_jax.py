@@ -13,6 +13,7 @@ from typing import Sequence
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 
 from orbit_wars_pt.constants import BOARD_SIZE, CENTER, SUN_RADIUS
 
@@ -215,6 +216,883 @@ def _quadratic_roots(a: jnp.ndarray, b: jnp.ndarray, c: jnp.ndarray, eps: float 
     r1 = jnp.where(quad_valid, (-b + sd) / (2.0 * a), r0)
     valid = (quad_valid & (disc >= -eps)) | lin_valid
     return jnp.stack([r0, r1]), jnp.stack([valid, valid])
+
+
+TANGENT_MODE_EXTERNAL = 1
+TANGENT_MODE_INTERNAL = 2
+TANGENT_MODE_BOTH = TANGENT_MODE_EXTERNAL | TANGENT_MODE_INTERNAL
+TANGENT_KIND_EXTERNAL = 0
+TANGENT_KIND_INTERNAL = 1
+TANGENT_BRANCH_MINUS = -1
+TANGENT_BRANCH_PLUS = 1
+
+
+def _sort_and_dedup_tangent_candidates(
+    times: jnp.ndarray,
+    kinds: jnp.ndarray,
+    valid: jnp.ndarray,
+    *,
+    tol: float = 1e-7,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    dedup_tol = max(tol, 1e-5)
+    inf = jnp.asarray(jnp.inf, dtype=times.dtype)
+    # Secondary key by kind keeps ordering deterministic for equal times.
+    key = jnp.where(valid, times + 1e-8 * kinds.astype(times.dtype), inf)
+    order = jnp.argsort(key)
+    t_sorted = times[order]
+    k_sorted = kinds[order]
+    v_sorted = valid[order]
+    prev_t = jnp.concatenate([jnp.asarray([-jnp.inf], dtype=t_sorted.dtype), t_sorted[:-1]])
+    prev_k = jnp.concatenate([jnp.asarray([-1], dtype=k_sorted.dtype), k_sorted[:-1]])
+    dedup = v_sorted & ~((jnp.abs(t_sorted - prev_t) <= dedup_tol) & (k_sorted == prev_k))
+    return t_sorted, k_sorted, dedup
+
+
+def _poly_pad_asc(coeff: jnp.ndarray, size: int) -> jnp.ndarray:
+    coeff = jnp.asarray(coeff)
+    if coeff.shape[0] >= size:
+        return coeff[:size]
+    return jnp.pad(coeff, (0, size - coeff.shape[0]))
+
+
+def _poly_add_asc_jax(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
+    size = max(a.shape[0], b.shape[0])
+    return _poly_pad_asc(a, size) + _poly_pad_asc(b, size)
+
+
+def _poly_sub_asc_jax(a: jnp.ndarray, b: jnp.ndarray) -> jnp.ndarray:
+    size = max(a.shape[0], b.shape[0])
+    return _poly_pad_asc(a, size) - _poly_pad_asc(b, size)
+
+
+def _poly_mul_asc_jax(a: jnp.ndarray, b: jnp.ndarray, *, size: int) -> jnp.ndarray:
+    return _poly_pad_asc(jnp.convolve(jnp.asarray(a), jnp.asarray(b)), size)
+
+
+def _poly_deriv_asc_jax(a: jnp.ndarray) -> jnp.ndarray:
+    a = jnp.asarray(a)
+    if a.shape[0] <= 1:
+        return jnp.zeros((1,), dtype=a.dtype)
+    idx = jnp.arange(1, a.shape[0], dtype=a.dtype)
+    return idx * a[1:]
+
+
+def _trim_degree6_desc(
+    coeff_desc: jnp.ndarray,
+    *,
+    eps: float = 1e-12,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Trim descending coeffs to degree<=6 and left-align into a fixed size tensor."""
+
+    c = jnp.asarray(coeff_desc)
+    if c.shape[0] != 7:
+        raise ValueError("degree-6 descending coefficients must have shape (7,)")
+    scale = jnp.max(jnp.abs(c))
+    nz = jnp.abs(c) > jnp.maximum(eps, eps * scale)
+    first = jnp.argmax(nz.astype(jnp.int32))
+    any_nz = jnp.any(nz)
+    degree = jnp.where(any_nz, 6 - first, 0).astype(jnp.int32)
+    shift = first.astype(jnp.int32)
+    idx = jnp.arange(7, dtype=jnp.int32)
+    src = jnp.minimum(idx + shift, 6)
+    shifted = c[src]
+    shifted = jnp.where(idx <= degree, shifted, jnp.asarray(0.0, dtype=c.dtype))
+    return shifted, degree
+
+
+def stationary_angle_sextic_coeffs_jax(
+    q0: jnp.ndarray,
+    b: jnp.ndarray,
+    r_planet: jnp.ndarray,
+    grow_rate: jnp.ndarray,
+    radius_at_zero: jnp.ndarray,
+) -> jnp.ndarray:
+    """Descending degree-6 coeffs mirroring ``_stationary_angle_sextic_coeffs``.
+
+    This builds the squared stationary-root numerator directly with fixed-size
+    polynomial arithmetic in ascending powers of ``t`` and then drops the
+    guaranteed-negligible degree-7/8 terms after trimming.
+    """
+
+    q0 = jnp.asarray(q0)
+    b = jnp.asarray(b, dtype=q0.dtype)
+    a_coef = jnp.sum(b * b)
+    bq = 2.0 * jnp.sum(q0 * b)
+    c_coef = jnp.sum(q0 * q0)
+    k = q0[0] * b[1] - q0[1] * b[0]
+    v = jnp.asarray(grow_rate, dtype=q0.dtype)
+    rp = jnp.asarray(r_planet, dtype=q0.dtype)
+    r0s = jnp.asarray(radius_at_zero, dtype=q0.dtype)
+
+    size = 9
+    s = _poly_pad_asc(jnp.asarray([c_coef, bq, a_coef], dtype=q0.dtype), size)
+    r = _poly_pad_asc(jnp.asarray([r0s, v], dtype=q0.dtype), size)
+    r2 = _poly_mul_asc_jax(r, r, size=size)
+    n = _poly_add_asc_jax(r2, s)
+    n = n.at[0].add(-(rp * rp))
+    qdb = _poly_deriv_asc_jax(0.5 * s)
+    qdb = _poly_pad_asc(qdb, size)
+    n_dot = _poly_deriv_asc_jax(n)
+    n_dot = _poly_pad_asc(n_dot, size)
+
+    four_r2s = 4.0 * _poly_mul_asc_jax(r2, s, size=size)
+    n_sq = _poly_mul_asc_jax(n, n, size=size)
+    left_inner = _poly_sub_asc_jax(four_r2s, n_sq)
+    left = (k * k) * _poly_mul_asc_jax(r2, left_inner, size=size)
+
+    r_ndot = _poly_mul_asc_jax(r, n_dot, size=size)
+    v_n = v * n
+    term_a = _poly_mul_asc_jax(s, _poly_sub_asc_jax(r_ndot, v_n), size=size)
+    nrq = _poly_mul_asc_jax(_poly_mul_asc_jax(n, r, size=size), qdb, size=size)
+    term = _poly_sub_asc_jax(term_a, nrq)
+    right = _poly_mul_asc_jax(term, term, size=size)
+
+    poly_asc = 4.0 * _poly_sub_asc_jax(left, right)
+    # The symbolic reference cancels to degree <= 6. In finite precision the top
+    # two degrees can retain tiny residue; drop them after scale-aware trimming.
+    scale = jnp.max(jnp.abs(poly_asc))
+    poly_asc = jnp.where(jnp.abs(poly_asc) <= jnp.maximum(1e-20, 1e-14 * scale), 0.0, poly_asc)
+    poly_asc_deg6 = poly_asc[:7]
+    return poly_asc_deg6[::-1]
+
+
+def _companion_matrix_degree6_desc_jax(
+    coeff_desc: jnp.ndarray,
+    *,
+    eps: float = 1e-12,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Build a 6×6 companion matrix and effective degree for descending coeffs."""
+
+    coeff, degree = _trim_degree6_desc(coeff_desc, eps=eps)
+    lead = coeff[0]
+    safe_lead = jnp.where(jnp.abs(lead) > eps, lead, jnp.asarray(1.0, dtype=coeff.dtype))
+    monic_tail = coeff[1:] / safe_lead
+    n = 6
+    comp = jnp.zeros((n, n), dtype=coeff.dtype)
+    comp = comp.at[1:, :-1].set(jnp.eye(n - 1, dtype=coeff.dtype))
+    comp = comp.at[:, -1].set(-monic_tail[::-1])
+    return comp, degree
+
+
+def poly_roots_degree6_desc_jax(
+    coeff_desc: jnp.ndarray,
+    *,
+    eps: float = 1e-12,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Companion-matrix roots for a real degree-<=6 polynomial in descending order.
+
+    Returns ``(roots[6], valid[6])``. For lower-degree polynomials, extra roots from the
+    padded companion matrix may appear; they are left to later physics/derivative filters.
+    """
+
+    comp, degree = _companion_matrix_degree6_desc_jax(coeff_desc, eps=eps)
+    roots = jnp.linalg.eigvals(comp)
+    valid = degree > 0
+    return roots, jnp.full((6,), valid, dtype=bool)
+
+
+def poly_roots_degree6_desc_batch_jax(
+    coeff_desc_batch: jnp.ndarray,
+    *,
+    eps: float = 1e-12,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Batched companion-matrix roots: one ``eigvals`` over ``[..., 6, 6]`` companions."""
+
+    coeff_desc_batch = jnp.asarray(coeff_desc_batch)
+    if coeff_desc_batch.shape[-1] != 7:
+        raise ValueError("coeff_desc_batch must have trailing shape (7,)")
+    batch_shape = coeff_desc_batch.shape[:-1]
+    flat = coeff_desc_batch.reshape(-1, 7)
+    companions, degrees = jax.vmap(
+        lambda c: _companion_matrix_degree6_desc_jax(c, eps=eps),
+        in_axes=0,
+    )(flat)
+    roots_flat = jnp.linalg.eigvals(companions)
+    valid_flat = jnp.broadcast_to((degrees > 0)[:, None], roots_flat.shape)
+    return (
+        roots_flat.reshape(batch_shape + (6,)),
+        valid_flat.reshape(batch_shape + (6,)),
+    )
+
+
+def poly_roots_degree6_desc_batch_impl_jax(
+    coeff_desc_batch: jnp.ndarray,
+    *,
+    implementation: lax.linalg.EigImplementation,
+    eps: float = 1e-12,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Batched companion-matrix roots using an explicit eig backend."""
+
+    coeff_desc_batch = jnp.asarray(coeff_desc_batch)
+    if coeff_desc_batch.shape[-1] != 7:
+        raise ValueError("coeff_desc_batch must have trailing shape (7,)")
+    batch_shape = coeff_desc_batch.shape[:-1]
+    flat = coeff_desc_batch.reshape(-1, 7)
+    companions, degrees = jax.vmap(
+        lambda c: _companion_matrix_degree6_desc_jax(c, eps=eps),
+        in_axes=0,
+    )(flat)
+    roots_flat = lax.linalg.eig(
+        companions,
+        compute_left_eigenvectors=False,
+        compute_right_eigenvectors=False,
+        implementation=implementation,
+    )[0]
+    valid_flat = jnp.broadcast_to((degrees > 0)[:, None], roots_flat.shape)
+    return (
+        roots_flat.reshape(batch_shape + (6,)),
+        valid_flat.reshape(batch_shape + (6,)),
+    )
+
+
+def _intersection_angles_exist_jax(
+    q: jnp.ndarray,
+    circle_radius: jnp.ndarray,
+    grow_radius: jnp.ndarray,
+    *,
+    eps: float = GEOM_EPS,
+) -> jnp.ndarray:
+    q = jnp.asarray(q)
+    d = jnp.linalg.norm(q)
+    denom = 2.0 * jnp.maximum(grow_radius * d, eps)
+    x = (grow_radius * grow_radius - circle_radius * circle_radius + d * d) / denom
+    return (d > eps) & (grow_radius > eps) & (x >= -1.0 - 1e-6) & (x <= 1.0 + 1e-6)
+
+
+def _intersection_angle_derivative_linear_jax(
+    q: jnp.ndarray,
+    b: jnp.ndarray,
+    r_planet: jnp.ndarray,
+    launch_offset: jnp.ndarray,
+    grow_rate: jnp.ndarray,
+    t: jnp.ndarray,
+    branch: jnp.ndarray,
+    *,
+    eps: float = GEOM_EPS,
+) -> jnp.ndarray:
+    """JAX port of ``_intersection_angle_derivative_linear``."""
+
+    q = jnp.asarray(q)
+    b = jnp.asarray(b, dtype=q.dtype)
+    r = launch_offset + grow_rate * t
+    d2 = jnp.sum(q * q)
+    d = jnp.sqrt(jnp.maximum(d2, eps))
+    alpha_dot = (q[0] * b[1] - q[1] * b[0]) / jnp.maximum(d2, eps)
+    q_dot_b = jnp.sum(q * b)
+    d_dot = q_dot_b / d
+    n = r * r - r_planet * r_planet + d2
+    den = 2.0 * r * d
+    x = n / jnp.maximum(den, eps)
+    n_dot = 2.0 * r * grow_rate + 2.0 * q_dot_b
+    den_dot = 2.0 * (grow_rate * d + r * d_dot)
+    x_dot = (n_dot * den - n * den_dot) / jnp.maximum(den * den, eps)
+    beta_dot = -x_dot / jnp.sqrt(jnp.maximum(1.0 - x * x, eps))
+    deriv = alpha_dot + branch.astype(q.dtype) * beta_dot
+    valid = (r > eps) & (d2 > eps) & (x > -1.0 + eps) & (x < 1.0 - eps)
+    return jnp.where(valid, deriv, jnp.asarray(jnp.nan, dtype=q.dtype))
+
+
+def _refine_stationary_time_jax(
+    u0: jnp.ndarray,
+    q0: jnp.ndarray,
+    b: jnp.ndarray,
+    r_planet: jnp.ndarray,
+    launch_offset: jnp.ndarray,
+    grow_rate: jnp.ndarray,
+    branch: jnp.ndarray,
+    seg_lo: jnp.ndarray,
+    seg_hi: jnp.ndarray,
+    *,
+    deriv_tol: float = 1e-5,
+    max_iter: int = 12,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Newton polish mirroring ``_refine_stationary_time``."""
+
+    dtype = q0.dtype
+    t0 = jnp.clip(u0, seg_lo, seg_hi)
+
+    def body(_, carry):
+        t, ok = carry
+        q = q0 + b * t
+        d = _intersection_angle_derivative_linear_jax(
+            q, b, r_planet, launch_offset, grow_rate, t, branch
+        )
+        finite = jnp.isfinite(d)
+        close = finite & (jnp.abs(d) <= deriv_tol)
+        eps_t = jnp.maximum(jnp.asarray(1e-7, dtype=dtype), jnp.asarray(1e-6, dtype=dtype) * jnp.maximum(jnp.abs(t), 1.0))
+        q_lo = q0 + b * (t - eps_t)
+        q_hi = q0 + b * (t + eps_t)
+        d_lo = _intersection_angle_derivative_linear_jax(
+            q_lo, b, r_planet, launch_offset, grow_rate, t - eps_t, branch
+        )
+        d_hi = _intersection_angle_derivative_linear_jax(
+            q_hi, b, r_planet, launch_offset, grow_rate, t + eps_t, branch
+        )
+        finite2 = finite & jnp.isfinite(d_lo) & jnp.isfinite(d_hi)
+        dd = (d_hi - d_lo) / (2.0 * eps_t)
+        step_ok = finite2 & (jnp.abs(dd) > 1e-14)
+        t_new = jnp.clip(t - d / dd, seg_lo, seg_hi)
+        t_out = jnp.where(close | (~step_ok), t, t_new)
+        ok_out = ok & (close | step_ok)
+        return t_out, ok_out
+
+    t1, ok1 = jax.lax.fori_loop(0, max_iter, body, (t0, jnp.asarray(True)))
+    q1 = q0 + b * t1
+    d1 = _intersection_angle_derivative_linear_jax(
+        q1, b, r_planet, launch_offset, grow_rate, t1, branch
+    )
+    final_ok = ok1 & jnp.isfinite(d1) & (jnp.abs(d1) <= deriv_tol)
+    return t1, final_ok
+
+
+def _sextic_stationary_root_candidates_from_roots_jax(
+    roots: jnp.ndarray,
+    roots_valid: jnp.ndarray,
+    q0: jnp.ndarray,
+    b: jnp.ndarray,
+    r_planet: jnp.ndarray,
+    launch_offset: jnp.ndarray,
+    grow_rate: jnp.ndarray,
+    u_len: jnp.ndarray,
+    *,
+    tol: float = GEOM_EPS,
+    root_imag_polish_tol: float = 1e-6,
+    deriv_tol: float = 1e-5,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Filter/refine stationary times given precomputed eigenvalue roots (length 6)."""
+    u_raw = jnp.real(roots)
+    imag_ok = jnp.abs(jnp.imag(roots)) <= root_imag_polish_tol
+    in_range = (u_raw >= -tol) & (u_raw <= u_len + tol)
+    u_clamped = jnp.clip(u_raw, 0.0, u_len)
+
+    root_idx = jnp.arange(6, dtype=jnp.int32)
+    branch_vals = jnp.asarray([TANGENT_BRANCH_MINUS, TANGENT_BRANCH_PLUS], dtype=jnp.int32)
+    root_grid = jnp.repeat(root_idx, 2)
+    branch_grid = jnp.tile(branch_vals, 6)
+    u_grid = jnp.repeat(u_clamped, 2)
+    valid_grid = jnp.repeat(roots_valid & imag_ok & in_range, 2)
+
+    def one_candidate(u, branch, valid0):
+        u_refined, ok = _refine_stationary_time_jax(
+            u,
+            q0,
+            b,
+            r_planet,
+            launch_offset,
+            grow_rate,
+            branch,
+            jnp.asarray(0.0, dtype=q0.dtype),
+            u_len,
+            deriv_tol=deriv_tol,
+        )
+        q = q0 + b * u_refined
+        gr = launch_offset + grow_rate * u_refined
+        exists = _intersection_angles_exist_jax(q, r_planet, gr)
+        d = _intersection_angle_derivative_linear_jax(
+            q, b, r_planet, launch_offset, grow_rate, u_refined, branch
+        )
+        ok = valid0 & ok & exists & jnp.isfinite(d) & (jnp.abs(d) <= deriv_tol)
+        return u_refined, branch, ok
+
+    times, branches, valid = jax.vmap(one_candidate)(u_grid, branch_grid, valid_grid)
+    # Sort by (time, branch) for easier comparison with NumPy.
+    inf = jnp.asarray(jnp.inf, dtype=times.dtype)
+    key = jnp.where(valid, times + 1e-8 * branches.astype(times.dtype), inf)
+    order = jnp.argsort(key)
+    t_sorted = times[order]
+    b_sorted = branches[order]
+    v_sorted = valid[order]
+    prev_t = jnp.concatenate([jnp.asarray([-jnp.inf], dtype=t_sorted.dtype), t_sorted[:-1]])
+    prev_b = jnp.concatenate([jnp.asarray([0], dtype=b_sorted.dtype), b_sorted[:-1]])
+    dedup = v_sorted & ~((jnp.abs(t_sorted - prev_t) <= 5e-5) & (b_sorted == prev_b))
+    return t_sorted, b_sorted, dedup
+
+
+def sextic_stationary_root_candidates_jax(
+    coeff_desc: jnp.ndarray,
+    q0: jnp.ndarray,
+    b: jnp.ndarray,
+    r_planet: jnp.ndarray,
+    launch_offset: jnp.ndarray,
+    grow_rate: jnp.ndarray,
+    u_len: jnp.ndarray,
+    *,
+    tol: float = GEOM_EPS,
+    root_imag_polish_tol: float = 1e-6,
+    deriv_tol: float = 1e-5,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Prototype JAX port of the per-segment sextic root filtering in the NumPy reference."""
+
+    roots, roots_valid = poly_roots_degree6_desc_jax(coeff_desc)
+    return _sextic_stationary_root_candidates_from_roots_jax(
+        roots,
+        roots_valid,
+        q0,
+        b,
+        r_planet,
+        launch_offset,
+        grow_rate,
+        u_len,
+        tol=tol,
+        root_imag_polish_tol=root_imag_polish_tol,
+        deriv_tol=deriv_tol,
+    )
+
+
+def sextic_stationary_root_candidates_batch_jax(
+    coeff_desc_batch: jnp.ndarray,
+    q0_batch: jnp.ndarray,
+    b_batch: jnp.ndarray,
+    r_planet: jnp.ndarray,
+    launch_offset_batch: jnp.ndarray,
+    grow_rate: jnp.ndarray,
+    u_len_batch: jnp.ndarray,
+    *,
+    tol: float = GEOM_EPS,
+    root_imag_polish_tol: float = 1e-6,
+    deriv_tol: float = 1e-5,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Batched sextic roots: one ``eigvals`` over all rows, then per-row Newton/filter."""
+
+    coeff_desc_batch = jnp.asarray(coeff_desc_batch)
+    batch_shape = coeff_desc_batch.shape[:-1]
+    flat_coeff = coeff_desc_batch.reshape(-1, 7)
+    flat_q0 = jnp.asarray(q0_batch).reshape(-1, 2)
+    flat_b = jnp.asarray(b_batch).reshape(-1, 2)
+    flat_r0 = jnp.asarray(launch_offset_batch).reshape(-1)
+    flat_u_len = jnp.asarray(u_len_batch).reshape(-1)
+    def _broadcast_batch(x: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.asarray(x)
+        if x.shape == batch_shape:
+            return x.reshape(-1)
+        pad = len(batch_shape) - x.ndim
+        if pad < 0:
+            raise ValueError(f"cannot broadcast {x.shape} to batch shape {batch_shape}")
+        return jnp.broadcast_to(x[(...,) + (None,) * pad], batch_shape).reshape(-1)
+
+    flat_r_planet = _broadcast_batch(r_planet)
+    flat_grow_rate = _broadcast_batch(grow_rate)
+
+    roots_batch, roots_valid_batch = poly_roots_degree6_desc_batch_jax(flat_coeff)
+
+    def one_row(roots, roots_valid, q0, b, launch_offset, u_len, rp, gr):
+        return _sextic_stationary_root_candidates_from_roots_jax(
+            roots,
+            roots_valid,
+            q0,
+            b,
+            rp,
+            launch_offset,
+            gr,
+            u_len,
+            tol=tol,
+            root_imag_polish_tol=root_imag_polish_tol,
+            deriv_tol=deriv_tol,
+        )
+
+    t_flat, br_flat, v_flat = jax.vmap(one_row)(
+        roots_batch,
+        roots_valid_batch,
+        flat_q0,
+        flat_b,
+        flat_r0,
+        flat_u_len,
+        flat_r_planet,
+        flat_grow_rate,
+    )
+    return (
+        t_flat.reshape(batch_shape + (12,)),
+        br_flat.reshape(batch_shape + (12,)),
+        v_flat.reshape(batch_shape + (12,)),
+    )
+
+
+def sextic_stationary_root_candidates_from_roots_batch_jax(
+    roots_batch: jnp.ndarray,
+    roots_valid_batch: jnp.ndarray,
+    q0_batch: jnp.ndarray,
+    b_batch: jnp.ndarray,
+    r_planet: jnp.ndarray,
+    launch_offset_batch: jnp.ndarray,
+    grow_rate: jnp.ndarray,
+    u_len_batch: jnp.ndarray,
+    *,
+    tol: float = GEOM_EPS,
+    root_imag_polish_tol: float = 1e-6,
+    deriv_tol: float = 1e-5,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Batched Newton/filter stage for precomputed sextic eigenvalue roots."""
+
+    roots_batch = jnp.asarray(roots_batch)
+    roots_valid_batch = jnp.asarray(roots_valid_batch)
+    batch_shape = roots_batch.shape[:-1]
+    flat_roots = roots_batch.reshape(-1, roots_batch.shape[-1])
+    flat_roots_valid = roots_valid_batch.reshape(-1, roots_valid_batch.shape[-1])
+    flat_q0 = jnp.asarray(q0_batch).reshape(-1, 2)
+    flat_b = jnp.asarray(b_batch).reshape(-1, 2)
+    flat_r0 = jnp.asarray(launch_offset_batch).reshape(-1)
+    flat_u_len = jnp.asarray(u_len_batch).reshape(-1)
+
+    def _broadcast_batch(x: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.asarray(x)
+        if x.shape == batch_shape:
+            return x.reshape(-1)
+        pad = len(batch_shape) - x.ndim
+        if pad < 0:
+            raise ValueError(f"cannot broadcast {x.shape} to batch shape {batch_shape}")
+        return jnp.broadcast_to(x[(...,) + (None,) * pad], batch_shape).reshape(-1)
+
+    flat_r_planet = _broadcast_batch(r_planet)
+    flat_grow_rate = _broadcast_batch(grow_rate)
+
+    def one_row(roots, roots_valid, q0, b, launch_offset, u_len, rp, gr):
+        return _sextic_stationary_root_candidates_from_roots_jax(
+            roots,
+            roots_valid,
+            q0,
+            b,
+            rp,
+            launch_offset,
+            gr,
+            u_len,
+            tol=tol,
+            root_imag_polish_tol=root_imag_polish_tol,
+            deriv_tol=deriv_tol,
+        )
+
+    t_flat, br_flat, v_flat = jax.vmap(one_row)(
+        flat_roots,
+        flat_roots_valid,
+        flat_q0,
+        flat_b,
+        flat_r0,
+        flat_u_len,
+        flat_r_planet,
+        flat_grow_rate,
+    )
+    return (
+        t_flat.reshape(batch_shape + (12,)),
+        br_flat.reshape(batch_shape + (12,)),
+        v_flat.reshape(batch_shape + (12,)),
+    )
+
+
+def tangent_hit_times_stationary_jax(
+    circle_center: jnp.ndarray,
+    circle_radius: jnp.ndarray,
+    grow_center: jnp.ndarray,
+    grow_rate: jnp.ndarray,
+    launch_offset: jnp.ndarray,
+    horizon: jnp.ndarray,
+    *,
+    mode_mask: int = TANGENT_MODE_BOTH,
+    tol: float = 1e-7,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Return fixed-capacity stationary tangency candidates sorted by time."""
+
+    verify_tol = 1e-5
+    c = jnp.asarray(circle_center)
+    g = jnp.asarray(grow_center)
+    r = jnp.asarray(circle_radius, dtype=c.dtype)
+    v = jnp.asarray(grow_rate, dtype=c.dtype)
+    lo = jnp.asarray(launch_offset, dtype=c.dtype)
+    t_max = jnp.asarray(horizon, dtype=c.dtype)
+    d = jnp.linalg.norm(c - g)
+
+    times = jnp.asarray(
+        [
+            (d - r - lo) / jnp.maximum(v, tol),
+            (r - lo - d) / jnp.maximum(v, tol),
+            (r - lo + d) / jnp.maximum(v, tol),
+            (r + d - lo) / jnp.maximum(v, tol),
+            (r - d - lo) / jnp.maximum(v, tol),
+        ],
+        dtype=c.dtype,
+    )
+    kinds = jnp.asarray(
+        [
+            TANGENT_KIND_EXTERNAL,
+            TANGENT_KIND_INTERNAL,
+            TANGENT_KIND_INTERNAL,
+            TANGENT_KIND_INTERNAL,
+            TANGENT_KIND_INTERNAL,
+        ],
+        dtype=jnp.int32,
+    )
+    ext_enabled = bool(mode_mask & TANGENT_MODE_EXTERNAL)
+    int_enabled = bool(mode_mask & TANGENT_MODE_INTERNAL)
+    mode_valid = jnp.asarray(
+        [ext_enabled, int_enabled, int_enabled, int_enabled, int_enabled], dtype=bool
+    )
+    in_range = (times >= -tol) & (times <= t_max + tol) & (v > tol)
+    times = jnp.clip(times, 0.0, t_max)
+    gr = lo + v * times
+    ext_err = jnp.abs(d - (r + gr))
+    int_err = jnp.abs(d - jnp.abs(r - gr))
+    geom_err = jnp.where(kinds == TANGENT_KIND_EXTERNAL, ext_err, int_err)
+    valid = mode_valid & in_range & (geom_err <= verify_tol)
+    return _sort_and_dedup_tangent_candidates(times, kinds, valid, tol=tol)
+
+
+def tangent_hit_times_polyline_jax(
+    points: jnp.ndarray,
+    circle_radius: jnp.ndarray,
+    grow_center: jnp.ndarray,
+    grow_rate: jnp.ndarray,
+    launch_offset: jnp.ndarray,
+    horizon: jnp.ndarray,
+    *,
+    mode_mask: int = TANGENT_MODE_BOTH,
+    tol: float = 1e-7,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Return fixed-capacity polyline tangency candidates sorted by time."""
+
+    verify_tol = 1e-4
+    pts = jnp.asarray(points)
+    g = jnp.asarray(grow_center, dtype=pts.dtype)
+    r = jnp.asarray(circle_radius, dtype=pts.dtype)
+    v = jnp.asarray(grow_rate, dtype=pts.dtype)
+    lo = jnp.asarray(launch_offset, dtype=pts.dtype)
+    t_cap = jnp.minimum(jnp.asarray(horizon, dtype=pts.dtype), pts.shape[0] - 1.0)
+
+    seg_t0 = jnp.arange(pts.shape[0] - 1, dtype=pts.dtype)
+    seg_t1 = jnp.minimum(seg_t0 + 1.0, t_cap)
+    seg_valid = (v >= 0.0) & (t_cap >= 0.0) & (seg_t1 >= seg_t0)
+
+    p0 = pts[:-1]
+    p1 = pts[1:]
+    b = p1 - p0
+    a = p0 - g
+    u_hi = seg_t1 - seg_t0
+    g0 = lo + v * seg_t0
+
+    branch_k0 = jnp.stack([r + g0, r - g0, g0 - r], axis=1)
+    branch_k1 = jnp.broadcast_to(
+        jnp.asarray([v, -v, v], dtype=pts.dtype)[None, :],
+        branch_k0.shape,
+    )
+    branch_kind = jnp.asarray(
+        [TANGENT_KIND_EXTERNAL, TANGENT_KIND_INTERNAL, TANGENT_KIND_INTERNAL], dtype=jnp.int32
+    )
+    ext_enabled = bool(mode_mask & TANGENT_MODE_EXTERNAL)
+    int_enabled = bool(mode_mask & TANGENT_MODE_INTERNAL)
+    branch_enabled = jnp.asarray([ext_enabled, int_enabled, int_enabled], dtype=bool)
+
+    dd = jnp.sum(b * b, axis=1)[:, None]
+    qd = jnp.sum(a * b, axis=1)[:, None]
+    qq = jnp.sum(a * a, axis=1)[:, None]
+    aq = dd - branch_k1 * branch_k1
+    bq = 2.0 * (qd - branch_k0 * branch_k1)
+    cq = qq - branch_k0 * branch_k0
+
+    roots, roots_valid = _quadratic_roots(aq, bq, cq, eps=tol)
+    roots = jnp.moveaxis(roots, 0, -1)
+    roots_valid = jnp.moveaxis(roots_valid, 0, -1)
+
+    u = jnp.clip(roots, 0.0, u_hi[:, None, None])
+    t = seg_t0[:, None, None] + u
+    centre = p0[:, None, None, :] + u[..., None] * b[:, None, None, :]
+    gr = lo + v * t
+    d = jnp.linalg.norm(centre - g, axis=-1)
+    ext_err = jnp.abs(d - (r + gr))
+    int_err = jnp.abs(d - jnp.abs(r - gr))
+    kind_grid = jnp.broadcast_to(branch_kind[None, :, None], roots.shape)
+    geom_err = jnp.where(kind_grid == TANGENT_KIND_EXTERNAL, ext_err, int_err)
+
+    valid = (
+        roots_valid
+        & seg_valid[:, None, None]
+        & branch_enabled[None, :, None]
+        & (roots >= -tol)
+        & (roots <= u_hi[:, None, None] + tol)
+        & (geom_err <= verify_tol)
+    )
+
+    return _sort_and_dedup_tangent_candidates(
+        t.reshape(-1),
+        kind_grid.reshape(-1),
+        valid.reshape(-1),
+        tol=tol,
+    )
+
+
+def _circles_overlap_at_t0_jax(
+    circle_center: jnp.ndarray,
+    circle_radius: jnp.ndarray,
+    grow_center: jnp.ndarray,
+    launch_offset: jnp.ndarray,
+    *,
+    eps: float = 1e-7,
+) -> jnp.ndarray:
+    """Strict overlap-at-zero test matching ``circles_overlap_at(..., t=0)``."""
+
+    d = jnp.linalg.norm(jnp.asarray(circle_center) - jnp.asarray(grow_center))
+    r = jnp.asarray(launch_offset, dtype=d.dtype)
+    rp = jnp.asarray(circle_radius, dtype=d.dtype)
+    return (d + eps < rp + r) & (d > jnp.abs(rp - r) - eps)
+
+
+def toggle_intersection_windows_jax(
+    hit_times: jnp.ndarray,
+    hit_valid: jnp.ndarray,
+    inside0: jnp.ndarray,
+    horizon: jnp.ndarray,
+    *,
+    max_windows: int | None = None,
+    eps: float = 1e-7,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Build fixed-capacity overlap windows by toggling on each valid tangency time.
+
+    Tangency kind is intentionally ignored. The first tangency opens or closes a
+    window depending on whether the circles overlap at ``t=0``; subsequent
+    tangencies alternate.
+
+    When ``max_windows`` is set, output arrays have shape ``(max_windows,)`` and at
+  most that many windows are stored (extra tangencies are still processed but
+    cannot append further windows).
+    """
+
+    times = jnp.clip(jnp.asarray(hit_times), 0.0, jnp.asarray(horizon, dtype=jnp.asarray(hit_times).dtype))
+    valid = jnp.asarray(hit_valid, dtype=bool)
+    hor = jnp.asarray(horizon, dtype=times.dtype)
+    cap = int(max_windows) if max_windows is not None else times.shape[0] + 1
+
+    def body(carry, x):
+        inside, t_open, count, lo_store, hi_store, v_store = carry
+        t, is_valid = x
+
+        def on_valid(args):
+            inside0, t_open0, count0, lo0, hi0, vv0 = args
+
+            def close_window(args2):
+                t_cur, t_open1, count1, lo1, hi1, vv1 = args2
+                can_write = (count1 < cap) & (t_cur > t_open1 + eps)
+                lo1 = jax.lax.cond(can_write, lambda a: a.at[count1].set(t_open1), lambda a: a, lo1)
+                hi1 = jax.lax.cond(can_write, lambda a: a.at[count1].set(t_cur), lambda a: a, hi1)
+                vv1 = jax.lax.cond(can_write, lambda a: a.at[count1].set(True), lambda a: a, vv1)
+                count1 = count1 + can_write.astype(jnp.int32)
+                return (jnp.asarray(False), t_open1, count1, lo1, hi1, vv1)
+
+            def open_window(args2):
+                _t_cur, _t_open1, count1, lo1, hi1, vv1 = args2
+                return (jnp.asarray(True), t, count1, lo1, hi1, vv1)
+
+            return jax.lax.cond(
+                inside0,
+                close_window,
+                open_window,
+                (t, t_open0, count0, lo0, hi0, vv0),
+            )
+
+        new_carry = jax.lax.cond(
+            is_valid,
+            on_valid,
+            lambda args: args,
+            (inside, t_open, count, lo_store, hi_store, v_store),
+        )
+        return new_carry, None
+
+    lo0 = jnp.zeros((cap,), dtype=times.dtype)
+    hi0 = jnp.zeros((cap,), dtype=times.dtype)
+    v0 = jnp.zeros((cap,), dtype=bool)
+    t_open0 = jnp.where(inside0, jnp.asarray(0.0, dtype=times.dtype), jnp.asarray(0.0, dtype=times.dtype))
+    (inside_f, t_open_f, count_f, lo_f, hi_f, v_f), _ = jax.lax.scan(
+        body,
+        (jnp.asarray(inside0, dtype=bool), t_open0, jnp.asarray(0, dtype=jnp.int32), lo0, hi0, v0),
+        (times, valid),
+    )
+
+    can_tail = inside_f & (t_open_f + eps < hor) & (count_f < cap)
+    lo_f = jax.lax.cond(can_tail, lambda a: a.at[count_f].set(t_open_f), lambda a: a, lo_f)
+    hi_f = jax.lax.cond(can_tail, lambda a: a.at[count_f].set(hor), lambda a: a, hi_f)
+    v_f = jax.lax.cond(can_tail, lambda a: a.at[count_f].set(True), lambda a: a, v_f)
+    return lo_f, hi_f, v_f
+
+
+def intersection_windows_stationary_jax(
+    circle_center: jnp.ndarray,
+    circle_radius: jnp.ndarray,
+    grow_center: jnp.ndarray,
+    grow_rate: jnp.ndarray,
+    launch_offset: jnp.ndarray,
+    horizon: jnp.ndarray,
+    *,
+    tol: float = 1e-7,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Stationary overlap windows from tangency-hit toggles."""
+
+    hit_t, _hit_kind, hit_valid = tangent_hit_times_stationary_jax(
+        circle_center,
+        circle_radius,
+        grow_center,
+        grow_rate,
+        launch_offset,
+        horizon,
+        tol=tol,
+    )
+    inside0 = _circles_overlap_at_t0_jax(circle_center, circle_radius, grow_center, launch_offset, eps=tol)
+    return toggle_intersection_windows_jax(hit_t, hit_valid, inside0, horizon, eps=tol)
+
+
+def intersection_windows_polyline_jax(
+    points: jnp.ndarray,
+    circle_radius: jnp.ndarray,
+    grow_center: jnp.ndarray,
+    grow_rate: jnp.ndarray,
+    launch_offset: jnp.ndarray,
+    horizon: jnp.ndarray,
+    *,
+    tol: float = 1e-7,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Polyline overlap windows from tangency-hit toggles."""
+
+    hit_t, _hit_kind, hit_valid = tangent_hit_times_polyline_jax(
+        points,
+        circle_radius,
+        grow_center,
+        grow_rate,
+        launch_offset,
+        horizon,
+        tol=tol,
+    )
+    inside0 = _circles_overlap_at_t0_jax(points[0], circle_radius, grow_center, launch_offset, eps=tol)
+    return toggle_intersection_windows_jax(hit_t, hit_valid, inside0, horizon, eps=tol)
+
+
+def intersection_windows_polyline_capped_jax(
+    points: jnp.ndarray,
+    circle_radius: jnp.ndarray,
+    grow_center: jnp.ndarray,
+    grow_rate: jnp.ndarray,
+    launch_offset: jnp.ndarray,
+    horizon: jnp.ndarray,
+    *,
+    max_tangency_hits: int = 4,
+    max_windows: int = 2,
+    tol: float = 1e-7,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Polyline overlap windows using the first ``max_tangency_hits`` tangencies, capped at ``max_windows``."""
+
+    hit_t, _hit_kind, hit_valid = tangent_hit_times_polyline_jax(
+        points,
+        circle_radius,
+        grow_center,
+        grow_rate,
+        launch_offset,
+        horizon,
+        tol=tol,
+    )
+    hit_t = hit_t[:max_tangency_hits]
+    hit_valid = hit_valid[:max_tangency_hits]
+    inside0 = _circles_overlap_at_t0_jax(points[0], circle_radius, grow_center, launch_offset, eps=tol)
+    return toggle_intersection_windows_jax(
+        hit_t,
+        hit_valid,
+        inside0,
+        horizon,
+        max_windows=max_windows,
+        eps=tol,
+    )
 
 
 def _radial_active_spans(
@@ -696,11 +1574,16 @@ def _hit_intervals_to_bin_mask(
     *,
     n_bins: int,
 ) -> jnp.ndarray:
-    """``[n_bins]`` bool: any bin center lies in a valid ``[lo, hi]`` elementary cell."""
+    """``[n_bins]`` bool: any angular bin overlaps a valid ``[lo, hi]`` elementary cell.
+
+    Overlap, rather than center membership, keeps sub-bin-width target cones visible.
+    """
 
     dtype = lo.dtype
-    centers = (jnp.arange(n_bins, dtype=dtype) + 0.5) * (TAU / jnp.asarray(float(n_bins), dtype=dtype))
-    inside = valid[:, None] & (centers[None, :] >= lo[:, None]) & (centers[None, :] <= hi[:, None])
+    dtheta = TAU / jnp.asarray(float(n_bins), dtype=dtype)
+    bin_lo = jnp.arange(n_bins, dtype=dtype) * dtheta
+    bin_hi = bin_lo + dtheta
+    inside = valid[:, None] & (bin_hi[None, :] >= lo[:, None]) & (bin_lo[None, :] <= hi[:, None])
     return jnp.any(inside, axis=0)
 
 
@@ -709,15 +1592,18 @@ def _max_circular_true_run_length_and_start(mask: jnp.ndarray) -> tuple[jnp.ndar
 
     n = int(mask.shape[0])
     m2 = jnp.concatenate([mask, mask], axis=0)
-    idx = jnp.arange(n, dtype=jnp.int32)
-
-    def length_from_start(s):
-        window = jax.lax.dynamic_slice(m2, (s,), (n,))
-        all_true = jnp.all(window)
-        first_false = jnp.argmax(~window)
-        return jnp.where(all_true, jnp.asarray(n, dtype=jnp.int32), first_false)
-
-    lengths = jax.vmap(length_from_start)(idx)
+    # Reverse scan gives the number of consecutive True values starting at each
+    # position in the doubled mask; clipping to ``n`` handles the circular wrap.
+    _, rev_lengths = jax.lax.scan(
+        lambda acc, x: (
+            jnp.where(x, acc + jnp.asarray(1, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32)),
+            jnp.where(x, acc + jnp.asarray(1, dtype=jnp.int32), jnp.asarray(0, dtype=jnp.int32)),
+        ),
+        jnp.asarray(0, dtype=jnp.int32),
+        m2[::-1],
+    )
+    lengths2 = rev_lengths[::-1]
+    lengths = jnp.minimum(lengths2[:n], jnp.asarray(n, dtype=jnp.int32))
     max_len = jnp.max(lengths)
     best_start = jnp.argmax(lengths)
     return max_len, best_start
@@ -805,6 +1691,110 @@ def first_hit_union_scan_bins_apply_jax(
     best_valid = (best_w > GEOM_EPS) & val_tab[best_t, rr]
     overflow = jnp.asarray(False)
     return best_angle, best_w, best_valid, overflow
+
+
+def first_hit_union_scan_bins_best_targets_apply_jax(
+    origin_xy: jnp.ndarray,
+    origin_radius: jnp.ndarray,
+    speed: jnp.ndarray,
+    object_p0_by_tick: jnp.ndarray,
+    object_p1_by_tick: jnp.ndarray,
+    object_radii: jnp.ndarray,
+    object_active_by_tick: jnp.ndarray,
+    policy_object_mask: jnp.ndarray | None = None,
+    *,
+    samples_per_span: int,
+    n_block_bins: int,
+    include_sun: bool = True,
+    include_board: bool = True,
+    board_size: float = BOARD_SIZE,
+    sun_radius: float = SUN_RADIUS,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Fast rollout-only interval-bin first-hit candidate generator.
+
+    This is deliberately approximate: hit intervals are rasterized to angular bins,
+    blockers are prefix-OR'd across ticks, and same-tick planet ordering is ignored.
+    It preserves narrow analytic target cones better than sparse rays while avoiding
+    the ``rays x planets`` swept collision matrix in the hot rollout path.
+    """
+
+    planets = int(object_radii.shape[0])
+    dtype = origin_xy.dtype
+    dtheta = TAU / jnp.asarray(float(n_block_bins), dtype=dtype)
+
+    all_lo, all_hi, all_va = _precompute_all_tick_planet_and_sun_hits_jax(
+        origin_xy,
+        origin_radius,
+        speed,
+        object_p0_by_tick,
+        object_p1_by_tick,
+        object_radii,
+        object_active_by_tick,
+        samples_per_span,
+        sun_radius if include_sun else 0.0,
+    )
+    if not include_sun:
+        all_va = all_va.at[:, planets, :].set(False)
+
+    ticks = int(all_lo.shape[0])
+
+    def hit_to_mask(row_lo: jnp.ndarray, row_hi: jnp.ndarray, row_va: jnp.ndarray) -> jnp.ndarray:
+        return _hit_intervals_to_bin_mask(row_lo, row_hi, row_va, n_bins=n_block_bins)
+
+    hit_mask_obj = jax.vmap(jax.vmap(hit_to_mask))(all_lo, all_hi, all_va)
+
+    if policy_object_mask is None:
+        policy_mask = jnp.ones((planets,), dtype=jnp.bool_)
+    else:
+        policy_mask = policy_object_mask.astype(jnp.bool_)
+    hit_mask_planets = hit_mask_obj[:, :planets, :] & policy_mask[None, :, None]
+    blocker_obj = hit_mask_obj
+
+    if include_board:
+        ti_vec = jnp.arange(ticks, dtype=jnp.int32)
+
+        def board_for_tick(ti: jnp.ndarray):
+            b_lo, b_hi, b_va = _board_exit_intervals_jax(
+                origin_xy, origin_radius, speed, ti, board_size
+            )
+            return _hit_intervals_to_bin_mask(b_lo, b_hi, b_va, n_bins=n_block_bins)
+
+        board_mask = jax.vmap(board_for_tick)(ti_vec)
+        blocker_tick = jnp.any(blocker_obj, axis=1) | board_mask
+    else:
+        blocker_tick = jnp.any(blocker_obj, axis=1)
+
+    cum_or = jax.lax.associative_scan(jnp.bitwise_or, blocker_tick, axis=0)
+    zeros = jnp.zeros((n_block_bins,), dtype=jnp.bool_)
+    blocked_before = jnp.concatenate([zeros[None, :], cum_or[:-1]], axis=0)
+
+    jp = jnp.arange(planets, dtype=jnp.int32)
+    jt = jnp.arange(ticks, dtype=jnp.int32)
+
+    def one_tj(t: jnp.ndarray, j: jnp.ndarray):
+        avail = hit_mask_planets[t, j] & (~blocked_before[t])
+        mlen, mstart = _max_circular_true_run_length_and_start(avail)
+        width = mlen.astype(dtype) * dtheta
+        angle = _norm_angle((mstart.astype(dtype) + 0.5 * mlen.astype(dtype)) * dtheta)
+        ok = mlen > 0
+        return width, angle, ok
+
+    def row_t(t: jnp.ndarray):
+        return jax.vmap(lambda j: one_tj(t, j))(jp)
+
+    w_tab, ang_tab, val_tab = jax.vmap(row_t)(jt)
+    iinf = jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32)
+    t_scores = jnp.where(val_tab, jt[:, None], iinf)
+    best_score = jnp.min(t_scores, axis=0)
+    best_t = jnp.argmin(t_scores, axis=0).astype(jnp.int32)
+    best_angle = ang_tab[best_t, jp]
+    best_w = w_tab[best_t, jp]
+    best_valid = (best_score < iinf) & (best_w > GEOM_EPS) & val_tab[best_t, jp]
+    hit_tick = jnp.where(best_valid, best_t.astype(dtype), jnp.asarray(0.0, dtype=dtype))
+    true_planet = jnp.where(best_valid, jp, jnp.asarray(-1, dtype=jnp.int32))
+    true_tick = jnp.where(best_valid, hit_tick, jnp.asarray(500.0, dtype=dtype))
+    overflow = jnp.asarray(False)
+    return best_angle, best_w, best_valid, overflow, hit_tick, true_planet, true_tick
 
 
 def _game_point_to_segment_distance(point: jnp.ndarray, start: jnp.ndarray, end: jnp.ndarray) -> jnp.ndarray:
@@ -1263,6 +2253,408 @@ def first_hit_brute_best_targets_from_rays_chunked_apply_jax(
     true_tick = jnp.where(ok, best_true_tick.astype(dtype), jnp.asarray(500.0, dtype=dtype))
     overflow = jnp.asarray(False)
     return ang, wid, ok, overflow, tick, true_planet, true_tick
+
+
+def ray_segments_by_tick_jax(
+    origin_xy: jnp.ndarray,
+    origin_radius: jnp.ndarray,
+    speed: jnp.ndarray,
+    *,
+    ticks: int,
+    n_rays: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Return ``(theta[R], dtheta, a0[T,R,2], a1[T,R,2])`` for straight launch rays."""
+
+    dtype = origin_xy.dtype
+    kvec = jnp.arange(n_rays, dtype=dtype)
+    theta = kvec * (TAU / jnp.asarray(float(n_rays), dtype=dtype))
+    u = jnp.stack([jnp.cos(theta), jnp.sin(theta)], axis=-1)
+    launch_off = origin_radius + jnp.asarray(0.1, dtype=dtype)
+    tvec = jnp.arange(ticks, dtype=dtype)[:, None, None]
+    factor = launch_off + speed * tvec
+    a0 = origin_xy[None, None, :] + u[None, :, :] * factor
+    a1 = a0 + speed * u[None, :, :]
+    dtheta = TAU / jnp.asarray(float(n_rays), dtype=dtype)
+    return theta, dtheta, a0, a1
+
+
+def _swept_disk_hits_core_jax(
+    a0: jnp.ndarray,
+    a1: jnp.ndarray,
+    p0: jnp.ndarray,
+    p1: jnp.ndarray,
+    radii: jnp.ndarray,
+    active: jnp.ndarray,
+) -> jnp.ndarray:
+    """Swept segment-vs-moving-disk hit mask ``[T, R, P]``."""
+
+    d0 = a0[:, :, None, :] - p0[:, None, :, :]
+    dv = (a1[:, :, None, :] - a0[:, :, None, :]) - (p1[:, None, :, :] - p0[:, None, :, :])
+    qa = jnp.sum(dv * dv, axis=-1)
+    qb = 2.0 * jnp.sum(d0 * dv, axis=-1)
+    qc = jnp.sum(d0 * d0, axis=-1) - radii[None, None, :] ** 2
+    disc = qb * qb - 4.0 * qa * qc
+    static_hit = qc <= 0.0
+    sqrt_disc = jnp.sqrt(jnp.maximum(disc, 0.0))
+    qa_small = jnp.asarray(1e-12, dtype=a0.dtype)
+    qa_safe = jnp.where(qa < qa_small, 1.0, qa)
+    t1 = (-qb - sqrt_disc) / (2.0 * qa_safe)
+    t2 = (-qb + sqrt_disc) / (2.0 * qa_safe)
+    moving_hit = (disc >= 0.0) & (t2 >= 0.0) & (t1 <= 1.0)
+    hit_raw = jnp.where(qa < qa_small, static_hit, moving_hit)
+    return hit_raw & active[:, None, :]
+
+
+def stationary_hits_by_tick_jax(
+    a0: jnp.ndarray,
+    a1: jnp.ndarray,
+    centers: jnp.ndarray,
+    radii: jnp.ndarray,
+    valid: jnp.ndarray,
+) -> jnp.ndarray:
+    """Specialized swept hits for stationary targets.
+
+    Solve one ray--circle intersection per ``(ray, target)`` from the launch point,
+    convert first contact distance to ``tick = floor(dist / speed)``, then emit a
+    one-hot ``[T, R, P]`` event tensor.
+    """
+
+    dtype = a0.dtype
+    ticks = a0.shape[0]
+    launch = a0[0]  # [R, 2]
+    ray_delta = a1[0] - a0[0]  # [R, 2]
+    speed = jnp.linalg.norm(ray_delta, axis=-1)  # [R]
+    speed_safe = jnp.maximum(speed, jnp.asarray(1e-12, dtype=dtype))
+    u = ray_delta / speed_safe[:, None]
+
+    m = launch[:, None, :] - centers[None, :, :]  # [R, P, 2]
+    b = 2.0 * jnp.sum(m * u[:, None, :], axis=-1)  # [R, P]
+    c = jnp.sum(m * m, axis=-1) - radii[None, :] ** 2  # [R, P]
+    disc = b * b - 4.0 * c
+    sqrt_disc = jnp.sqrt(jnp.maximum(disc, 0.0))
+    root_lo = (-b - sqrt_disc) * 0.5
+    root_hi = (-b + sqrt_disc) * 0.5
+
+    inside = c <= 0.0
+    has_forward = root_hi >= 0.0
+    s_hit = jnp.where(
+        inside,
+        jnp.asarray(0.0, dtype=dtype),
+        jnp.where(root_lo >= 0.0, root_lo, root_hi),
+    )
+    hit_ok = valid[None, :] & (disc >= 0.0) & has_forward
+    tick_f = jnp.floor(s_hit / speed_safe[:, None])
+    tick_i = tick_f.astype(jnp.int32)
+    tick_ok = (tick_i >= 0) & (tick_i < ticks)
+    hit_ok = hit_ok & tick_ok
+
+    tick_axis = jnp.arange(ticks, dtype=jnp.int32)[:, None, None]
+    return hit_ok[None, :, :] & (tick_axis == tick_i[None, :, :])
+
+
+def rotating_hits_by_tick_jax(
+    a0: jnp.ndarray,
+    a1: jnp.ndarray,
+    init_xy: jnp.ndarray,
+    radii: jnp.ndarray,
+    valid: jnp.ndarray,
+    angular_velocity: jnp.ndarray,
+    step_count: jnp.ndarray,
+) -> jnp.ndarray:
+    """Specialized swept hits for orbiting targets, projected inline from initial state."""
+
+    delta = init_xy - CENTER
+    orbital_r = jnp.linalg.norm(delta, axis=1)
+    initial_angle = jnp.arctan2(delta[:, 1], delta[:, 0])
+    tick = jnp.arange(a0.shape[0], dtype=jnp.float32)[:, None]
+    step_f = step_count.astype(jnp.float32)
+    # Mirror the env timing exactly: the state at ``step_count`` still stores the
+    # position reached after the previous move, so forecast segment ``t`` is
+    # ``(step_count + t - 1) -> (step_count + t)``, clamped at 0 for the first turn.
+    t0 = jnp.maximum(step_f + tick - 1.0, 0.0)
+    t1 = step_f + tick
+    ang0 = initial_angle[None, :] + angular_velocity * t0
+    ang1 = initial_angle[None, :] + angular_velocity * t1
+    active = jnp.broadcast_to(valid[None, :], (a0.shape[0], valid.shape[0]))
+    p0x = CENTER + orbital_r[None, :] * jnp.cos(ang0)
+    p0y = CENTER + orbital_r[None, :] * jnp.sin(ang0)
+    p1x = CENTER + orbital_r[None, :] * jnp.cos(ang1)
+    p1y = CENTER + orbital_r[None, :] * jnp.sin(ang1)
+
+    d0x = a0[..., 0][:, :, None] - p0x[:, None, :]
+    d0y = a0[..., 1][:, :, None] - p0y[:, None, :]
+    dvx = (a1[..., 0] - a0[..., 0])[:, :, None] - (p1x - p0x)[:, None, :]
+    dvy = (a1[..., 1] - a0[..., 1])[:, :, None] - (p1y - p0y)[:, None, :]
+    qa = dvx * dvx + dvy * dvy
+    qb = 2.0 * (d0x * dvx + d0y * dvy)
+    qc = d0x * d0x + d0y * d0y - radii[None, None, :] ** 2
+    disc = qb * qb - 4.0 * qa * qc
+    static_hit = qc <= 0.0
+    sqrt_disc = jnp.sqrt(jnp.maximum(disc, 0.0))
+    qa_small = jnp.asarray(1e-12, dtype=a0.dtype)
+    qa_safe = jnp.where(qa < qa_small, 1.0, qa)
+    root_lo = (-qb - sqrt_disc) / (2.0 * qa_safe)
+    root_hi = (-qb + sqrt_disc) / (2.0 * qa_safe)
+    moving_hit = (disc >= 0.0) & (root_hi >= 0.0) & (root_lo <= 1.0)
+    hit_raw = jnp.where(qa < qa_small, static_hit, moving_hit)
+    return hit_raw & active[:, None, :]
+
+
+def comet_hits_by_tick_jax(
+    a0: jnp.ndarray,
+    a1: jnp.ndarray,
+    cur_xy: jnp.ndarray,
+    radii: jnp.ndarray,
+    group_for_slot: jnp.ndarray,
+    comet_k: jnp.ndarray,
+    group_active: jnp.ndarray,
+    path_idx0: jnp.ndarray,
+    path_len: jnp.ndarray,
+    comet_paths: jnp.ndarray,
+    valid: jnp.ndarray,
+) -> jnp.ndarray:
+    """Specialized swept hits for already-active comet slots using direct path slices."""
+
+    tick = jnp.arange(a0.shape[0], dtype=jnp.int32)[:, None]
+    p0_idx = path_idx0[None, :] + tick
+    p1_idx = p0_idx + 1
+    active = (
+        valid[None, :]
+        & group_active[None, :]
+        & (path_idx0[None, :] >= 0)
+        & (p0_idx < path_len[None, :])
+    )
+    p0_safe = jnp.clip(p0_idx, 0, comet_paths.shape[2] - 1)
+    p1_safe = jnp.clip(p1_idx, 0, comet_paths.shape[2] - 1)
+    path_p0x = comet_paths[group_for_slot[None, :], comet_k[None, :], p0_safe, 0]
+    path_p0y = comet_paths[group_for_slot[None, :], comet_k[None, :], p0_safe, 1]
+    path_p1x = comet_paths[group_for_slot[None, :], comet_k[None, :], p1_safe, 0]
+    path_p1y = comet_paths[group_for_slot[None, :], comet_k[None, :], p1_safe, 1]
+    p0x = jnp.where(tick == 0, cur_xy[None, :, 0], path_p0x)
+    p0y = jnp.where(tick == 0, cur_xy[None, :, 1], path_p0y)
+    p1x = jnp.where(p1_idx < path_len[None, :], path_p1x, path_p0x)
+    p1y = jnp.where(p1_idx < path_len[None, :], path_p1y, path_p0y)
+
+    d0x = a0[..., 0][:, :, None] - p0x[:, None, :]
+    d0y = a0[..., 1][:, :, None] - p0y[:, None, :]
+    dvx = (a1[..., 0] - a0[..., 0])[:, :, None] - (p1x - p0x)[:, None, :]
+    dvy = (a1[..., 1] - a0[..., 1])[:, :, None] - (p1y - p0y)[:, None, :]
+    qa = dvx * dvx + dvy * dvy
+    qb = 2.0 * (d0x * dvx + d0y * dvy)
+    qc = d0x * d0x + d0y * d0y - radii[None, None, :] ** 2
+    disc = qb * qb - 4.0 * qa * qc
+    static_hit = qc <= 0.0
+    sqrt_disc = jnp.sqrt(jnp.maximum(disc, 0.0))
+    qa_small = jnp.asarray(1e-12, dtype=a0.dtype)
+    qa_safe = jnp.where(qa < qa_small, 1.0, qa)
+    root_lo = (-qb - sqrt_disc) / (2.0 * qa_safe)
+    root_hi = (-qb + sqrt_disc) / (2.0 * qa_safe)
+    moving_hit = (disc >= 0.0) & (root_hi >= 0.0) & (root_lo <= 1.0)
+    hit_raw = jnp.where(qa < qa_small, static_hit, moving_hit)
+    return hit_raw & active[:, None, :]
+
+
+def scheduled_comet_hits_by_tick_jax(
+    a0: jnp.ndarray,
+    a1: jnp.ndarray,
+    comet_paths: jnp.ndarray,
+    comet_path_lengths: jnp.ndarray,
+    step_count: jnp.ndarray,
+    reserve_valid: jnp.ndarray,
+    *,
+    spawn_steps: tuple[int, ...],
+) -> jnp.ndarray:
+    """Specialized swept hits for comets derived directly from schedule/path tables.
+
+    Slots are the stable reserve comet slots ``k=0..3``. Group ``g`` contributes to slot
+    ``k`` on tick ``t`` when ``rel = step_count + t - spawn_steps[g]`` satisfies
+    ``0 <= rel`` and ``rel + 1 < path_len[g, k]``. Different comet groups do not overlap
+    in time, so OR over groups is valid.
+    """
+
+    dtype = a0.dtype
+    ticks = a0.shape[0]
+    groups = comet_paths.shape[0]
+    comet_k = comet_paths.shape[1]
+
+    tick = jnp.arange(ticks, dtype=jnp.int32)[:, None, None, None]  # [T,1,1,1]
+    spawn = jnp.asarray(spawn_steps, dtype=jnp.int32)[None, :, None, None]  # [1,G,1,1]
+    rel = step_count.astype(jnp.int32) + tick - spawn  # [T,G,1,1]
+    lengths = comet_path_lengths[None, :, :, None]  # [1,G,K,1]
+    valid = reserve_valid[None, None, :, None]  # [1,1,K,1]
+    active = (valid & (rel >= 0) & ((rel + 1) < lengths))[..., 0]  # [T,G,K]
+
+    rel0 = jnp.clip(rel[..., 0], 0, comet_paths.shape[2] - 1)  # [T,G,1]
+    rel1 = jnp.clip(rel[..., 0] + 1, 0, comet_paths.shape[2] - 1)
+    p0x = comet_paths[None, :, :, :, 0]
+    p0y = comet_paths[None, :, :, :, 1]
+    # Gather per (T,G,K)
+    path0x = jnp.take_along_axis(p0x, rel0[:, :, None, :], axis=3)[..., 0]  # [T,G,K]
+    path0y = jnp.take_along_axis(p0y, rel0[:, :, None, :], axis=3)[..., 0]
+    path1x = jnp.take_along_axis(p0x, rel1[:, :, None, :], axis=3)[..., 0]
+    path1y = jnp.take_along_axis(p0y, rel1[:, :, None, :], axis=3)[..., 0]
+
+    ax0 = a0[..., 0][:, :, None, None]
+    ay0 = a0[..., 1][:, :, None, None]
+    dax = (a1[..., 0] - a0[..., 0])[:, :, None, None]
+    day = (a1[..., 1] - a0[..., 1])[:, :, None, None]
+    dvx = dax - (path1x[:, None, :, :] - path0x[:, None, :, :])
+    dvy = day - (path1y[:, None, :, :] - path0y[:, None, :, :])
+    d0x = ax0 - path0x[:, None, :, :]
+    d0y = ay0 - path0y[:, None, :, :]
+    qa = dvx * dvx + dvy * dvy
+    qb = 2.0 * (d0x * dvx + d0y * dvy)
+    qc = d0x * d0x + d0y * d0y - (jnp.asarray(1.0, dtype=dtype) ** 2)
+    disc = qb * qb - 4.0 * qa * qc
+    static_hit = qc <= 0.0
+    sqrt_disc = jnp.sqrt(jnp.maximum(disc, 0.0))
+    qa_small = jnp.asarray(1e-12, dtype=dtype)
+    qa_safe = jnp.where(qa < qa_small, 1.0, qa)
+    root_lo = (-qb - sqrt_disc) / (2.0 * qa_safe)
+    root_hi = (-qb + sqrt_disc) / (2.0 * qa_safe)
+    moving_hit = (disc >= 0.0) & (root_hi >= 0.0) & (root_lo <= 1.0)
+    hit_raw = jnp.where(qa < qa_small, static_hit, moving_hit)
+    return jnp.any(hit_raw & active[:, None, :, :], axis=2)
+
+
+def swept_disk_hits_from_positions_jax(
+    a0: jnp.ndarray,
+    a1: jnp.ndarray,
+    p0: jnp.ndarray,
+    p1: jnp.ndarray,
+    radii: jnp.ndarray,
+    active: jnp.ndarray,
+) -> jnp.ndarray:
+    """Compatibility wrapper for callers that already have explicit positions."""
+
+    return _swept_disk_hits_core_jax(a0, a1, p0, p1, radii, active)
+
+
+def sun_board_hits_by_tick_jax(
+    a0: jnp.ndarray,
+    a1: jnp.ndarray,
+    *,
+    include_sun: bool = True,
+    include_board: bool = True,
+    board_size: float = BOARD_SIZE,
+    sun_radius: float = SUN_RADIUS,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Return ``(sun_hit[T,R], board_hit[T,R])`` for ray segments."""
+
+    dtype = a0.dtype
+    sun_xy = jnp.asarray([CENTER, CENTER], dtype=dtype)
+    sun_hit = _game_point_to_segment_distance(sun_xy, a0, a1) < jnp.asarray(sun_radius, dtype=dtype)
+    sun_hit = sun_hit & jnp.asarray(include_sun, dtype=jnp.bool_)
+    board = jnp.asarray(board_size, dtype=dtype)
+    in_bounds = (
+        (a1[..., 0] >= 0.0)
+        & (a1[..., 0] <= board)
+        & (a1[..., 1] >= 0.0)
+        & (a1[..., 1] <= board)
+    )
+    board_hit = (~in_bounds) & jnp.asarray(include_board, dtype=jnp.bool_)
+    return sun_hit, board_hit
+
+
+def reduce_ray_planet_hits_to_targets_jax(
+    object_hits: jnp.ndarray,
+    hidden_object_mask: jnp.ndarray,
+    *,
+    n_rays: int,
+    num_targets: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Reduce per-ray per-tick object hits into per-target best headings.
+
+    ``object_hits`` may contain non-target occluders in slots ``[num_targets, ...)``.
+    ``hidden_object_mask`` marks hits that env sees but policy skips. In this path that
+    should only be future comet reserve slots; sun is not hidden and still occludes.
+    The reduction is sequential only over ticks: once a ray sees any event on a tick,
+    later ticks are ignored for that ray. Within a tick, lowest object index wins.
+    """
+
+    ticks, _, object_count = object_hits.shape
+    dtype = jnp.float32
+    iinf = jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32)
+    hidden_object_mask = hidden_object_mask.astype(jnp.bool_)
+
+    def body(tick_i, carry):
+        policy_done, policy_first_object, policy_first_tick, true_done, true_first_object, true_first_tick = carry
+        hits_t = object_hits[tick_i]
+
+        true_object_hits = hits_t & (~true_done[:, None])
+        any_true_object = jnp.any(true_object_hits, axis=1)
+        true_object_idx = jnp.argmax(true_object_hits.astype(jnp.int32), axis=1)
+        new_true = (~true_done) & any_true_object
+        true_first_object = jnp.where(new_true, true_object_idx, true_first_object)
+        true_first_tick = jnp.where(new_true, jnp.asarray(tick_i, dtype=jnp.int32), true_first_tick)
+        true_done = true_done | new_true
+
+        policy_effective_hits = hits_t & (~policy_done[:, None]) & (~hidden_object_mask[None, :])
+        any_policy_blocker = jnp.any(policy_effective_hits, axis=1)
+        policy_target_hits = policy_effective_hits[:, :num_targets]
+        any_policy_target = jnp.any(policy_target_hits, axis=1)
+        policy_object_idx = jnp.argmax(policy_target_hits.astype(jnp.int32), axis=1)
+        new_policy = (~policy_done) & any_policy_blocker
+        policy_first_object = jnp.where(new_policy & any_policy_target, policy_object_idx, policy_first_object)
+        policy_first_tick = jnp.where(new_policy, jnp.asarray(tick_i, dtype=jnp.int32), policy_first_tick)
+        policy_done = policy_done | new_policy
+        return (
+            policy_done,
+            policy_first_object,
+            policy_first_tick,
+            true_done,
+            true_first_object,
+            true_first_tick,
+        )
+
+    init = (
+        jnp.zeros((n_rays,), dtype=jnp.bool_),
+        jnp.full((n_rays,), -1, dtype=jnp.int32),
+        jnp.full((n_rays,), iinf, dtype=jnp.int32),
+        jnp.zeros((n_rays,), dtype=jnp.bool_),
+        jnp.full((n_rays,), -1, dtype=jnp.int32),
+        jnp.full((n_rays,), iinf, dtype=jnp.int32),
+    )
+    (
+        _policy_done,
+        policy_first_object,
+        policy_first_tick,
+        _true_done,
+        true_first_object,
+        true_first_tick,
+    ) = jax.lax.fori_loop(0, ticks, body, init)
+
+    kvec = jnp.arange(n_rays, dtype=dtype)
+    dtheta = TAU / jnp.asarray(float(n_rays), dtype=dtype)
+    theta = kvec * dtheta
+    jp = jnp.arange(num_targets, dtype=jnp.int32)
+    hit_any = policy_first_object >= 0
+    score_inf = jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32)
+    ray_idx = jnp.arange(n_rays, dtype=jnp.int32)
+    mask = hit_any[:, None] & (policy_first_object[:, None] == jp[None, :])
+    scores = jnp.where(
+        mask,
+        policy_first_tick[:, None] * jnp.asarray(n_rays + 1, dtype=jnp.int32) + ray_idx[:, None],
+        score_inf,
+    )
+    best_score = jnp.min(scores, axis=0)
+    best_ray = jnp.argmin(scores, axis=0).astype(jnp.int32)
+    valid = best_score < score_inf
+    angle = jnp.where(valid, _norm_angle(theta[best_ray]), jnp.asarray(0.0, dtype=dtype))
+    width = jnp.where(valid, dtheta, jnp.asarray(0.0, dtype=dtype))
+    hit_tick = jnp.where(valid, policy_first_tick[best_ray].astype(dtype), jnp.asarray(0.0, dtype=dtype))
+    true_planet = jnp.where(
+        valid & (true_first_object[best_ray] < num_targets),
+        true_first_object[best_ray],
+        jnp.asarray(-1, dtype=jnp.int32),
+    )
+    true_tick = jnp.where(
+        valid & (true_planet >= 0),
+        true_first_tick[best_ray].astype(dtype),
+        jnp.asarray(500.0, dtype=dtype),
+    )
+    overflow = jnp.asarray(False)
+    return angle, width, valid, overflow, hit_tick, true_planet, true_tick
 
 
 def _sweep_best_targets_from_precomputed_hits_jax(

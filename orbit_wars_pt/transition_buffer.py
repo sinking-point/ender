@@ -7,7 +7,8 @@ which planets are valid first-hit targets for the sampled origin/fraction), and
 ``target_hit_tick`` (the matching per-target ETA feature used by the target head).
 Canonical ``planets`` / ``fleets`` / ``fleet_active`` live in ``turn_state_cache`` per
 turn.  PPO gather replays a prefix with :func:`apply_prefix_micro_deltas_batched`
-(no scan over ``H_buf``).
+(no scan over ``H_buf``). Launch angle is intentionally not stored because the
+training rollout env schedules incoming mass by target/ETA metadata only.
 """
 
 from __future__ import annotations
@@ -36,7 +37,6 @@ class TransitionBuffer(NamedTuple):
 
     micro_halt_now: jnp.ndarray
     send: jnp.ndarray
-    angle: jnp.ndarray
     fleet_eta: jnp.ndarray
     slot: jnp.ndarray
     halt_action: jnp.ndarray
@@ -60,7 +60,6 @@ class TorchTransitionBuffer(NamedTuple):
 
     micro_halt_now: torch.Tensor
     send: torch.Tensor
-    angle: torch.Tensor
     fleet_eta: torch.Tensor
     slot: torch.Tensor
     halt_action: torch.Tensor
@@ -82,7 +81,6 @@ def init_transition_buffer(num_envs: int, H_buf: int, max_micro_steps: int) -> T
     return TransitionBuffer(
         micro_halt_now=noop_halt,
         send=jnp.zeros((H_buf, num_envs, m), dtype=jnp.float32),
-        angle=jnp.zeros((H_buf, num_envs, m), dtype=jnp.float32),
         fleet_eta=jnp.zeros((H_buf, num_envs, m), dtype=jnp.float32),
         slot=jnp.full((H_buf, num_envs, m), -1, dtype=jnp.int32),
         halt_action=jnp.zeros((H_buf, num_envs), dtype=jnp.int32),
@@ -110,7 +108,6 @@ def init_torch_transition_buffer(
     return TorchTransitionBuffer(
         micro_halt_now=torch.ones((H_buf, num_envs, m), dtype=torch.bool, device=device),
         send=torch.zeros((H_buf, num_envs, m), dtype=torch.float32, device=device),
-        angle=torch.zeros((H_buf, num_envs, m), dtype=torch.float32, device=device),
         fleet_eta=torch.zeros((H_buf, num_envs, m), dtype=torch.float32, device=device),
         slot=torch.full((H_buf, num_envs, m), -1, dtype=torch.int32, device=device),
         halt_action=torch.zeros((H_buf, num_envs), dtype=torch.int32, device=device),
@@ -130,7 +127,6 @@ def append_to_torch_buffer(
     buf: TorchTransitionBuffer,
     micro_halt_now: torch.Tensor,
     send_now: torch.Tensor,
-    angle_now: torch.Tensor,
     fleet_eta_now: torch.Tensor,
     slot_now: torch.Tensor,
     halt_action: torch.Tensor,
@@ -184,7 +180,6 @@ def append_to_torch_buffer(
 
     new_halt = _grow(buf.micro_halt_now, micro_halt_now, True)
     new_send = _grow(buf.send, send_now, 0.0)
-    new_angle = _grow(buf.angle, angle_now, 0.0)
     new_fleet_eta = _grow(buf.fleet_eta, fleet_eta_now, 0.0)
     new_slot = _grow(buf.slot, slot_now, -1)
     new_pf = _grow(buf.pair_flat, pair_flat, 0)
@@ -194,7 +189,6 @@ def append_to_torch_buffer(
     row = wr[active_b]
     buf.micro_halt_now[row, env, :] = new_halt[active_b]
     buf.send[row, env, :] = new_send[active_b]
-    buf.angle[row, env, :] = new_angle[active_b]
     buf.fleet_eta[row, env, :] = new_fleet_eta[active_b]
     buf.slot[row, env, :] = new_slot[active_b]
     buf.pair_flat[row, env, :] = new_pf[active_b]
@@ -215,7 +209,6 @@ def append_active_to_torch_buffer(
     env_idx: torch.Tensor,
     micro_halt_now: torch.Tensor,
     send_now: torch.Tensor,
-    angle_now: torch.Tensor,
     fleet_eta_now: torch.Tensor,
     slot_now: torch.Tensor,
     halt_action: torch.Tensor,
@@ -266,7 +259,6 @@ def append_active_to_torch_buffer(
 
     new_halt = _grow(buf.micro_halt_now, micro_halt_now, True)
     new_send = _grow(buf.send, send_now, 0.0)
-    new_angle = _grow(buf.angle, angle_now, 0.0)
     new_fleet_eta = _grow(buf.fleet_eta, fleet_eta_now, 0.0)
     new_slot = _grow(buf.slot, slot_now, -1)
     new_pf = _grow(buf.pair_flat, pair_flat, 0)
@@ -274,7 +266,6 @@ def append_active_to_torch_buffer(
 
     buf.micro_halt_now[row, env, :] = new_halt
     buf.send[row, env, :] = new_send
-    buf.angle[row, env, :] = new_angle
     buf.fleet_eta[row, env, :] = new_fleet_eta
     buf.slot[row, env, :] = new_slot
     buf.pair_flat[row, env, :] = new_pf
@@ -294,7 +285,6 @@ def _noop_prefix_planes(num_envs: int, max_micro_steps: int):
     return (
         jnp.ones((num_envs, m), dtype=jnp.bool_),
         jnp.zeros((num_envs, m), dtype=jnp.float32),
-        jnp.zeros((num_envs, m), dtype=jnp.float32),
         jnp.full((num_envs, m), -1, dtype=jnp.int32),
         jnp.zeros((num_envs, m), dtype=jnp.int32),
         jnp.zeros((num_envs, m), dtype=jnp.int32),
@@ -306,7 +296,6 @@ def append_to_buffer(
     buf: TransitionBuffer,
     micro_halt_now,
     send_now,
-    angle_now,
     fleet_eta_now,
     slot_now,
     halt_action,
@@ -325,7 +314,7 @@ def append_to_buffer(
     """Write one transition per env at ``write_row[n]``, extending the in-phase prefix at slot ``micro_k[n]``."""
 
     n_idx = jnp.arange(write_row.shape[0], dtype=jnp.int32)
-    noop_h, noop_s, noop_a, noop_sl, noop_pf, noop_fi = _noop_prefix_planes(write_row.shape[0], max_micro_steps)
+    noop_h, noop_s, noop_sl, noop_pf, noop_fi = _noop_prefix_planes(write_row.shape[0], max_micro_steps)
 
     prev_row = jnp.where(micro_k > 0, write_row - 1, -1)
     safe_prev = jnp.maximum(prev_row, 0)
@@ -337,8 +326,7 @@ def append_to_buffer(
 
     new_halt = _grow(buf.micro_halt_now, micro_halt_now.astype(jnp.bool_), noop_h)
     new_send = _grow(buf.send, send_now.astype(jnp.float32), noop_s)
-    new_angle = _grow(buf.angle, angle_now.astype(jnp.float32), noop_a)
-    new_fleet_eta = _grow(buf.fleet_eta, fleet_eta_now.astype(jnp.float32), noop_a)
+    new_fleet_eta = _grow(buf.fleet_eta, fleet_eta_now.astype(jnp.float32), noop_s)
     new_slot = _grow(buf.slot, slot_now.astype(jnp.int32), noop_sl)
     new_pf = _grow(buf.pair_flat, pair_flat.astype(jnp.int32), noop_pf)
     new_fi = _grow(buf.frac_idx, frac_idx.astype(jnp.int32), noop_fi)
@@ -350,7 +338,6 @@ def append_to_buffer(
 
     out_halt = _scatter_rows(buf.micro_halt_now, new_halt)
     out_send = _scatter_rows(buf.send, new_send)
-    out_angle = _scatter_rows(buf.angle, new_angle)
     out_fleet_eta = _scatter_rows(buf.fleet_eta, new_fleet_eta)
     out_slot = _scatter_rows(buf.slot, new_slot)
     out_pf = _scatter_rows(buf.pair_flat, new_pf)
@@ -372,7 +359,6 @@ def append_to_buffer(
     return TransitionBuffer(
         micro_halt_now=out_halt,
         send=out_send,
-        angle=out_angle,
         fleet_eta=out_fleet_eta,
         slot=out_slot,
         halt_action=out_ha,
@@ -428,7 +414,6 @@ def gather_minibatch(
 
     halt_m = _gp(buf0.micro_halt_now, buf1.micro_halt_now)
     send_m = _gp(buf0.send, buf1.send)
-    angle_m = _gp(buf0.angle, buf1.angle)
     fleet_eta_m = _gp(buf0.fleet_eta, buf1.fleet_eta)
     slot_m = _gp(buf0.slot, buf1.slot)
     pf_m = _gp(buf0.pair_flat, buf1.pair_flat)
@@ -443,7 +428,6 @@ def gather_minibatch(
         slot_m,
         pf_m,
         fi_m,
-        angle_m,
         fleet_eta_m,
         apply_mask_m,
     )
@@ -492,7 +476,6 @@ def gather_minibatch_selected(
     max_micro_steps: int,
     micro_halt_now_m: jnp.ndarray,
     send_m: jnp.ndarray,
-    angle_m: jnp.ndarray,
     fleet_eta_m: jnp.ndarray,
     slot_m: jnp.ndarray,
     halt_action: jnp.ndarray,
@@ -524,7 +507,6 @@ def gather_minibatch_selected(
         slot_m,
         pair_flat_m,
         frac_idx_m,
-        angle_m,
         fleet_eta_m,
         apply_mask_m,
     )

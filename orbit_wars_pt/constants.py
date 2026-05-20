@@ -7,6 +7,11 @@ ROTATION_RADIUS_LIMIT = 50.0
 
 MAX_PLANETS = 60  # MAX_BASE_PLANETS + MAX_COMETS in jax
 
+# Tangent geometry: peak moving bodies (orbiting + comets) and overlap windows per horizon.
+MAX_MOVING_TARGETS = 32
+MAX_POLYLINE_TANGENCY_HITS = 4
+MAX_POLYLINE_INTERSECTION_WINDOWS = 2
+
 # Incoming-fleet countdown bins stored directly on each planet token.
 # Dispatch geometry only allows hits inside this horizon.
 INCOMING_TA_BINS = 24

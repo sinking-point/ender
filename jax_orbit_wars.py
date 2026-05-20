@@ -87,17 +87,17 @@ class OrbitWarsState(NamedTuple):
 
 
 def empty_actions(num_agents: int = 2, max_actions: int = DEFAULT_MAX_ACTIONS) -> jnp.ndarray:
-    """Returns a no-op action tensor shaped [num_agents, max_actions, 6].
+    """Returns a no-op metadata action tensor shaped [num_agents, max_actions, 6].
 
-    Columns are ``from_id, angle, ships, true_target, hit_tick, policy_target``.
-    ``policy_target`` defaults to ``-1`` (use ``true_target`` only). The metadata
-    columns are ignored for no-op rows.
+    Columns are ``from_id, ships, true_target, true_eta, policy_target, policy_eta``.
+    The metadata columns are ignored for no-op rows.
     """
 
     actions = jnp.zeros((num_agents, max_actions, 6), dtype=jnp.float32)
-    actions = actions.at[..., 3].set(-1.0)
-    actions = actions.at[..., 4].set(500.0)
-    actions = actions.at[..., 5].set(-1.0)
+    actions = actions.at[..., 2].set(-1.0)
+    actions = actions.at[..., 3].set(500.0)
+    actions = actions.at[..., 4].set(-1.0)
+    actions = actions.at[..., 5].set(500.0)
     return actions
 
 
@@ -366,6 +366,12 @@ def _launch_fleets(state: OrbitWarsState, actions: jnp.ndarray) -> OrbitWarsStat
     Callers are assumed never to submit an infeasible **total** outflow from a
     source planet in one turn (same assumption as trusting sequential order
     without redundant cross-checks).
+
+    Supported action layouts:
+    * ``[from_id, angle, ships]`` or ``[..., true_target, true_eta, policy_target, policy_eta]``
+      for legacy / explicit-angle callers.
+    * ``[from_id, ships, true_target, true_eta, policy_target, policy_eta]`` for
+      rollout metadata launches where angle is intentionally omitted.
     """
 
     actions = jnp.asarray(actions, dtype=jnp.float32)
@@ -376,21 +382,28 @@ def _launch_fleets(state: OrbitWarsState, actions: jnp.ndarray) -> OrbitWarsStat
 
     aflat = actions.reshape((total_actions,) + tuple(actions.shape[2:]))
     from_id = aflat[:, 0]
-    ships_raw = aflat[:, 2]
-    if actions.shape[-1] >= 5:
-        target_planet = aflat[:, 3]
-        eta = aflat[:, 4]
+    if actions.shape[-1] == 6:
+        ships_raw = aflat[:, 1]
+        target_planet = aflat[:, 2]
+        eta = aflat[:, 3]
+        policy_planet = aflat[:, 4]
+        policy_eta = aflat[:, 5]
     else:
-        target_planet = jnp.full((total_actions,), -1.0, dtype=jnp.float32)
-        eta = jnp.full((total_actions,), 500.0, dtype=jnp.float32)
-    if actions.shape[-1] >= 6:
-        policy_planet = aflat[:, 5]
-    else:
-        policy_planet = target_planet
-    if actions.shape[-1] >= 7:
-        policy_eta = aflat[:, 6]
-    else:
-        policy_eta = eta
+        ships_raw = aflat[:, 2]
+        if actions.shape[-1] >= 5:
+            target_planet = aflat[:, 3]
+            eta = aflat[:, 4]
+        else:
+            target_planet = jnp.full((total_actions,), -1.0, dtype=jnp.float32)
+            eta = jnp.full((total_actions,), 500.0, dtype=jnp.float32)
+        if actions.shape[-1] >= 6:
+            policy_planet = aflat[:, 5]
+        else:
+            policy_planet = target_planet
+        if actions.shape[-1] >= 7:
+            policy_eta = aflat[:, 6]
+        else:
+            policy_eta = eta
 
     flat = jnp.arange(total_actions, dtype=jnp.int32)
     player = flat // max_actions
@@ -506,11 +519,15 @@ def _planet_paths(state: OrbitWarsState):
             in_path = active & (idx < length)
             path_pos = state.comet_paths[group_idx, comet_idx, jnp.maximum(idx, 0)]
             first_placement = state.planets[safe_slot, PLANET_X] < 0.0
-            new_pos = new_pos.at[safe_slot].set(jnp.where(in_path, path_pos, new_pos[safe_slot]))
+            new_pos = new_pos.at[safe_slot].set(
+                jnp.where(active, jnp.where(in_path, path_pos, new_pos[safe_slot]), new_pos[safe_slot])
+            )
             check = active & (~first_placement | expired)
-            check_collision = check_collision.at[safe_slot].set(check)
+            check_collision = check_collision.at[safe_slot].set(
+                jnp.where(active, check, check_collision[safe_slot])
+            )
             expired_after_move = expired_after_move.at[safe_slot].set(
-                expired | expired_after_move[safe_slot]
+                jnp.where(active, expired | expired_after_move[safe_slot], expired_after_move[safe_slot])
             )
             return (new_pos, check_collision, expired_after_move), None
 
@@ -625,8 +642,12 @@ def step(
 ) -> OrbitWarsState:
     """Runs one Orbit Wars turn.
 
-    `actions` is shaped `[num_agents, max_actions, 3]` with rows
-    `[from_planet_id, direction_angle, num_ships]`. Zero rows are no-ops.
+    `actions` may be either:
+    * `[num_agents, max_actions, 3]` with rows `[from_planet_id, direction_angle, num_ships]`
+    * `[num_agents, max_actions, 6]` with rollout metadata rows
+      `[from_planet_id, num_ships, true_target, true_eta, policy_target, policy_eta]`
+
+    Zero rows are no-ops.
     """
 
     def do_step(s):
