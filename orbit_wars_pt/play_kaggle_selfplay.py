@@ -57,6 +57,36 @@ def main() -> None:
         help="Inference device for the adapter. Default is cpu for local Kaggle-env runs.",
     )
     parser.add_argument(
+        "--member",
+        type=int,
+        default=None,
+        help="Population member used by all seats unless overridden by --member-p0 / --member-p1 / --member-p2 / --member-p3.",
+    )
+    parser.add_argument(
+        "--member-p0",
+        type=int,
+        default=None,
+        help="Population member for player 0. Default: same as --member.",
+    )
+    parser.add_argument(
+        "--member-p1",
+        type=int,
+        default=None,
+        help="Population member for player 1. Default: same as --member.",
+    )
+    parser.add_argument(
+        "--member-p2",
+        type=int,
+        default=None,
+        help="Population member for player 2 in 4-player mode. Default: same as --member.",
+    )
+    parser.add_argument(
+        "--member-p3",
+        type=int,
+        default=None,
+        help="Population member for player 3 in 4-player mode. Default: same as --member.",
+    )
+    parser.add_argument(
         "--greedy",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -177,6 +207,25 @@ def main() -> None:
 
     os.environ["ORBIT_WARS_CHECKPOINT"] = str(Path(args.checkpoint).expanduser())
     os.environ["ORBIT_WARS_DEVICE"] = str(args.device)
+    if args.member is not None:
+        os.environ["ORBIT_WARS_MEMBER"] = str(int(args.member))
+    else:
+        os.environ.pop("ORBIT_WARS_MEMBER", None)
+    member_p0 = args.member if args.member_p0 is None else args.member_p0
+    member_p1 = args.member if args.member_p1 is None else args.member_p1
+    member_p2 = args.member if args.member_p2 is None else args.member_p2
+    member_p3 = args.member if args.member_p3 is None else args.member_p3
+    member_env = {
+        "ORBIT_WARS_MEMBER_P0": member_p0,
+        "ORBIT_WARS_MEMBER_P1": member_p1,
+        "ORBIT_WARS_MEMBER_P2": member_p2,
+        "ORBIT_WARS_MEMBER_P3": member_p3,
+    }
+    for key, value in member_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = str(int(value))
     greedy_p0 = args.greedy if args.greedy_p0 is None else args.greedy_p0
     greedy_p1 = args.greedy if args.greedy_p1 is None else args.greedy_p1
     greedy_p2 = args.greedy if args.greedy_p2 is None else args.greedy_p2

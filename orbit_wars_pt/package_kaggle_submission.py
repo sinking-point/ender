@@ -94,12 +94,62 @@ def _slim_checkpoint_payload(payload: Any) -> dict[str, Any]:
     return slim
 
 
-def _write_slim_checkpoint(src: Path, dest: Path) -> None:
+def _collapse_population_members(
+    payload: dict[str, Any],
+    *,
+    keep_member: int | None,
+) -> dict[str, Any]:
+    """Alias all population tail tensors to one selected member for smaller serialization."""
+
+    if keep_member is None:
+        return payload
+    policy_state = payload.get("policy")
+    if not isinstance(policy_state, dict):
+        return payload
+    training_args = payload.get("training_args", {})
+    population_size = int(training_args.get("population_size", 1)) if isinstance(training_args, dict) else 1
+    if population_size <= 1:
+        return payload
+    selected = int(keep_member)
+    if selected < 0 or selected >= population_size:
+        raise ValueError(
+            f"population member {selected} out of range for population_size={population_size}"
+        )
+
+    remapped: dict[str, Any] = dict(policy_state)
+    prefix = f"population_tails.{selected}."
+    selected_keys = {
+        key[len(prefix) :]: value
+        for key, value in policy_state.items()
+        if key.startswith(prefix)
+    }
+    if not selected_keys:
+        raise ValueError(f"Selected population member {selected} not present in checkpoint policy state")
+
+    for member in range(population_size):
+        member_prefix = f"population_tails.{member}."
+        if member == selected:
+            continue
+        for suffix, value in selected_keys.items():
+            key = member_prefix + suffix
+            if key in policy_state:
+                remapped[key] = value
+
+    out = dict(payload)
+    out["policy"] = remapped
+    return out
+
+
+def _write_checkpoint(src: Path, dest: Path, *, slim: bool, keep_member: int | None = None) -> None:
     try:
         payload = torch.load(src, map_location="cpu", weights_only=False)
     except TypeError:
         payload = torch.load(src, map_location="cpu")
-    torch.save(_slim_checkpoint_payload(payload), dest)
+    payload_out = _slim_checkpoint_payload(payload) if slim else payload
+    if not isinstance(payload_out, dict):
+        raise ValueError("Expected checkpoint payload to be a dict after loading")
+    payload_out = _collapse_population_members(payload_out, keep_member=keep_member)
+    torch.save(payload_out, dest)
 
 
 def _copy_inference_package(dest_pkg: Path, *, source_pkg: Path) -> None:
@@ -142,6 +192,9 @@ def package_submission(
     slim: bool = True,
     target_method: str | None = None,
     interval_geometry: str | None = None,
+    population_member: int | None = None,
+    population_member_4p: int | None = None,
+    population_member_2p: int | None = None,
 ) -> Path:
     """Write a submission bundle directory; return its path."""
 
@@ -160,14 +213,32 @@ def package_submission(
         shutil.rmtree(bundle_dir)
     bundle_dir.mkdir(parents=True)
 
-    if slim:
-        _write_slim_checkpoint(checkpoint_4p, bundle_dir / "checkpoint_4p.pt")
-        _write_slim_checkpoint(checkpoint_2p, bundle_dir / "checkpoint_2p.pt")
+    keep_member_4p = population_member if population_member_4p is None else population_member_4p
+    keep_member_2p = population_member if population_member_2p is None else population_member_2p
+    if slim or keep_member_4p is not None or keep_member_2p is not None:
+        _write_checkpoint(
+            checkpoint_4p,
+            bundle_dir / "checkpoint_4p.pt",
+            slim=slim,
+            keep_member=keep_member_4p,
+        )
+        _write_checkpoint(
+            checkpoint_2p,
+            bundle_dir / "checkpoint_2p.pt",
+            slim=slim,
+            keep_member=keep_member_2p,
+        )
     else:
         shutil.copy2(checkpoint_4p, bundle_dir / "checkpoint_4p.pt")
         shutil.copy2(checkpoint_2p, bundle_dir / "checkpoint_2p.pt")
     _copy_inference_package(bundle_dir / "orbit_wars_pt", source_pkg=source_pkg)
     submission_env = dict(extra_env or {})
+    if population_member is not None:
+        submission_env["ORBIT_WARS_MEMBER"] = str(int(population_member))
+    if population_member_4p is not None:
+        submission_env["ORBIT_WARS_MEMBER_4P"] = str(int(population_member_4p))
+    if population_member_2p is not None:
+        submission_env["ORBIT_WARS_MEMBER_2P"] = str(int(population_member_2p))
     if target_method is not None:
         submission_env["ORBIT_WARS_TARGET_METHOD"] = str(target_method)
     if interval_geometry is not None:
@@ -189,6 +260,9 @@ def package_submission(
         2-player checkpoint: {checkpoint_2p.name} (copied to checkpoint_2p.pt)
         Greedy: {greedy}
         Device: {device}
+        Population member (fallback): {population_member if population_member is not None else 'member 0 / checkpoint default'}
+        Population member 4p: {population_member_4p if population_member_4p is not None else (population_member if population_member is not None else 'member 0 / checkpoint default')}
+        Population member 2p: {population_member_2p if population_member_2p is not None else (population_member if population_member is not None else 'member 0 / checkpoint default')}
         Target method: {target_method or 'checkpoint/default'}
         Interval geometry: {interval_geometry or 'checkpoint/default'}
 
@@ -253,6 +327,24 @@ def main() -> None:
         help="Torch device written into main.py (default: cpu for Kaggle).",
     )
     parser.add_argument(
+        "--member",
+        type=int,
+        default=None,
+        help="Bake ORBIT_WARS_MEMBER into main.py as the fallback population member for both checkpoints.",
+    )
+    parser.add_argument(
+        "--member-4p",
+        type=int,
+        default=None,
+        help="Bake ORBIT_WARS_MEMBER_4P into main.py for the 4-player checkpoint. Defaults to --member if set.",
+    )
+    parser.add_argument(
+        "--member-2p",
+        type=int,
+        default=None,
+        help="Bake ORBIT_WARS_MEMBER_2P into main.py for the 2-player checkpoint. Defaults to --member if set.",
+    )
+    parser.add_argument(
         "--target-method",
         choices=("rays", "interval"),
         default=None,
@@ -292,6 +384,9 @@ def main() -> None:
         slim=not args.no_slim,
         target_method=args.target_method,
         interval_geometry=args.interval_geometry,
+        population_member=args.member,
+        population_member_4p=args.member if args.member_4p is None else args.member_4p,
+        population_member_2p=args.member if args.member_2p is None else args.member_2p,
     )
 
     bundle_dir, archive_path = _submission_paths(args.out.expanduser().resolve())

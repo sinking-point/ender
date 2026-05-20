@@ -2730,6 +2730,7 @@ def _build_turn_actions_torch_only(
     normalize_obs_to_p0: bool = False,
     launch_geometry: LaunchGeometryInputs | None = None,
     deadline_s: float | None = None,
+    population_member: Optional[int] = None,
 ) -> list[list[float]]:
     planets = np.array(np.asarray(state.planets), copy=True)
     incoming_fleets = np.array(np.asarray(state.incoming_fleets), copy=True)
@@ -2755,7 +2756,10 @@ def _build_turn_actions_torch_only(
             timing.micro_obs_tensors_s += perf_counter() - t0
 
         t0 = perf_counter()
-        out = policy(**batch)
+        population_idx = None
+        if population_member is not None:
+            population_idx = torch.tensor([int(population_member)], device=device, dtype=torch.long)
+        out = policy(**batch, population_idx=population_idx)
         if timing is not None:
             timing.micro_policy_forward_s += perf_counter() - t0
 
@@ -2823,6 +2827,7 @@ def _build_turn_actions_torch_only(
             ),
             target_eta=torch.from_numpy(ray_hit_tick[None, :]).to(device=device, dtype=torch.float32),
             target_ships=torch.from_numpy(planets[None, :, 5]).to(device=device, dtype=torch.float32),
+            population_idx=population_idx,
         )[0]
         target_mask = out["pair_mask"][0, o_idx].clone()
         ray_valid_t = torch.from_numpy(ray_valid).to(device=device, dtype=torch.bool)
@@ -3208,6 +3213,7 @@ class KaggleOrbitWarsAgent:
         *,
         device: Optional[str | torch.device] = None,
         greedy: bool | Mapping[int, bool] = False,
+        population_member: Optional[int | Mapping[int, int]] = None,
         max_micro_steps: Optional[int] = None,
         max_fleets: int = 512,
         seed: Optional[int] = None,
@@ -3218,6 +3224,12 @@ class KaggleOrbitWarsAgent:
         _configure_cpu_threads()
         self.checkpoint_path = resolve_checkpoint_path(checkpoint_path)
         self.policy, self.device, training_args = load_policy(self.checkpoint_path, device=device)
+        self.population_size = int(training_args.get("population_size", 1))
+        self._population_member_by_player = _normalize_population_members(
+            population_member,
+            population_size=self.population_size,
+            context="single",
+        )
         self.normalize_obs_to_p0 = bool(training_args.get("normalize_obs_to_p0", False))
         self._greedy_by_player = _normalize_greedy(greedy)
         self.max_micro_steps = int(
@@ -3262,6 +3274,11 @@ class KaggleOrbitWarsAgent:
             warn_forecast_mismatch=_warn_forecast_mismatch_enabled(),
             warn_unmatched_fleet=_warn_unmatched_fleet_enabled(),
         )
+
+    def _population_member_for_player(self, player: int) -> Optional[int]:
+        if self.population_size <= 1:
+            return None
+        return int(self._population_member_by_player.get(int(player), self._population_member_by_player[-1]))
 
     def _obs_game_key(self, obs: Mapping[str, Any]) -> str:
         """Stable per-episode id.
@@ -3394,6 +3411,7 @@ class KaggleOrbitWarsAgent:
             game_step=step_count,
             normalize_obs_to_p0=self.normalize_obs_to_p0,
             launch_geometry=launch_geometry,
+            population_member=self._population_member_for_player(ego_player),
             deadline_s=(
                 call_t0 + max(0.0, float(_cfg_get(config, "actTimeout", 1.0)) - 0.1)
                 if _cfg_get(config, "actTimeout", None) is not None
@@ -3427,6 +3445,8 @@ class KaggleOrbitWarsDualPolicyAgent:
         *,
         device: Optional[str | torch.device] = None,
         greedy: bool | Mapping[int, bool] = False,
+        population_member_4p: Optional[int] = None,
+        population_member_2p: Optional[int] = None,
         max_micro_steps: Optional[int] = None,
         max_fleets: int = 512,
         seed: Optional[int] = None,
@@ -3439,6 +3459,18 @@ class KaggleOrbitWarsDualPolicyAgent:
         self.checkpoint_2p = resolve_checkpoint_path(checkpoint_2p)
         self.policy_4p, self.device, training_args_4p = load_policy(self.checkpoint_4p, device=device)
         self.policy_2p, _, training_args_2p = load_policy(self.checkpoint_2p, device=self.device)
+        self.population_size_4p = int(training_args_4p.get("population_size", 1))
+        self.population_size_2p = int(training_args_2p.get("population_size", 1))
+        self.population_member_4p = _normalize_population_member(
+            population_member_4p,
+            population_size=self.population_size_4p,
+            context="dual:4p",
+        )
+        self.population_member_2p = _normalize_population_member(
+            population_member_2p,
+            population_size=self.population_size_2p,
+            context="dual:2p",
+        )
         self.normalize_obs_to_p0_4p = bool(training_args_4p.get("normalize_obs_to_p0", False))
         self.normalize_obs_to_p0_2p = bool(training_args_2p.get("normalize_obs_to_p0", False))
         self._greedy_by_player = _normalize_greedy(greedy)
@@ -3615,6 +3647,7 @@ class KaggleOrbitWarsDualPolicyAgent:
             policy_player_count=policy_player_count,
             normalize_obs_to_p0=normalize_obs_to_p0,
             launch_geometry=launch_geometry,
+            population_member=self.population_member_4p if use_4p_policy else self.population_member_2p,
             deadline_s=(
                 call_t0 + max(0.0, float(_cfg_get(config, "actTimeout", 1.0)) - 0.1)
                 if _cfg_get(config, "actTimeout", None) is not None
@@ -3643,6 +3676,16 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str) -> Optional[int]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    return int(raw)
+
+
 def _normalize_greedy(greedy: bool | Mapping[int, bool]) -> dict[int, bool]:
     if isinstance(greedy, Mapping):
         out = {0: False, 1: False}
@@ -3662,6 +3705,79 @@ def _greedy_from_env() -> bool | dict[int, bool]:
             for i in range(4)
         }
     return _env_bool("ORBIT_WARS_GREEDY", False)
+
+
+def _normalize_population_member(
+    member: Optional[int],
+    *,
+    population_size: int,
+    context: str,
+) -> Optional[int]:
+    if population_size <= 1:
+        return None
+    selected = 0 if member is None else int(member)
+    if selected < 0 or selected >= population_size:
+        raise ValueError(
+            f"{context}: population member {selected} out of range for population_size={population_size}"
+        )
+    return selected
+
+
+def _normalize_population_members(
+    members: Optional[int | Mapping[int, int]],
+    *,
+    population_size: int,
+    context: str,
+) -> dict[int, int]:
+    if population_size <= 1:
+        return {}
+    fallback = 0
+    out: dict[int, int] = {}
+    if isinstance(members, Mapping):
+        if -1 in members:
+            fallback = int(members[-1])
+        for player, member in members.items():
+            if int(player) == -1:
+                continue
+            out[int(player)] = _normalize_population_member(
+                int(member),
+                population_size=population_size,
+                context=f"{context}:player{int(player)}",
+            )
+    elif members is not None:
+        fallback = int(members)
+    fallback = _normalize_population_member(
+        fallback,
+        population_size=population_size,
+        context=context,
+    )
+    out[-1] = 0 if fallback is None else int(fallback)
+    return out
+
+
+def _population_members_single_from_env() -> Optional[int | dict[int, int]]:
+    fallback = _env_int("ORBIT_WARS_MEMBER")
+    per_player = [f"ORBIT_WARS_MEMBER_P{i}" in os.environ for i in range(4)]
+    if any(per_player):
+        out: dict[int, int] = {}
+        if fallback is not None:
+            out[-1] = int(fallback)
+        for i in range(4):
+            value = _env_int(f"ORBIT_WARS_MEMBER_P{i}")
+            if value is not None:
+                out[i] = int(value)
+        return out
+    return fallback
+
+
+def _population_members_dual_from_env() -> tuple[Optional[int], Optional[int]]:
+    fallback = _env_int("ORBIT_WARS_MEMBER")
+    member_4p = _env_int("ORBIT_WARS_MEMBER_4P")
+    member_2p = _env_int("ORBIT_WARS_MEMBER_2P")
+    return (
+        fallback if member_4p is None else int(member_4p),
+        fallback if member_2p is None else int(member_2p),
+    )
 
 
 _AGENT: Optional[KaggleOrbitWarsAgent | KaggleOrbitWarsDualPolicyAgent] = None
@@ -3697,6 +3813,8 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
     if _AGENT is None:
         device = os.environ.get("ORBIT_WARS_DEVICE")
         greedy = _greedy_from_env()
+        population_members = _population_members_single_from_env()
+        population_member_4p, population_member_2p = _population_members_dual_from_env()
         seed_raw = os.environ.get("ORBIT_WARS_AGENT_SEED")
         seed = int(seed_raw) if seed_raw is not None else None
         rays_raw = os.environ.get("ORBIT_WARS_RAYCAST_RAYS")
@@ -3715,6 +3833,8 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
                     resolve_checkpoint_path(ckpt_2p),
                     device=device,
                     greedy=greedy,
+                    population_member_4p=population_member_4p,
+                    population_member_2p=population_member_2p,
                     max_micro_steps=max_micro_steps,
                     seed=seed,
                     raycast_rays=rays,
@@ -3729,6 +3849,7 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
                     ckpt,
                     device=device,
                     greedy=greedy,
+                    population_member=population_members,
                     max_micro_steps=max_micro_steps,
                     seed=seed,
                     raycast_rays=rays,
