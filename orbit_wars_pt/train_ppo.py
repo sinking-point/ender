@@ -32,7 +32,7 @@ import jax.numpy as jnp
 
 from orbit_wars_pt.batched_env import heal_terminal_env_slices
 from orbit_wars_pt.env_wrapper import OrbitWarsEnvConfig
-from orbit_wars_pt.constants import obs_feature_dim_for_num_agents
+from orbit_wars_pt.constants import FEATURE_DIM, INCOMING_TA_BINS, MAX_PLANETS, obs_feature_dim_for_num_agents
 from orbit_wars_pt.gpu_mem import (
     log_cuda_mem,
     print_cuda_memory_summary,
@@ -49,10 +49,16 @@ from orbit_wars_pt.parallel_rollout import (
     collect_parallel_micro_rollouts,
 )
 from orbit_wars_pt.reset_prefetch import RolloutResetPrefetch
-from orbit_wars_pt.ppo_replay import compute_ppo_loss_torch
+from orbit_wars_pt.ppo_replay import compute_ppo_loss_compressed_torch, compute_ppo_loss_torch
 from orbit_wars_pt.transition_buffer import TorchTransitionBuffer
-from orbit_wars_pt.torch_replay import select_stored_observation_minibatch_torch
-from orbit_wars_pt.compressed_observation import compressed_observation_to_host
+from orbit_wars_pt.torch_replay import (
+    select_stored_compressed_minibatch_torch,
+    select_stored_observation_minibatch_torch,
+)
+from orbit_wars_pt.compressed_observation import (
+    CompressedObservationBuffer,
+    compressed_observation_to_host,
+)
 
 from jax_orbit_wars import OrbitWarsState
 
@@ -65,6 +71,18 @@ class HostRolloutChunk:
 
     segment: RolloutSegment
     samples: dict
+
+
+@dataclass
+class HostReplayMemberStore:
+    """Flattened host-side PPO replay for one population member."""
+
+    obs: CompressedObservationBuffer
+    actions: dict[str, torch.Tensor]
+    advantages: torch.Tensor
+    returns: torch.Tensor
+    old_logprob: torch.Tensor
+    old_value: torch.Tensor
 
 
 def _sanitize_experiment_name(name: str) -> str:
@@ -539,7 +557,19 @@ def normalize_advantages(samples: dict) -> None:
     a = samples["advantages"]
     if a.size == 0:
         return
-    samples["advantages"] = ((a - a.mean()) / (a.std() + 1e-8)).astype(np.float32)
+    pop_idx = samples.get("population_idx", None)
+    if pop_idx is None:
+        samples["advantages"] = ((a - a.mean()) / (a.std() + 1e-8)).astype(np.float32)
+        return
+    out = a.astype(np.float32, copy=True)
+    pop_idx = np.asarray(pop_idx, dtype=np.int32)
+    for member in np.unique(pop_idx):
+        mask = pop_idx == int(member)
+        if not np.any(mask):
+            continue
+        vals = a[mask]
+        out[mask] = ((vals - vals.mean()) / (vals.std() + 1e-8)).astype(np.float32)
+    samples["advantages"] = out
 
 
 def _torch_buffer_to_host(buf: TorchTransitionBuffer) -> TorchTransitionBuffer:
@@ -591,10 +621,161 @@ def _concat_sample_dicts(sample_dicts: list[dict]) -> dict:
 
 def _normalize_chunk_advantages(chunks: list[HostRolloutChunk]) -> None:
     adv = np.concatenate([c.samples["advantages"] for c in chunks])
-    mean = float(adv.mean())
-    std = float(adv.std()) + 1e-8
+    pop = np.concatenate([c.samples["population_idx"] for c in chunks]).astype(np.int32)
+    out = adv.astype(np.float32, copy=True)
+    for member in np.unique(pop):
+        mask = pop == int(member)
+        if not np.any(mask):
+            continue
+        vals = adv[mask]
+        out[mask] = ((vals - vals.mean()) / (vals.std() + 1e-8)).astype(np.float32)
+    offset = 0
     for chunk in chunks:
-        chunk.samples["advantages"] = ((chunk.samples["advantages"] - mean) / std).astype(np.float32)
+        size = int(chunk.samples["advantages"].shape[0])
+        chunk.samples["advantages"] = out[offset : offset + size].astype(np.float32)
+        offset += size
+
+
+def _stratified_population_minibatches(
+    population_idx: np.ndarray,
+    minibatch_size: int,
+    population_size: int,
+    rnd: np.random.Generator,
+) -> list[np.ndarray]:
+    pop_idx = np.asarray(population_idx, dtype=np.int32).reshape(-1)
+    n = int(pop_idx.shape[0])
+    if n == 0:
+        return []
+    if int(population_size) <= 1:
+        idx = np.arange(n, dtype=np.int32)
+        rnd.shuffle(idx)
+        return [idx[start : start + minibatch_size] for start in range(0, n, minibatch_size)]
+
+    n_batches = max(1, int(np.ceil(float(n) / float(max(1, minibatch_size)))))
+    per_batch: list[list[np.ndarray]] = [[] for _ in range(n_batches)]
+    for member in range(int(population_size)):
+        member_idx = np.flatnonzero(pop_idx == member).astype(np.int32)
+        rnd.shuffle(member_idx)
+        count = int(member_idx.shape[0])
+        base = count // n_batches
+        rem = count % n_batches
+        start = 0
+        for batch_i in range(n_batches):
+            take = base + (1 if batch_i < rem else 0)
+            if take > 0:
+                per_batch[batch_i].append(member_idx[start : start + take])
+                start += take
+    out: list[np.ndarray] = []
+    for parts in per_batch:
+        if not parts:
+            continue
+        out.append(np.concatenate(parts, axis=0).astype(np.int32, copy=False))
+    return out
+
+
+def _population_member_counts_torch(population_idx: torch.Tensor, population_size: int) -> torch.Tensor:
+    if int(population_size) <= 1:
+        return torch.full((1,), int(population_idx.shape[0]), device=population_idx.device, dtype=torch.long)
+    return torch.bincount(population_idx.to(dtype=torch.long), minlength=int(population_size)).to(dtype=torch.long)
+
+
+def _concat_tensor_dicts(parts: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    if not parts:
+        return {}
+    keys = parts[0].keys()
+    return {k: torch.cat([p[k] for p in parts], dim=0) for k in keys}
+
+def _concat_compressed_parts(parts: list[CompressedObservationBuffer]) -> CompressedObservationBuffer:
+    if not parts:
+        raise ValueError("cannot concatenate empty compressed observation parts")
+    return CompressedObservationBuffer(
+        **{field: torch.cat([getattr(p, field) for p in parts], dim=0) for field in parts[0]._fields}
+    )
+
+
+def _index_compressed_observation(comp: CompressedObservationBuffer, idx: torch.Tensor) -> CompressedObservationBuffer:
+    return CompressedObservationBuffer(
+        **{field: getattr(comp, field).index_select(0, idx) for field in comp._fields}
+    )
+
+
+def _build_host_member_replay_stores(
+    chunks: list[HostRolloutChunk],
+    population_size: int,
+) -> list[HostReplayMemberStore]:
+    pop_n = max(1, int(population_size))
+    obs_parts: list[list[CompressedObservationBuffer]] = [[] for _ in range(pop_n)]
+    action_parts: list[list[dict[str, torch.Tensor]]] = [[] for _ in range(pop_n)]
+    adv_parts: list[list[torch.Tensor]] = [[] for _ in range(pop_n)]
+    ret_parts: list[list[torch.Tensor]] = [[] for _ in range(pop_n)]
+    old_lp_parts: list[list[torch.Tensor]] = [[] for _ in range(pop_n)]
+    old_v_parts: list[list[torch.Tensor]] = [[] for _ in range(pop_n)]
+
+    for chunk in chunks:
+        samples = chunk.samples
+        if int(samples["advantages"].shape[0]) == 0:
+            continue
+        comp, actions = select_stored_compressed_minibatch_torch(
+            chunk.segment,
+            np.asarray(samples["players"], dtype=np.int32),
+            np.asarray(samples["t_idx"], dtype=np.int32),
+            np.asarray(samples["n_idx"], dtype=np.int32),
+            replay_device=torch.device("cpu"),
+            timing=None,
+        )
+        pop_idx = torch.as_tensor(samples["population_idx"], dtype=torch.long)
+        adv_t = torch.as_tensor(samples["advantages"], dtype=torch.float32)
+        ret_t = torch.as_tensor(samples["returns"], dtype=torch.float32)
+        old_lp_t = torch.as_tensor(samples["old_logprob"], dtype=torch.float32)
+        old_v_t = torch.as_tensor(samples["old_value"], dtype=torch.float32)
+        for member in range(pop_n):
+            member_rows = torch.nonzero(pop_idx == member, as_tuple=False).squeeze(-1)
+            if int(member_rows.numel()) == 0:
+                continue
+            obs_parts[member].append(_index_compressed_observation(comp, member_rows))
+            action_parts[member].append({k: v.index_select(0, member_rows) for k, v in actions.items()})
+            adv_parts[member].append(adv_t.index_select(0, member_rows))
+            ret_parts[member].append(ret_t.index_select(0, member_rows))
+            old_lp_parts[member].append(old_lp_t.index_select(0, member_rows))
+            old_v_parts[member].append(old_v_t.index_select(0, member_rows))
+
+    stores: list[HostReplayMemberStore] = []
+    for member in range(pop_n):
+        if obs_parts[member]:
+            obs = _concat_compressed_parts(obs_parts[member])
+            actions = _concat_tensor_dicts(action_parts[member])
+            adv = torch.cat(adv_parts[member], dim=0)
+            ret = torch.cat(ret_parts[member], dim=0)
+            old_lp = torch.cat(old_lp_parts[member], dim=0)
+            old_v = torch.cat(old_v_parts[member], dim=0)
+        else:
+            obs = CompressedObservationBuffer(
+                token_meta=torch.zeros((0, 1 + MAX_PLANETS), dtype=torch.int16),
+                owner_idx=torch.zeros((0, 1 + MAX_PLANETS), dtype=torch.int16),
+                production=torch.zeros((0, MAX_PLANETS), dtype=torch.int16),
+                ships=torch.zeros((0, MAX_PLANETS), dtype=torch.int16),
+                velocity=torch.zeros((0, MAX_PLANETS, 2), dtype=torch.float16),
+                xy=torch.zeros((0, MAX_PLANETS, 2), dtype=torch.float16),
+                turn_progress=torch.zeros((0,), dtype=torch.float16),
+                incoming_net=torch.zeros((0, MAX_PLANETS, INCOMING_TA_BINS), dtype=torch.int16),
+                incoming_survivor=torch.zeros((0, MAX_PLANETS, INCOMING_TA_BINS), dtype=torch.int16),
+            )
+            actions = {}
+            adv = torch.zeros((0,), dtype=torch.float32)
+            ret = torch.zeros((0,), dtype=torch.float32)
+            old_lp = torch.zeros((0,), dtype=torch.float32)
+            old_v = torch.zeros((0,), dtype=torch.float32)
+        stores.append(
+            HostReplayMemberStore(
+                obs=obs,
+                actions=actions,
+                advantages=adv,
+                returns=ret,
+                old_logprob=old_lp,
+                old_value=old_v,
+            )
+        )
+    return stores
 
 
 def _build_host_chunk_samples(
@@ -933,7 +1114,7 @@ def _print_rollout_pre_ppo(
 
 def _torch_ppo_loss_from_replay(
     *,
-    obs: dict[str, torch.Tensor],
+    obs: dict[str, torch.Tensor] | CompressedObservationBuffer,
     actions: dict[str, torch.Tensor],
     adv: torch.Tensor,
     returns: torch.Tensor,
@@ -945,10 +1126,12 @@ def _torch_ppo_loss_from_replay(
     vf_coef: float,
     entropy_coef: float,
     loss_fn: Optional[Any],
+    compressed_loss_fn: Optional[Any],
     amp_dtype: Optional[torch.dtype],
+    member_counts: Optional[torch.Tensor] = None,
+    obs_feature_dim: int = FEATURE_DIM,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     del ship_speed
-    fn = loss_fn if loss_fn is not None else compute_ppo_loss_torch
     target_valid = actions["target_planet_reachable"].to(device=adv.device, dtype=torch.bool)
     target_overflow = torch.zeros((target_valid.shape[0],), dtype=torch.bool, device=adv.device)
     target_hit_tick = actions["target_hit_tick"].to(device=adv.device, dtype=torch.float32)
@@ -958,6 +1141,40 @@ def _torch_ppo_loss_from_replay(
         else nullcontext()
     )
     with amp_ctx:
+        if isinstance(obs, CompressedObservationBuffer):
+            fn = compressed_loss_fn if compressed_loss_fn is not None else compute_ppo_loss_compressed_torch
+            return fn(
+                policy,
+                obs.token_meta.to(device=adv.device),
+                obs.owner_idx.to(device=adv.device),
+                obs.production.to(device=adv.device),
+                obs.ships.to(device=adv.device),
+                obs.velocity.to(device=adv.device),
+                obs.xy.to(device=adv.device),
+                obs.turn_progress.to(device=adv.device),
+                obs.incoming_net.to(device=adv.device),
+                obs.incoming_survivor.to(device=adv.device),
+                int(obs_feature_dim),
+                target_valid,
+                target_overflow,
+                target_hit_tick,
+                actions["halt_action"].to(device=adv.device, dtype=torch.long),
+                actions["pair_flat"].to(device=adv.device, dtype=torch.long),
+                actions["frac_idx"].to(device=adv.device, dtype=torch.long),
+                actions["no_valid_pairs"].to(device=adv.device, dtype=torch.bool),
+                actions["no_valid_fracs"].to(device=adv.device, dtype=torch.bool),
+                actions["must_halt_no_ships"].to(device=adv.device, dtype=torch.bool),
+                adv,
+                returns,
+                old_logp,
+                old_v,
+                clip_eps,
+                vf_coef,
+                entropy_coef,
+                actions["population_idx"].to(device=adv.device, dtype=torch.long),
+                member_counts,
+            )
+        fn = loss_fn if loss_fn is not None else compute_ppo_loss_torch
         return fn(
             policy,
             obs["entity_type"].to(device=adv.device, dtype=torch.long),
@@ -983,6 +1200,7 @@ def _torch_ppo_loss_from_replay(
             vf_coef,
             entropy_coef,
             actions["population_idx"].to(device=adv.device, dtype=torch.long),
+            member_counts,
         )
 
 
@@ -1004,8 +1222,10 @@ def ppo_iteration(
     *,
     rnd: np.random.Generator,
     loss_fn: Optional[Any] = None,
+    compressed_loss_fn: Optional[Any] = None,
     amp_dtype: Optional[torch.dtype] = None,
     obs_feature_dim: int,
+    population_size: int,
 ) -> Tuple[float, PPOTiming, PPOStats]:
     """Multiple epochs of clipped PPO surrogate with minibatches.
 
@@ -1023,7 +1243,6 @@ def ppo_iteration(
     old_value = samples["old_value"]
 
     n = advantages.shape[0]
-    idx = np.arange(n)
     total_loss_sum = 0.0
     n_mb = 0
     timing = PPOTiming()
@@ -1031,9 +1250,8 @@ def ppo_iteration(
     t_total0 = perf_counter()
 
     for _ in range(ppo_epochs):
-        rnd.shuffle(idx)
-        for start in range(0, n, minibatch_size):
-            mb_idx = idx[start : start + minibatch_size]
+        minibatches = _stratified_population_minibatches(samples["population_idx"], minibatch_size, population_size, rnd)
+        for mb_idx in minibatches:
 
             t0 = perf_counter()
             mb_player = players[mb_idx]
@@ -1054,6 +1272,7 @@ def ppo_iteration(
             ret_t = torch.as_tensor(returns[mb_idx], device=device, dtype=torch.float32)
             old_logp = torch.as_tensor(old_logprob[mb_idx], device=device, dtype=torch.float32)
             old_v = torch.as_tensor(old_value[mb_idx], device=device, dtype=torch.float32)
+            member_counts = _population_member_counts_torch(actions["population_idx"], population_size)
             timing.gather_s += perf_counter() - t0
 
             t0 = perf_counter()
@@ -1070,7 +1289,10 @@ def ppo_iteration(
                 vf_coef=vf_coef,
                 entropy_coef=entropy_coef,
                 loss_fn=loss_fn,
+                compressed_loss_fn=compressed_loss_fn,
                 amp_dtype=amp_dtype,
+                member_counts=member_counts,
+                obs_feature_dim=obs_feature_dim,
             )
             timing.compiled_loss_s += perf_counter() - t0
 
@@ -1102,7 +1324,7 @@ def ppo_iteration(
 def ppo_iteration_host_staged(
     policy: OrbitWarsPolicy,
     opt: torch.optim.Optimizer,
-    chunks: list[HostRolloutChunk],
+    member_stores: list[HostReplayMemberStore],
     device: torch.device,
     minibatch_size: int,
     ppo_epochs: int,
@@ -1116,82 +1338,121 @@ def ppo_iteration_host_staged(
     *,
     rnd: np.random.Generator,
     loss_fn: Optional[Any] = None,
+    compressed_loss_fn: Optional[Any] = None,
     amp_dtype: Optional[torch.dtype] = None,
     obs_feature_dim: int,
+    population_size: int,
 ) -> Tuple[float, PPOTiming, PPOStats]:
-    """PPO over CPU-resident rollout chunks, staging only minibatches to device."""
+    """PPO over flattened host-side replay, staging only minibatches to device."""
 
     total_loss_sum = 0.0
     n_mb = 0
     timing = PPOTiming()
     stats = PPOStats()
     t_total0 = perf_counter()
+    total_samples = int(sum(store.advantages.shape[0] for store in member_stores))
+    n_batches = max(1, int(np.ceil(float(total_samples) / float(max(1, minibatch_size)))))
 
     for _ in range(ppo_epochs):
-        chunk_order = np.arange(len(chunks))
-        rnd.shuffle(chunk_order)
-        for chunk_i in chunk_order:
-            chunk_idx = int(chunk_i)
-            chunk = chunks[chunk_idx]
-            samples = chunk.samples
-            n = int(samples["advantages"].shape[0])
-            idx = np.arange(n)
-            rnd.shuffle(idx)
-            for start in range(0, n, minibatch_size):
-                mb_idx = idx[start : start + minibatch_size]
-
-                t0 = perf_counter()
-                mb_player = samples["players"][mb_idx]
-                mb_t = samples["t_idx"][mb_idx]
-                mb_n = samples["n_idx"][mb_idx]
-                obs, actions = select_stored_observation_minibatch_torch(
-                    chunk.segment,
-                    mb_player,
-                    mb_t,
-                    mb_n,
-                    replay_device=device,
-                    timing=timing,
-                    obs_feature_dim=obs_feature_dim,
+        shuffled_stores: list[HostReplayMemberStore] = []
+        batch_ranges: list[list[tuple[int, int]]] = []
+        for member in range(max(1, int(population_size))):
+            store = member_stores[member]
+            count = int(store.advantages.shape[0])
+            if count > 0:
+                perm_np = np.arange(count, dtype=np.int32)
+                rnd.shuffle(perm_np)
+                perm = torch.as_tensor(perm_np, dtype=torch.long)
+                shuffled = HostReplayMemberStore(
+                    obs=_index_compressed_observation(store.obs, perm),
+                    actions={k: v.index_select(0, perm) for k, v in store.actions.items()},
+                    advantages=store.advantages.index_select(0, perm),
+                    returns=store.returns.index_select(0, perm),
+                    old_logprob=store.old_logprob.index_select(0, perm),
+                    old_value=store.old_value.index_select(0, perm),
                 )
-                adv = torch.as_tensor(samples["advantages"][mb_idx], device=device, dtype=torch.float32)
-                ret_t = torch.as_tensor(samples["returns"][mb_idx], device=device, dtype=torch.float32)
-                old_logp = torch.as_tensor(samples["old_logprob"][mb_idx], device=device, dtype=torch.float32)
-                old_v = torch.as_tensor(samples["old_value"][mb_idx], device=device, dtype=torch.float32)
-                timing.gather_s += perf_counter() - t0
+            else:
+                shuffled = store
+            shuffled_stores.append(shuffled)
+            base = count // n_batches
+            rem = count % n_batches
+            start = 0
+            ranges: list[tuple[int, int]] = []
+            for batch_i in range(n_batches):
+                take = base + (1 if batch_i < rem else 0)
+                stop = start + take
+                ranges.append((start, stop))
+                start = stop
+            batch_ranges.append(ranges)
 
-                t0 = perf_counter()
-                loss, mb_stats = _torch_ppo_loss_from_replay(
-                    obs=obs,
-                    actions=actions,
-                    adv=adv,
-                    returns=ret_t,
-                    old_logp=old_logp,
-                    old_v=old_v,
-                    policy=policy,
-                    ship_speed=ship_speed,
-                    clip_eps=clip_eps,
-                    vf_coef=vf_coef,
-                    entropy_coef=entropy_coef,
-                    loss_fn=loss_fn,
-                    amp_dtype=amp_dtype,
-                )
-                timing.compiled_loss_s += perf_counter() - t0
+        for batch_i in range(n_batches):
+            t0 = perf_counter()
+            obs_parts: list[CompressedObservationBuffer] = []
+            action_parts: list[dict[str, torch.Tensor]] = []
+            adv_parts: list[torch.Tensor] = []
+            ret_parts: list[torch.Tensor] = []
+            old_lp_parts: list[torch.Tensor] = []
+            old_v_parts: list[torch.Tensor] = []
+            for member in range(max(1, int(population_size))):
+                start, stop = batch_ranges[member][batch_i]
+                if stop <= start:
+                    continue
+                store = shuffled_stores[member]
+                sl = torch.arange(start, stop, dtype=torch.long)
+                obs_parts.append(_index_compressed_observation(store.obs, sl))
+                action_parts.append({k: v.index_select(0, sl) for k, v in store.actions.items()})
+                adv_parts.append(store.advantages.index_select(0, sl))
+                ret_parts.append(store.returns.index_select(0, sl))
+                old_lp_parts.append(store.old_logprob.index_select(0, sl))
+                old_v_parts.append(store.old_value.index_select(0, sl))
+            if not obs_parts:
+                continue
+            obs = _concat_compressed_parts(obs_parts)
+            actions_cpu = _concat_tensor_dicts(action_parts)
+            actions = {k: v.to(device) for k, v in actions_cpu.items()}
+            adv = torch.cat(adv_parts, dim=0).to(device=device, dtype=torch.float32)
+            ret_t = torch.cat(ret_parts, dim=0).to(device=device, dtype=torch.float32)
+            old_logp = torch.cat(old_lp_parts, dim=0).to(device=device, dtype=torch.float32)
+            old_v = torch.cat(old_v_parts, dim=0).to(device=device, dtype=torch.float32)
+            member_counts = _population_member_counts_torch(actions["population_idx"], population_size)
+            timing.gather_s += perf_counter() - t0
 
-                t0 = perf_counter()
-                opt.zero_grad()
-                loss.backward()
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm))
-                timing.backward_s += perf_counter() - t0
+            t0 = perf_counter()
+            loss, mb_stats = _torch_ppo_loss_from_replay(
+                obs=obs,
+                actions=actions,
+                adv=adv,
+                returns=ret_t,
+                old_logp=old_logp,
+                old_v=old_v,
+                policy=policy,
+                ship_speed=ship_speed,
+                clip_eps=clip_eps,
+                vf_coef=vf_coef,
+                entropy_coef=entropy_coef,
+                loss_fn=loss_fn,
+                compressed_loss_fn=compressed_loss_fn,
+                amp_dtype=amp_dtype,
+                member_counts=member_counts,
+                obs_feature_dim=obs_feature_dim,
+            )
+            timing.compiled_loss_s += perf_counter() - t0
 
-                t0 = perf_counter()
-                opt.step()
-                timing.optim_s += perf_counter() - t0
+            t0 = perf_counter()
+            opt.zero_grad()
+            loss.backward()
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm))
+            timing.backward_s += perf_counter() - t0
 
-                t0 = perf_counter()
-                total_loss_sum += float(loss.item())
-                stats.update(mb_stats, grad_norm)
-                timing.sync_s += perf_counter() - t0
-                n_mb += 1
+            t0 = perf_counter()
+            opt.step()
+            timing.optim_s += perf_counter() - t0
+
+            t0 = perf_counter()
+            total_loss_sum += float(loss.item())
+            stats.update(mb_stats, grad_norm)
+            timing.sync_s += perf_counter() - t0
+            n_mb += 1
 
     timing.n_minibatches = n_mb
     timing.total_s = perf_counter() - t_total0
@@ -1376,6 +1637,7 @@ def train(args: argparse.Namespace) -> None:
     #     because observations are 61 tokens and calls are frequent; PPO replay
     #     keeps the packed forward path, which benchmarks faster there.
     compiled_loss_fn: Optional[Any] = None
+    compiled_compressed_loss_fn: Optional[Any] = None
     if args.compile:
         compile_mode = args.compile_mode
         helper_compile_mode = "default" if compile_mode == "reduce-overhead" else compile_mode
@@ -1387,6 +1649,9 @@ def train(args: argparse.Namespace) -> None:
         )
         compiled_loss_fn = torch.compile(
             compute_ppo_loss_torch, mode=compile_mode, dynamic=True
+        )
+        compiled_compressed_loss_fn = torch.compile(
+            compute_ppo_loss_compressed_torch, mode=compile_mode, dynamic=True
         )
         policy.forward = torch.compile(  # type: ignore[assignment]
             policy.forward, mode=helper_compile_mode, dynamic=True
@@ -1493,6 +1758,7 @@ def train(args: argparse.Namespace) -> None:
             policy,
             opt,
             compiled_loss_fn,
+            compiled_compressed_loss_fn,
             rng,
             rnd,
             rollout_carry,
@@ -1517,6 +1783,7 @@ def _train_loop(
     policy: OrbitWarsPolicy,
     opt: torch.optim.Optimizer,
     compiled_loss_fn: Optional[Any],
+    compiled_compressed_loss_fn: Optional[Any],
     rng: torch.Generator,
     rnd: np.random.Generator,
     rollout_carry: Optional[RolloutCarry],
@@ -1533,6 +1800,7 @@ def _train_loop(
             log_cuda_mem(f"iter {it} start (peak reset)", device)
 
         host_chunks: Optional[list[HostRolloutChunk]] = None
+        host_member_stores: Optional[list[HostReplayMemberStore]] = None
         if args.rollout_storage == "host":
             chunk_segments: list[RolloutSegment] = []
             chunk_timings: list[RolloutTiming] = []
@@ -1590,6 +1858,7 @@ def _train_loop(
                     if samples_i
                 ]
                 _normalize_chunk_advantages(host_chunks)
+                host_member_stores = _build_host_member_replay_stores(host_chunks, int(args.population_size))
                 segment = _combine_segments_for_stats(chunk_segments)
                 rt = _combine_rollout_timing(chunk_timings)
                 game_stats = _combine_game_stats(chunk_stats)
@@ -1685,7 +1954,7 @@ def _train_loop(
                 loss_mb, ppo_t, ppo_stats = ppo_iteration_host_staged(
                     policy,
                     opt,
-                    host_chunks,
+                    host_member_stores if host_member_stores is not None else [],
                     device,
                     args.minibatch_size,
                     args.ppo_epochs,
@@ -1698,8 +1967,10 @@ def _train_loop(
                     max(0, int(args.first_hit_ray_chunk_size)),
                     rnd=rnd,
                     loss_fn=compiled_loss_fn,
+                    compressed_loss_fn=compiled_compressed_loss_fn,
                     amp_dtype=amp_dtype,
                     obs_feature_dim=obs_fd,
+                    population_size=int(args.population_size),
                 )
             else:
                 loss_mb, ppo_t, ppo_stats = ppo_iteration(
@@ -1719,8 +1990,10 @@ def _train_loop(
                     max(0, int(args.first_hit_ray_chunk_size)),
                     rnd=rnd,
                     loss_fn=compiled_loss_fn,
+                    compressed_loss_fn=compiled_compressed_loss_fn,
                     amp_dtype=amp_dtype,
                     obs_feature_dim=obs_fd,
+                    population_size=int(args.population_size),
                 )
             ppo_s = time.perf_counter() - t_ppo0
 

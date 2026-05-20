@@ -286,6 +286,46 @@ def select_stored_observation_minibatch_torch(
     return obs, actions
 
 
+def select_stored_compressed_minibatch_torch(
+    segment: RolloutSegment,
+    mb_player: np.ndarray,
+    mb_t: np.ndarray,
+    mb_n: np.ndarray,
+    replay_device: Optional[torch.device] = None,
+    timing: Optional[object] = None,
+) -> tuple[CompressedObservationBuffer, dict[str, torch.Tensor]]:
+    """Select stored compressed observations and action records for PPO."""
+
+    import time
+
+    bufs = segment.bufs
+    storage_device = bufs[0].micro_halt_now.device
+    out_device = replay_device if replay_device is not None else storage_device
+    mb_t_t = torch.as_tensor(mb_t, dtype=torch.long, device=storage_device)
+    mb_n_t = torch.as_tensor(mb_n, dtype=torch.long, device=storage_device)
+    player_t = torch.as_tensor(mb_player, dtype=torch.long, device=storage_device)
+
+    t_select0 = time.perf_counter()
+    comp = _select_multi_compressed_observation(
+        segment.obs_bufs,
+        player_t,
+        mb_t_t,
+        mb_n_t,
+        device=out_device,
+    )
+    actions = _gather_transition_fields_for_players(
+        bufs,
+        player_t,
+        mb_t_t,
+        mb_n_t,
+        storage_device=storage_device,
+        out_device=out_device,
+    )
+    if timing is not None:
+        timing.gather_select_s += time.perf_counter() - t_select0
+    return comp, actions
+
+
 def _planet_velocities_torch(state: OrbitWarsState, is_comet: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     planets = state.planets
     init = state.initial_planets

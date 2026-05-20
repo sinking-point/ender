@@ -314,6 +314,47 @@ class OrbitWarsPolicy(nn.Module):
             chunks.append(tail.norm_f(x_m))
         return torch.cat(chunks, dim=0)
 
+    def _population_member_counts(
+        self,
+        population_idx: torch.Tensor,
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        pop = self._normalize_population_idx(population_idx, batch_size, device)
+        if self.population_size == 1:
+            return torch.full((1,), batch_size, device=device, dtype=torch.long)
+        return torch.bincount(pop, minlength=self.population_size).to(device=device, dtype=torch.long)
+
+    def _apply_encoder_sorted_population(
+        self,
+        x: torch.Tensor,
+        rope_pos: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor],
+        member_counts: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.population_size == 1:
+            for blk in self.blocks:
+                x = self._run_block(blk, x, rope_pos, key_padding_mask)
+            return self.norm_f(x)
+
+        for blk in self.shared_blocks:
+            x = self._run_block(blk, x, rope_pos, key_padding_mask)
+
+        chunks = []
+        start = 0
+        for member_idx, tail in enumerate(self.population_tails):
+            count = int(member_counts[member_idx].item())
+            if count <= 0:
+                continue
+            stop = start + count
+            x_m = x[start:stop]
+            rope_m = rope_pos[start:stop]
+            mask_m = None if key_padding_mask is None else key_padding_mask[start:stop]
+            x_m = self._run_block(tail.block, x_m, rope_m, mask_m)
+            chunks.append(tail.norm_f(x_m))
+            start = stop
+        return torch.cat(chunks, dim=0) if chunks else x.new_empty((0,) + x.shape[1:])
+
     def _compute_outputs_single(
         self,
         h: torch.Tensor,
@@ -362,6 +403,49 @@ class OrbitWarsPolicy(nn.Module):
             "origin_frac_mask": origin_frac_mask,
             "planet_hidden": planet_h,
         }
+
+    def _compute_ppo_outputs_single(
+        self,
+        h: torch.Tensor,
+        owner_idx: torch.Tensor,
+        features: torch.Tensor,
+        entity_mask: torch.Tensor,
+        planet_mask: torch.Tensor,
+        origin_idx: torch.Tensor,
+        frac_idx: torch.Tensor,
+        fleet_size: torch.Tensor,
+        target_eta: torch.Tensor,
+        target_ships: torch.Tensor,
+        *,
+        pair_q: nn.Linear,
+        pair_k: nn.Linear,
+        origin_frac_head: nn.Linear,
+        halt_head: nn.Linear,
+        value_head: nn.Linear,
+        target_pick_head: nn.Module,
+    ) -> Dict[str, Any]:
+        out = self._compute_outputs_single(
+            h,
+            owner_idx,
+            features,
+            entity_mask,
+            planet_mask,
+            pair_q=pair_q,
+            pair_k=pair_k,
+            origin_frac_head=origin_frac_head,
+            halt_head=halt_head,
+            value_head=value_head,
+        )
+        planet_hidden = out["planet_hidden"]
+        fleet_scalar = (fleet_size.to(device=planet_hidden.device, dtype=planet_hidden.dtype) / 1000.0).reshape(-1, 1, 1)
+        fleet_feat = fleet_scalar.expand(-1, planet_hidden.shape[1], -1)
+        eta_feat = (target_eta.to(device=planet_hidden.device, dtype=planet_hidden.dtype) / 500.0).unsqueeze(-1)
+        target_ships_t = target_ships.to(device=planet_hidden.device, dtype=planet_hidden.dtype)
+        is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
+        target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
+        target_logits = target_pick_head(target_in).squeeze(-1)
+        out["target_logits"] = target_logits
+        return out
 
     def _compute_outputs_population(
         self,
@@ -477,6 +561,158 @@ class OrbitWarsPolicy(nn.Module):
         outputs["origin_frac_logits"] = torch.cat(origin_frac_logits, dim=0)
         outputs["origin_frac_mask"] = torch.cat(origin_frac_mask, dim=0)
         outputs["planet_hidden"] = torch.cat(planet_hidden, dim=0)
+        return outputs
+
+    def _compute_outputs_sorted_population(
+        self,
+        h: torch.Tensor,
+        owner_idx: torch.Tensor,
+        features: torch.Tensor,
+        entity_mask: torch.Tensor,
+        planet_mask: torch.Tensor,
+        member_counts: torch.Tensor,
+    ) -> Dict[str, Any]:
+        if self.population_size == 1:
+            return self._compute_outputs_single(
+                h,
+                owner_idx,
+                features,
+                entity_mask,
+                planet_mask,
+                pair_q=self.pair_q,
+                pair_k=self.pair_k,
+                origin_frac_head=self.origin_frac_head,
+                halt_head=self.halt_head,
+                value_head=self.value_head,
+            )
+
+        outputs: Dict[str, Any] = {"hidden": h}
+        halt_logits = []
+        value = []
+        pair_logits = []
+        pair_mask = []
+        origin_frac_logits = []
+        origin_frac_mask = []
+        planet_hidden = []
+        start = 0
+        for member_idx, tail in enumerate(self.population_tails):
+            count = int(member_counts[member_idx].item())
+            if count <= 0:
+                continue
+            stop = start + count
+            out_m = self._compute_outputs_single(
+                h[start:stop],
+                owner_idx[start:stop],
+                features[start:stop],
+                entity_mask[start:stop],
+                planet_mask[start:stop],
+                pair_q=tail.pair_q,
+                pair_k=tail.pair_k,
+                origin_frac_head=tail.origin_frac_head,
+                halt_head=tail.halt_head,
+                value_head=tail.value_head,
+            )
+            halt_logits.append(out_m["halt_logits"])
+            value.append(out_m["value"])
+            pair_logits.append(out_m["pair_logits"])
+            pair_mask.append(out_m["pair_mask"])
+            origin_frac_logits.append(out_m["origin_frac_logits"])
+            origin_frac_mask.append(out_m["origin_frac_mask"])
+            planet_hidden.append(out_m["planet_hidden"])
+            start = stop
+        outputs["halt_logits"] = torch.cat(halt_logits, dim=0)
+        outputs["value"] = torch.cat(value, dim=0)
+        outputs["pair_logits"] = torch.cat(pair_logits, dim=0)
+        outputs["pair_mask"] = torch.cat(pair_mask, dim=0)
+        outputs["origin_frac_logits"] = torch.cat(origin_frac_logits, dim=0)
+        outputs["origin_frac_mask"] = torch.cat(origin_frac_mask, dim=0)
+        outputs["planet_hidden"] = torch.cat(planet_hidden, dim=0)
+        return outputs
+
+    def _compute_ppo_outputs_sorted_population(
+        self,
+        h: torch.Tensor,
+        owner_idx: torch.Tensor,
+        features: torch.Tensor,
+        entity_mask: torch.Tensor,
+        planet_mask: torch.Tensor,
+        origin_idx: torch.Tensor,
+        frac_idx: torch.Tensor,
+        fleet_size: torch.Tensor,
+        target_eta: torch.Tensor,
+        target_ships: torch.Tensor,
+        member_counts: torch.Tensor,
+    ) -> Dict[str, Any]:
+        if self.population_size == 1:
+            return self._compute_ppo_outputs_single(
+                h,
+                owner_idx,
+                features,
+                entity_mask,
+                planet_mask,
+                origin_idx,
+                frac_idx,
+                fleet_size,
+                target_eta,
+                target_ships,
+                pair_q=self.pair_q,
+                pair_k=self.pair_k,
+                origin_frac_head=self.origin_frac_head,
+                halt_head=self.halt_head,
+                value_head=self.value_head,
+                target_pick_head=self.target_pick_head,
+            )
+
+        outputs: Dict[str, Any] = {"hidden": h}
+        halt_logits = []
+        value = []
+        pair_logits = []
+        pair_mask = []
+        origin_frac_logits = []
+        origin_frac_mask = []
+        planet_hidden = []
+        target_logits = []
+        start = 0
+        for member_idx, tail in enumerate(self.population_tails):
+            count = int(member_counts[member_idx].item())
+            if count <= 0:
+                continue
+            stop = start + count
+            out_m = self._compute_ppo_outputs_single(
+                h[start:stop],
+                owner_idx[start:stop],
+                features[start:stop],
+                entity_mask[start:stop],
+                planet_mask[start:stop],
+                origin_idx[start:stop],
+                frac_idx[start:stop],
+                fleet_size[start:stop],
+                target_eta[start:stop],
+                target_ships[start:stop],
+                pair_q=tail.pair_q,
+                pair_k=tail.pair_k,
+                origin_frac_head=tail.origin_frac_head,
+                halt_head=tail.halt_head,
+                value_head=tail.value_head,
+                target_pick_head=tail.target_pick_head,
+            )
+            halt_logits.append(out_m["halt_logits"])
+            value.append(out_m["value"])
+            pair_logits.append(out_m["pair_logits"])
+            pair_mask.append(out_m["pair_mask"])
+            origin_frac_logits.append(out_m["origin_frac_logits"])
+            origin_frac_mask.append(out_m["origin_frac_mask"])
+            planet_hidden.append(out_m["planet_hidden"])
+            target_logits.append(out_m["target_logits"])
+            start = stop
+        outputs["halt_logits"] = torch.cat(halt_logits, dim=0)
+        outputs["value"] = torch.cat(value, dim=0)
+        outputs["pair_logits"] = torch.cat(pair_logits, dim=0)
+        outputs["pair_mask"] = torch.cat(pair_mask, dim=0)
+        outputs["origin_frac_logits"] = torch.cat(origin_frac_logits, dim=0)
+        outputs["origin_frac_mask"] = torch.cat(origin_frac_mask, dim=0)
+        outputs["planet_hidden"] = torch.cat(planet_hidden, dim=0)
+        outputs["target_logits"] = torch.cat(target_logits, dim=0)
         return outputs
 
     def forward(
@@ -630,6 +866,85 @@ class OrbitWarsPolicy(nn.Module):
         h = self._apply_encoder_grouped_population(x, rope_pos, padding_mask)
         return self._compute_outputs_grouped_population(h, owner_idx, features, entity_mask, planet_mask)
 
+    def forward_sorted_population(
+        self,
+        entity_type: torch.Tensor,
+        owner_idx: torch.Tensor,
+        features: torch.Tensor,
+        rope_pos: torch.Tensor,
+        entity_mask: torch.Tensor,
+        planet_mask: torch.Tensor,
+        population_idx: torch.Tensor,
+    ) -> Dict[str, Any]:
+        """Packed forward assuming rows are already contiguous by population member."""
+
+        b, l, _ = features.shape
+        x_dense = self.embed(entity_type, owner_idx, features)
+        counts = entity_mask.sum(dim=-1).to(torch.int64)
+        L_packed = int(counts.max().item())
+        sort_keys = (~entity_mask).to(torch.int32)
+        pack_idx_full = sort_keys.argsort(dim=-1, stable=True)
+        pack_idx = pack_idx_full[:, :L_packed]
+        pack_idx_d = pack_idx.unsqueeze(-1).expand(b, L_packed, self.d_model)
+        x_packed = torch.gather(x_dense, 1, pack_idx_d)
+        pack_idx_r = pack_idx.unsqueeze(-1).expand(b, L_packed, 3)
+        rope_packed = torch.gather(rope_pos, 1, pack_idx_r)
+        arange = torch.arange(L_packed, device=counts.device)
+        padding_mask = arange[None, :] >= counts[:, None]
+        member_counts = self._population_member_counts(population_idx, b, features.device)
+        h_packed = self._apply_encoder_sorted_population(x_packed, rope_packed, padding_mask, member_counts)
+        h = torch.zeros(b, l, self.d_model, dtype=h_packed.dtype, device=h_packed.device)
+        h = h.scatter(1, pack_idx_d, h_packed)
+        return self._compute_outputs_sorted_population(h, owner_idx, features, entity_mask, planet_mask, member_counts)
+
+    def forward_ppo_sorted_population(
+        self,
+        entity_type: torch.Tensor,
+        owner_idx: torch.Tensor,
+        features: torch.Tensor,
+        rope_pos: torch.Tensor,
+        entity_mask: torch.Tensor,
+        planet_mask: torch.Tensor,
+        population_idx: torch.Tensor,
+        origin_idx: torch.Tensor,
+        frac_idx: torch.Tensor,
+        fleet_size: torch.Tensor,
+        target_eta: torch.Tensor,
+        target_ships: torch.Tensor,
+    ) -> Dict[str, Any]:
+        """PPO-specific sorted forward that computes all private outputs in one member loop."""
+
+        b, l, _ = features.shape
+        x_dense = self.embed(entity_type, owner_idx, features)
+        counts = entity_mask.sum(dim=-1).to(torch.int64)
+        L_packed = int(counts.max().item())
+        sort_keys = (~entity_mask).to(torch.int32)
+        pack_idx_full = sort_keys.argsort(dim=-1, stable=True)
+        pack_idx = pack_idx_full[:, :L_packed]
+        pack_idx_d = pack_idx.unsqueeze(-1).expand(b, L_packed, self.d_model)
+        x_packed = torch.gather(x_dense, 1, pack_idx_d)
+        pack_idx_r = pack_idx.unsqueeze(-1).expand(b, L_packed, 3)
+        rope_packed = torch.gather(rope_pos, 1, pack_idx_r)
+        arange = torch.arange(L_packed, device=counts.device)
+        padding_mask = arange[None, :] >= counts[:, None]
+        member_counts = self._population_member_counts(population_idx, b, features.device)
+        h_packed = self._apply_encoder_sorted_population(x_packed, rope_packed, padding_mask, member_counts)
+        h = torch.zeros(b, l, self.d_model, dtype=h_packed.dtype, device=h_packed.device)
+        h = h.scatter(1, pack_idx_d, h_packed)
+        return self._compute_ppo_outputs_sorted_population(
+            h,
+            owner_idx,
+            features,
+            entity_mask,
+            planet_mask,
+            origin_idx,
+            frac_idx,
+            fleet_size,
+            target_eta,
+            target_ships,
+            member_counts,
+        )
+
     def target_logits_for_origin_fraction(
         self,
         planet_hidden: torch.Tensor,
@@ -724,6 +1039,53 @@ class OrbitWarsPolicy(nn.Module):
             stop = start + group_size
             logits.append(tail.target_pick_head(target_in[start:stop]).squeeze(-1))
         return torch.cat(logits, dim=0)
+
+    def target_logits_for_origin_fraction_sorted_population(
+        self,
+        planet_hidden: torch.Tensor,
+        origin_idx: torch.Tensor,
+        frac_idx: torch.Tensor,
+        population_idx: torch.Tensor,
+        fleet_size: Optional[torch.Tensor] = None,
+        target_eta: Optional[torch.Tensor] = None,
+        target_ships: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Target logits assuming rows are already contiguous by population member."""
+
+        b = origin_idx.shape[0]
+        device = planet_hidden.device
+        del frac_idx
+        if fleet_size is None:
+            fleet_scalar = torch.zeros((b, 1, 1), device=device, dtype=planet_hidden.dtype)
+        else:
+            fleet_scalar = (fleet_size.to(device=device, dtype=planet_hidden.dtype) / 1000.0).reshape(b, 1, 1)
+        fleet_feat = fleet_scalar.expand(-1, planet_hidden.shape[1], -1)
+        if target_eta is None:
+            eta_feat = torch.zeros(
+                (b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype
+            )
+        else:
+            eta_feat = (target_eta.to(device=device, dtype=planet_hidden.dtype) / 500.0).unsqueeze(-1)
+        if target_ships is None:
+            is_bigger = torch.zeros((b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype)
+        else:
+            target_ships_t = target_ships.to(device=device, dtype=planet_hidden.dtype)
+            is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
+        target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
+        if self.population_size == 1:
+            return self.target_pick_head(target_in).squeeze(-1)
+
+        member_counts = self._population_member_counts(population_idx, b, planet_hidden.device)
+        logits = []
+        start = 0
+        for member_idx, tail in enumerate(self.population_tails):
+            count = int(member_counts[member_idx].item())
+            if count <= 0:
+                continue
+            stop = start + count
+            logits.append(tail.target_pick_head(target_in[start:stop]).squeeze(-1))
+            start = stop
+        return torch.cat(logits, dim=0) if logits else target_in.new_empty((0, target_in.shape[1]))
 
     def fraction_logits(
         self,

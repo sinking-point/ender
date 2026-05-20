@@ -28,6 +28,7 @@ import jax.numpy as jnp
 import torch
 
 from orbit_wars_pt.batched_env import obs_jax_to_torch
+from orbit_wars_pt.compressed_observation import CompressedObservationBuffer, decode_observation
 from orbit_wars_pt.constants import FRACTIONS, MAX_PLANETS
 from orbit_wars_pt.micro_jax import selected_origin_fraction_targets_batched
 from orbit_wars_pt.model import OrbitWarsPolicy
@@ -51,6 +52,7 @@ def _compute_logp_value_entropy_torch(
     no_valid_pairs: torch.Tensor,
     no_valid_fracs: torch.Tensor,
     population_idx: Optional[torch.Tensor] = None,
+    member_counts: Optional[torch.Tensor] = None,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor,
     torch.Tensor, torch.Tensor, torch.Tensor,
@@ -78,25 +80,55 @@ def _compute_logp_value_entropy_torch(
     fraction / target) conditioned on the rows where each head is sampled.
     """
 
-    out = policy(
-        entity_type=entity_type,
-        owner_idx=owner_idx,
-        features=features,
-        rope_pos=rope_pos,
-        entity_mask=entity_mask,
-        planet_mask=planet_mask,
-        population_idx=population_idx,
-    )
+    P = MAX_PLANETS
+    o_idx = pair_flat // P
+    d_idx = pair_flat % P
+    origin_frac_flat = o_idx * len(FRACTIONS) + frac_idx
+
+    mb = halt_action.shape[0]
+    n_idx = torch.arange(mb, device=halt_action.device)
+    ships = features[:, 1 : 1 + MAX_PLANETS, 1] * 1000.0
+    fleet_size = torch.floor(features.new_tensor(FRACTIONS)[frac_idx] * ships[n_idx, o_idx])
+    if member_counts is not None and population_idx is not None and int(getattr(policy, "population_size", 1)) > 1:
+        out = policy.forward_ppo_sorted_population(
+            entity_type=entity_type,
+            owner_idx=owner_idx,
+            features=features,
+            rope_pos=rope_pos,
+            entity_mask=entity_mask,
+            planet_mask=planet_mask,
+            population_idx=population_idx,
+            origin_idx=o_idx,
+            frac_idx=frac_idx,
+            fleet_size=fleet_size,
+            target_eta=target_hit_tick,
+            target_ships=ships,
+        )
+    else:
+        out = policy(
+            entity_type=entity_type,
+            owner_idx=owner_idx,
+            features=features,
+            rope_pos=rope_pos,
+            entity_mask=entity_mask,
+            planet_mask=planet_mask,
+            population_idx=population_idx,
+        )
+        ph = out["planet_hidden"]
+        target_logits = policy.target_logits_for_origin_fraction(
+            ph,
+            o_idx,
+            frac_idx,
+            fleet_size=fleet_size,
+            target_eta=target_hit_tick,
+            target_ships=ships,
+            population_idx=population_idx,
+        )
 
     halt_logits = out["halt_logits"]
     halt_lp = torch.log_softmax(halt_logits, dim=-1)
     new_halt_logp = halt_lp.gather(1, halt_action[:, None]).squeeze(-1)
     new_halt_entropy = -(halt_lp.exp() * halt_lp).sum(dim=-1)
-
-    P = MAX_PLANETS
-    o_idx = pair_flat // P
-    d_idx = pair_flat % P
-    origin_frac_flat = o_idx * len(FRACTIONS) + frac_idx
 
     origin_frac_mask = out["origin_frac_mask"]
     origin_frac_logits = out["origin_frac_logits"].flatten(start_dim=1)
@@ -106,20 +138,8 @@ def _compute_logp_value_entropy_torch(
     new_origin_frac_logp = origin_frac_lp.gather(1, origin_frac_flat[:, None]).squeeze(-1)
     new_origin_frac_entropy = -(origin_frac_lp.exp() * origin_frac_lp).sum(dim=-1)
 
-    mb = halt_action.shape[0]
-    n_idx = torch.arange(mb, device=halt_action.device)
-    ph = out["planet_hidden"]
-    ships = features[:, 1 : 1 + MAX_PLANETS, 1] * 1000.0
-    fleet_size = torch.floor(features.new_tensor(FRACTIONS)[frac_idx] * ships[n_idx, o_idx])
-    target_logits = policy.target_logits_for_origin_fraction(
-        ph,
-        o_idx,
-        frac_idx,
-        fleet_size=fleet_size,
-        target_eta=target_hit_tick,
-        target_ships=ships,
-        population_idx=population_idx,
-    )
+    if "target_logits" in out:
+        target_logits = out["target_logits"]
     target_mask = (
         out["pair_mask"][n_idx, o_idx, :]
         & target_valid
@@ -184,6 +204,7 @@ def compute_ppo_loss_torch(
     vf_coef: float,
     entropy_coef: float,
     population_idx: Optional[torch.Tensor] = None,
+    member_counts: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Full PPO scalar loss + diagnostics on one minibatch.
 
@@ -251,6 +272,7 @@ def compute_ppo_loss_torch(
         no_valid_pairs,
         no_valid_fracs,
         population_idx,
+        member_counts,
     )
 
     log_ratio = new_logp - old_logp
@@ -259,22 +281,66 @@ def compute_ppo_loss_torch(
     surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
     # No policy gradient through halt when the env forced halt (no owned ships).
     w_pi = (~must_halt_no_ships).to(dtype=torch.float32)
-    w_sum = w_pi.sum().clamp(min=1.0)
-    loss_pi = -(torch.min(surr1, surr2) * w_pi).sum() / w_sum
-
     v_clipped = old_v + (new_value - old_v).clamp(-clip_eps, clip_eps)
-    loss_vf = torch.max((new_value - returns).pow(2), (v_clipped - returns).pow(2)).mean()
+    value_err = torch.max((new_value - returns).pow(2), (v_clipped - returns).pow(2))
 
-    entropy = (new_entropy * w_pi).sum() / w_sum
+    if member_counts is None or population_idx is None or int(getattr(policy, "population_size", 1)) <= 1:
+        w_sum = w_pi.sum().clamp(min=1.0)
+        loss_pi = -(torch.min(surr1, surr2) * w_pi).sum() / w_sum
+        loss_vf = value_err.mean()
+        entropy = (new_entropy * w_pi).sum() / w_sum
+    else:
+        loss_pi_parts = []
+        loss_vf_parts = []
+        entropy_parts = []
+        start = 0
+        for count_t in member_counts:
+            count = int(count_t.item())
+            if count <= 0:
+                continue
+            stop = start + count
+            w_pi_m = w_pi[start:stop]
+            w_sum_m = w_pi_m.sum().clamp(min=1.0)
+            loss_pi_parts.append(-(torch.min(surr1[start:stop], surr2[start:stop]) * w_pi_m).sum() / w_sum_m)
+            loss_vf_parts.append(value_err[start:stop].mean())
+            entropy_parts.append((new_entropy[start:stop] * w_pi_m).sum() / w_sum_m)
+            start = stop
+        loss_pi = torch.stack(loss_pi_parts).mean()
+        loss_vf = torch.stack(loss_vf_parts).mean()
+        entropy = torch.stack(entropy_parts).mean()
+
     loss_ent = -entropy_coef * entropy
-
     loss = loss_pi + vf_coef * loss_vf + loss_ent
 
     with torch.no_grad():
-        approx_kl = (-log_ratio * w_pi).sum() / w_sum
-        approx_kl_k3 = ((ratio - 1.0 - log_ratio) * w_pi).sum() / w_sum
-        clip_frac = (((ratio - 1.0).abs() > clip_eps).float() * w_pi).sum() / w_sum
-        value_mean = new_value.mean()
+        if member_counts is None or population_idx is None or int(getattr(policy, "population_size", 1)) <= 1:
+            w_sum = w_pi.sum().clamp(min=1.0)
+            approx_kl = (-log_ratio * w_pi).sum() / w_sum
+            approx_kl_k3 = ((ratio - 1.0 - log_ratio) * w_pi).sum() / w_sum
+            clip_frac = (((ratio - 1.0).abs() > clip_eps).float() * w_pi).sum() / w_sum
+            value_mean = new_value.mean()
+        else:
+            approx_kl_parts = []
+            approx_kl_k3_parts = []
+            clip_frac_parts = []
+            value_mean_parts = []
+            start = 0
+            for count_t in member_counts:
+                count = int(count_t.item())
+                if count <= 0:
+                    continue
+                stop = start + count
+                w_pi_m = w_pi[start:stop]
+                w_sum_m = w_pi_m.sum().clamp(min=1.0)
+                approx_kl_parts.append(((-log_ratio[start:stop]) * w_pi_m).sum() / w_sum_m)
+                approx_kl_k3_parts.append((((ratio[start:stop] - 1.0 - log_ratio[start:stop]) * w_pi_m).sum()) / w_sum_m)
+                clip_frac_parts.append(((((ratio[start:stop] - 1.0).abs() > clip_eps).float() * w_pi_m).sum()) / w_sum_m)
+                value_mean_parts.append(new_value[start:stop].mean())
+                start = stop
+            approx_kl = torch.stack(approx_kl_parts).mean()
+            approx_kl_k3 = torch.stack(approx_kl_k3_parts).mean()
+            clip_frac = torch.stack(clip_frac_parts).mean()
+            value_mean = torch.stack(value_mean_parts).mean()
         diff_sq_sum = (returns - new_value).pow(2).sum()
         ret_sum = returns.sum()
         ret_sq_sum = returns.pow(2).sum()
@@ -326,6 +392,78 @@ def compute_ppo_loss_torch(
         "count": count,
     }
     return loss, stats
+
+
+def compute_ppo_loss_compressed_torch(
+    policy: OrbitWarsPolicy,
+    token_meta: torch.Tensor,
+    owner_idx_comp: torch.Tensor,
+    production: torch.Tensor,
+    ships_comp: torch.Tensor,
+    velocity: torch.Tensor,
+    xy: torch.Tensor,
+    turn_progress: torch.Tensor,
+    incoming_net: torch.Tensor,
+    incoming_survivor: torch.Tensor,
+    feature_dim: int,
+    target_valid: torch.Tensor,
+    target_overflow: torch.Tensor,
+    target_hit_tick: torch.Tensor,
+    halt_action: torch.Tensor,
+    pair_flat: torch.Tensor,
+    frac_idx: torch.Tensor,
+    no_valid_pairs: torch.Tensor,
+    no_valid_fracs: torch.Tensor,
+    must_halt_no_ships: torch.Tensor,
+    adv: torch.Tensor,
+    returns: torch.Tensor,
+    old_logp: torch.Tensor,
+    old_v: torch.Tensor,
+    clip_eps: float,
+    vf_coef: float,
+    entropy_coef: float,
+    population_idx: Optional[torch.Tensor] = None,
+    member_counts: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    comp = CompressedObservationBuffer(
+        token_meta=token_meta,
+        owner_idx=owner_idx_comp,
+        production=production,
+        ships=ships_comp,
+        velocity=velocity,
+        xy=xy,
+        turn_progress=turn_progress,
+        incoming_net=incoming_net,
+        incoming_survivor=incoming_survivor,
+    )
+    obs = decode_observation(comp, feature_dim=int(feature_dim))
+    return compute_ppo_loss_torch(
+        policy,
+        obs["entity_type"],
+        obs["owner_idx"],
+        obs["features"],
+        obs["rope_pos"],
+        obs["entity_mask"],
+        obs["planet_mask"],
+        target_valid,
+        target_overflow,
+        target_hit_tick,
+        halt_action,
+        pair_flat,
+        frac_idx,
+        no_valid_pairs,
+        no_valid_fracs,
+        must_halt_no_ships,
+        adv,
+        returns,
+        old_logp,
+        old_v,
+        clip_eps,
+        vf_coef,
+        entropy_coef,
+        population_idx,
+        member_counts,
+    )
 
 
 def _jax_preamble_to_torch(
