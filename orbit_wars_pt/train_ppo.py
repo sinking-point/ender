@@ -172,6 +172,7 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "minibatch_size",
         "ship_speed",
         "reward_mode",
+        "normalize_obs_to_p0",
         "first_hit_n_rays",
         "first_hit_ray_chunk_size",
         "first_hit_method",
@@ -1249,6 +1250,7 @@ def train(args: argparse.Namespace) -> None:
         max_fleets=args.max_fleets,
         episode_seed=args.seed,
         reward_mode=args.reward_mode,
+        normalize_obs_to_p0=args.normalize_obs_to_p0,
     )
 
     policy = OrbitWarsPolicy(
@@ -1804,6 +1806,16 @@ def parse_args() -> argparse.Namespace:
             "Shaped reward delta to train on. 'ship-mass-share' is the existing default "
             "(garrisons plus fleets); 'production-share' uses owned planet production over "
             "all non-neutral owned planet production."
+        ),
+    )
+    p.add_argument(
+        "--normalize-obs-to-p0",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Rotate non-player-0 observations into player 0's board frame in the live JAX "
+            "rollout path. In 4-player mode this also rotates opponent owner slots so every "
+            "seat sees the same canonical top-left / bottom-left / top-right labeling."
         ),
     )
     p.add_argument("--max-grad-norm", type=float, default=0.5)

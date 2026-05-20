@@ -46,11 +46,57 @@ from orbit_wars_pt.constants import (
 # Fixed sequence length: [CLS, planet tokens].
 SEQ_LEN = 1 + MAX_PLANETS
 
+_SEAT_QTURNS_TO_P0_2P = jnp.asarray([0, 2], dtype=jnp.int32)
+_SEAT_QTURNS_TO_P0_4P = jnp.asarray([0, 3, 1, 2], dtype=jnp.int32)
+_NORMALIZED_OWNER_SLOT_4P = jnp.asarray(
+    [
+        [1, 3, 4, 2],
+        [4, 1, 2, 3],
+        [3, 2, 1, 4],
+        [2, 4, 3, 1],
+    ],
+    dtype=jnp.int32,
+)
+
 
 # ---- Owner remap (matches host ``observation._remap_owner``). ----
 
 
-def _remap_owner_jax(owner: jnp.ndarray, ego: int, num_agents: jnp.ndarray) -> jnp.ndarray:
+def _obs_qturns_to_p0_jax(ego: int, num_agents: jnp.ndarray, normalize_to_p0: bool) -> jnp.ndarray:
+    ego_j = jnp.asarray(ego, dtype=jnp.int32)
+    na = jnp.asarray(num_agents, dtype=jnp.int32)
+    qturns_2p = jnp.take(_SEAT_QTURNS_TO_P0_2P, jnp.clip(ego_j, 0, 1))
+    qturns_4p = jnp.take(_SEAT_QTURNS_TO_P0_4P, jnp.clip(ego_j, 0, 3))
+    qturns = jnp.where(na <= 2, qturns_2p, qturns_4p)
+    return jnp.where(jnp.asarray(normalize_to_p0, dtype=jnp.bool_), qturns, 0)
+
+
+def _rotate_vec_jax(xy: jnp.ndarray, qturns: jnp.ndarray) -> jnp.ndarray:
+    q = jnp.asarray(qturns, dtype=jnp.int32) & 3
+    x = xy[..., 0]
+    y = xy[..., 1]
+    rx = jnp.where(q == 0, x, jnp.where(q == 1, -y, jnp.where(q == 2, -x, y)))
+    ry = jnp.where(q == 0, y, jnp.where(q == 1, x, jnp.where(q == 2, -y, -x)))
+    return jnp.stack([rx, ry], axis=-1)
+
+
+def _rotate_xy_about_center_jax(xy: jnp.ndarray, qturns: jnp.ndarray) -> jnp.ndarray:
+    centered = xy - jnp.asarray([CENTER, CENTER], dtype=xy.dtype)
+    return _rotate_vec_jax(centered, qturns) + jnp.asarray([CENTER, CENTER], dtype=xy.dtype)
+
+
+def _opponent_slot_4p_jax(owner: jnp.ndarray, ego: int, normalize_to_p0: bool) -> jnp.ndarray:
+    o = owner.astype(jnp.int32)
+    ego_j = jnp.asarray(ego, dtype=jnp.int32)
+    canonical = jnp.where(o < ego_j, 2 + o, 2 + (o - 1))
+    row = jnp.take(_NORMALIZED_OWNER_SLOT_4P, jnp.clip(ego_j, 0, 3), axis=0)
+    normalized = jnp.take(row, jnp.clip(o, 0, 3), axis=0)
+    return jnp.where(jnp.asarray(normalize_to_p0, dtype=jnp.bool_), normalized, canonical)
+
+
+def _remap_owner_jax(
+    owner: jnp.ndarray, ego: int, num_agents: jnp.ndarray, normalize_to_p0: bool = False
+) -> jnp.ndarray:
     """Egocentric owner bucket per planet: 0 neutral, 1 self, 2–4 opponents (4p) or 2 (2p)."""
 
     o = owner.astype(jnp.int32)
@@ -59,7 +105,7 @@ def _remap_owner_jax(owner: jnp.ndarray, ego: int, num_agents: jnp.ndarray) -> j
     is_neutral = o < 0
     is_self = o == ego_j
     slot_2p = jnp.full_like(o, 2)
-    slot_4p = jnp.where(o < ego_j, 2 + o, 2 + (o - 1))
+    slot_4p = _opponent_slot_4p_jax(o, ego, normalize_to_p0)
     opponent_slot = jnp.where(na <= 2, slot_2p, slot_4p)
     out = jnp.where(is_neutral, 0, jnp.where(is_self, 1, opponent_slot))
     return jnp.minimum(out, NUM_OWNER_SLOTS - 1).astype(jnp.int32)
@@ -149,6 +195,7 @@ def _incoming_interfleet_ego_features(
     incoming_apt: jnp.ndarray,
     ego: int,
     num_agents: jnp.ndarray,
+    normalize_to_p0: bool = False,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Match ``jax_orbit_wars._resolve_combats`` interfleet step (largest vs 2nd largest per slot).
 
@@ -179,7 +226,7 @@ def _incoming_interfleet_ego_features(
     slot_gt2 = jnp.where(
         survivor <= 0.0,
         0,
-        jnp.where(is_self, 1, jnp.where(top_p < ego_j, 2 + top_p, 2 + (top_p - 1))),
+        jnp.where(is_self, 1, _opponent_slot_4p_jax(top_p, ego, normalize_to_p0)),
     )
     survivor_slot = jnp.where(na <= 2, slot_le2, slot_gt2)
     survivor_slot = jnp.clip(survivor_slot, 0, NUM_OWNER_SLOTS - 1).astype(jnp.int32)
@@ -187,7 +234,11 @@ def _incoming_interfleet_ego_features(
 
 
 def _build_observation_one_env(
-    state: OrbitWarsState, ego: int, ship_speed: float, obs_feature_dim: int
+    state: OrbitWarsState,
+    ego: int,
+    ship_speed: float,
+    obs_feature_dim: int,
+    normalize_to_p0: bool,
 ) -> Dict[str, jnp.ndarray]:
     """Single-env observation (the function that we vmap over the num_envs axis)."""
 
@@ -202,7 +253,10 @@ def _build_observation_one_env(
     planet_prod = planets[:, 6]
 
     incoming = state.incoming_fleets.astype(jnp.float32)  # [A, P, T]
-    incoming_net, survivor_slot = _incoming_interfleet_ego_features(incoming, ego, state.num_agents)
+    incoming_net, survivor_slot = _incoming_interfleet_ego_features(
+        incoming, ego, state.num_agents, normalize_to_p0
+    )
+    obs_qturns = _obs_qturns_to_p0_jax(ego, state.num_agents, normalize_to_p0)
 
     # is_comet[i] = True iff pid[i] appears anywhere in comet_planet_ids (which holds
     # only currently spawned-and-alive comet pids; expired entries are -1).
@@ -224,14 +278,16 @@ def _build_observation_one_env(
 
     # ---- Planet token tensors (slot 1 .. 1+P). ----
     planet_etype = jnp.where(is_comet_per_planet, ENTITY_COMET, ENTITY_PLANET).astype(jnp.int32)
-    planet_owner_idx = _remap_owner_jax(planet_owner, ego, state.num_agents)  # [P], int32
+    planet_owner_idx = _remap_owner_jax(planet_owner, ego, state.num_agents, normalize_to_p0)  # [P], int32
+    vel_xy = _rotate_vec_jax(jnp.stack([vx, vy], axis=-1), obs_qturns)
+    rope_xy = _rotate_xy_about_center_jax(planet_xy, obs_qturns)
 
     assert obs_feature_dim in (FEATURE_DIM, FEATURE_DIM_MULTI)
     planet_features = jnp.zeros((MAX_PLANETS, obs_feature_dim), dtype=jnp.float32)
     planet_features = planet_features.at[:, 0].set(jnp.log1p(jnp.maximum(planet_prod, 0.0)))
     planet_features = planet_features.at[:, 1].set(planet_ships / 1000.0)
-    planet_features = planet_features.at[:, 2].set(vx / 5.0)
-    planet_features = planet_features.at[:, 3].set(vy / 5.0)
+    planet_features = planet_features.at[:, 2].set(vel_xy[:, 0] / 5.0)
+    planet_features = planet_features.at[:, 3].set(vel_xy[:, 1] / 5.0)
     planet_features = planet_features.at[:, 4].set(planet_active.astype(jnp.float32))
     planet_features = planet_features.at[:, 5].set(planet_r / 10.0)
     planet_features = planet_features.at[:, 8 : 8 + INCOMING_TA_BINS].set(incoming_net)
@@ -244,7 +300,7 @@ def _build_observation_one_env(
             :, 8 + INCOMING_TA_BINS : 8 + INCOMING_TA_BINS + INCOMING_SURVIVOR_FLAT
         ].set(surv_write)
 
-    planet_xy_for_rope = jnp.where(planet_active[:, None], planet_xy, 0.0)
+    planet_xy_for_rope = jnp.where(planet_active[:, None], rope_xy, 0.0)
     planet_rope = jnp.zeros((MAX_PLANETS, 3), dtype=jnp.float32)
     planet_rope = planet_rope.at[:, 0].set(planet_xy_for_rope[:, 0] / BOARD_SIZE)
     planet_rope = planet_rope.at[:, 1].set(planet_xy_for_rope[:, 1] / BOARD_SIZE)
@@ -283,12 +339,13 @@ def _build_observation_one_env(
     }
 
 
-@partial(jax.jit, static_argnames=("ego", "ship_speed", "obs_feature_dim"))
+@partial(jax.jit, static_argnames=("ego", "ship_speed", "obs_feature_dim", "normalize_to_p0"))
 def build_observation_batched_jax(
     state_b: OrbitWarsState,
     ego: int,
     ship_speed: float = 6.0,
     obs_feature_dim: int = FEATURE_DIM,
+    normalize_to_p0: bool = False,
 ) -> Dict[str, jnp.ndarray]:
     """Batched observation: ``state_b`` has leading ``num_envs`` axis on every leaf.
 
@@ -301,15 +358,18 @@ def build_observation_batched_jax(
     ``obs_jax_to_torch`` (``nn.Embedding`` requires long indices).
     """
 
-    return jax.vmap(lambda s: _build_observation_one_env(s, ego, ship_speed, obs_feature_dim))(state_b)
+    return jax.vmap(
+        lambda s: _build_observation_one_env(s, ego, ship_speed, obs_feature_dim, normalize_to_p0)
+    )(state_b)
 
 
-@partial(jax.jit, static_argnames=("ship_speed", "obs_feature_dim"))
+@partial(jax.jit, static_argnames=("ship_speed", "obs_feature_dim", "normalize_to_p0"))
 def build_observation_batched_jax_per_ego(
     state_b: OrbitWarsState,
     ego_b: jnp.ndarray,
     ship_speed: float = 6.0,
     obs_feature_dim: int = FEATURE_DIM,
+    normalize_to_p0: bool = False,
 ) -> Dict[str, jnp.ndarray]:
     """Per-element ego variant used at PPO replay.
 
@@ -318,6 +378,6 @@ def build_observation_batched_jax_per_ego(
     state and the ego.
     """
 
-    return jax.vmap(_build_observation_one_env, in_axes=(0, 0, None, None))(
-        state_b, ego_b, ship_speed, obs_feature_dim
+    return jax.vmap(_build_observation_one_env, in_axes=(0, 0, None, None, None))(
+        state_b, ego_b, ship_speed, obs_feature_dim, normalize_to_p0
     )

@@ -50,6 +50,17 @@ DEFAULT_MAX_ACTIONS = 64
 DEFAULT_CPU_THREADS = 1
 MAX_COMET_GROUPS = 5
 MAX_COMET_PATH = 40
+_SEAT_QTURNS_TO_P0_2P = np.asarray([0, 2], dtype=np.int32)
+_SEAT_QTURNS_TO_P0_4P = np.asarray([0, 3, 1, 2], dtype=np.int32)
+_NORMALIZED_OWNER_SLOT_4P = np.asarray(
+    [
+        [1, 3, 4, 2],
+        [4, 1, 2, 3],
+        [3, 2, 1, 4],
+        [2, 4, 3, 1],
+    ],
+    dtype=np.int32,
+)
 CPU_THREAD_ENV_VARS = (
     "OMP_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -1136,6 +1147,7 @@ def _incoming_interfleet_np(
     incoming: np.ndarray,
     ego: int,
     num_agents: int,
+    normalize_to_p0: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Interfleet largest-vs-2nd reduction; returns (signed_net[P,T], survivor_slot[P,T] int)."""
 
@@ -1154,7 +1166,7 @@ def _incoming_interfleet_np(
     slot_gt2 = np.where(
         survivor <= 0.0,
         0,
-        np.where(is_self, 1, np.where(top_p < ego_j, 2 + top_p, 2 + (top_p - 1))),
+        np.where(is_self, 1, _opponent_slot_4p_np(top_p, ego_j, normalize_to_p0)),
     )
     survivor_slot = np.where(num_agents <= 2, slot_le2, slot_gt2)
     survivor_slot = np.clip(survivor_slot, 0, NUM_OWNER_SLOTS - 1).astype(np.int32)
@@ -1179,7 +1191,41 @@ def _hide_enemy_far_right_after_resolution(
     return incoming_net, survivor_slot
 
 
-def _remap_owner(owner: float, ego: int, num_agents: int) -> int:
+def _obs_qturns_to_p0_np(ego: int, num_agents: int, normalize_to_p0: bool) -> int:
+    if not normalize_to_p0:
+        return 0
+    if num_agents <= 2:
+        return int(_SEAT_QTURNS_TO_P0_2P[min(max(int(ego), 0), 1)])
+    return int(_SEAT_QTURNS_TO_P0_4P[min(max(int(ego), 0), 3)])
+
+
+def _rotate_vec_np(x: float, y: float, qturns: int) -> tuple[float, float]:
+    q = int(qturns) & 3
+    if q == 0:
+        return float(x), float(y)
+    if q == 1:
+        return float(-y), float(x)
+    if q == 2:
+        return float(-x), float(-y)
+    return float(y), float(-x)
+
+
+def _rotate_xy_about_center_np(x: float, y: float, qturns: int) -> tuple[float, float]:
+    rx, ry = _rotate_vec_np(float(x) - CENTER, float(y) - CENTER, qturns)
+    return float(rx + CENTER), float(ry + CENTER)
+
+
+def _opponent_slot_4p_np(owner: np.ndarray | int, ego: int, normalize_to_p0: bool) -> np.ndarray | int:
+    o = np.asarray(owner, dtype=np.int32)
+    canonical = np.where(o < ego, 2 + o, 2 + (o - 1))
+    if not normalize_to_p0:
+        return canonical if isinstance(owner, np.ndarray) else int(np.asarray(canonical))
+    row = _NORMALIZED_OWNER_SLOT_4P[min(max(int(ego), 0), 3)]
+    normalized = row[np.clip(o, 0, 3)]
+    return normalized if isinstance(owner, np.ndarray) else int(np.asarray(normalized))
+
+
+def _remap_owner(owner: float, ego: int, num_agents: int, normalize_to_p0: bool = False) -> int:
     o = int(owner)
     if o < 0:
         return 0
@@ -1187,7 +1233,7 @@ def _remap_owner(owner: float, ego: int, num_agents: int) -> int:
         return 1
     if num_agents <= 2:
         return 2
-    return 2 + o if o < ego else 2 + (o - 1)
+    return int(_opponent_slot_4p_np(o, ego, normalize_to_p0))
 
 
 def _count_live_opponents(state: OrbitWarsState, ego: int) -> int:
@@ -2567,6 +2613,7 @@ def _obs_tensors_for_state(
     device: torch.device,
     *,
     policy_player_count: Optional[int] = None,
+    normalize_obs_to_p0: bool = False,
 ) -> dict[str, torch.Tensor]:
     planets = np.asarray(state.planets)
     planet_active = np.asarray(state.planet_active)
@@ -2577,6 +2624,7 @@ def _obs_tensors_for_state(
     step_count = int(np.asarray(state.step_count))
     num_agents = int(np.asarray(state.num_agents))
     player_count = int(policy_player_count if policy_player_count is not None else num_agents)
+    obs_qturns = _obs_qturns_to_p0_np(int(ego_player), player_count, normalize_obs_to_p0)
     comet_ids = np.asarray(state.comet_planet_ids)
     comet_set = set(float(x) for x in comet_ids.flatten() if int(x) >= 0)
 
@@ -2595,7 +2643,7 @@ def _obs_tensors_for_state(
     entity_mask[0] = True
 
     incoming_net, survivor_slot = _incoming_interfleet_np(
-        incoming_fleets.astype(np.float32), int(ego_player), player_count
+        incoming_fleets.astype(np.float32), int(ego_player), player_count, normalize_obs_to_p0
     )
     incoming_net, survivor_slot = _hide_enemy_far_right_after_resolution(incoming_net, survivor_slot)
 
@@ -2605,7 +2653,10 @@ def _obs_tensors_for_state(
         pid = float(planets[i, 0])
         is_comet = pid in comet_set
         entity_type[j] = ENTITY_COMET if is_comet else ENTITY_PLANET
-        owner_idx[j] = min(_remap_owner(float(planets[i, 1]), ego_player, player_count), NUM_OWNER_SLOTS - 1)
+        owner_idx[j] = min(
+            _remap_owner(float(planets[i, 1]), ego_player, player_count, normalize_obs_to_p0),
+            NUM_OWNER_SLOTS - 1,
+        )
         vx, vy = planet_pred_velocity(
             initial_planets[i, 2:4].astype(np.float64),
             planets[i, 2:4].astype(np.float64),
@@ -2625,6 +2676,7 @@ def _obs_tensors_for_state(
                 if lens > 1 and 0 <= idx < lens - 1:
                     vx = float(paths[idx + 1, 0] - paths[idx, 0])
                     vy = float(paths[idx + 1, 1] - paths[idx, 1])
+        vx, vy = _rotate_vec_np(vx, vy, obs_qturns)
 
         features[j, 0] = np.log1p(max(float(planets[i, 6]), 0.0))
         features[j, 1] = float(planets[i, 5]) / 1000.0
@@ -2639,8 +2691,9 @@ def _obs_tensors_for_state(
                 j, 8 + INCOMING_TA_BINS : 8 + INCOMING_TA_BINS + INCOMING_SURVIVOR_FLAT
             ] = oh.reshape(INCOMING_SURVIVOR_FLAT)
         if active:
-            rope_pos[j, 0] = float(planets[i, 2]) / BOARD_SIZE
-            rope_pos[j, 1] = float(planets[i, 3]) / BOARD_SIZE
+            px, py = _rotate_xy_about_center_np(float(planets[i, 2]), float(planets[i, 3]), obs_qturns)
+            rope_pos[j, 0] = px / BOARD_SIZE
+            rope_pos[j, 1] = py / BOARD_SIZE
         entity_mask[j] = active
         planet_mask[j] = True
 
@@ -2674,6 +2727,7 @@ def _build_turn_actions_torch_only(
     launch_tracker: Optional[FleetLaunchDebugTracker] = None,
     game_step: int = 0,
     policy_player_count: Optional[int] = None,
+    normalize_obs_to_p0: bool = False,
     launch_geometry: LaunchGeometryInputs | None = None,
     deadline_s: float | None = None,
 ) -> list[list[float]]:
@@ -2691,7 +2745,11 @@ def _build_turn_actions_torch_only(
         t0 = perf_counter()
         virt = state._replace(planets=planets, incoming_fleets=incoming_fleets)
         batch = _obs_tensors_for_state(
-            virt, ego_player, device, policy_player_count=policy_player_count
+            virt,
+            ego_player,
+            device,
+            policy_player_count=policy_player_count,
+            normalize_obs_to_p0=normalize_obs_to_p0,
         )
         if timing is not None:
             timing.micro_obs_tensors_s += perf_counter() - t0
@@ -3140,6 +3198,7 @@ class KaggleOrbitWarsAgent:
         _configure_cpu_threads()
         self.checkpoint_path = resolve_checkpoint_path(checkpoint_path)
         self.policy, self.device, training_args = load_policy(self.checkpoint_path, device=device)
+        self.normalize_obs_to_p0 = bool(training_args.get("normalize_obs_to_p0", False))
         self._greedy_by_player = _normalize_greedy(greedy)
         self.max_micro_steps = int(
             max_micro_steps
@@ -3313,6 +3372,7 @@ class KaggleOrbitWarsAgent:
             timing=timing,
             launch_tracker=self.launch_tracker,
             game_step=step_count,
+            normalize_obs_to_p0=self.normalize_obs_to_p0,
             launch_geometry=launch_geometry,
             deadline_s=(
                 call_t0 + max(0.0, float(_cfg_get(config, "actTimeout", 1.0)) - 0.1)
@@ -3359,6 +3419,8 @@ class KaggleOrbitWarsDualPolicyAgent:
         self.checkpoint_2p = resolve_checkpoint_path(checkpoint_2p)
         self.policy_4p, self.device, training_args_4p = load_policy(self.checkpoint_4p, device=device)
         self.policy_2p, _, training_args_2p = load_policy(self.checkpoint_2p, device=self.device)
+        self.normalize_obs_to_p0_4p = bool(training_args_4p.get("normalize_obs_to_p0", False))
+        self.normalize_obs_to_p0_2p = bool(training_args_2p.get("normalize_obs_to_p0", False))
         self._greedy_by_player = _normalize_greedy(greedy)
         micro_4p = int(training_args_4p.get("max_micro_steps", DEFAULT_MAX_ACTIONS))
         micro_2p = int(training_args_2p.get("max_micro_steps", DEFAULT_MAX_ACTIONS))
@@ -3499,6 +3561,7 @@ class KaggleOrbitWarsDualPolicyAgent:
         use_4p_policy = live_opponents >= 2
         policy = self.policy_4p if use_4p_policy else self.policy_2p
         policy_player_count = int(np.asarray(state.num_agents)) if use_4p_policy else 2
+        normalize_obs_to_p0 = self.normalize_obs_to_p0_4p if use_4p_policy else self.normalize_obs_to_p0_2p
         _check_4p_adapter_sanity(
             obs=obs,
             config=config,
@@ -3530,6 +3593,7 @@ class KaggleOrbitWarsDualPolicyAgent:
             launch_tracker=self.launch_tracker,
             game_step=step_count,
             policy_player_count=policy_player_count,
+            normalize_obs_to_p0=normalize_obs_to_p0,
             launch_geometry=launch_geometry,
             deadline_s=(
                 call_t0 + max(0.0, float(_cfg_get(config, "actTimeout", 1.0)) - 0.1)

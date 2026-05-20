@@ -558,6 +558,7 @@ def _run_async_micro_step_multi(
     first_hit_env_chunk_size: int = 0,
     first_hit_method: str = "category-rays",
     obs_feature_dim: int = FEATURE_DIM,
+    normalize_obs_to_p0: bool = False,
     sync_policy_timing: bool = False,
 ) -> tuple[OrbitWarsState, List[TorchTransitionBuffer], List[CompressedObservationBuffer]]:
     """Run one micro decision for every pending egocentric row in a ``n_ego * num_envs`` JAX batch."""
@@ -581,7 +582,13 @@ def _run_async_micro_step_multi(
     ego_b_j = jnp.concatenate(ego_rows, axis=0)
 
     t0 = perf_counter()
-    obs_jax = build_observation_batched_jax_per_ego(virt_b, ego_b_j, ship_speed, obs_feature_dim)
+    obs_jax = build_observation_batched_jax_per_ego(
+        virt_b,
+        ego_b_j,
+        ship_speed,
+        obs_feature_dim,
+        normalize_to_p0=normalize_obs_to_p0,
+    )
     must_halt_j = must_halt_no_owned_ships_per_ego(virt_b, ego_b_j)
     timing.obs_build_s += perf_counter() - t0
 
@@ -967,6 +974,7 @@ def collect_parallel_micro_rollouts(
     else:
         state_b, cfg = carry_in.state_b, carry_in.cfg
         cfg.reward_mode = cfg_template.reward_mode
+        cfg.normalize_obs_to_p0 = cfg_template.normalize_obs_to_p0
         episode_turns = list(carry_in.episode_turns)
         if len(episode_turns) != num_envs:
             episode_turns = [0] * num_envs
@@ -1207,6 +1215,7 @@ def collect_parallel_micro_rollouts(
                 first_hit_env_chunk_size=first_hit_env_chunk_size,
                 first_hit_method=first_hit_method,
                 obs_feature_dim=obs_feature_dim,
+                normalize_obs_to_p0=cfg.normalize_obs_to_p0,
                 sync_policy_timing=sync_policy_timing,
             )
             if profile_rollout and device.type == "cuda" and not logged_first_policy_fwd:
@@ -1229,7 +1238,13 @@ def collect_parallel_micro_rollouts(
         value_np_per_ego: list[np.ndarray] = []
         for ego in range(n_ego):
             t0 = perf_counter()
-            obs_j = build_observation_batched_jax(state_b, ego, ship_speed, obs_feature_dim)
+            obs_j = build_observation_batched_jax(
+                state_b,
+                ego,
+                ship_speed,
+                obs_feature_dim,
+                normalize_to_p0=cfg.normalize_obs_to_p0,
+            )
             timing.obs_build_s += perf_counter() - t0
             tb0 = perf_counter()
             obs_t = decode_observation(compress_observation(obs_jax_to_torch(obs_j)), feature_dim=obs_feature_dim)

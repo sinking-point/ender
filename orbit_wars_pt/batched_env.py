@@ -124,6 +124,7 @@ def stack_initial_states(
         max_fleets=cfg_template.max_fleets,
         episode_seed=cfg_template.episode_seed,
         reward_mode=cfg_template.reward_mode,
+        normalize_obs_to_p0=cfg_template.normalize_obs_to_p0,
     )
     states: List[OrbitWarsState] = []
     for i in range(num_envs):
