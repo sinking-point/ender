@@ -287,7 +287,7 @@ def replay_micro_step_logprob_entropy(
         ph.unsqueeze(0),
         torch.tensor([o_idx], device=device, dtype=torch.long),
         torch.tensor([d_idx], device=device, dtype=torch.long),
-        times_norm,
+        times_norm=times_norm,
     )
     frac_logits = frac_logits_b[0]
 
@@ -507,7 +507,7 @@ def micro_step_apply(
         ph.unsqueeze(0),
         torch.tensor([o_idx], device=device, dtype=torch.long),
         torch.tensor([d_idx], device=device, dtype=torch.long),
-        times_norm,
+        times_norm=times_norm,
     )
     frac_logits = frac_logits_b[0]
 

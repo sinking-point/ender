@@ -50,6 +50,7 @@ def _compute_logp_value_entropy_torch(
     frac_idx: torch.Tensor,
     no_valid_pairs: torch.Tensor,
     no_valid_fracs: torch.Tensor,
+    population_idx: Optional[torch.Tensor] = None,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor,
     torch.Tensor, torch.Tensor, torch.Tensor,
@@ -84,6 +85,7 @@ def _compute_logp_value_entropy_torch(
         rope_pos=rope_pos,
         entity_mask=entity_mask,
         planet_mask=planet_mask,
+        population_idx=population_idx,
     )
 
     halt_logits = out["halt_logits"]
@@ -113,9 +115,10 @@ def _compute_logp_value_entropy_torch(
         ph,
         o_idx,
         frac_idx,
-        fleet_size,
-        target_hit_tick,
-        ships,
+        fleet_size=fleet_size,
+        target_eta=target_hit_tick,
+        target_ships=ships,
+        population_idx=population_idx,
     )
     target_mask = (
         out["pair_mask"][n_idx, o_idx, :]
@@ -180,6 +183,7 @@ def compute_ppo_loss_torch(
     clip_eps: float,
     vf_coef: float,
     entropy_coef: float,
+    population_idx: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Full PPO scalar loss + diagnostics on one minibatch.
 
@@ -246,6 +250,7 @@ def compute_ppo_loss_torch(
         frac_idx,
         no_valid_pairs,
         no_valid_fracs,
+        population_idx,
     )
 
     log_ratio = new_logp - old_logp

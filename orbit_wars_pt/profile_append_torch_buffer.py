@@ -60,6 +60,7 @@ def _run_steps(
             tensors["must_halt_no_ships"],
             tensors["target_pr"],
             tensors["target_hit_tick"],
+            tensors["population_idx"],
             wr,
             mk,
             active,
@@ -109,6 +110,7 @@ def main() -> None:
         "must_halt_no_ships": torch.zeros((N,), dtype=torch.bool, device=device),
         "target_pr": torch.zeros((N, P), dtype=torch.bool, device=device),
         "target_hit_tick": torch.zeros((N, P), dtype=torch.float32, device=device),
+        "population_idx": torch.zeros((N,), dtype=torch.int32, device=device),
     }
 
     wr0 = max(1, H // 4)

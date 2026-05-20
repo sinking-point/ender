@@ -142,8 +142,35 @@ class TransformerBlock(nn.Module):
         return x
 
 
+def _make_target_pick_head(d_model: int) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Linear(d_model + 3, d_model),
+        nn.GELU(),
+        nn.Linear(d_model, d_model // 2),
+        nn.GELU(),
+        nn.Linear(d_model // 2, 1),
+    )
+
+
+class OrbitWarsPopulationTail(nn.Module):
+    """One population member's private final block + output heads."""
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.block = TransformerBlock(d_model, n_heads, dropout=dropout)
+        self.norm_f = nn.LayerNorm(d_model)
+        self.pair_q = nn.Linear(d_model, d_model // 2, bias=False)
+        self.pair_k = nn.Linear(d_model, d_model // 2, bias=False)
+        self.origin_frac_head = nn.Linear(d_model, NUM_FRACTIONS)
+        self.target_pick_head = _make_target_pick_head(d_model)
+        self.time_proj = nn.Linear(1, 32)
+        self.frac_heads = nn.ModuleList([nn.Linear(d_model * 2 + 32, 1) for _ in range(NUM_FRACTIONS)])
+        self.halt_head = nn.Linear(d_model, 2)
+        self.value_head = nn.Linear(d_model, 1)
+
+
 class OrbitWarsPolicy(nn.Module):
-    """Encoder-only transformer; heads for halt, planet pair, dispatch fractions, value."""
+    """Encoder-only transformer; optional population-specific final block + heads."""
 
     def __init__(
         self,
@@ -153,38 +180,42 @@ class OrbitWarsPolicy(nn.Module):
         feature_dim: int = FEATURE_DIM,
         dropout: float = 0.0,
         activation_checkpointing: bool = False,
+        population_size: int = 1,
     ):
         super().__init__()
         assert (d_model // n_heads) % 6 == 0
         self.d_model = d_model
         self.n_heads = n_heads
         self.activation_checkpointing = activation_checkpointing
+        self.population_size = int(population_size)
+        if self.population_size < 1:
+            raise ValueError(f"population_size must be >= 1, got {self.population_size}")
         self.type_emb = nn.Embedding(NUM_ENTITY_TYPES, d_model)
         self.owner_emb = nn.Embedding(NUM_OWNER_SLOTS, d_model)
         self.feat_proj = nn.Linear(feature_dim, d_model)
         self.cls_type_idx = ENTITY_CLS
 
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(d_model, n_heads, dropout=dropout) for _ in range(n_layers)]
-        )
-        self.norm_f = nn.LayerNorm(d_model)
-
-        self.pair_q = nn.Linear(d_model, d_model // 2, bias=False)
-        self.pair_k = nn.Linear(d_model, d_model // 2, bias=False)
-        self.origin_frac_head = nn.Linear(d_model, NUM_FRACTIONS)
-        self.target_pick_head = nn.Sequential(
-            nn.Linear(d_model + 3, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Linear(d_model // 2, 1),
-        )
-
-        self.time_proj = nn.Linear(1, 32)
-        self.frac_heads = nn.ModuleList([nn.Linear(d_model * 2 + 32, 1) for _ in range(NUM_FRACTIONS)])
-
-        self.halt_head = nn.Linear(d_model, 2)
-        self.value_head = nn.Linear(d_model, 1)
+        if self.population_size == 1:
+            self.blocks = nn.ModuleList(
+                [TransformerBlock(d_model, n_heads, dropout=dropout) for _ in range(n_layers)]
+            )
+            self.norm_f = nn.LayerNorm(d_model)
+            self.pair_q = nn.Linear(d_model, d_model // 2, bias=False)
+            self.pair_k = nn.Linear(d_model, d_model // 2, bias=False)
+            self.origin_frac_head = nn.Linear(d_model, NUM_FRACTIONS)
+            self.target_pick_head = _make_target_pick_head(d_model)
+            self.time_proj = nn.Linear(1, 32)
+            self.frac_heads = nn.ModuleList([nn.Linear(d_model * 2 + 32, 1) for _ in range(NUM_FRACTIONS)])
+            self.halt_head = nn.Linear(d_model, 2)
+            self.value_head = nn.Linear(d_model, 1)
+        else:
+            shared_layers = max(0, int(n_layers) - 1)
+            self.shared_blocks = nn.ModuleList(
+                [TransformerBlock(d_model, n_heads, dropout=dropout) for _ in range(shared_layers)]
+            )
+            self.population_tails = nn.ModuleList(
+                [OrbitWarsPopulationTail(d_model, n_heads, dropout=dropout) for _ in range(self.population_size)]
+            )
 
         self.register_buffer("_frac_const", torch.tensor(FRACTIONS, dtype=torch.float32))
 
@@ -192,6 +223,164 @@ class OrbitWarsPolicy(nn.Module):
         t_ok = entity_type.clamp(0, NUM_ENTITY_TYPES - 1)
         o_ok = owner_idx.clamp(0, NUM_OWNER_SLOTS - 1)
         return self.type_emb(t_ok) + self.owner_emb(o_ok) + self.feat_proj(features)
+
+    def _run_block(
+        self,
+        block: TransformerBlock,
+        x: torch.Tensor,
+        rope_pos: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if self.activation_checkpointing and torch.is_grad_enabled():
+            return checkpoint(block, x, rope_pos, key_padding_mask, use_reentrant=False)
+        return block(x, rope_pos, key_padding_mask)
+
+    def _normalize_population_idx(
+        self,
+        population_idx: Optional[torch.Tensor],
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if population_idx is None:
+            return torch.zeros((batch_size,), device=device, dtype=torch.long)
+        pop = population_idx.to(device=device, dtype=torch.long).reshape(-1)
+        if pop.shape[0] != batch_size:
+            raise ValueError(f"population_idx batch {pop.shape[0]} != expected {batch_size}")
+        if self.population_size == 1:
+            return torch.zeros_like(pop)
+        return pop
+
+    def _apply_encoder(
+        self,
+        x: torch.Tensor,
+        rope_pos: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor],
+        population_idx: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = int(x.shape[0])
+        pop = self._normalize_population_idx(population_idx, batch_size, x.device)
+        if self.population_size == 1:
+            for blk in self.blocks:
+                x = self._run_block(blk, x, rope_pos, key_padding_mask)
+            return self.norm_f(x), pop
+
+        for blk in self.shared_blocks:
+            x = self._run_block(blk, x, rope_pos, key_padding_mask)
+
+        h = torch.empty_like(x)
+        for member_idx, tail in enumerate(self.population_tails):
+            member_rows = torch.nonzero(pop == member_idx, as_tuple=False).squeeze(-1)
+            if member_rows.numel() == 0:
+                continue
+            x_m = x.index_select(0, member_rows)
+            rope_m = rope_pos.index_select(0, member_rows)
+            mask_m = None if key_padding_mask is None else key_padding_mask.index_select(0, member_rows)
+            x_m = self._run_block(tail.block, x_m, rope_m, mask_m)
+            h.index_copy_(0, member_rows, tail.norm_f(x_m))
+        return h, pop
+
+    def _compute_outputs_single(
+        self,
+        h: torch.Tensor,
+        owner_idx: torch.Tensor,
+        features: torch.Tensor,
+        entity_mask: torch.Tensor,
+        planet_mask: torch.Tensor,
+        *,
+        pair_q: nn.Linear,
+        pair_k: nn.Linear,
+        origin_frac_head: nn.Linear,
+        halt_head: nn.Linear,
+        value_head: nn.Linear,
+    ) -> Dict[str, Any]:
+        b = h.shape[0]
+        cls_h = h[:, 0, :]
+        halt_logits = halt_head(cls_h)
+        value = value_head(cls_h).squeeze(-1)
+
+        planet_h = h[:, 1 : 1 + MAX_PLANETS, :]
+        pq = pair_q(planet_h)
+        pk = pair_k(planet_h)
+        pair_logits = torch.matmul(pq, pk.transpose(-2, -1)) * (pq.shape[-1] ** -0.5)
+
+        pm = planet_mask[:, 1 : 1 + MAX_PLANETS]
+        em = entity_mask[:, 1 : 1 + MAX_PLANETS]
+        active_planet = pm & em
+        eye = torch.eye(MAX_PLANETS, device=h.device, dtype=torch.bool).unsqueeze(0).expand(b, -1, -1)
+        owned_self = owner_idx[:, 1 : 1 + MAX_PLANETS] == 1
+        ships = features[:, 1 : 1 + MAX_PLANETS, 1] * 1000.0
+        has_ships = ships > 0.5
+        origin_ok = active_planet & owned_self & has_ships
+        dest_ok = active_planet
+        pair_mask = origin_ok[:, :, None] & dest_ok[:, None, :] & ~eye
+        sends = torch.floor(self._frac_const.to(features.dtype)[None, None, :] * ships[:, :, None])
+        origin_frac_mask = origin_ok[:, :, None] & (sends >= 1.0)
+        origin_frac_logits = origin_frac_head(planet_h)
+
+        return {
+            "hidden": h,
+            "halt_logits": halt_logits,
+            "value": value,
+            "pair_logits": pair_logits,
+            "pair_mask": pair_mask,
+            "origin_frac_logits": origin_frac_logits,
+            "origin_frac_mask": origin_frac_mask,
+            "planet_hidden": planet_h,
+        }
+
+    def _compute_outputs_population(
+        self,
+        h: torch.Tensor,
+        owner_idx: torch.Tensor,
+        features: torch.Tensor,
+        entity_mask: torch.Tensor,
+        planet_mask: torch.Tensor,
+        population_idx: torch.Tensor,
+    ) -> Dict[str, Any]:
+        batch_size = int(h.shape[0])
+        outputs: Optional[Dict[str, Any]] = None
+
+        for member_idx, tail in enumerate(self.population_tails):
+            member_rows = torch.nonzero(population_idx == member_idx, as_tuple=False).squeeze(-1)
+            if member_rows.numel() == 0:
+                continue
+            out_m = self._compute_outputs_single(
+                h.index_select(0, member_rows),
+                owner_idx.index_select(0, member_rows),
+                features.index_select(0, member_rows),
+                entity_mask.index_select(0, member_rows),
+                planet_mask.index_select(0, member_rows),
+                pair_q=tail.pair_q,
+                pair_k=tail.pair_k,
+                origin_frac_head=tail.origin_frac_head,
+                halt_head=tail.halt_head,
+                value_head=tail.value_head,
+            )
+            if outputs is None:
+                outputs = {
+                    "hidden": h,
+                    "halt_logits": out_m["halt_logits"].new_empty((batch_size, 2)),
+                    "value": out_m["value"].new_empty((batch_size,)),
+                    "pair_logits": out_m["pair_logits"].new_empty((batch_size, MAX_PLANETS, MAX_PLANETS)),
+                    "pair_mask": out_m["pair_mask"].new_zeros((batch_size, MAX_PLANETS, MAX_PLANETS)),
+                    "origin_frac_logits": out_m["origin_frac_logits"].new_empty(
+                        (batch_size, MAX_PLANETS, NUM_FRACTIONS)
+                    ),
+                    "origin_frac_mask": out_m["origin_frac_mask"].new_zeros(
+                        (batch_size, MAX_PLANETS, NUM_FRACTIONS)
+                    ),
+                    "planet_hidden": out_m["planet_hidden"].new_empty((batch_size, MAX_PLANETS, self.d_model)),
+                }
+            outputs["halt_logits"].index_copy_(0, member_rows, out_m["halt_logits"])
+            outputs["value"].index_copy_(0, member_rows, out_m["value"])
+            outputs["pair_logits"].index_copy_(0, member_rows, out_m["pair_logits"])
+            outputs["pair_mask"].index_copy_(0, member_rows, out_m["pair_mask"])
+            outputs["origin_frac_logits"].index_copy_(0, member_rows, out_m["origin_frac_logits"])
+            outputs["origin_frac_mask"].index_copy_(0, member_rows, out_m["origin_frac_mask"])
+            outputs["planet_hidden"].index_copy_(0, member_rows, out_m["planet_hidden"])
+
+        assert outputs is not None
+        return outputs
 
     def forward(
         self,
@@ -201,6 +390,7 @@ class OrbitWarsPolicy(nn.Module):
         rope_pos: torch.Tensor,
         entity_mask: torch.Tensor,
         planet_mask: torch.Tensor,
+        population_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """Returns logits and masks for action decoding.
 
@@ -243,18 +433,8 @@ class OrbitWarsPolicy(nn.Module):
         arange = torch.arange(L_packed, device=counts.device)
         padding_mask = arange[None, :] >= counts[:, None]  # [B, L_packed]
 
-        for blk in self.blocks:
-            if self.activation_checkpointing and torch.is_grad_enabled():
-                x_packed = checkpoint(
-                    blk,
-                    x_packed,
-                    rope_packed,
-                    padding_mask,
-                    use_reentrant=False,
-                )
-            else:
-                x_packed = blk(x_packed, rope_packed, padding_mask)
-        h_packed = self.norm_f(x_packed)
+        pop = self._normalize_population_idx(population_idx, b, features.device)
+        h_packed, _ = self._apply_encoder(x_packed, rope_packed, padding_mask, pop)
 
         # Scatter back to dense [B, L, d]. Padding rows of ``h_packed``
         # contain garbage (masked-attention output), and they get scattered
@@ -265,39 +445,20 @@ class OrbitWarsPolicy(nn.Module):
         h = torch.zeros(b, l, self.d_model, dtype=h_packed.dtype, device=h_packed.device)
         h = h.scatter(1, pack_idx_d, h_packed)
 
-        cls_h = h[:, 0, :]
-        halt_logits = self.halt_head(cls_h)
-        value = self.value_head(cls_h).squeeze(-1)
-
-        planet_h = h[:, 1 : 1 + MAX_PLANETS, :]
-        pq = self.pair_q(planet_h)
-        pk = self.pair_k(planet_h)
-        pair_logits = torch.matmul(pq, pk.transpose(-2, -1)) * (pq.shape[-1] ** -0.5)
-
-        pm = planet_mask[:, 1 : 1 + MAX_PLANETS]
-        em = entity_mask[:, 1 : 1 + MAX_PLANETS]
-        active_planet = pm & em
-        eye = torch.eye(MAX_PLANETS, device=h.device, dtype=torch.bool).unsqueeze(0).expand(b, -1, -1)
-        owned_self = owner_idx[:, 1 : 1 + MAX_PLANETS] == 1
-        ships = features[:, 1 : 1 + MAX_PLANETS, 1] * 1000.0
-        has_ships = ships > 0.5
-        origin_ok = active_planet & owned_self & has_ships
-        dest_ok = active_planet
-        pair_mask = origin_ok[:, :, None] & dest_ok[:, None, :] & ~eye
-        sends = torch.floor(self._frac_const.to(features.dtype)[None, None, :] * ships[:, :, None])
-        origin_frac_mask = origin_ok[:, :, None] & (sends >= 1.0)
-        origin_frac_logits = self.origin_frac_head(planet_h)
-
-        return {
-            "hidden": h,
-            "halt_logits": halt_logits,
-            "value": value,
-            "pair_logits": pair_logits,
-            "pair_mask": pair_mask,
-            "origin_frac_logits": origin_frac_logits,
-            "origin_frac_mask": origin_frac_mask,
-            "planet_hidden": planet_h,
-        }
+        if self.population_size == 1:
+            return self._compute_outputs_single(
+                h,
+                owner_idx,
+                features,
+                entity_mask,
+                planet_mask,
+                pair_q=self.pair_q,
+                pair_k=self.pair_k,
+                origin_frac_head=self.origin_frac_head,
+                halt_head=self.halt_head,
+                value_head=self.value_head,
+            )
+        return self._compute_outputs_population(h, owner_idx, features, entity_mask, planet_mask, pop)
 
     def _forward_dense_fixed(
         self,
@@ -307,58 +468,28 @@ class OrbitWarsPolicy(nn.Module):
         rope_pos: torch.Tensor,
         entity_mask: torch.Tensor,
         planet_mask: torch.Tensor,
+        population_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """Fixed-length dense path shared by rollout and PPO."""
 
         x = self.embed(entity_type, owner_idx, features)
         padding_mask = ~entity_mask
 
-        for blk in self.blocks:
-            if self.activation_checkpointing and torch.is_grad_enabled():
-                x = checkpoint(
-                    blk,
-                    x,
-                    rope_pos,
-                    padding_mask,
-                    use_reentrant=False,
-                )
-            else:
-                x = blk(x, rope_pos, padding_mask)
-        h = self.norm_f(x)
-
-        cls_h = h[:, 0, :]
-        halt_logits = self.halt_head(cls_h)
-        value = self.value_head(cls_h).squeeze(-1)
-
-        planet_h = h[:, 1 : 1 + MAX_PLANETS, :]
-        pq = self.pair_q(planet_h)
-        pk = self.pair_k(planet_h)
-        pair_logits = torch.matmul(pq, pk.transpose(-2, -1)) * (pq.shape[-1] ** -0.5)
-
-        pm = planet_mask[:, 1 : 1 + MAX_PLANETS]
-        em = entity_mask[:, 1 : 1 + MAX_PLANETS]
-        active_planet = pm & em
-        eye = torch.eye(MAX_PLANETS, device=h.device, dtype=torch.bool).unsqueeze(0).expand(h.shape[0], -1, -1)
-        owned_self = owner_idx[:, 1 : 1 + MAX_PLANETS] == 1
-        ships = features[:, 1 : 1 + MAX_PLANETS, 1] * 1000.0
-        has_ships = ships > 0.5
-        origin_ok = active_planet & owned_self & has_ships
-        dest_ok = active_planet
-        pair_mask = origin_ok[:, :, None] & dest_ok[:, None, :] & ~eye
-        sends = torch.floor(self._frac_const.to(features.dtype)[None, None, :] * ships[:, :, None])
-        origin_frac_mask = origin_ok[:, :, None] & (sends >= 1.0)
-        origin_frac_logits = self.origin_frac_head(planet_h)
-
-        return {
-            "hidden": h,
-            "halt_logits": halt_logits,
-            "value": value,
-            "pair_logits": pair_logits,
-            "pair_mask": pair_mask,
-            "origin_frac_logits": origin_frac_logits,
-            "origin_frac_mask": origin_frac_mask,
-            "planet_hidden": planet_h,
-        }
+        h, pop = self._apply_encoder(x, rope_pos, padding_mask, population_idx)
+        if self.population_size == 1:
+            return self._compute_outputs_single(
+                h,
+                owner_idx,
+                features,
+                entity_mask,
+                planet_mask,
+                pair_q=self.pair_q,
+                pair_k=self.pair_k,
+                origin_frac_head=self.origin_frac_head,
+                halt_head=self.halt_head,
+                value_head=self.value_head,
+            )
+        return self._compute_outputs_population(h, owner_idx, features, entity_mask, planet_mask, pop)
 
     def forward_dense_rollout(
         self,
@@ -368,6 +499,7 @@ class OrbitWarsPolicy(nn.Module):
         rope_pos: torch.Tensor,
         entity_mask: torch.Tensor,
         planet_mask: torch.Tensor,
+        population_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """Fixed-length rollout forward path.
 
@@ -382,6 +514,7 @@ class OrbitWarsPolicy(nn.Module):
             rope_pos=rope_pos,
             entity_mask=entity_mask,
             planet_mask=planet_mask,
+            population_idx=population_idx,
         )
 
     def target_logits_for_origin_fraction(
@@ -392,6 +525,7 @@ class OrbitWarsPolicy(nn.Module):
         fleet_size: Optional[torch.Tensor] = None,
         target_eta: Optional[torch.Tensor] = None,
         target_ships: Optional[torch.Tensor] = None,
+        population_idx: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Per-target pick logits after sampled launch size/reachability are known.
 
@@ -420,7 +554,21 @@ class OrbitWarsPolicy(nn.Module):
             target_ships_t = target_ships.to(device=device, dtype=planet_hidden.dtype)
             is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
         target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
-        return self.target_pick_head(target_in).squeeze(-1)
+        if self.population_size == 1:
+            return self.target_pick_head(target_in).squeeze(-1)
+
+        pop = self._normalize_population_idx(population_idx, b, planet_hidden.device)
+        logits: Optional[torch.Tensor] = None
+        for member_idx, tail in enumerate(self.population_tails):
+            member_rows = torch.nonzero(pop == member_idx, as_tuple=False).squeeze(-1)
+            if member_rows.numel() == 0:
+                continue
+            logits_m = tail.target_pick_head(target_in.index_select(0, member_rows)).squeeze(-1)
+            if logits is None:
+                logits = logits_m.new_empty((b, planet_hidden.shape[1]))
+            logits.index_copy_(0, member_rows, logits_m)
+        assert logits is not None
+        return logits
 
     def fraction_logits(
         self,
@@ -428,6 +576,7 @@ class OrbitWarsPolicy(nn.Module):
         origin_idx: torch.Tensor,
         dest_idx: torch.Tensor,
         times_norm: torch.Tensor,
+        population_idx: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """times_norm: [B, NUM_FRACTIONS] — eta_k / 500 per fraction head."""
 
@@ -435,10 +584,33 @@ class OrbitWarsPolicy(nn.Module):
         device = planet_hidden.device
         ho = planet_hidden[torch.arange(b, device=device), origin_idx]
         hd = planet_hidden[torch.arange(b, device=device), dest_idx]
-        logits = []
-        for k in range(NUM_FRACTIONS):
-            tt = times_norm[:, k : k + 1]
-            te = self.time_proj(tt)
-            z = torch.cat([ho, hd, te], dim=-1)
-            logits.append(self.frac_heads[k](z).squeeze(-1))
-        return torch.stack(logits, dim=-1)
+        if self.population_size == 1:
+            logits = []
+            for k in range(NUM_FRACTIONS):
+                tt = times_norm[:, k : k + 1]
+                te = self.time_proj(tt)
+                z = torch.cat([ho, hd, te], dim=-1)
+                logits.append(self.frac_heads[k](z).squeeze(-1))
+            return torch.stack(logits, dim=-1)
+
+        pop = self._normalize_population_idx(population_idx, b, planet_hidden.device)
+        logits: Optional[torch.Tensor] = None
+        for member_idx, tail in enumerate(self.population_tails):
+            member_rows = torch.nonzero(pop == member_idx, as_tuple=False).squeeze(-1)
+            if member_rows.numel() == 0:
+                continue
+            ho_m = ho.index_select(0, member_rows)
+            hd_m = hd.index_select(0, member_rows)
+            times_m = times_norm.index_select(0, member_rows)
+            out_m = []
+            for k in range(NUM_FRACTIONS):
+                tt = times_m[:, k : k + 1]
+                te = tail.time_proj(tt)
+                z = torch.cat([ho_m, hd_m, te], dim=-1)
+                out_m.append(tail.frac_heads[k](z).squeeze(-1))
+            logits_m = torch.stack(out_m, dim=-1)
+            if logits is None:
+                logits = logits_m.new_empty((b, NUM_FRACTIONS))
+            logits.index_copy_(0, member_rows, logits_m)
+        assert logits is not None
+        return logits

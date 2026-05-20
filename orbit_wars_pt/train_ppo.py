@@ -56,7 +56,7 @@ from orbit_wars_pt.compressed_observation import compressed_observation_to_host
 
 from jax_orbit_wars import OrbitWarsState
 
-CHECKPOINT_VERSION = 3
+CHECKPOINT_VERSION = 4
 
 
 @dataclass
@@ -108,6 +108,11 @@ def _serialize_rollout_carry(carry: RolloutCarry) -> Dict[str, Any]:
         "player_done": (
             None if carry.player_done is None else np.asarray(carry.player_done, dtype=np.bool_)
         ),
+        "population_assignments": (
+            None
+            if carry.population_assignments is None
+            else np.asarray(carry.population_assignments, dtype=np.int32)
+        ),
     }
 
 
@@ -128,11 +133,18 @@ def _deserialize_rollout_carry(obj: Dict[str, Any]) -> RolloutCarry:
         pd = np.asarray(player_done_obj, dtype=np.bool_)
         if pd.shape == (int(cfg.num_agents), ne):
             player_done = pd
+    population_assignments_obj = obj.get("population_assignments", None)
+    population_assignments = None
+    if population_assignments_obj is not None:
+        pop = np.asarray(population_assignments_obj, dtype=np.int32)
+        if pop.shape == (int(cfg.num_agents), ne):
+            population_assignments = pop
     return RolloutCarry(
         state_b=state_b,
         cfg=cfg,
         episode_turns=episode_turns,
         player_done=player_done,
+        population_assignments=population_assignments,
     )
 
 
@@ -183,6 +195,7 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "n_layers",
         "max_fleets",
         "num_agents",
+        "population_size",
         "activation_checkpointing",
         "device",
         "compile",
@@ -302,7 +315,7 @@ def build_ppo_samples(
     have shape ``[M]`` where ``M`` is the total number of valid transitions.
     """
 
-    advs, rets, players, t_idx, n_idx, old_lp, old_v = [], [], [], [], [], [], []
+    advs, rets, players, t_idx, n_idx, old_lp, old_v, pop_idx = [], [], [], [], [], [], [], []
     num_envs = int(segment.valid[0].shape[1])
     num_players = len(segment.bufs)
 
@@ -314,6 +327,7 @@ def build_ppo_samples(
         bootstrap = segment.bootstrap[player]
         bootstrap_valid = segment.bootstrap_valid[player]
         write_idx = segment.write_idx[player]
+        buf_population_idx = np.asarray(segment.bufs[player].population_idx.detach().cpu())
 
         for n in range(num_envs):
             T = int(write_idx[n])
@@ -331,6 +345,7 @@ def build_ppo_samples(
             n_idx.append(np.full((T,), n, dtype=np.int32))
             old_lp.append(old_logprob[:T, n])
             old_v.append(v)
+            pop_idx.append(buf_population_idx[:T, n].astype(np.int32))
 
     if not advs:
         return None
@@ -342,6 +357,7 @@ def build_ppo_samples(
         "n_idx": np.concatenate(n_idx).astype(np.int32),
         "old_logprob": np.concatenate(old_lp).astype(np.float32),
         "old_value": np.concatenate(old_v).astype(np.float32),
+        "population_idx": np.concatenate(pop_idx).astype(np.int32),
     }
 
 
@@ -584,7 +600,7 @@ def _build_host_chunk_samples(
     if not segments:
         return None
 
-    keys = ("advantages", "returns", "players", "t_idx", "n_idx", "old_logprob", "old_value")
+    keys = ("advantages", "returns", "players", "t_idx", "n_idx", "old_logprob", "old_value", "population_idx")
     per_chunk = [{k: [] for k in keys} for _ in segments]
     num_envs = int(segments[0].valid[0].shape[1])
     num_players = len(segments[0].bufs)
@@ -592,6 +608,7 @@ def _build_host_chunk_samples(
     for player in range(num_players):
         for n in range(num_envs):
             values_parts, rewards_parts, dones_parts, old_lp_parts = [], [], [], []
+            pop_parts: list[np.ndarray] = []
             t_parts: list[np.ndarray] = []
             lengths: list[int] = []
             last_nonempty_i: Optional[int] = None
@@ -602,6 +619,7 @@ def _build_host_chunk_samples(
                 rewards = segment.reward[player]
                 dones = segment.done[player]
                 write_idx = segment.write_idx[player]
+                buf_population_idx = np.asarray(segment.bufs[player].population_idx.detach().cpu())
 
                 T = int(write_idx[n])
                 lengths.append(T)
@@ -612,6 +630,7 @@ def _build_host_chunk_samples(
                 rewards_parts.append(rewards[:T, n])
                 dones_parts.append(dones[:T, n])
                 old_lp_parts.append(old_logprob[:T, n])
+                pop_parts.append(buf_population_idx[:T, n].astype(np.int32))
                 t_parts.append(np.arange(T, dtype=np.int32))
 
             if last_nonempty_i is None:
@@ -643,6 +662,7 @@ def _build_host_chunk_samples(
                 dst["n_idx"].append(np.full((T,), n, dtype=np.int32))
                 dst["old_logprob"].append(old_lp)
                 dst["old_value"].append(values[offset : offset + T])
+                dst["population_idx"].append(pop_parts[part_i])
                 offset += T
                 part_i += 1
 
@@ -656,6 +676,7 @@ def _build_host_chunk_samples(
         "n_idx": np.int32,
         "old_logprob": np.float32,
         "old_value": np.float32,
+        "population_idx": np.int32,
     }
     for chunk in per_chunk:
         if not chunk["advantages"]:
@@ -715,6 +736,14 @@ def _combine_game_stats(items: list[RolloutGameStats]) -> RolloutGameStats:
         out.sum_final_ships_p0 += gs.sum_final_ships_p0
         out.sum_final_ships_p1 += gs.sum_final_ships_p1
         out.sum_episode_turns += gs.sum_episode_turns
+        if gs.member_episode_count is not None:
+            if out.member_episode_count is None:
+                out.member_episode_count = np.zeros_like(gs.member_episode_count)
+            out.member_episode_count += gs.member_episode_count
+        if gs.member_positive_reward_count is not None:
+            if out.member_positive_reward_count is None:
+                out.member_positive_reward_count = np.zeros_like(gs.member_positive_reward_count)
+            out.member_positive_reward_count += gs.member_positive_reward_count
     return out
 
 
@@ -775,6 +804,62 @@ def _ppo_timing_str(pt: PPOTiming) -> str:
         f"backward {pt.backward_s:.3f}s optim {pt.optim_s:.3f}s sync {pt.sync_s:.3f}s "
         f"unaccounted {unacc:.3f}s"
     )
+
+
+def _population_metric_summary(
+    *,
+    samples: Optional[dict],
+    population_assignments: Optional[np.ndarray],
+    game_stats: Optional[RolloutGameStats],
+    population_size: int,
+) -> Optional[dict[str, float]]:
+    if int(population_size) <= 1:
+        return None
+
+    summary: dict[str, float] = {}
+    if population_assignments is not None:
+        pop_assign = np.asarray(population_assignments, dtype=np.int32)
+        if pop_assign.size > 0:
+            total_assign = float(pop_assign.size)
+            for member in range(int(population_size)):
+                count = float(np.sum(pop_assign == member))
+                summary[f"active_seats/member_{member}"] = count
+                summary[f"active_seats_frac/member_{member}"] = count / max(1.0, total_assign)
+
+    if (
+        game_stats is not None
+        and game_stats.member_episode_count is not None
+        and game_stats.member_positive_reward_count is not None
+    ):
+        episodes = np.asarray(game_stats.member_episode_count, dtype=np.float64)
+        positive = np.asarray(game_stats.member_positive_reward_count, dtype=np.float64)
+        for member in range(min(int(population_size), int(episodes.shape[0]))):
+            summary[f"episodes_completed/member_{member}"] = float(episodes[member])
+            if episodes[member] > 0.0:
+                summary[f"p_win_reward/member_{member}"] = float(positive[member] / episodes[member])
+
+    if samples is None or "population_idx" not in samples:
+        return summary if summary else None
+
+    pop_idx = np.asarray(samples["population_idx"], dtype=np.int32)
+    returns = np.asarray(samples["returns"], dtype=np.float32)
+    old_value = np.asarray(samples["old_value"], dtype=np.float32)
+    total_samples = int(pop_idx.shape[0])
+    if total_samples == 0:
+        for member in range(int(population_size)):
+            summary[f"samples/member_{member}"] = 0.0
+            summary[f"sample_frac/member_{member}"] = 0.0
+        return summary if summary else None
+
+    for member in range(int(population_size)):
+        mask = pop_idx == member
+        count = int(mask.sum())
+        summary[f"samples/member_{member}"] = float(count)
+        summary[f"sample_frac/member_{member}"] = float(count) / float(total_samples)
+        if count > 0:
+            summary[f"return_mean/member_{member}"] = float(returns[mask].mean())
+            summary[f"old_value_mean/member_{member}"] = float(old_value[mask].mean())
+    return summary if summary else None
 
 
 def _segment_rollout_counts(segment: RolloutSegment) -> Tuple[int, int, int, float]:
@@ -885,6 +970,7 @@ def _torch_ppo_loss_from_replay(
             clip_eps,
             vf_coef,
             entropy_coef,
+            actions["population_idx"].to(device=adv.device, dtype=torch.long),
         )
 
 
@@ -1116,6 +1202,7 @@ def _log_iter_tensorboard(
     loss_mb: float = 0.0,
     ppo_s: float = 0.0,
     ppo_summary: Optional[dict] = None,
+    population_summary: Optional[dict[str, float]] = None,
     rt: Optional[RolloutTiming] = None,
     ppo_t: Optional[PPOTiming] = None,
 ) -> None:
@@ -1147,6 +1234,9 @@ def _log_iter_tensorboard(
             writer.add_scalar(
                 "rollout/p_win_reward_p1", float(game_stats.n_p1_positive_reward) / nc, it
             )
+    if population_summary is not None:
+        for k, v in population_summary.items():
+            writer.add_scalar(f"population/{k}", v, it)
     writer.add_scalar("train/skipped_empty_rollout", 1.0 if skipped else 0.0, it)
     if skipped:
         writer.flush()
@@ -1188,6 +1278,8 @@ def train(args: argparse.Namespace) -> None:
         raise SystemExit("--checkpoint-every must be >= 1")
     if args.rollout_host_chunks < 1:
         raise SystemExit("--rollout-host-chunks must be >= 1")
+    if args.population_size < 1:
+        raise SystemExit("--population-size must be >= 1")
 
     exp_dir, tb_dir, ckpt_dir = experiment_dirs(args)
     exp_dir.mkdir(parents=True, exist_ok=True)
@@ -1259,6 +1351,7 @@ def train(args: argparse.Namespace) -> None:
         n_layers=args.n_layers,
         activation_checkpointing=args.activation_checkpointing,
         feature_dim=obs_feature_dim_for_num_agents(args.num_agents),
+        population_size=args.population_size,
     ).to(device)
     opt = optim.Adam(policy.parameters(), lr=args.lr)
 
@@ -1345,6 +1438,7 @@ def train(args: argparse.Namespace) -> None:
                 cfg=rollout_carry.cfg,
                 episode_turns=heal_et,
                 player_done=rollout_carry.player_done,
+                population_assignments=rollout_carry.population_assignments,
             )
             rollout_env_seed += heal_seeds
             if int(rollout_carry.cfg.num_agents) != int(args.num_agents):
@@ -1522,6 +1616,12 @@ def _train_loop(
             samples_s = time.perf_counter() - t_samples0
         cfg.max_fleets = rollout_carry.cfg.max_fleets
         num_fleets, mean_fleets_per_env = _fleet_counts_from_state(rollout_carry.state_b)
+        population_summary = _population_metric_summary(
+            samples=samples,
+            population_assignments=rollout_carry.population_assignments,
+            game_stats=game_stats,
+            population_size=int(args.population_size),
+        )
 
         if mem_dbg and device.type == "cuda":
             log_cuda_mem(f"iter {it} after rollouts", device)
@@ -1548,6 +1648,7 @@ def _train_loop(
                 mean_fleets_per_env=mean_fleets_per_env,
                 cfg_max_fleets=cfg.max_fleets,
                 game_stats=game_stats,
+                population_summary=population_summary,
             )
         else:
             if mem_dbg and device.type == "cuda":
@@ -1635,6 +1736,7 @@ def _train_loop(
                 loss_mb=loss_mb,
                 ppo_s=ppo_s,
                 ppo_summary=ppo_stats.summary(),
+                population_summary=population_summary,
                 rt=rt,
                 ppo_t=ppo_t,
             )
@@ -1702,6 +1804,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help="Max fleet launches per player per turn (within one env-step).",
+    )
+    p.add_argument(
+        "--population-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of rollout population members. 1 keeps pure selfplay. "
+            "If >1, the policy shares the trunk and gives each population member its own "
+            "final transformer block and output heads."
+        ),
     )
     p.add_argument(
         "--rollout-micro-horizon",

@@ -112,6 +112,13 @@ def _validate_numpy_index_range(name: str, idx: np.ndarray, size: int, *, mask: 
         raise RuntimeError(f"{name} out of range: min={lo} max={hi} size={int(size)}")
 
 
+def _sample_population_assignments_for_env(seed: int, num_agents: int, population_size: int) -> np.ndarray:
+    if int(population_size) <= 1:
+        return np.zeros((num_agents,), dtype=np.int32)
+    rng = np.random.default_rng(np.uint64(seed) + np.uint64(0x9E3779B97F4A7C15))
+    return rng.integers(0, int(population_size), size=(num_agents,), dtype=np.int32)
+
+
 @jax.jit
 def _scatter_state_bucket(
     state_b: OrbitWarsState,
@@ -160,6 +167,8 @@ class RolloutCarry:
     #: Per-player local terminal flags for unfinished 4p games. The env may continue
     #: after a player is eliminated; that player's PPO stream should not.
     player_done: Optional[np.ndarray] = None
+    #: Active population member per seat/env for the ongoing episode.
+    population_assignments: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -175,6 +184,8 @@ class RolloutGameStats:
     sum_episode_turns: float = 0.0
     n_p0_positive_reward: int = 0
     n_p1_positive_reward: int = 0
+    member_episode_count: Optional[np.ndarray] = None
+    member_positive_reward_count: Optional[np.ndarray] = None
 
     def record_completion(
         self,
@@ -185,6 +196,8 @@ class RolloutGameStats:
         episode_turns: int,
         reward0: float,
         reward1: float,
+        reward_by_player: Optional[np.ndarray] = None,
+        population_assignment: Optional[np.ndarray] = None,
     ) -> None:
         self.n_completed += 1
         if step_limit:
@@ -198,6 +211,20 @@ class RolloutGameStats:
             self.n_p0_positive_reward += 1
         if reward1 > 0.0:
             self.n_p1_positive_reward += 1
+        if (
+            reward_by_player is not None
+            and population_assignment is not None
+            and self.member_episode_count is not None
+            and self.member_positive_reward_count is not None
+        ):
+            rewards_np = np.asarray(reward_by_player, dtype=np.float32).reshape(-1)
+            pop_np = np.asarray(population_assignment, dtype=np.int32).reshape(-1)
+            if rewards_np.shape == pop_np.shape:
+                for player_i, member_i in enumerate(pop_np):
+                    if 0 <= int(member_i) < int(self.member_episode_count.shape[0]):
+                        self.member_episode_count[int(member_i)] += 1
+                        if float(rewards_np[player_i]) > 0.0:
+                            self.member_positive_reward_count[int(member_i)] += 1
 
 
 @dataclass
@@ -541,6 +568,7 @@ def _run_async_micro_step_multi(
     old_logprob: List[np.ndarray],
     old_value: List[np.ndarray],
     reward: List[np.ndarray],
+    population_assignments: np.ndarray,
     pending_actions: np.ndarray,
     pending_action_count: np.ndarray,
     reward_idx: np.ndarray,
@@ -576,7 +604,11 @@ def _run_async_micro_step_multi(
         return virt_b, bufs, obs_bufs
 
     active_rows = np.concatenate([players_active[p] + p * num_envs for p in range(n_ego)]).astype(np.int32)
+    active_population_idx = np.concatenate(
+        [population_assignments[p, players_active[p]] for p in range(n_ego)]
+    ).astype(np.int64)
     active_idx_t = torch.as_tensor(active_rows, device=device, dtype=torch.long)
+    active_population_idx_t = torch.as_tensor(active_population_idx, device=device, dtype=torch.long)
 
     ego_rows = [jnp.full((num_envs,), p, dtype=jnp.int32) for p in range(n_ego)]
     ego_b_j = jnp.concatenate(ego_rows, axis=0)
@@ -604,7 +636,7 @@ def _run_async_micro_step_multi(
     if sync_policy_timing:
         _sync_rollout_policy_timing(device)
     t0 = perf_counter()
-    out = policy.forward_dense_rollout(**active_obs)
+    out = policy.forward_dense_rollout(**active_obs, population_idx=active_population_idx_t)
     if sync_policy_timing:
         _sync_rollout_policy_timing(device)
     t_model = perf_counter()
@@ -708,9 +740,10 @@ def _run_async_micro_step_multi(
         out["planet_hidden"],
         o_idx,
         frac_idx,
-        fleet_size_for_logits,
-        target_hit_tick_t,
-        planet_ships,
+        fleet_size=fleet_size_for_logits,
+        target_eta=target_hit_tick_t,
+        target_ships=planet_ships,
+        population_idx=active_population_idx_t,
     )
     target_mask = out["pair_mask"][n_a_idx, o_idx, :] & target_valid_t & ~target_overflow_t[:, None]
     any_valid_target = target_mask.any(dim=-1)
@@ -810,6 +843,7 @@ def _run_async_micro_step_multi(
             must_halt_a.index_select(0, pos_p_t).to(torch.bool),
             (target_valid_t & ~target_overflow_t[:, None]).index_select(0, pos_p_t).to(torch.bool),
             target_hit_tick_t.index_select(0, pos_p_t).to(torch.float32),
+            active_population_idx_t.index_select(0, pos_p_t).to(torch.int32),
             write_row_t,
             micro_kp_t,
             max_micro_steps,
@@ -959,6 +993,7 @@ def collect_parallel_micro_rollouts(
 
     seeds_consumed = 0
     t_init0 = perf_counter()
+    population_size = int(getattr(policy, "population_size", 1))
     if reset_prefetch is not None:
         mf0 = int(carry_in.cfg.max_fleets) if carry_in is not None else int(cfg_template.max_fleets)
         na0 = int(cfg_template.num_agents)
@@ -971,6 +1006,13 @@ def collect_parallel_micro_rollouts(
         seeds_consumed += num_envs
         episode_turns = [0] * num_envs
         player_done = np.zeros((int(cfg.num_agents), num_envs), dtype=np.bool_)
+        population_assignments = np.stack(
+            [
+                _sample_population_assignments_for_env(seed_base + env_i, int(cfg.num_agents), population_size)
+                for env_i in range(num_envs)
+            ],
+            axis=1,
+        )
     else:
         state_b, cfg = carry_in.state_b, carry_in.cfg
         cfg.reward_mode = cfg_template.reward_mode
@@ -985,6 +1027,13 @@ def collect_parallel_micro_rollouts(
             player_done = np.asarray(pd, dtype=np.bool_)
             if player_done.shape != (int(cfg.num_agents), num_envs):
                 player_done = np.zeros((int(cfg.num_agents), num_envs), dtype=np.bool_)
+        pop = carry_in.population_assignments
+        if pop is None:
+            population_assignments = np.zeros((int(cfg.num_agents), num_envs), dtype=np.int32)
+        else:
+            population_assignments = np.asarray(pop, dtype=np.int32)
+            if population_assignments.shape != (int(cfg.num_agents), num_envs):
+                population_assignments = np.zeros((int(cfg.num_agents), num_envs), dtype=np.int32)
 
     obs_feature_dim = obs_feature_dim_for_num_agents(int(cfg.num_agents))
     n_ego = int(cfg.num_agents)
@@ -994,7 +1043,10 @@ def collect_parallel_micro_rollouts(
 
     episode_lim = int(np.asarray(jax.device_get(jow.OrbitWarsConfig().episode_steps)))
     episode_timeout_step_count = episode_lim - 1
-    game_stats = RolloutGameStats()
+    game_stats = RolloutGameStats(
+        member_episode_count=np.zeros((population_size,), dtype=np.int64),
+        member_positive_reward_count=np.zeros((population_size,), dtype=np.int64),
+    )
 
     # Allocate per-segment device buffers. Once any player's write index hits
     # the horizon, async collection drains every env to its next real env-step
@@ -1131,6 +1183,8 @@ def collect_parallel_micro_rollouts(
                             episode_turns=int(episode_turns[env_i]),
                             reward0=float(rewards_np[local_i, 0]),
                             reward1=float(rewards_np[local_i, 1]),
+                            reward_by_player=np.asarray(rewards_np[local_i, : int(cfg.num_agents)]),
+                            population_assignment=np.asarray(population_assignments[: int(cfg.num_agents), env_i]),
                         )
                         episode_turns[env_i] = 0
                         sid = int(seed_base + seeds_consumed)
@@ -1147,6 +1201,9 @@ def collect_parallel_micro_rollouts(
 
                     if bool(done_np[local_i]):
                         player_done[:, env_i] = False
+                        population_assignments[:, env_i] = _sample_population_assignments_for_env(
+                            sid, int(cfg.num_agents), population_size
+                        )
                     halted[:, env_i] = player_done[:, env_i]
                     micro_k[:, env_i] = 0
                     pending_actions[env_i] = 0.0
@@ -1217,6 +1274,7 @@ def collect_parallel_micro_rollouts(
                 obs_feature_dim=obs_feature_dim,
                 normalize_obs_to_p0=cfg.normalize_obs_to_p0,
                 sync_policy_timing=sync_policy_timing,
+                population_assignments=population_assignments,
             )
             if profile_rollout and device.type == "cuda" and not logged_first_policy_fwd:
                 log_cuda_mem("rollout after first batched policy forward", device)
@@ -1249,7 +1307,10 @@ def collect_parallel_micro_rollouts(
             tb0 = perf_counter()
             obs_t = decode_observation(compress_observation(obs_jax_to_torch(obs_j)), feature_dim=obs_feature_dim)
             with amp_ctx:
-                out_e = policy.forward_dense_rollout(**obs_t)
+                out_e = policy.forward_dense_rollout(
+                    **obs_t,
+                    population_idx=torch.as_tensor(population_assignments[ego], device=device, dtype=torch.long),
+                )
             timing.policy_batch_s += perf_counter() - tb0
             tf0 = perf_counter()
             value_np_per_ego.append(out_e["value"].float().detach().cpu().numpy())
@@ -1281,5 +1342,6 @@ def collect_parallel_micro_rollouts(
         cfg=cfg,
         episode_turns=episode_turns,
         player_done=player_done,
+        population_assignments=population_assignments,
     )
     return segment, timing, next_carry, seeds_consumed, game_stats

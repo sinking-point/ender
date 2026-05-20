@@ -2816,9 +2816,13 @@ def _build_turn_actions_torch_only(
             out["planet_hidden"],
             torch.tensor([o_idx], device=device, dtype=torch.long),
             torch.tensor([frac_idx], device=device, dtype=torch.long),
-            torch.tensor([float(_planned_send(float(planets[o_idx, 5]), int(frac_idx)))], device=device, dtype=torch.float32),
-            torch.from_numpy(ray_hit_tick[None, :]).to(device=device, dtype=torch.float32),
-            torch.from_numpy(planets[None, :, 5]).to(device=device, dtype=torch.float32),
+            fleet_size=torch.tensor(
+                [float(_planned_send(float(planets[o_idx, 5]), int(frac_idx)))],
+                device=device,
+                dtype=torch.float32,
+            ),
+            target_eta=torch.from_numpy(ray_hit_tick[None, :]).to(device=device, dtype=torch.float32),
+            target_ships=torch.from_numpy(planets[None, :, 5]).to(device=device, dtype=torch.float32),
         )[0]
         target_mask = out["pair_mask"][0, o_idx].clone()
         ray_valid_t = torch.from_numpy(ray_valid).to(device=device, dtype=torch.bool)
@@ -3092,6 +3096,7 @@ def _infer_policy_kwargs(payload: Any) -> dict[str, Any]:
         "n_heads": int(training_args.get("n_heads", 8)),
         "n_layers": int(training_args.get("n_layers", 4)),
         "activation_checkpointing": False,
+        "population_size": int(training_args.get("population_size", 1)),
     }
     if isinstance(policy_state, Mapping):
         w = policy_state.get("feat_proj.weight")
@@ -3099,14 +3104,29 @@ def _infer_policy_kwargs(payload: Any) -> dict[str, Any]:
             kwargs["d_model"] = int(w.shape[0])
             kwargs["feature_dim"] = int(w.shape[1])
         layer_ids = []
+        shared_layer_ids = []
+        pop_ids = []
         for key in policy_state:
             if key.startswith("blocks."):
                 try:
                     layer_ids.append(int(key.split(".")[1]))
                 except (IndexError, ValueError):
                     pass
+            elif key.startswith("shared_blocks."):
+                try:
+                    shared_layer_ids.append(int(key.split(".")[1]))
+                except (IndexError, ValueError):
+                    pass
+            elif key.startswith("population_tails."):
+                try:
+                    pop_ids.append(int(key.split(".")[1]))
+                except (IndexError, ValueError):
+                    pass
         if layer_ids:
             kwargs["n_layers"] = max(layer_ids) + 1
+        elif pop_ids:
+            kwargs["population_size"] = max(pop_ids) + 1
+            kwargs["n_layers"] = (max(shared_layer_ids) + 1 if shared_layer_ids else 0) + 1
     return kwargs
 
 

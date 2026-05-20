@@ -48,6 +48,7 @@ class TransitionBuffer(NamedTuple):
     target_planet_reachable: jnp.ndarray
     target_hit_tick: jnp.ndarray
     phase_micro_idx: jnp.ndarray
+    population_idx: jnp.ndarray
 
 
 class TorchTransitionBuffer(NamedTuple):
@@ -71,6 +72,7 @@ class TorchTransitionBuffer(NamedTuple):
     target_planet_reachable: torch.Tensor
     target_hit_tick: torch.Tensor
     phase_micro_idx: torch.Tensor
+    population_idx: torch.Tensor
 
 
 def init_transition_buffer(num_envs: int, H_buf: int, max_micro_steps: int) -> TransitionBuffer:
@@ -92,6 +94,7 @@ def init_transition_buffer(num_envs: int, H_buf: int, max_micro_steps: int) -> T
         target_planet_reachable=jnp.zeros((H_buf, num_envs, MAX_PLANETS), dtype=jnp.bool_),
         target_hit_tick=jnp.zeros((H_buf, num_envs, MAX_PLANETS), dtype=jnp.float32),
         phase_micro_idx=jnp.zeros((H_buf, num_envs), dtype=jnp.int32),
+        population_idx=jnp.zeros((H_buf, num_envs), dtype=jnp.int32),
     )
 
 
@@ -119,6 +122,7 @@ def init_torch_transition_buffer(
         target_planet_reachable=torch.zeros((H_buf, num_envs, MAX_PLANETS), dtype=torch.bool, device=device),
         target_hit_tick=torch.zeros((H_buf, num_envs, MAX_PLANETS), dtype=torch.float32, device=device),
         phase_micro_idx=torch.zeros((H_buf, num_envs), dtype=torch.int32, device=device),
+        population_idx=torch.zeros((H_buf, num_envs), dtype=torch.int32, device=device),
     )
 
 
@@ -137,6 +141,7 @@ def append_to_torch_buffer(
     must_halt_no_ships: torch.Tensor,
     target_planet_reachable_now: torch.Tensor,
     target_hit_tick_now: torch.Tensor,
+    population_idx: torch.Tensor,
     write_row: torch.Tensor,
     micro_k: torch.Tensor,
     active: torch.Tensor,
@@ -200,6 +205,7 @@ def append_to_torch_buffer(
     buf.target_planet_reachable[row, env, :] = target_planet_reachable_now.to(device=device, dtype=torch.bool)[active_b]
     buf.target_hit_tick[row, env, :] = target_hit_tick_now.to(device=device, dtype=torch.float32)[active_b]
     buf.phase_micro_idx[row, env] = micro_k.to(device=device, dtype=torch.int32)[active_b]
+    buf.population_idx[row, env] = population_idx.to(device=device, dtype=torch.int32)[active_b]
     return buf
 
 
@@ -219,6 +225,7 @@ def append_active_to_torch_buffer(
     must_halt_no_ships: torch.Tensor,
     target_planet_reachable_now: torch.Tensor,
     target_hit_tick_now: torch.Tensor,
+    population_idx: torch.Tensor,
     write_row: torch.Tensor,
     micro_k: torch.Tensor,
     max_micro_steps: int,
@@ -277,6 +284,7 @@ def append_active_to_torch_buffer(
     buf.target_planet_reachable[row, env, :] = target_planet_reachable_now.to(device=device, dtype=torch.bool)
     buf.target_hit_tick[row, env, :] = target_hit_tick_now.to(device=device, dtype=torch.float32)
     buf.phase_micro_idx[row, env] = micro_k.to(device=device, dtype=torch.int32)
+    buf.population_idx[row, env] = population_idx.to(device=device, dtype=torch.int32)
     return buf
 
 
@@ -306,6 +314,7 @@ def append_to_buffer(
     must_halt_no_ships,
     target_planet_reachable_now,
     target_hit_tick_now,
+    population_idx,
     write_row: jnp.ndarray,
     micro_k: jnp.ndarray,
     active: jnp.ndarray,
@@ -355,6 +364,9 @@ def append_to_buffer(
     old_pm = buf.phase_micro_idx[write_row, n_idx]
     new_pm = jnp.where(active, micro_k.astype(jnp.int32), old_pm)
     out_pm = buf.phase_micro_idx.at[write_row, n_idx].set(new_pm)
+    old_pop = buf.population_idx[write_row, n_idx]
+    new_pop = jnp.where(active, population_idx.astype(jnp.int32), old_pop)
+    out_pop = buf.population_idx.at[write_row, n_idx].set(new_pop)
 
     return TransitionBuffer(
         micro_halt_now=out_halt,
@@ -370,6 +382,7 @@ def append_to_buffer(
         target_planet_reachable=out_tpr,
         target_hit_tick=out_tht,
         phase_micro_idx=out_pm,
+        population_idx=out_pop,
     )
 
 
