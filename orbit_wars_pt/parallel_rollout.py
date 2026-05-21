@@ -1668,7 +1668,8 @@ def collect_parallel_micro_rollouts(
                         reward_time_bonus_coef=time_reward_coef_bucket,
                     )
                 )
-                dr_np, alive_post_np, done_np, step_count_np, rewards_np, s0_fin_np, s1_fin_np = jax.device_get(
+                min_garrison_jax = jnp.min(next_bucket.planets[:, :, jow.PLANET_SHIPS])
+                dr_np, alive_post_np, done_np, step_count_np, rewards_np, s0_fin_np, s1_fin_np, min_garrison_np = jax.device_get(
                     (
                         dr_jax,
                         alive_post_jax,
@@ -1677,6 +1678,7 @@ def collect_parallel_micro_rollouts(
                         next_bucket.rewards,
                         s0_post,
                         s1_post,
+                        min_garrison_jax,
                     )
                 )
                 dr_np = np.asarray(dr_np)
@@ -1686,6 +1688,12 @@ def collect_parallel_micro_rollouts(
                 rewards_np = np.asarray(rewards_np)
                 s0_fin_np = np.asarray(s0_fin_np)
                 s1_fin_np = np.asarray(s1_fin_np)
+                min_garrison = float(np.asarray(min_garrison_np, dtype=np.float32))
+                if min_garrison < -1e-6:
+                    raise RuntimeError(
+                        f"negative env-step garrison detected after step_env_with_scores_batched: "
+                        f"min_garrison={min_garrison:+g}"
+                    )
                 timing.env_step_core_s += perf_counter() - t_core0
                 t_book0 = perf_counter()
                 state_b = _scatter_state_bucket(state_b, idx_j, next_bucket, mask_j)
