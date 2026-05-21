@@ -12,7 +12,6 @@ live on host — those move to JAX in later phases.
 
 from __future__ import annotations
 
-from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -35,16 +34,7 @@ from orbit_wars_pt.scores_jax import (
 
 
 _DEFAULT_STEP_CFG = OrbitWarsConfig()
-REWARD_MODE_SHIP_MASS_SHARE = 0
-REWARD_MODE_PRODUCTION_SHARE = 1
 
-
-def reward_mode_to_id(reward_mode: str) -> int:
-    if reward_mode == "ship-mass-share":
-        return REWARD_MODE_SHIP_MASS_SHARE
-    if reward_mode == "production-share":
-        return REWARD_MODE_PRODUCTION_SHARE
-    raise ValueError(f"unknown reward mode {reward_mode!r}")
 
 # vmap leading num_envs axis on (state, actions); broadcast the static config.
 _vmapped_step = jax.jit(jax.vmap(jow.step, in_axes=(0, 0, None), out_axes=0))
@@ -124,6 +114,12 @@ def stack_initial_states(
         max_fleets=cfg_template.max_fleets,
         episode_seed=cfg_template.episode_seed,
         reward_mode=cfg_template.reward_mode,
+        reward_ship_mass_share_coef=cfg_template.reward_ship_mass_share_coef,
+        reward_ship_mass_share_member_coefs=cfg_template.reward_ship_mass_share_member_coefs,
+        reward_production_share_coef=cfg_template.reward_production_share_coef,
+        reward_production_share_member_coefs=cfg_template.reward_production_share_member_coefs,
+        reward_time_bonus_coef=cfg_template.reward_time_bonus_coef,
+        reward_time_bonus_member_coefs=cfg_template.reward_time_bonus_member_coefs,
         normalize_obs_to_p0=cfg_template.normalize_obs_to_p0,
     )
     states: List[OrbitWarsState] = []
@@ -238,30 +234,35 @@ def ship_totals_batched(state: OrbitWarsState) -> Tuple[jnp.ndarray, jnp.ndarray
     return s0, s1
 
 
-@partial(jax.jit, static_argnames=("reward_mode",))
+@jax.jit
 def step_env_with_scores_batched(
     state: OrbitWarsState,
     actions: jnp.ndarray,
-    reward_mode: int = REWARD_MODE_SHIP_MASS_SHARE,
+    reward_ship_mass_share_coef: jnp.ndarray,
+    reward_production_share_coef: jnp.ndarray,
+    reward_time_bonus_coef: jnp.ndarray,
 ) -> Tuple[OrbitWarsState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Step a bucket; return next state, reward deltas, post-step alive mask, ships p0/p1."""
 
-    if reward_mode == REWARD_MODE_PRODUCTION_SHARE:
-        ratios_pre = jax.vmap(_production_ratios_four_core)(state.planets, state.planet_active)
-    else:
-        ratios_pre = jax.vmap(_ship_mass_ratios_four_core)(
-            state.planets, state.planet_active, state.incoming_fleets
-        )
+    ship_coef = jnp.asarray(reward_ship_mass_share_coef, dtype=jnp.float32)
+    prod_coef = jnp.asarray(reward_production_share_coef, dtype=jnp.float32)
+    time_coef = jnp.asarray(reward_time_bonus_coef, dtype=jnp.float32)
+    ratios_pre = ship_coef * jax.vmap(_ship_mass_ratios_four_core)(
+        state.planets, state.planet_active, state.incoming_fleets
+    ) + prod_coef * jax.vmap(_production_ratios_four_core)(state.planets, state.planet_active)
     next_state = _vmapped_step(state, actions, _DEFAULT_STEP_CFG)
-    if reward_mode == REWARD_MODE_PRODUCTION_SHARE:
-        ratios_post = jax.vmap(_production_ratios_four_core)(
-            next_state.planets, next_state.planet_active
-        )
-    else:
-        ratios_post = jax.vmap(_ship_mass_ratios_four_core)(
-            next_state.planets, next_state.planet_active, next_state.incoming_fleets
-        )
+    ratios_post = ship_coef * jax.vmap(_ship_mass_ratios_four_core)(
+        next_state.planets, next_state.planet_active, next_state.incoming_fleets
+    ) + prod_coef * jax.vmap(_production_ratios_four_core)(
+        next_state.planets, next_state.planet_active
+    )
     dr = ratios_post - ratios_pre
+    timeout_turn = jnp.maximum(_DEFAULT_STEP_CFG.episode_steps - 2, 1).astype(jnp.float32)
+    pre_turn = state.step_count.astype(jnp.float32)
+    time_bonus_scale = jnp.clip(1.0 - pre_turn / timeout_turn, 0.0, 1.0)
+    timeout_done = state.step_count >= (_DEFAULT_STEP_CFG.episode_steps - 2)
+    win_mask = next_state.done[:, None] & (~timeout_done[:, None]) & (next_state.rewards > 0.0)
+    dr = dr + time_coef * win_mask.astype(jnp.float32) * time_bonus_scale[:, None]
     s0_post, s1_post = jax.vmap(_ship_totals_p01_core)(
         next_state.planets, next_state.planet_active, next_state.incoming_fleets
     )

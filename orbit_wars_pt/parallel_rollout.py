@@ -39,7 +39,6 @@ from orbit_wars_pt.reset_prefetch import RolloutResetPrefetch
 
 from orbit_wars_pt.batched_env import (
     obs_jax_to_torch,
-    reward_mode_to_id,
     reset_env_at_index,
     stack_initial_states,
     step_env_with_scores_batched,
@@ -76,6 +75,7 @@ from orbit_wars_pt.transition_buffer import (
 )
 
 _MAX_FLEET_EXPAND_RETRIES = 48
+
 
 def _bucket_size(count: int, capacity: int) -> int:
     count = max(1, int(count))
@@ -187,6 +187,27 @@ def _reassign_policy_rows_for_reset_envs(
     rng.shuffle(released_rows)
     mapping[:, done_envs] = released_rows.reshape(mapping.shape[0], done_envs.size)
     return mapping
+
+
+def _reward_coef_matrix_for_population(
+    population_assignments: np.ndarray,
+    global_coef: float,
+    member_coefs: Optional[list[float]],
+    num_agents: int,
+) -> np.ndarray:
+    env_count = int(population_assignments.shape[1])
+    out = np.zeros((env_count, 4), dtype=np.float32)
+    out[:, :num_agents] = float(global_coef)
+    if not member_coefs:
+        return out
+    member_arr = np.asarray(member_coefs, dtype=np.float32).reshape(-1)
+    for ego in range(int(num_agents)):
+        pop = np.asarray(population_assignments[ego], dtype=np.int32)
+        valid = (pop >= 0) & (pop < int(member_arr.shape[0]))
+        if not np.any(valid):
+            continue
+        out[valid, ego] = member_arr[pop[valid]]
+    return out
 
 
 @jax.jit
@@ -1460,6 +1481,12 @@ def collect_parallel_micro_rollouts(
     else:
         state_b, cfg = carry_in.state_b, carry_in.cfg
         cfg.reward_mode = cfg_template.reward_mode
+        cfg.reward_ship_mass_share_coef = cfg_template.reward_ship_mass_share_coef
+        cfg.reward_ship_mass_share_member_coefs = cfg_template.reward_ship_mass_share_member_coefs
+        cfg.reward_production_share_coef = cfg_template.reward_production_share_coef
+        cfg.reward_production_share_member_coefs = cfg_template.reward_production_share_member_coefs
+        cfg.reward_time_bonus_coef = cfg_template.reward_time_bonus_coef
+        cfg.reward_time_bonus_member_coefs = cfg_template.reward_time_bonus_member_coefs
         cfg.normalize_obs_to_p0 = cfg_template.normalize_obs_to_p0
         episode_turns = list(carry_in.episode_turns)
         if len(episode_turns) != num_envs:
@@ -1506,8 +1533,6 @@ def collect_parallel_micro_rollouts(
 
     obs_feature_dim = obs_feature_dim_for_num_agents(int(cfg.num_agents))
     n_ego = int(cfg.num_agents)
-    reward_mode_id = reward_mode_to_id(str(cfg.reward_mode))
-
     _reset_prefetch_resync(reset_prefetch, seed_base, seeds_consumed, cfg)
 
     episode_lim = int(np.asarray(jax.device_get(jow.OrbitWarsConfig().episode_steps)))
@@ -1616,8 +1641,32 @@ def collect_parallel_micro_rollouts(
 
                 t_core0 = perf_counter()
                 state_bucket = jax.tree.map(lambda leaf: leaf[idx_j], state_b)
+                ship_reward_coef_bucket = _reward_coef_matrix_for_population(
+                    population_assignments[:, bucket_idx],
+                    cfg.reward_ship_mass_share_coef,
+                    cfg.reward_ship_mass_share_member_coefs,
+                    int(cfg.num_agents),
+                )
+                production_reward_coef_bucket = _reward_coef_matrix_for_population(
+                    population_assignments[:, bucket_idx],
+                    cfg.reward_production_share_coef,
+                    cfg.reward_production_share_member_coefs,
+                    int(cfg.num_agents),
+                )
+                time_reward_coef_bucket = _reward_coef_matrix_for_population(
+                    population_assignments[:, bucket_idx],
+                    cfg.reward_time_bonus_coef,
+                    cfg.reward_time_bonus_member_coefs,
+                    int(cfg.num_agents),
+                )
                 next_bucket, dr_jax, alive_post_jax, s0_post, s1_post = (
-                    step_env_with_scores_batched(state_bucket, actions_bucket, reward_mode_id)
+                    step_env_with_scores_batched(
+                        state_bucket,
+                        actions_bucket,
+                        reward_ship_mass_share_coef=ship_reward_coef_bucket,
+                        reward_production_share_coef=production_reward_coef_bucket,
+                        reward_time_bonus_coef=time_reward_coef_bucket,
+                    )
                 )
                 dr_np, alive_post_np, done_np, step_count_np, rewards_np, s0_fin_np, s1_fin_np = jax.device_get(
                     (
@@ -1638,7 +1687,6 @@ def collect_parallel_micro_rollouts(
                 s0_fin_np = np.asarray(s0_fin_np)
                 s1_fin_np = np.asarray(s1_fin_np)
                 timing.env_step_core_s += perf_counter() - t_core0
-
                 t_book0 = perf_counter()
                 state_b = _scatter_state_bucket(state_b, idx_j, next_bucket, mask_j)
                 timing.env_bookkeeping_s += perf_counter() - t_book0
@@ -1726,7 +1774,14 @@ def collect_parallel_micro_rollouts(
                     assert policy_row_for_seat is not None
                     row_env, row_ego = _invert_policy_row_mapping(policy_row_for_seat)
                     row_env_j = jnp.asarray(row_env, dtype=jnp.int32)
-                    virt_b = _gather_state_rows(state_b, row_env_j)
+                    step_rows = np.flatnonzero(np.isin(row_env, step_envs)).astype(np.int32)
+                    if step_rows.size:
+                        virt_b = _copy_state_slices_between(
+                            virt_b,
+                            jnp.asarray(step_rows, dtype=jnp.int32),
+                            state_b,
+                            jnp.asarray(row_env[step_rows], dtype=jnp.int32),
+                        )
                 else:
                     actual_idx_j = jnp.asarray(step_envs, dtype=jnp.int32)
                     virt_dst_idx_j = jnp.concatenate(

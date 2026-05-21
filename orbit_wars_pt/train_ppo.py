@@ -114,6 +114,68 @@ def experiment_dirs(args: argparse.Namespace) -> Tuple[Path, Path, Path]:
     return exp, tb_dir, exp / "checkpoints"
 
 
+def _parse_optional_float_list(text: Optional[str], *, name: str) -> Optional[list[float]]:
+    if text is None:
+        return None
+    vals = [part.strip() for part in str(text).split(",")]
+    vals = [part for part in vals if part]
+    if not vals:
+        raise ValueError(f"{name} must contain at least one float when provided")
+    try:
+        return [float(part) for part in vals]
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a comma-separated list of floats") from exc
+
+
+def resolve_reward_mix(args: argparse.Namespace) -> Tuple[float, float, float]:
+    """Resolve reward coefficients, preserving legacy ``--reward-mode`` presets."""
+
+    if args.reward_mode == "ship-mass-share":
+        ship_coef, prod_coef = 1.0, 0.0
+    elif args.reward_mode == "production-share":
+        ship_coef, prod_coef = 0.0, 1.0
+    else:
+        raise ValueError(f"unknown reward mode {args.reward_mode!r}")
+    time_coef = 0.0
+    if args.reward_ship_mass_share_coef is not None:
+        ship_coef = float(args.reward_ship_mass_share_coef)
+    if args.reward_production_share_coef is not None:
+        prod_coef = float(args.reward_production_share_coef)
+    if args.reward_time_bonus_coef is not None:
+        time_coef = float(args.reward_time_bonus_coef)
+    return float(ship_coef), float(prod_coef), float(time_coef)
+
+
+def resolve_member_reward_mix(
+    args: argparse.Namespace,
+    population_size: int,
+) -> Tuple[Optional[list[float]], Optional[list[float]], Optional[list[float]]]:
+    ship = _parse_optional_float_list(
+        args.reward_ship_mass_share_member_coefs,
+        name="--reward-ship-mass-share-member-coefs",
+    )
+    prod = _parse_optional_float_list(
+        args.reward_production_share_member_coefs,
+        name="--reward-production-share-member-coefs",
+    )
+    time = _parse_optional_float_list(
+        args.reward_time_bonus_member_coefs,
+        name="--reward-time-bonus-member-coefs",
+    )
+    for name, vals in (
+        ("--reward-ship-mass-share-member-coefs", ship),
+        ("--reward-production-share-member-coefs", prod),
+        ("--reward-time-bonus-member-coefs", time),
+    ):
+        if vals is not None and len(vals) != int(population_size):
+            raise ValueError(
+                f"{name} length {len(vals)} must equal population_size {int(population_size)}"
+            )
+    if int(population_size) <= 1:
+        return None, None, None
+    return ship, prod, time
+
+
 def _serialize_rollout_carry(carry: RolloutCarry) -> Dict[str, Any]:
     state_np = {
         field: np.asarray(jax.device_get(getattr(carry.state_b, field)))
@@ -214,6 +276,12 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "minibatch_size",
         "ship_speed",
         "reward_mode",
+        "reward_ship_mass_share_coef",
+        "reward_ship_mass_share_member_coefs",
+        "reward_production_share_coef",
+        "reward_production_share_member_coefs",
+        "reward_time_bonus_coef",
+        "reward_time_bonus_member_coefs",
         "normalize_obs_to_p0",
         "first_hit_n_rays",
         "first_hit_ray_chunk_size",
@@ -839,7 +907,6 @@ def _build_host_chunk_samples(
                 else None
             )
             adv, ret = compute_gae(rewards, values, dones, gamma, lam, bootstrap=bootstrap)
-
             offset = 0
             part_i = 0
             for ci, T in enumerate(lengths):
@@ -1315,7 +1382,6 @@ def ppo_iteration(
             stats.update(mb_stats, grad_norm)
             timing.sync_s += perf_counter() - t0
             n_mb += 1
-
     timing.n_minibatches = n_mb
     timing.total_s = perf_counter() - t_total0
     return total_loss_sum / max(1, n_mb), timing, stats
@@ -1453,7 +1519,6 @@ def ppo_iteration_host_staged(
             stats.update(mb_stats, grad_norm)
             timing.sync_s += perf_counter() - t0
             n_mb += 1
-
     timing.n_minibatches = n_mb
     timing.total_s = perf_counter() - t_total0
     return total_loss_sum / max(1, n_mb), timing, stats
@@ -1610,11 +1675,49 @@ def train(args: argparse.Namespace) -> None:
         else:
             print("[orbit_wars_pt] no checkpoint in experiment dir — starting fresh", flush=True)
 
+    reward_ship_mass_share_coef, reward_production_share_coef, reward_time_bonus_coef = resolve_reward_mix(args)
+    (
+        reward_ship_mass_share_member_coefs,
+        reward_production_share_member_coefs,
+        reward_time_bonus_member_coefs,
+    ) = resolve_member_reward_mix(args, int(args.population_size))
+    print(
+        "[orbit_wars_pt] reward mix "
+        f"ship_mass_share={reward_ship_mass_share_coef:g} "
+        f"production_share={reward_production_share_coef:g} "
+        f"time_bonus={reward_time_bonus_coef:g}",
+        flush=True,
+    )
+    if reward_ship_mass_share_member_coefs is not None:
+        print(
+            "[orbit_wars_pt] reward ship-mass-share member coefs "
+            f"{reward_ship_mass_share_member_coefs}",
+            flush=True,
+        )
+    if reward_production_share_member_coefs is not None:
+        print(
+            "[orbit_wars_pt] reward production-share member coefs "
+            f"{reward_production_share_member_coefs}",
+            flush=True,
+        )
+    if reward_time_bonus_member_coefs is not None:
+        print(
+            "[orbit_wars_pt] reward time-bonus member coefs "
+            f"{reward_time_bonus_member_coefs}",
+            flush=True,
+        )
+
     cfg = OrbitWarsEnvConfig(
         num_agents=args.num_agents,
         max_fleets=args.max_fleets,
         episode_seed=args.seed,
         reward_mode=args.reward_mode,
+        reward_ship_mass_share_coef=reward_ship_mass_share_coef,
+        reward_ship_mass_share_member_coefs=reward_ship_mass_share_member_coefs,
+        reward_production_share_coef=reward_production_share_coef,
+        reward_production_share_member_coefs=reward_production_share_member_coefs,
+        reward_time_bonus_coef=reward_time_bonus_coef,
+        reward_time_bonus_member_coefs=reward_time_bonus_member_coefs,
         normalize_obs_to_p0=args.normalize_obs_to_p0,
     )
 
@@ -2210,9 +2313,64 @@ def parse_args() -> argparse.Namespace:
         default="ship-mass-share",
         choices=("ship-mass-share", "production-share"),
         help=(
-            "Shaped reward delta to train on. 'ship-mass-share' is the existing default "
-            "(garrisons plus fleets); 'production-share' uses owned planet production over "
-            "all non-neutral owned planet production."
+            "Legacy preset for the reward mix. 'ship-mass-share' initializes to "
+            "(ship=1, production=0), 'production-share' initializes to "
+            "(ship=0, production=1). The explicit coefficient flags below override "
+            "individual terms."
+        ),
+    )
+    p.add_argument(
+        "--reward-ship-mass-share-coef",
+        type=float,
+        default=None,
+        help=(
+            "Coefficient for shaped deltas of per-player ship mass share "
+            "(garrisons plus fleets). Defaults to the value implied by --reward-mode."
+        ),
+    )
+    p.add_argument(
+        "--reward-ship-mass-share-member-coefs",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated per-population-member coefficients for ship mass share, "
+            "for example '1.0,0.5,0.0,1.5'. Length must equal --population-size."
+        ),
+    )
+    p.add_argument(
+        "--reward-production-share-coef",
+        type=float,
+        default=None,
+        help=(
+            "Coefficient for shaped deltas of owned production share over all "
+            "non-neutral owned production. Defaults to the value implied by --reward-mode."
+        ),
+    )
+    p.add_argument(
+        "--reward-production-share-member-coefs",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated per-population-member coefficients for production share. "
+            "Length must equal --population-size."
+        ),
+    )
+    p.add_argument(
+        "--reward-time-bonus-coef",
+        type=float,
+        default=None,
+        help=(
+            "Coefficient for a terminal winner-only time bonus. A timeout victory gets 0; "
+            "a turn-0 decisive victory gets 1 before this coefficient is applied."
+        ),
+    )
+    p.add_argument(
+        "--reward-time-bonus-member-coefs",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated per-population-member coefficients for the terminal "
+            "winner time bonus. Length must equal --population-size."
         ),
     )
     p.add_argument(
