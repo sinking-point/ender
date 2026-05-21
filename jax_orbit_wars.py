@@ -615,7 +615,10 @@ def _score_and_done(state: OrbitWarsState, config: OrbitWarsConfig) -> OrbitWars
     planet_scores = jnp.zeros((4,), dtype=jnp.float32).at[safe_planet_owners].add(
         planet_values
     )
-    fleet_scores_a = jnp.sum(state.incoming_fleets.astype(jnp.float32), axis=(1, 2))
+    incoming_active = (
+        state.incoming_fleets.astype(jnp.float32) * state.planet_active.astype(jnp.float32)[None, :, None]
+    )
+    fleet_scores_a = jnp.sum(incoming_active, axis=(1, 2))
     fleet_scores = jnp.pad(fleet_scores_a, (0, 4 - state.incoming_fleets.shape[0]))
     scores = planet_scores + fleet_scores
     alive_planet_values = (state.planet_active & (planet_owners >= 0)).astype(jnp.int32)
@@ -623,7 +626,7 @@ def _score_and_done(state: OrbitWarsState, config: OrbitWarsConfig) -> OrbitWars
         jnp.zeros((4,), dtype=jnp.int32).at[safe_planet_owners].max(alive_planet_values)
         > 0
     )
-    alive_from_fleets_a = jnp.sum(state.incoming_fleets, axis=(1, 2)) > 0
+    alive_from_fleets_a = jnp.sum(incoming_active, axis=(1, 2)) > 0
     alive_from_fleets = jnp.pad(alive_from_fleets_a, (0, 4 - state.incoming_fleets.shape[0]))
     alive = alive_from_planets | alive_from_fleets
     player_mask = jnp.arange(4, dtype=jnp.int32) < state.num_agents

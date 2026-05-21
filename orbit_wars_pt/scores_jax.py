@@ -25,7 +25,8 @@ def _per_player_ship_masses_core(
     oh = jax.nn.one_hot(oc, 4)
     scores_p = jnp.sum(oh * mask_p[:, None] * ships_p[:, None], axis=0)
 
-    scores_f_a = jnp.sum(incoming_fleets.astype(jnp.float32), axis=(1, 2))
+    incoming_active = incoming_fleets.astype(jnp.float32) * planet_active.astype(jnp.float32)[None, :, None]
+    scores_f_a = jnp.sum(incoming_active, axis=(1, 2))
     scores_f = jnp.pad(scores_f_a, (0, 4 - incoming_fleets.shape[0]))
 
     return scores_p + scores_f
@@ -106,7 +107,8 @@ def _player_alive_four_core(
         jnp.zeros((4,), dtype=jnp.int32).at[safe_owners].max(owned_planet.astype(jnp.int32))
         > 0
     )
-    alive_from_fleets_a = jnp.sum(incoming_fleets, axis=(1, 2)) > 0
+    incoming_active = incoming_fleets.astype(jnp.float32) * planet_active.astype(jnp.float32)[None, :, None]
+    alive_from_fleets_a = jnp.sum(incoming_active, axis=(1, 2)) > 0
     alive_from_fleets = jnp.pad(alive_from_fleets_a, (0, 4 - incoming_fleets.shape[0]))
     return alive_from_planets | alive_from_fleets
 
