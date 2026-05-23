@@ -62,7 +62,7 @@ LAUNCH_STEP = SPAWN_STEP - 2
 
 
 def _ta(eta: float) -> int:
-    return int(max(math.floor(eta - 1.0), 0.0))
+    return int(math.floor(eta))
 
 
 def _shifted(ta: int, n: int) -> int:

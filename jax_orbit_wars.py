@@ -425,8 +425,17 @@ def _launch_fleets(state: OrbitWarsState, actions: jnp.ndarray) -> OrbitWarsStat
     )
     target_i = target_planet.astype(jnp.int32)
     policy_i = policy_planet.astype(jnp.int32)
-    ta_true_i = jnp.floor(jnp.maximum(eta - 1.0, 0.0)).astype(jnp.int32)
-    ta_policy_i = jnp.floor(jnp.maximum(policy_eta - 1.0, 0.0)).astype(jnp.int32)
+    # ``eta``/``policy_eta`` are raycast hit-ticks where ``tick=k`` means the
+    # fleet's ``(k+1)``th move collides. ``_move_fleets_and_collect_combats``
+    # resolves bin 0 in this same step and then ``_shift_bins`` drops it, so
+    # writing bin = floor(eta) gives the correct timing: tick 0 fights now,
+    # tick 1 fights next step, ..., tick 23 sits in bin 23 until shifted in.
+    # The previous ``floor(max(eta - 1, 0))`` formula collapsed ticks 0 and 1
+    # into bin 0, resolving tick-1 fleets one step too early, and left bin 23
+    # unreachable. ``eta`` should never be negative; the upper clip below
+    # guards against fleets that hit beyond the forecast horizon.
+    ta_true_i = jnp.floor(eta).astype(jnp.int32)
+    ta_policy_i = jnp.floor(policy_eta).astype(jnp.int32)
     meta_ok = (
         (player < incoming_players)
         & (target_i >= 0)

@@ -110,7 +110,8 @@ def apply_prefix_micro_deltas_torch(
     planets = state.planets.clone()
     planets[..., PLANET_SHIPS] = planets[..., PLANET_SHIPS] - deduct
 
-    ta_m = (fleet_eta_m - 1.0).clamp_min(0.0).floor().to(torch.long).clamp(0, INCOMING_TA_BINS - 1)
+    # Mirror ``micro_jax._per_env_apply_one`` / ``_launch_fleets``: bin = floor(eta).
+    ta_m = fleet_eta_m.floor().to(torch.long).clamp(0, INCOMING_TA_BINS - 1)
     d_idx_m = (pair_flat_m % MAX_PLANETS).to(torch.long).clamp(0, MAX_PLANETS - 1)
     num_players = int(state.incoming_fleets.shape[1])
     ego_m = ego.to(torch.long).clamp(0, num_players - 1)[:, None].expand(b, m)

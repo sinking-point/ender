@@ -666,6 +666,7 @@ def _rollout_segment_to_host(segment: RolloutSegment) -> RolloutSegment:
         bootstrap=[np.asarray(x) for x in segment.bootstrap],
         bootstrap_valid=[np.asarray(x) for x in segment.bootstrap_valid],
         env_steps_per_env=np.asarray(segment.env_steps_per_env),
+        first_reset_event=segment.first_reset_event,
     )
 
 
@@ -1024,6 +1025,7 @@ def _combine_segments_for_stats(segments: list[RolloutSegment]) -> RolloutSegmen
         bootstrap=[first.bootstrap[p] for p in range(P)],
         bootstrap_valid=[first.bootstrap_valid[p] for p in range(P)],
         env_steps_per_env=sum((s.env_steps_per_env for s in segments), np.zeros_like(first.env_steps_per_env)),
+        first_reset_event=first.first_reset_event,
     )
 
 
@@ -1850,6 +1852,25 @@ def train(args: argparse.Namespace) -> None:
             flush=True,
         )
 
+    consistency_proc = None
+    if bool(args.consistency_check) and str(args.rollout_storage) == "host":
+        from orbit_wars_pt.consistency_check import ConsistencyCheckProcess, default_output_dir
+
+        out_dir = default_output_dir(ckpt_dir)
+        consistency_proc = ConsistencyCheckProcess(
+            out_dir,
+            eta_tolerance=float(args.consistency_check_eta_tol),
+        )
+        print(
+            f"[orbit_wars_pt] consistency check enabled; mismatches -> {out_dir}",
+            flush=True,
+        )
+    elif bool(args.consistency_check):
+        print(
+            "[orbit_wars_pt] --consistency-check is only effective with --rollout-storage=host; ignoring.",
+            flush=True,
+        )
+
     writer = SummaryWriter(log_dir=str(tb_dir))
     try:
         _train_loop(
@@ -1870,10 +1891,13 @@ def train(args: argparse.Namespace) -> None:
             writer,
             ckpt_dir,
             reset_prefetch,
+            consistency_proc,
         )
     finally:
         if reset_prefetch is not None:
             reset_prefetch.stop()
+        if consistency_proc is not None:
+            consistency_proc.stop()
         writer.close()
 
 
@@ -1895,6 +1919,7 @@ def _train_loop(
     writer: SummaryWriter,
     ckpt_dir: Path,
     reset_prefetch: Optional[RolloutResetPrefetch],
+    consistency_proc: Optional[Any] = None,
 ) -> None:
     for it in range(start_iter, args.iterations):
         iter_start = time.perf_counter()
@@ -1968,6 +1993,20 @@ def _train_loop(
                 samples = _concat_sample_dicts([c.samples for c in host_chunks])
                 samples_s = time.perf_counter() - samples_t0
                 _release_rollout_device_refs(device)
+                if consistency_proc is not None and chunk_segments[0].first_reset_event is not None:
+                    from orbit_wars_pt.consistency_check import build_trajectory_from_segment
+
+                    traj = build_trajectory_from_segment(
+                        chunk_segments[0],
+                        iter_id=int(it),
+                        num_agents=int(cfg.num_agents),
+                        ship_speed=float(args.ship_speed),
+                        n_rays=int(max(8, int(args.first_hit_n_rays))),
+                        normalize_obs_to_p0=bool(cfg.normalize_obs_to_p0),
+                        max_micro_steps=int(args.max_micro_steps),
+                    )
+                    if traj is not None:
+                        consistency_proc.submit(traj)
             else:
                 # Keep a tiny empty segment around for the existing skipped-iteration logging.
                 segment = _combine_segments_for_stats(chunk_segments)
@@ -2243,6 +2282,25 @@ def parse_args() -> argparse.Namespace:
             "--rollout-storage=host. Effective rollout length is roughly "
             "rollout_micro_horizon * rollout_host_chunks."
         ),
+    )
+    p.add_argument(
+        "--consistency-check",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "When --rollout-storage=host, ship the trajectory of the first env to reset "
+            "during each rollout to a background process that replays it through the "
+            "official Kaggle env via the adapter and flags any disagreement between the "
+            "rollout's stored agent observations and the adapter-built ones. Mismatches "
+            "are persisted under <checkpoint_root>/consistency_mismatches/."
+        ),
+    )
+    p.add_argument(
+        "--consistency-check-eta-tol",
+        type=float,
+        default=1.5,
+        help="Allowed ticks of error between recorded policy_eta and raycast tick when "
+        "resolving launch angles in the consistency replay.",
     )
     p.add_argument("--lr", type=float, default=3e-5)
     p.add_argument("--gamma", type=float, default=1.0)

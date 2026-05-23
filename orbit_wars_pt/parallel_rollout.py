@@ -349,6 +349,12 @@ class RolloutSegment:
     bootstrap: List[np.ndarray]
     bootstrap_valid: List[np.ndarray]
     env_steps_per_env: np.ndarray
+    #: Host-only sidecar for the consistency check: ``(env_i, new_seed,
+    #: write_idx_at_reset_per_seat)`` of the first env that resets during this
+    #: segment, or ``None`` if no env reset. ``new_seed`` is the seed used to
+    #: reset ``env_i``; ``write_idx_at_reset_per_seat[p]`` is the buffer row
+    #: index where the freshly-reset game's first row lands for seat ``p``.
+    first_reset_event: Optional[Tuple[int, int, np.ndarray]] = None
 
 
 @dataclass
@@ -1600,6 +1606,11 @@ def collect_parallel_micro_rollouts(
     pending_action_count = np.zeros((n_ego, num_envs), dtype=np.int32)
     reward_idx = np.full((n_ego, num_envs), -1, dtype=np.int32)
     segment_done = np.zeros((num_envs,), dtype=np.bool_)
+    # First env to reset during this segment, recorded for the optional
+    # background consistency check. Stored as ``(env_i, new_seed,
+    # write_idx_at_reset_per_seat)``; ``write_idx_at_reset`` is the per-seat
+    # row count BEFORE the reset (i.e. the first post-reset row index).
+    first_reset_event: Optional[Tuple[int, int, np.ndarray]] = None
 
     with torch.inference_mode(), amp_ctx:
         while outer < max_outer_iters:
@@ -1741,6 +1752,15 @@ def collect_parallel_micro_rollouts(
                         t_py0 += reset_dt
                         seeds_consumed += 1
                         done_env_seed[env_i] = sid
+                        if first_reset_event is None:
+                            first_reset_event = (
+                                int(env_i),
+                                int(sid),
+                                np.asarray(
+                                    [int(write_idx[p][env_i]) for p in range(n_ego)],
+                                    dtype=np.int64,
+                                ),
+                            )
 
                     halted[:, env_i] = player_done[:, env_i]
                     micro_k[:, env_i] = 0
@@ -1974,6 +1994,7 @@ def collect_parallel_micro_rollouts(
         bootstrap=bootstrap,
         bootstrap_valid=bootstrap_valid,
         env_steps_per_env=env_steps_per_env,
+        first_reset_event=first_reset_event,
     )
 
     next_carry = RolloutCarry(

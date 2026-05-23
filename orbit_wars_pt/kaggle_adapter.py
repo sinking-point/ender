@@ -2869,14 +2869,15 @@ def _build_turn_actions_torch_only(
             )
         )
         micro_idx += 1
-        planets[o_idx, 5] -= float(send)
-        env_target = int(true_planet[d_idx])
-        if 0 <= env_target < MAX_PLANETS:
-            ta = int(math.floor(max(float(true_hit_tick[d_idx]) - 1.0, 0.0)))
-            ta = max(0, min(ta, incoming_fleets.shape[2] - 1))
-            owner = max(0, min(int(ego_player), incoming_fleets.shape[0] - 1))
-            cur = int(incoming_fleets[owner, env_target, ta])
-            incoming_fleets[owner, env_target, ta] = min(cur + int(send), 65535)
+        apply_micro_launch_in_place(
+            planets,
+            incoming_fleets,
+            ego_player=int(ego_player),
+            origin_slot=int(o_idx),
+            send=int(send),
+            true_target_slot=int(true_planet[d_idx]),
+            true_hit_tick=float(true_hit_tick[d_idx]),
+        )
         if not planet_active[o_idx] or planets[o_idx, 5] < 1.0:
             if timing is not None:
                 timing.micro_book_s += perf_counter() - t0
@@ -2935,6 +2936,40 @@ def _build_turn_actions_torch_only(
             )
 
     return actions
+
+
+def apply_micro_launch_in_place(
+    planets: np.ndarray,
+    incoming_fleets: np.ndarray,
+    *,
+    ego_player: int,
+    origin_slot: int,
+    send: int,
+    true_target_slot: int,
+    true_hit_tick: float,
+) -> None:
+    """Mutate ``planets`` / ``incoming_fleets`` for one launched micro-step.
+
+    Matches the inline mutation inside ``_build_turn_actions_torch_only``: ships
+    are deducted from the origin planet's stock and added to the destination's
+    incoming-fleets bin keyed by ``(ego_player, true_target_slot, ta)`` where
+    ``ta = floor(true_hit_tick)`` and ``tick=k`` means the fleet's ``(k+1)``th
+    move collides (so ``ta=0`` is "hits during the same env step that processes
+    the launch", matching ``jax_orbit_wars._launch_fleets`` after the bin-0
+    consume-and-shift). Out-of-range targets are no-ops on the incoming table
+    (origin deduction still applies). This is the single source of truth used
+    by both the live adapter and the background consistency worker so they
+    stay numerically identical.
+    """
+
+    planets[int(origin_slot), 5] -= float(send)
+    if not (0 <= int(true_target_slot) < MAX_PLANETS):
+        return
+    ta = int(math.floor(float(true_hit_tick)))
+    ta = max(0, min(ta, incoming_fleets.shape[2] - 1))
+    owner = max(0, min(int(ego_player), incoming_fleets.shape[0] - 1))
+    cur = int(incoming_fleets[owner, int(true_target_slot), ta])
+    incoming_fleets[owner, int(true_target_slot), ta] = min(cur + int(send), 65535)
 
 
 def observation_to_state(

@@ -215,7 +215,7 @@ def run_check(
         f"interval vs raycast first-hit: cases={cases} angles/case={n_angles} "
         f"ticks={ticks} planets={planets} samples_per_span={samples_per_span}"
     )
-    print("  (incoming TA = floor(max(hit_tick - 1, 0)) for planet hits)")
+    print("  (incoming TA = floor(hit_tick) for planet hits)")
     for line in cmp.format_lines("interval vs raycast"):
         print(line)
     for line in examples:

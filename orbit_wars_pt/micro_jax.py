@@ -723,7 +723,10 @@ def _per_env_apply_one(
     ship_col_after = ship_col.at[o_idx].add(-jnp.where(update_state, send, 0.0))
     new_planets = state.planets.at[:, PLANET_SHIPS].set(ship_col_after)
 
-    ta = jnp.floor(jnp.maximum(fleet_eta - 1.0, 0.0)).astype(jnp.int32)
+    # See ``jax_orbit_wars._launch_fleets``: bin = floor(eta) where tick 0 is
+    # "fleet hits on its first move (the launch step itself)". The clip is an
+    # upper bound only; ``fleet_eta`` should never be negative.
+    ta = jnp.floor(fleet_eta).astype(jnp.int32)
     ta = jnp.clip(ta, 0, state.incoming_fleets.shape[2] - 1)
     incoming_u32 = state.incoming_fleets.astype(jnp.uint32)
     send_u32 = jnp.minimum(send, jnp.asarray(65535.0, dtype=jnp.float32)).astype(jnp.uint32)
@@ -850,7 +853,8 @@ def apply_prefix_micro_deltas_batched(
         incoming = carry
         dispatch = dispatch_bm[:, k]
         d_idx = (pair_flat_m[:, k] % p).astype(jnp.int32)
-        ta = jnp.floor(jnp.maximum(fleet_eta_m[:, k] - 1.0, 0.0)).astype(jnp.int32)
+        # Mirror ``_per_env_apply_one`` / ``_launch_fleets``: bin = floor(eta).
+        ta = jnp.floor(fleet_eta_m[:, k]).astype(jnp.int32)
         ta = jnp.clip(ta, 0, state.incoming_fleets.shape[2] - 1)
         ego_i = jnp.clip(ego_b.astype(jnp.int32), 0, state.incoming_fleets.shape[1] - 1)
         send_u32 = jnp.minimum(send_m[:, k], jnp.asarray(65535.0, dtype=jnp.float32)).astype(jnp.uint32)

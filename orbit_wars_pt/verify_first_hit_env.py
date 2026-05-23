@@ -250,7 +250,7 @@ def run_mismatch_audit(
     print(f"  official loop (kaggle):   {kk}")
     if kv[0] == "planet":
         print(
-            f"  incoming TA bins (floor(hit_tick-1)): "
+            f"  incoming TA bins (floor(hit_tick)): "
             f"official={hit_incoming_ta(kv)} interval={hit_incoming_ta(iv)} raycast={hit_incoming_ta(rv)}"
         )
 
@@ -335,7 +335,7 @@ def run_batch(
         f"batch: cases={cases} angles={n_angles} ticks={ticks} planets={planets} "
         f"samples={samples_per_span}"
     )
-    print("  (incoming TA = floor(max(hit_tick - 1, 0)) for planet hits)")
+    print("  (incoming TA = floor(hit_tick) for planet hits)")
     for line in iv_vs_kv.format_lines("interval vs official"):
         print(line)
     for line in rv_vs_kv.format_lines("raycast vs official"):

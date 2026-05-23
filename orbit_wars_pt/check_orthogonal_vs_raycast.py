@@ -218,7 +218,7 @@ def run_check(
         f"{geom_label} vs raycast first-hit: cases={cases} angles/case={n_angles} "
         f"ticks={ticks} planets={planets} motion={motion}"
     )
-    print("  (incoming TA = floor(max(hit_tick - 1, 0)) for planet hits)")
+    print("  (incoming TA = floor(hit_tick) for planet hits)")
     for line in cmp.format_lines(f"{geom_label} vs raycast (all events)"):
         print(line)
     for line in cmp_planet.format_lines("both planet hits only"):

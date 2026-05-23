@@ -123,7 +123,7 @@ def main() -> None:
         assert not bool(dispatched_np[i])
 
     incoming_np = np.asarray(jax.device_get(new_state.incoming_fleets))
-    ta0 = int(max(np.floor(float(jax.device_get(fleet_eta[0])) - 1.0), 0.0))
+    ta0 = int(np.floor(float(jax.device_get(fleet_eta[0]))))
     assert incoming_np[0, 0, d_idx, ta0] == int(send_np[0]), "env 0 launch should be scheduled in incoming_fleets"
 
     # ---- Phase 5: compact buffer + turn_state_cache + gather. ----

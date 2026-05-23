@@ -9,12 +9,16 @@ Hit = tuple[str, int, int]  # (kind, slot, hit_tick)
 
 
 def hit_incoming_ta(hit: Hit) -> int:
-    """TA bin index for a planet hit (``kaggle_adapter``: ``floor(max(hit_tick - 1, 0))``)."""
+    """TA bin index for a planet hit (``kaggle_adapter``: ``floor(hit_tick)``).
+
+    ``tick=k`` means the fleet's ``(k+1)``th move collides; bin ``k`` lines up
+    with the convention used by ``_launch_fleets`` and ``_forecast_incoming_fleets``.
+    """
 
     kind, _slot, tick = hit
     if kind != "planet" or tick < 0:
         return -1
-    return int(math.floor(max(float(tick) - 1.0, 0.0)))
+    return int(math.floor(float(tick)))
 
 
 def hit_event(hit: Hit) -> tuple[str, int]:
