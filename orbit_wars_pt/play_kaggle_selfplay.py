@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+import numpy as np
+
 CPU_THREAD_ENV_VARS = (
     "OMP_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -34,7 +36,11 @@ def main() -> None:
         "--checkpoint",
         type=str,
         default="checkpoint.pt",
-        help="Policy checkpoint path used by orbit_wars_pt.kaggle_adapter.agent.",
+        help=(
+            "Policy checkpoint path used by orbit_wars_pt.kaggle_adapter.agent. "
+            "This can be a normal training checkpoint or an exploiter-mode checkpoint; "
+            "the single-policy selfplay path uses the main policy."
+        ),
     )
     parser.add_argument(
         "--num-agents",
@@ -42,6 +48,24 @@ def main() -> None:
         default=2,
         choices=(2, 4),
         help="Run a 2-player duel or 4-player FFA self-play episode.",
+    )
+    parser.add_argument(
+        "--main-vs-exploiter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the checkpoint's main policy for one seat and its exploiter policy for the others. "
+            "In 2p this is 1 main vs 1 exploiter; in 4p it is 1 main vs 3 exploiters."
+        ),
+    )
+    parser.add_argument(
+        "--main-seat",
+        type=int,
+        default=None,
+        help=(
+            "Seat index for the main policy when --main-vs-exploiter is set. "
+            "Default: sample from --seed (or --agent-seed if --seed is unset)."
+        ),
     )
     parser.add_argument(
         "--out",
@@ -206,6 +230,8 @@ def main() -> None:
         os.environ["ORBIT_WARS_CPU_THREADS"] = "0"
 
     os.environ["ORBIT_WARS_CHECKPOINT"] = str(Path(args.checkpoint).expanduser())
+    os.environ.pop("ORBIT_WARS_CHECKPOINT_4P", None)
+    os.environ.pop("ORBIT_WARS_CHECKPOINT_2P", None)
     os.environ["ORBIT_WARS_DEVICE"] = str(args.device)
     if args.member is not None:
         os.environ["ORBIT_WARS_MEMBER"] = str(int(args.member))
@@ -255,12 +281,11 @@ def main() -> None:
 
     from kaggle_environments import make
 
-    from agent import agent
     from orbit_wars_pt.interval_geometry_np import format_interval_aim_stats, reset_interval_aim_stats
-    from orbit_wars_pt.kaggle_adapter import get_last_agent_call_timing
+    from orbit_wars_pt.kaggle_adapter import KaggleOrbitWarsAgent
 
-    def _agent_internal_timing_suffix(dt_wall: float) -> str:
-        t = get_last_agent_call_timing()
+    def _agent_internal_timing_suffix(dt_wall: float, timing_obj: Any) -> str:
+        t = timing_obj
         if t is None:
             return " internal=unavailable"
         micro_sum = t.micro_sum_s()
@@ -288,17 +313,22 @@ def main() -> None:
             return 0
         return owner
 
-    def _swapped_view_agent(obs: dict[str, Any], config: Any = None) -> list[list[float]]:
-        obs2 = copy.deepcopy(obs)
-        if "player" in obs2:
-            obs2["player"] = _swap_owner(obs2["player"])
-        for planet in obs2.get("planets", []) or []:
-            planet[1] = _swap_owner(planet[1])
-        for planet in obs2.get("initial_planets", []) or []:
-            planet[1] = _swap_owner(planet[1])
-        for fleet in obs2.get("fleets", []) or []:
-            fleet[1] = _swap_owner(fleet[1])
-        return agent(obs2, config)
+    def _swapped_view_agent(
+        base_agent: Callable[[dict[str, Any], Any], list[list[float]]]
+    ) -> Callable[[dict[str, Any], Any], list[list[float]]]:
+        def wrapped(obs: dict[str, Any], config: Any = None) -> list[list[float]]:
+            obs2 = copy.deepcopy(obs)
+            if "player" in obs2:
+                obs2["player"] = _swap_owner(obs2["player"])
+            for planet in obs2.get("planets", []) or []:
+                planet[1] = _swap_owner(planet[1])
+            for planet in obs2.get("initial_planets", []) or []:
+                planet[1] = _swap_owner(planet[1])
+            for fleet in obs2.get("fleets", []) or []:
+                fleet[1] = _swap_owner(fleet[1])
+            return base_agent(obs2, config)
+
+        return wrapped
 
     def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
         if config is None:
@@ -307,7 +337,12 @@ def main() -> None:
             return config.get(key, default)
         return getattr(config, key, default)
 
-    def _timed_agent(base_agent: Callable[[dict[str, Any], Any], list[list[float]]], *, show_internal: bool):
+    def _timed_agent(
+        base_agent: Callable[[dict[str, Any], Any], list[list[float]]],
+        *,
+        show_internal: bool,
+        timing_getter: Callable[[], Any],
+    ):
         def wrapped(obs: dict[str, Any], config: Any = None) -> list[list[float]]:
             step = obs.get("step", obs.get("step_count", "?"))
             player = obs.get("player", "?")
@@ -328,7 +363,7 @@ def main() -> None:
                 overage_suffix = ""
                 if before_overage is not None:
                     overage_suffix = f" remainingOverage {float(before_overage):.3f}->{after_overage:.3f}s"
-                internal_suffix = _agent_internal_timing_suffix(dt) if show_internal else ""
+                internal_suffix = _agent_internal_timing_suffix(dt, timing_getter()) if show_internal else ""
                 print(
                     f"[timing] step={step} player={player} duration={dt:.6f}s{internal_suffix}"
                     f"{timeout_suffix}{overage_suffix}",
@@ -343,11 +378,61 @@ def main() -> None:
         configuration["seed"] = int(args.seed)
 
     env = make("orbit_wars", configuration=configuration, debug=bool(args.debug))
-    run_agent = _swapped_view_agent if args.swap_player_view else agent
-    if args.timings:
-        run_agent = _timed_agent(run_agent, show_internal=True)
+    greedy_by_seat = [
+        greedy_p0,
+        greedy_p1,
+        greedy_p2,
+        greedy_p3,
+    ]
+    member_by_seat = [
+        member_p0,
+        member_p1,
+        member_p2,
+        member_p3,
+    ]
+    if args.main_vs_exploiter:
+        if args.main_seat is None:
+            seat_rng_seed = int(args.seed if args.seed is not None else args.agent_seed)
+            main_seat = int(np.random.default_rng(seat_rng_seed).integers(int(args.num_agents)))
+        else:
+            main_seat = int(args.main_seat)
+            if not (0 <= main_seat < int(args.num_agents)):
+                raise SystemExit(f"--main-seat must be in [0, {int(args.num_agents) - 1}]")
+        print(
+            f"[orbit_wars_pt] selfplay main-vs-exploiter mode: main_seat={main_seat} "
+            f"checkpoint={Path(args.checkpoint).expanduser()}",
+            flush=True,
+        )
+    else:
+        main_seat = -1
+
+    run_agents: list[Callable[[dict[str, Any], Any], list[list[float]]]] = []
+    for seat in range(int(args.num_agents)):
+        policy_key = "policy"
+        if args.main_vs_exploiter and seat != main_seat:
+            policy_key = "exploiter_policy"
+        seat_agent = KaggleOrbitWarsAgent(
+            Path(args.checkpoint).expanduser(),
+            device=str(args.device),
+            policy_key=policy_key,
+            greedy=bool(greedy_by_seat[seat]),
+            population_member=member_by_seat[seat],
+            max_micro_steps=(None if args.max_micro_steps is None else int(args.max_micro_steps)),
+            seed=int(args.agent_seed) + seat + (1000 if policy_key != "policy" else 0),
+            raycast_rays=(None if args.raycast_rays is None else int(args.raycast_rays)),
+        )
+        run_agent = seat_agent
+        if args.swap_player_view:
+            run_agent = _swapped_view_agent(run_agent)
+        if args.timings:
+            run_agent = _timed_agent(
+                run_agent,
+                show_internal=True,
+                timing_getter=lambda inst=seat_agent: getattr(inst, "_last_call_timing", None),
+            )
+        run_agents.append(run_agent)
     reset_interval_aim_stats()
-    env.run([run_agent] * int(args.num_agents))
+    env.run(run_agents)
 
     record = {
         "name": "orbit_wars",

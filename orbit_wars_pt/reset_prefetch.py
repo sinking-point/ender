@@ -14,10 +14,23 @@ import multiprocessing as mp
 import queue
 import sys
 import time
+from dataclasses import dataclass
 from multiprocessing.context import BaseContext
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-def _worker_loop(task_q: "mp.Queue[Optional[Tuple[int, int, int, int]]]", result_q: "mp.Queue[Any]") -> None:
+from orbit_wars_pt.exploiter_reset import build_unified_exploiter_state_variant
+
+
+@dataclass
+class PrefetchPopMeta:
+    wait_s: float = 0.0
+    immediate_bank_hit: bool = False
+    drained_results: int = 0
+    banked_other_results: int = 0
+    fallback_used: bool = False
+
+
+def _worker_loop(task_q: "mp.Queue[Optional[Tuple[int, int, int, int, Optional[int]]]]", result_q: "mp.Queue[Any]") -> None:
     import os
 
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -30,10 +43,17 @@ def _worker_loop(task_q: "mp.Queue[Optional[Tuple[int, int, int, int]]]", result
         msg = task_q.get()
         if msg is None:
             break
-        gen, seed, num_agents, max_fleets = msg
-        st = jow.reset_from_reference(int(seed), int(num_agents), max_fleets=int(max_fleets))
+        gen, seed, num_agents, max_fleets, mode_code = msg
+        if mode_code is None:
+            st = jow.reset_from_reference(int(seed), int(num_agents), max_fleets=int(max_fleets))
+        else:
+            st = build_unified_exploiter_state_variant(
+                int(seed),
+                active_seat_count=int(mode_code),
+                max_fleets=int(max_fleets),
+            )
         np_st = jax.device_get(st)
-        result_q.put((gen, int(seed), int(num_agents), int(max_fleets), np_st))
+        result_q.put((gen, int(seed), int(num_agents), int(max_fleets), mode_code, np_st))
 
 
 class RolloutResetPrefetch:
@@ -52,8 +72,8 @@ class RolloutResetPrefetch:
         self._procs: List[mp.Process] = []
         self._gen = 0
         self._mf = -1
-        self._submitted: Set[Tuple[int, int, int, int]] = set()
-        self._bank: Dict[Tuple[int, int, int, int], Any] = {}
+        self._submitted: Set[Tuple[int, int, int, int, Optional[int]]] = set()
+        self._bank: Dict[Tuple[int, int, int, int, Optional[int]], Any] = {}
         self._started = False
 
     @property
@@ -100,8 +120,15 @@ class RolloutResetPrefetch:
             except queue.Empty:
                 break
 
-    def _submit(self, gen: int, seed: int, num_agents: int, max_fleets: int) -> None:
-        key = (gen, int(seed), int(num_agents), int(max_fleets))
+    def _submit(
+        self,
+        gen: int,
+        seed: int,
+        num_agents: int,
+        max_fleets: int,
+        mode_code: Optional[int] = None,
+    ) -> None:
+        key = (gen, int(seed), int(num_agents), int(max_fleets), None if mode_code is None else int(mode_code))
         if key in self._submitted or key in self._bank:
             return
         self._submitted.add(key)
@@ -119,7 +146,35 @@ class RolloutResetPrefetch:
         for k in range(self._lookahead):
             self._submit(g, int(first_seed) + k, int(num_agents), mf)
 
-    def pop_state(self, seed: int, num_agents: int, max_fleets: int, *, sync_timeout_s: float = 120.0) -> Any:
+    def prefetch_unified_exploiter_ahead(
+        self,
+        first_seed_2p: int,
+        first_seed_4p: int,
+        max_fleets: int,
+    ) -> None:
+        """Queue padded-2p even seeds and native-4p odd seeds for future unified exploiter resets."""
+
+        if not self._started:
+            raise RuntimeError("RolloutResetPrefetch.start() first")
+        mf = int(max_fleets)
+        if self._mf < 0:
+            self._mf = mf
+        g = self._gen
+        for k in range(self._lookahead):
+            seed_2p = 2 * (int(first_seed_2p) + k)
+            seed_4p = 2 * (int(first_seed_4p) + k) + 1
+            self._submit(g, seed_2p, 4, mf, 2)
+            self._submit(g, seed_4p, 4, mf, 4)
+
+    def pop_state(
+        self,
+        seed: int,
+        num_agents: int,
+        max_fleets: int,
+        *,
+        sync_timeout_s: float = 120.0,
+        return_meta: bool = False,
+    ) -> Any:
         """Return a NumPy ``OrbitWarsState`` (``jax.device_get`` shape) for this seed."""
 
         import jax
@@ -129,23 +184,32 @@ class RolloutResetPrefetch:
             raise RuntimeError("RolloutResetPrefetch.start() first")
         mf = int(max_fleets)
         g = self._gen
-        key = (g, int(seed), int(num_agents), mf)
+        key = (g, int(seed), int(num_agents), mf, None)
+        meta = PrefetchPopMeta()
         if key in self._bank:
-            return self._bank.pop(key)
+            meta.immediate_bank_hit = True
+            out = self._bank.pop(key)
+            return (out, meta) if return_meta else out
         self._submit(g, int(seed), int(num_agents), mf)
 
-        deadline = time.perf_counter() + float(sync_timeout_s)
+        t_wait0 = time.perf_counter()
+        deadline = t_wait0 + float(sync_timeout_s)
         while time.perf_counter() < deadline:
             try:
-                gen_r, seed_r, na_r, mf_r, np_st = self._result_q.get(timeout=0.5)
+                gen_r, seed_r, na_r, mf_r, mode_r, np_st = self._result_q.get(timeout=0.5)
             except queue.Empty:
                 continue
-            rkey = (gen_r, seed_r, na_r, mf_r)
+            meta.drained_results += 1
+            rkey = (gen_r, seed_r, na_r, mf_r, mode_r)
             if rkey == key:
-                return np_st
+                meta.wait_s = time.perf_counter() - t_wait0
+                return (np_st, meta) if return_meta else np_st
             self._bank[rkey] = np_st
+            meta.banked_other_results += 1
             if key in self._bank:
-                return self._bank.pop(key)
+                meta.wait_s = time.perf_counter() - t_wait0
+                out = self._bank.pop(key)
+                return (out, meta) if return_meta else out
 
         print(
             "[orbit_wars_pt] reset prefetch timed out; falling back to in-process reset "
@@ -154,4 +218,64 @@ class RolloutResetPrefetch:
             flush=True,
         )
         st = jow.reset_from_reference(int(seed), int(num_agents), max_fleets=mf)
-        return jax.device_get(st)
+        meta.wait_s = time.perf_counter() - t_wait0
+        meta.fallback_used = True
+        out = jax.device_get(st)
+        return (out, meta) if return_meta else out
+
+    def pop_unified_exploiter_state(
+        self,
+        seed: int,
+        active_seat_count: int,
+        max_fleets: int,
+        *,
+        sync_timeout_s: float = 120.0,
+        return_meta: bool = False,
+    ) -> Any:
+        """Return a NumPy unified exploiter reset state for padded-2p or native-4p."""
+
+        import jax
+
+        if not self._started:
+            raise RuntimeError("RolloutResetPrefetch.start() first")
+        mf = int(max_fleets)
+        active = int(active_seat_count)
+        g = self._gen
+        key = (g, int(seed), 4, mf, active)
+        meta = PrefetchPopMeta()
+        if key in self._bank:
+            meta.immediate_bank_hit = True
+            out = self._bank.pop(key)
+            return (out, meta) if return_meta else out
+        self._submit(g, int(seed), 4, mf, active)
+
+        t_wait0 = time.perf_counter()
+        deadline = t_wait0 + float(sync_timeout_s)
+        while time.perf_counter() < deadline:
+            try:
+                gen_r, seed_r, na_r, mf_r, mode_r, np_st = self._result_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            meta.drained_results += 1
+            rkey = (gen_r, seed_r, na_r, mf_r, mode_r)
+            if rkey == key:
+                meta.wait_s = time.perf_counter() - t_wait0
+                return (np_st, meta) if return_meta else np_st
+            self._bank[rkey] = np_st
+            meta.banked_other_results += 1
+            if key in self._bank:
+                meta.wait_s = time.perf_counter() - t_wait0
+                out = self._bank.pop(key)
+                return (out, meta) if return_meta else out
+
+        print(
+            "[orbit_wars_pt] unified exploiter reset prefetch timed out; falling back to in-process reset "
+            f"(seed={seed}, active_seats={active}, max_fleets={mf}).",
+            file=sys.stderr,
+            flush=True,
+        )
+        st = build_unified_exploiter_state_variant(int(seed), active_seat_count=active, max_fleets=mf)
+        meta.wait_s = time.perf_counter() - t_wait0
+        meta.fallback_used = True
+        out = jax.device_get(st)
+        return (out, meta) if return_meta else out

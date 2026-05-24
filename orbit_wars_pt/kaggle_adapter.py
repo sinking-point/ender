@@ -3178,6 +3178,22 @@ def _checkpoint_training_args(payload: Any) -> Mapping[str, Any]:
     return {}
 
 
+def _infer_policy_player_count_from_payload(payload: Any) -> int:
+    training_args = _checkpoint_training_args(payload)
+    for key in ("policy_player_count", "inference_policy_player_count"):
+        if key in training_args:
+            return 4 if int(training_args[key]) > 2 else 2
+    policy_state = payload.get("policy", payload) if isinstance(payload, Mapping) else payload
+    if isinstance(policy_state, Mapping):
+        w = policy_state.get("feat_proj.weight")
+        if hasattr(w, "shape") and len(w.shape) >= 2:
+            feat_dim = int(w.shape[1])
+            return 4 if feat_dim > 32 else 2
+    if "num_agents" in training_args:
+        return 4 if int(training_args["num_agents"]) > 2 else 2
+    return 2
+
+
 def _checkpoint_search_roots() -> list[Path]:
     """Directories to try when resolving a relative checkpoint path."""
 
@@ -3223,6 +3239,7 @@ def load_policy(
     checkpoint_path: str | os.PathLike[str] = DEFAULT_CHECKPOINT,
     *,
     device: Optional[str | torch.device] = None,
+    policy_key: str = "policy",
 ) -> tuple[OrbitWarsPolicy, torch.device, Mapping[str, Any]]:
     """Load a training checkpoint or raw policy state dict for inference."""
 
@@ -3232,11 +3249,31 @@ def load_policy(
         payload = torch.load(resolved, map_location="cpu", weights_only=False)
     except TypeError:
         payload = torch.load(checkpoint_path, map_location="cpu")
-    policy_state = payload.get("policy", payload) if isinstance(payload, Mapping) else payload
-    policy = OrbitWarsPolicy(**_infer_policy_kwargs(payload)).to(torch_device)
+    if isinstance(payload, Mapping):
+        if policy_key == "policy":
+            policy_state = payload.get("policy", payload)
+        else:
+            if policy_key not in payload:
+                raise KeyError(
+                    f"Checkpoint {resolved} does not contain policy key {policy_key!r}"
+                )
+            policy_state = payload[policy_key]
+        payload_for_kwargs: Any = {
+            "policy": policy_state,
+            "training_args": _checkpoint_training_args(payload),
+        }
+    else:
+        policy_state = payload
+        payload_for_kwargs = payload
+    policy = OrbitWarsPolicy(**_infer_policy_kwargs(payload_for_kwargs)).to(torch_device)
     policy.load_state_dict(policy_state)
     policy.eval()
-    return policy, torch_device, _checkpoint_training_args(payload)
+    training_args = dict(_checkpoint_training_args(payload))
+    training_args.setdefault(
+        "policy_player_count",
+        _infer_policy_player_count_from_payload(payload),
+    )
+    return policy, torch_device, training_args
 
 
 class KaggleOrbitWarsAgent:
@@ -3247,6 +3284,7 @@ class KaggleOrbitWarsAgent:
         checkpoint_path: str | os.PathLike[str] = DEFAULT_CHECKPOINT,
         *,
         device: Optional[str | torch.device] = None,
+        policy_key: str = "policy",
         greedy: bool | Mapping[int, bool] = False,
         population_member: Optional[int | Mapping[int, int]] = None,
         max_micro_steps: Optional[int] = None,
@@ -3258,7 +3296,12 @@ class KaggleOrbitWarsAgent:
     ):
         _configure_cpu_threads()
         self.checkpoint_path = resolve_checkpoint_path(checkpoint_path)
-        self.policy, self.device, training_args = load_policy(self.checkpoint_path, device=device)
+        self.policy_key = str(policy_key)
+        self.policy, self.device, training_args = load_policy(
+            self.checkpoint_path,
+            device=device,
+            policy_key=self.policy_key,
+        )
         self.population_size = int(training_args.get("population_size", 1))
         self._population_member_by_player = _normalize_population_members(
             population_member,
@@ -3266,6 +3309,7 @@ class KaggleOrbitWarsAgent:
             context="single",
         )
         self.normalize_obs_to_p0 = bool(training_args.get("normalize_obs_to_p0", False))
+        self.policy_player_count = 4 if int(training_args.get("policy_player_count", 2)) > 2 else 2
         self._greedy_by_player = _normalize_greedy(greedy)
         self.max_micro_steps = int(
             max_micro_steps
@@ -3423,7 +3467,7 @@ class KaggleOrbitWarsAgent:
             ego_player=ego_player,
             step_count=step_count,
             policy=self.policy,
-            policy_player_count=int(np.asarray(state.num_agents)),
+            policy_player_count=self.policy_player_count,
             seen=self._sanity_warnings,
             context="single",
         )
@@ -3444,6 +3488,7 @@ class KaggleOrbitWarsAgent:
             timing=timing,
             launch_tracker=self.launch_tracker,
             game_step=step_count,
+            policy_player_count=self.policy_player_count,
             normalize_obs_to_p0=self.normalize_obs_to_p0,
             launch_geometry=launch_geometry,
             population_member=self._population_member_for_player(ego_player),
@@ -3508,6 +3553,8 @@ class KaggleOrbitWarsDualPolicyAgent:
         )
         self.normalize_obs_to_p0_4p = bool(training_args_4p.get("normalize_obs_to_p0", False))
         self.normalize_obs_to_p0_2p = bool(training_args_2p.get("normalize_obs_to_p0", False))
+        self.policy_player_count_4p = 4 if int(training_args_4p.get("policy_player_count", 4)) > 2 else 2
+        self.policy_player_count_2p = 4 if int(training_args_2p.get("policy_player_count", 2)) > 2 else 2
         self._greedy_by_player = _normalize_greedy(greedy)
         micro_4p = int(training_args_4p.get("max_micro_steps", DEFAULT_MAX_ACTIONS))
         micro_2p = int(training_args_2p.get("max_micro_steps", DEFAULT_MAX_ACTIONS))
@@ -3647,7 +3694,7 @@ class KaggleOrbitWarsDualPolicyAgent:
         live_opponents = _count_live_opponents(state, ego_player)
         use_4p_policy = live_opponents >= 2
         policy = self.policy_4p if use_4p_policy else self.policy_2p
-        policy_player_count = int(np.asarray(state.num_agents)) if use_4p_policy else 2
+        policy_player_count = self.policy_player_count_4p if use_4p_policy else self.policy_player_count_2p
         normalize_obs_to_p0 = self.normalize_obs_to_p0_4p if use_4p_policy else self.normalize_obs_to_p0_2p
         _check_4p_adapter_sanity(
             obs=obs,

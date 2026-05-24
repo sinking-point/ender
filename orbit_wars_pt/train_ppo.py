@@ -30,9 +30,13 @@ import orbit_wars_pt.xla_env  # noqa: F401
 
 import jax.numpy as jnp
 
-from orbit_wars_pt.batched_env import heal_terminal_env_slices
+from orbit_wars_pt.batched_env import heal_terminal_env_slices, reset_env_at_index
 from orbit_wars_pt.env_wrapper import OrbitWarsEnvConfig
 from orbit_wars_pt.constants import FEATURE_DIM, INCOMING_TA_BINS, MAX_PLANETS, obs_feature_dim_for_num_agents
+from orbit_wars_pt.exploiter_reset import (
+    build_unified_exploiter_reset,
+    unified_exploiter_active_seat_count,
+)
 from orbit_wars_pt.gpu_mem import (
     log_cuda_mem,
     print_cuda_memory_summary,
@@ -42,6 +46,10 @@ from orbit_wars_pt.gpu_mem import (
 from orbit_wars_pt.jax_setup import configure_jax_for_training
 from orbit_wars_pt.model import OrbitWarsPolicy
 from orbit_wars_pt.parallel_rollout import (
+    EXPLOITER_MODE_SELFPLAY_2P,
+    EXPLOITER_MODE_SELFPLAY_4P,
+    EXPLOITER_MODE_VS_2P,
+    EXPLOITER_MODE_VS_4P,
     RolloutCarry,
     RolloutGameStats,
     RolloutSegment,
@@ -62,7 +70,7 @@ from orbit_wars_pt.compressed_observation import (
 
 from jax_orbit_wars import OrbitWarsState
 
-CHECKPOINT_VERSION = 5
+CHECKPOINT_VERSION = 6
 
 
 @dataclass
@@ -198,6 +206,26 @@ def _serialize_rollout_carry(carry: RolloutCarry) -> Dict[str, Any]:
             if carry.policy_row_for_seat is None
             else np.asarray(carry.policy_row_for_seat, dtype=np.int32)
         ),
+        "controller_assignments": (
+            None
+            if carry.controller_assignments is None
+            else np.asarray(carry.controller_assignments, dtype=np.int32)
+        ),
+        "main_player_mask": (
+            None
+            if carry.main_player_mask is None
+            else np.asarray(carry.main_player_mask, dtype=np.bool_)
+        ),
+        "env_mode_by_env": (
+            None
+            if carry.env_mode_by_env is None
+            else np.asarray(carry.env_mode_by_env, dtype=np.int32)
+        ),
+        "pending_exploiter_terminal": (
+            None
+            if carry.pending_exploiter_terminal is None
+            else np.asarray(carry.pending_exploiter_terminal, dtype=np.bool_)
+        ),
     }
 
 
@@ -230,6 +258,30 @@ def _deserialize_rollout_carry(obj: Dict[str, Any]) -> RolloutCarry:
         prs = np.asarray(policy_row_for_seat_obj, dtype=np.int32)
         if prs.shape == (int(cfg.num_agents), ne):
             policy_row_for_seat = prs
+    controller_assignments_obj = obj.get("controller_assignments", None)
+    controller_assignments = None
+    if controller_assignments_obj is not None:
+        ca = np.asarray(controller_assignments_obj, dtype=np.int32)
+        if ca.shape == (int(cfg.num_agents), ne):
+            controller_assignments = ca
+    main_player_mask_obj = obj.get("main_player_mask", None)
+    main_player_mask = None
+    if main_player_mask_obj is not None:
+        mpm = np.asarray(main_player_mask_obj, dtype=np.bool_)
+        if mpm.shape == (int(cfg.num_agents), ne):
+            main_player_mask = mpm
+    env_mode_obj = obj.get("env_mode_by_env", None)
+    env_mode_by_env = None
+    if env_mode_obj is not None:
+        em = np.asarray(env_mode_obj, dtype=np.int32).reshape(-1)
+        if em.shape[0] == ne:
+            env_mode_by_env = em
+    pending_exploiter_terminal_obj = obj.get("pending_exploiter_terminal", None)
+    pending_exploiter_terminal = None
+    if pending_exploiter_terminal_obj is not None:
+        pet = np.asarray(pending_exploiter_terminal_obj, dtype=np.bool_)
+        if pet.shape == (int(cfg.num_agents), ne):
+            pending_exploiter_terminal = pet
     return RolloutCarry(
         state_b=state_b,
         cfg=cfg,
@@ -237,6 +289,96 @@ def _deserialize_rollout_carry(obj: Dict[str, Any]) -> RolloutCarry:
         player_done=player_done,
         population_assignments=population_assignments,
         policy_row_for_seat=policy_row_for_seat,
+        controller_assignments=controller_assignments,
+        main_player_mask=main_player_mask,
+        env_mode_by_env=env_mode_by_env,
+        pending_exploiter_terminal=pending_exploiter_terminal,
+    )
+
+
+def _normalize_unified_exploiter_rollout_seed_state(seed_state: Any) -> dict[str, int]:
+    if isinstance(seed_state, dict):
+        if "two_p" in seed_state and "four_p" in seed_state:
+            return {
+                "two_p": int(seed_state["two_p"]),
+                "four_p": int(seed_state["four_p"]),
+            }
+        if "2p" in seed_state and "4p" in seed_state:
+            return {
+                "two_p": int(seed_state["2p"]),
+                "four_p": int(seed_state["4p"]),
+            }
+    base = int(seed_state)
+    return {"two_p": base, "four_p": base}
+
+
+def _take_unified_exploiter_rollout_seed(seed_state: dict[str, int], active_seat_count: int) -> int:
+    if int(active_seat_count) == 2:
+        logical = int(seed_state["two_p"])
+        seed_state["two_p"] = logical + 1
+        return 2 * logical
+    if int(active_seat_count) == 4:
+        logical = int(seed_state["four_p"])
+        seed_state["four_p"] = logical + 1
+        return 2 * logical + 1
+    raise ValueError(f"unsupported active_seat_count {int(active_seat_count)}")
+
+
+def _heal_unified_exploiter_terminal_env_slices(
+    carry: RolloutCarry,
+    seed_state: dict[str, int],
+) -> tuple[RolloutCarry, dict[str, int]]:
+    done_np = np.asarray(jax.device_get(carry.state_b.done)).reshape(-1)
+    num_envs = int(carry.state_b.planets.shape[0])
+    episode_turns = list(carry.episode_turns)
+    if len(episode_turns) != num_envs:
+        episode_turns = [0] * num_envs
+    state_b = carry.state_b
+    player_done = None if carry.player_done is None else np.asarray(carry.player_done).copy()
+    pending_exploiter_terminal = (
+        None
+        if carry.pending_exploiter_terminal is None
+        else np.asarray(carry.pending_exploiter_terminal).copy()
+    )
+    controller_assignments = None if carry.controller_assignments is None else np.asarray(carry.controller_assignments).copy()
+    main_player_mask = None if carry.main_player_mask is None else np.asarray(carry.main_player_mask).copy()
+    mode_arr = None if carry.env_mode_by_env is None else np.asarray(carry.env_mode_by_env, dtype=np.int32)
+    if mode_arr is None:
+        return carry, seed_state
+    for env_i in range(num_envs):
+        if not bool(done_np[env_i]):
+            continue
+        active_seat_count = unified_exploiter_active_seat_count(int(mode_arr[env_i]))
+        sid = _take_unified_exploiter_rollout_seed(seed_state, active_seat_count)
+        state_i, ctrl_i, main_i = build_unified_exploiter_reset(
+            sid,
+            int(mode_arr[env_i]),
+            int(carry.cfg.max_fleets),
+        )
+        state_b = reset_env_at_index(state_b, env_i, sid, carry.cfg, fresh_np=jax.device_get(state_i))
+        episode_turns[env_i] = 0
+        if controller_assignments is not None:
+            controller_assignments[:, env_i] = ctrl_i.astype(np.int32, copy=False)
+        if player_done is not None:
+            player_done[:, env_i] = ctrl_i.astype(np.int32, copy=False) < 0
+        if pending_exploiter_terminal is not None:
+            pending_exploiter_terminal[:, env_i] = False
+        if main_player_mask is not None:
+            main_player_mask[:, env_i] = main_i.astype(np.bool_, copy=False)
+    return (
+        RolloutCarry(
+            state_b=state_b,
+            cfg=carry.cfg,
+            episode_turns=episode_turns,
+            player_done=player_done,
+            population_assignments=carry.population_assignments,
+            policy_row_for_seat=carry.policy_row_for_seat,
+            controller_assignments=controller_assignments,
+            main_player_mask=main_player_mask,
+            env_mode_by_env=carry.env_mode_by_env,
+            pending_exploiter_terminal=pending_exploiter_terminal,
+        ),
+        seed_state,
     )
 
 
@@ -294,6 +436,7 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "max_fleets",
         "num_agents",
         "population_size",
+        "exploiter_mode",
         "activation_checkpointing",
         "device",
         "compile",
@@ -336,10 +479,12 @@ def save_checkpoint(
     next_iteration: int,
     policy: OrbitWarsPolicy,
     opt: torch.optim.Optimizer,
+    exploiter_policy: Optional[OrbitWarsPolicy],
+    exploiter_opt: Optional[torch.optim.Optimizer],
     rng: torch.Generator,
     rnd: np.random.Generator,
-    rollout_env_seed: int,
-    rollout_carry: Optional[RolloutCarry],
+    rollout_env_seed: Any,
+    rollout_carry: Any,
     args: argparse.Namespace,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -348,12 +493,19 @@ def save_checkpoint(
         "iteration": next_iteration,
         "policy": policy.state_dict(),
         "optimizer": opt.state_dict(),
+        "exploiter_policy": None if exploiter_policy is None else exploiter_policy.state_dict(),
+        "exploiter_optimizer": None if exploiter_opt is None else exploiter_opt.state_dict(),
         "torch_rng": rng.get_state(),
         "numpy_rng_state": rnd.bit_generator.state,
         "rollout_env_seed": rollout_env_seed,
-        "rollout_carry": _serialize_rollout_carry(rollout_carry)
-        if rollout_carry is not None
-        else None,
+        "rollout_carry": (
+            {
+                key: (_serialize_rollout_carry(val) if val is not None else None)
+                for key, val in dict(rollout_carry or {}).items()
+            }
+            if isinstance(rollout_carry, dict)
+            else (_serialize_rollout_carry(rollout_carry) if rollout_carry is not None else None)
+        ),
         "training_args": _checkpoint_training_args(args),
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -413,9 +565,10 @@ def build_ppo_samples(
     have shape ``[M]`` where ``M`` is the total number of valid transitions.
     """
 
-    advs, rets, players, t_idx, n_idx, old_lp, old_v, pop_idx = [], [], [], [], [], [], [], []
+    advs, rets, players, t_idx, n_idx, old_lp, old_v, pop_idx, policy_idx, env_mode_idx = [], [], [], [], [], [], [], [], [], []
     num_envs = int(segment.valid[0].shape[1])
     num_players = len(segment.bufs)
+    env_mode_by_env = None if segment.env_mode_by_env is None else np.asarray(segment.env_mode_by_env, dtype=np.int32).reshape(-1)
 
     for player in range(num_players):
         old_value = segment.old_value[player]
@@ -426,6 +579,7 @@ def build_ppo_samples(
         bootstrap_valid = segment.bootstrap_valid[player]
         write_idx = segment.write_idx[player]
         buf_population_idx = np.asarray(segment.bufs[player].population_idx.detach().cpu())
+        buf_policy_idx = np.asarray(segment.bufs[player].policy_id.detach().cpu())
 
         for n in range(num_envs):
             T = int(write_idx[n])
@@ -444,6 +598,9 @@ def build_ppo_samples(
             old_lp.append(old_logprob[:T, n])
             old_v.append(v)
             pop_idx.append(buf_population_idx[:T, n].astype(np.int32))
+            policy_idx.append(buf_policy_idx[:T, n].astype(np.int32))
+            env_code = -1 if env_mode_by_env is None else int(env_mode_by_env[n])
+            env_mode_idx.append(np.full((T,), env_code, dtype=np.int32))
 
     if not advs:
         return None
@@ -456,6 +613,8 @@ def build_ppo_samples(
         "old_logprob": np.concatenate(old_lp).astype(np.float32),
         "old_value": np.concatenate(old_v).astype(np.float32),
         "population_idx": np.concatenate(pop_idx).astype(np.int32),
+        "policy_id": np.concatenate(policy_idx).astype(np.int32),
+        "env_mode": np.concatenate(env_mode_idx).astype(np.int32),
     }
 
 
@@ -666,6 +825,9 @@ def _rollout_segment_to_host(segment: RolloutSegment) -> RolloutSegment:
         bootstrap=[np.asarray(x) for x in segment.bootstrap],
         bootstrap_valid=[np.asarray(x) for x in segment.bootstrap_valid],
         env_steps_per_env=np.asarray(segment.env_steps_per_env),
+        env_mode_by_env=(
+            None if segment.env_mode_by_env is None else np.asarray(segment.env_mode_by_env, dtype=np.int32)
+        ),
         first_reset_event=segment.first_reset_event,
     )
 
@@ -686,6 +848,74 @@ def _release_rollout_device_refs(device: torch.device) -> None:
 def _concat_sample_dicts(sample_dicts: list[dict]) -> dict:
     keys = sample_dicts[0].keys()
     return {k: np.concatenate([s[k] for s in sample_dicts]).astype(sample_dicts[0][k].dtype) for k in keys}
+
+
+def _combine_optional_sample_dicts(sample_dicts: list[Optional[dict]]) -> Optional[dict]:
+    parts = [s for s in sample_dicts if s]
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return _concat_sample_dicts(parts)
+
+
+def _filter_sample_dict(
+    samples: Optional[dict],
+    *,
+    policy_id: Optional[int] = None,
+    env_modes: Optional[tuple[int, ...]] = None,
+) -> Optional[dict]:
+    if not samples:
+        return None
+    ref = None
+    for value in samples.values():
+        ref = np.asarray(value)
+        break
+    if ref is None or ref.size == 0:
+        return None
+    mask = np.ones((int(ref.shape[0]),), dtype=np.bool_)
+    if policy_id is not None:
+        policy_idx = np.asarray(samples.get("policy_id", []), dtype=np.int32).reshape(-1)
+        if policy_idx.size == 0:
+            return None
+        mask &= policy_idx == int(policy_id)
+    if env_modes is not None:
+        env_mode_idx = np.asarray(samples.get("env_mode", []), dtype=np.int32).reshape(-1)
+        if env_mode_idx.size == 0:
+            return None
+        mask &= np.isin(env_mode_idx, np.asarray(env_modes, dtype=np.int32))
+    if not np.any(mask):
+        return None
+    out: dict[str, np.ndarray] = {}
+    for key, value in samples.items():
+        arr = np.asarray(value)
+        out[key] = arr[mask].astype(arr.dtype, copy=False)
+    return out
+
+
+def _sample_unified_exploiter_env_modes(num_envs: int, seed: int) -> np.ndarray:
+    counts = np.asarray(
+        [
+            int(num_envs * 0.2),
+            int(num_envs * 0.2),
+            int(num_envs * 0.2),
+            0,
+        ],
+        dtype=np.int32,
+    )
+    counts[3] = int(num_envs) - int(counts[:3].sum())
+    modes = np.concatenate(
+        [
+            np.full((int(counts[0]),), EXPLOITER_MODE_SELFPLAY_2P, dtype=np.int32),
+            np.full((int(counts[1]),), EXPLOITER_MODE_SELFPLAY_4P, dtype=np.int32),
+            np.full((int(counts[2]),), EXPLOITER_MODE_VS_2P, dtype=np.int32),
+            np.full((int(counts[3]),), EXPLOITER_MODE_VS_4P, dtype=np.int32),
+        ],
+        axis=0,
+    )
+    rng = np.random.default_rng(np.uint64(seed) + np.uint64(0x94D049BB133111EB))
+    rng.shuffle(modes)
+    return modes.astype(np.int32, copy=False)
 
 
 def _normalize_chunk_advantages(chunks: list[HostRolloutChunk]) -> None:
@@ -862,7 +1092,18 @@ def _build_host_chunk_samples(
     if not segments:
         return None
 
-    keys = ("advantages", "returns", "players", "t_idx", "n_idx", "old_logprob", "old_value", "population_idx")
+    keys = (
+        "advantages",
+        "returns",
+        "players",
+        "t_idx",
+        "n_idx",
+        "old_logprob",
+        "old_value",
+        "population_idx",
+        "policy_id",
+        "env_mode",
+    )
     per_chunk = [{k: [] for k in keys} for _ in segments]
     num_envs = int(segments[0].valid[0].shape[1])
     num_players = len(segments[0].bufs)
@@ -871,6 +1112,8 @@ def _build_host_chunk_samples(
         for n in range(num_envs):
             values_parts, rewards_parts, dones_parts, old_lp_parts = [], [], [], []
             pop_parts: list[np.ndarray] = []
+            policy_parts: list[np.ndarray] = []
+            env_mode_parts: list[np.ndarray] = []
             t_parts: list[np.ndarray] = []
             lengths: list[int] = []
             last_nonempty_i: Optional[int] = None
@@ -882,6 +1125,8 @@ def _build_host_chunk_samples(
                 dones = segment.done[player]
                 write_idx = segment.write_idx[player]
                 buf_population_idx = np.asarray(segment.bufs[player].population_idx.detach().cpu())
+                buf_policy_idx = np.asarray(segment.bufs[player].policy_id.detach().cpu())
+                env_mode_by_env = None if segment.env_mode_by_env is None else np.asarray(segment.env_mode_by_env, dtype=np.int32).reshape(-1)
 
                 T = int(write_idx[n])
                 lengths.append(T)
@@ -893,6 +1138,9 @@ def _build_host_chunk_samples(
                 dones_parts.append(dones[:T, n])
                 old_lp_parts.append(old_logprob[:T, n])
                 pop_parts.append(buf_population_idx[:T, n].astype(np.int32))
+                policy_parts.append(buf_policy_idx[:T, n].astype(np.int32))
+                env_code = -1 if env_mode_by_env is None else int(env_mode_by_env[n])
+                env_mode_parts.append(np.full((T,), env_code, dtype=np.int32))
                 t_parts.append(np.arange(T, dtype=np.int32))
 
             if last_nonempty_i is None:
@@ -924,6 +1172,8 @@ def _build_host_chunk_samples(
                 dst["old_logprob"].append(old_lp)
                 dst["old_value"].append(values[offset : offset + T])
                 dst["population_idx"].append(pop_parts[part_i])
+                dst["policy_id"].append(policy_parts[part_i])
+                dst["env_mode"].append(env_mode_parts[part_i])
                 offset += T
                 part_i += 1
 
@@ -938,6 +1188,8 @@ def _build_host_chunk_samples(
         "old_logprob": np.float32,
         "old_value": np.float32,
         "population_idx": np.int32,
+        "policy_id": np.int32,
+        "env_mode": np.int32,
     }
     for chunk in per_chunk:
         if not chunk["advantages"]:
@@ -957,8 +1209,21 @@ def _combine_rollout_timing(items: list[RolloutTiming]) -> RolloutTiming:
         out.env_prep_s += rt.env_prep_s
         out.env_step_core_s += rt.env_step_core_s
         out.env_reset_s += rt.env_reset_s
+        out.env_reset_count += rt.env_reset_count
+        out.env_reset_mode_2p_count += rt.env_reset_mode_2p_count
+        out.env_reset_mode_4p_count += rt.env_reset_mode_4p_count
         out.env_bookkeeping_s += rt.env_bookkeeping_s
         out.env_python_s += rt.env_python_s
+        out.reset_prefetch_pop_s += rt.reset_prefetch_pop_s
+        out.reset_prefetch_pop_init_s += rt.reset_prefetch_pop_init_s
+        out.reset_prefetch_pop_episode_s += rt.reset_prefetch_pop_episode_s
+        out.reset_prefetch_bank_hit_n += rt.reset_prefetch_bank_hit_n
+        out.reset_prefetch_wait_n += rt.reset_prefetch_wait_n
+        out.reset_prefetch_fallback_n += rt.reset_prefetch_fallback_n
+        out.reset_prefetch_drained_results += rt.reset_prefetch_drained_results
+        out.reset_prefetch_banked_other_results += rt.reset_prefetch_banked_other_results
+        out.reset_prefetch_mode_2p_n += rt.reset_prefetch_mode_2p_n
+        out.reset_prefetch_mode_4p_n += rt.reset_prefetch_mode_4p_n
         out.micro_cap_s += rt.micro_cap_s
         out.obs_build_s += rt.obs_build_s
         out.policy_batch_s += rt.policy_batch_s
@@ -994,6 +1259,18 @@ def _combine_game_stats(items: list[RolloutGameStats]) -> RolloutGameStats:
         out.n_decisive += gs.n_decisive
         out.n_p0_positive_reward += gs.n_p0_positive_reward
         out.n_p1_positive_reward += gs.n_p1_positive_reward
+        out.main_vs_exploiter_games += gs.main_vs_exploiter_games
+        out.main_vs_exploiter_wins += gs.main_vs_exploiter_wins
+        out.main_vs_exploiter_games_2p += gs.main_vs_exploiter_games_2p
+        out.main_vs_exploiter_wins_2p += gs.main_vs_exploiter_wins_2p
+        out.main_vs_exploiter_games_4p += gs.main_vs_exploiter_games_4p
+        out.main_vs_exploiter_wins_4p += gs.main_vs_exploiter_wins_4p
+        out.main_vs_exploiter_sum_episode_turns_2p += gs.main_vs_exploiter_sum_episode_turns_2p
+        out.main_vs_exploiter_sum_episode_turns_4p += gs.main_vs_exploiter_sum_episode_turns_4p
+        out.main_vs_exploiter_timeout_2p += gs.main_vs_exploiter_timeout_2p
+        out.main_vs_exploiter_timeout_4p += gs.main_vs_exploiter_timeout_4p
+        out.main_vs_exploiter_main_eliminated_2p += gs.main_vs_exploiter_main_eliminated_2p
+        out.main_vs_exploiter_main_eliminated_4p += gs.main_vs_exploiter_main_eliminated_4p
         out.sum_final_ships_p0 += gs.sum_final_ships_p0
         out.sum_final_ships_p1 += gs.sum_final_ships_p1
         out.sum_episode_turns += gs.sum_episode_turns
@@ -1025,6 +1302,9 @@ def _combine_segments_for_stats(segments: list[RolloutSegment]) -> RolloutSegmen
         bootstrap=[first.bootstrap[p] for p in range(P)],
         bootstrap_valid=[first.bootstrap_valid[p] for p in range(P)],
         env_steps_per_env=sum((s.env_steps_per_env for s in segments), np.zeros_like(first.env_steps_per_env)),
+        env_mode_by_env=(
+            None if first.env_mode_by_env is None else np.asarray(first.env_mode_by_env, dtype=np.int32)
+        ),
         first_reset_event=first.first_reset_event,
     )
 
@@ -1039,10 +1319,19 @@ def _rollout_timing_str(rt: RolloutTiming) -> str:
         + rt.env_python_s
     )
     env_other = max(0.0, rt.env_step_s - env_accounted)
+    reset_prefetch_hit_n = rt.reset_prefetch_bank_hit_n
+    reset_prefetch_wait_n = rt.reset_prefetch_wait_n
     return (
         f"rollout_wall {rt.wall_s:.3f}s loop {rt.loop_s:.3f}s "
         f"env_step {rt.env_step_s:.3f}s env_prep {rt.env_prep_s:.3f}s env_core {rt.env_step_core_s:.3f}s "
-        f"env_reset {rt.env_reset_s:.3f}s env_book {rt.env_bookkeeping_s:.3f}s env_py {rt.env_python_s:.3f}s "
+        f"env_reset {rt.env_reset_s:.3f}s"
+        f"(n {rt.env_reset_count} 2p {rt.env_reset_mode_2p_count} 4p {rt.env_reset_mode_4p_count}) "
+        f"env_book {rt.env_bookkeeping_s:.3f}s env_py {rt.env_python_s:.3f}s "
+        f"prefetch_pop {rt.reset_prefetch_pop_s:.3f}s"
+        f"(init {rt.reset_prefetch_pop_init_s:.3f} ep {rt.reset_prefetch_pop_episode_s:.3f} "
+        f"hit {reset_prefetch_hit_n} wait {reset_prefetch_wait_n} fb {rt.reset_prefetch_fallback_n} "
+        f"2p {rt.reset_prefetch_mode_2p_n} 4p {rt.reset_prefetch_mode_4p_n} "
+        f"drain {rt.reset_prefetch_drained_results} bank {rt.reset_prefetch_banked_other_results}) "
         f"env_other {env_other:.3f}s "
         f"micro_cap {rt.micro_cap_s:.3f}s obs {rt.obs_build_s:.3f}s "
         f"pt_batch {rt.policy_batch_s:.3f}s pt_fwd {rt.policy_forward_s:.3f}s "
@@ -1574,6 +1863,82 @@ def _log_iter_tensorboard(
             writer.add_scalar(
                 "rollout/p_win_reward_p1", float(game_stats.n_p1_positive_reward) / nc, it
             )
+        if game_stats.main_vs_exploiter_games > 0:
+            writer.add_scalar(
+                "exploiter/main_win_rate",
+                float(game_stats.main_vs_exploiter_wins) / float(game_stats.main_vs_exploiter_games),
+                it,
+            )
+        if game_stats.main_vs_exploiter_games_2p > 0:
+            writer.add_scalar(
+                "exploiter/main_win_rate_2p",
+                float(game_stats.main_vs_exploiter_wins_2p)
+                / float(game_stats.main_vs_exploiter_games_2p),
+                it,
+            )
+            writer.add_scalar(
+                "exploiter/main_vs_games_2p",
+                float(game_stats.main_vs_exploiter_games_2p),
+                it,
+            )
+            writer.add_scalar(
+                "exploiter/main_vs_wins_2p",
+                float(game_stats.main_vs_exploiter_wins_2p),
+                it,
+            )
+            writer.add_scalar(
+                "exploiter/main_vs_avg_env_turns_2p",
+                float(game_stats.main_vs_exploiter_sum_episode_turns_2p)
+                / float(game_stats.main_vs_exploiter_games_2p),
+                it,
+            )
+            writer.add_scalar(
+                "exploiter/main_vs_timeout_termination_rate_2p",
+                float(game_stats.main_vs_exploiter_timeout_2p)
+                / float(game_stats.main_vs_exploiter_games_2p),
+                it,
+            )
+            writer.add_scalar(
+                "exploiter/main_vs_main_eliminated_termination_rate_2p",
+                float(game_stats.main_vs_exploiter_main_eliminated_2p)
+                / float(game_stats.main_vs_exploiter_games_2p),
+                it,
+            )
+        if game_stats.main_vs_exploiter_games_4p > 0:
+            writer.add_scalar(
+                "exploiter/main_win_rate_4p",
+                float(game_stats.main_vs_exploiter_wins_4p)
+                / float(game_stats.main_vs_exploiter_games_4p),
+                it,
+            )
+            writer.add_scalar(
+                "exploiter/main_vs_games_4p",
+                float(game_stats.main_vs_exploiter_games_4p),
+                it,
+            )
+            writer.add_scalar(
+                "exploiter/main_vs_wins_4p",
+                float(game_stats.main_vs_exploiter_wins_4p),
+                it,
+            )
+            writer.add_scalar(
+                "exploiter/main_vs_avg_env_turns_4p",
+                float(game_stats.main_vs_exploiter_sum_episode_turns_4p)
+                / float(game_stats.main_vs_exploiter_games_4p),
+                it,
+            )
+            writer.add_scalar(
+                "exploiter/main_vs_timeout_termination_rate_4p",
+                float(game_stats.main_vs_exploiter_timeout_4p)
+                / float(game_stats.main_vs_exploiter_games_4p),
+                it,
+            )
+            writer.add_scalar(
+                "exploiter/main_vs_main_eliminated_termination_rate_4p",
+                float(game_stats.main_vs_exploiter_main_eliminated_4p)
+                / float(game_stats.main_vs_exploiter_games_4p),
+                it,
+            )
     if population_summary is not None:
         for k, v in population_summary.items():
             writer.add_scalar(f"population/{k}", v, it)
@@ -1595,8 +1960,25 @@ def _log_iter_tensorboard(
         writer.add_scalar("timing/env_prep_s", rt.env_prep_s, it)
         writer.add_scalar("timing/env_step_core_s", rt.env_step_core_s, it)
         writer.add_scalar("timing/env_reset_s", rt.env_reset_s, it)
+        writer.add_scalar("timing/env_reset_count", float(rt.env_reset_count), it)
+        writer.add_scalar("timing/env_reset_mode_2p_count", float(rt.env_reset_mode_2p_count), it)
+        writer.add_scalar("timing/env_reset_mode_4p_count", float(rt.env_reset_mode_4p_count), it)
         writer.add_scalar("timing/env_bookkeeping_s", rt.env_bookkeeping_s, it)
         writer.add_scalar("timing/env_python_s", rt.env_python_s, it)
+        writer.add_scalar("timing/reset_prefetch_pop_s", rt.reset_prefetch_pop_s, it)
+        writer.add_scalar("timing/reset_prefetch_pop_init_s", rt.reset_prefetch_pop_init_s, it)
+        writer.add_scalar("timing/reset_prefetch_pop_episode_s", rt.reset_prefetch_pop_episode_s, it)
+        writer.add_scalar("timing/reset_prefetch_bank_hit_n", float(rt.reset_prefetch_bank_hit_n), it)
+        writer.add_scalar("timing/reset_prefetch_wait_n", float(rt.reset_prefetch_wait_n), it)
+        writer.add_scalar("timing/reset_prefetch_fallback_n", float(rt.reset_prefetch_fallback_n), it)
+        writer.add_scalar("timing/reset_prefetch_drained_results", float(rt.reset_prefetch_drained_results), it)
+        writer.add_scalar(
+            "timing/reset_prefetch_banked_other_results",
+            float(rt.reset_prefetch_banked_other_results),
+            it,
+        )
+        writer.add_scalar("timing/reset_prefetch_mode_2p_n", float(rt.reset_prefetch_mode_2p_n), it)
+        writer.add_scalar("timing/reset_prefetch_mode_4p_n", float(rt.reset_prefetch_mode_4p_n), it)
         writer.add_scalar("timing/micro_apply_dlpack_in_s", rt.micro_apply_dlpack_in_s, it)
         writer.add_scalar("timing/micro_apply_jax_s", rt.micro_apply_jax_s, it)
         writer.add_scalar("timing/micro_apply_dlpack_out_s", rt.micro_apply_dlpack_out_s, it)
@@ -1620,6 +2002,10 @@ def train(args: argparse.Namespace) -> None:
         raise SystemExit("--rollout-host-chunks must be >= 1")
     if args.population_size < 1:
         raise SystemExit("--population-size must be >= 1")
+    if args.exploiter_mode and args.population_size != 1:
+        raise SystemExit("--exploiter-mode currently requires --population-size=1")
+    if args.exploiter_mode and int(args.num_agents) != 4:
+        raise SystemExit("--exploiter-mode currently requires --num-agents=4")
 
     exp_dir, tb_dir, ckpt_dir = experiment_dirs(args)
     exp_dir.mkdir(parents=True, exist_ok=True)
@@ -1722,16 +2108,22 @@ def train(args: argparse.Namespace) -> None:
         reward_time_bonus_member_coefs=reward_time_bonus_member_coefs,
         normalize_obs_to_p0=args.normalize_obs_to_p0,
     )
+    policy_feature_agents = 4 if args.exploiter_mode else int(args.num_agents)
 
-    policy = OrbitWarsPolicy(
-        d_model=args.d_model,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
-        activation_checkpointing=args.activation_checkpointing,
-        feature_dim=obs_feature_dim_for_num_agents(args.num_agents),
-        population_size=args.population_size,
-    ).to(device)
+    def _make_policy() -> OrbitWarsPolicy:
+        return OrbitWarsPolicy(
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            n_layers=args.n_layers,
+            activation_checkpointing=args.activation_checkpointing,
+            feature_dim=obs_feature_dim_for_num_agents(policy_feature_agents),
+            population_size=args.population_size,
+        ).to(device)
+
+    policy = _make_policy()
     opt = optim.Adam(policy.parameters(), lr=args.lr)
+    exploiter_policy = _make_policy() if args.exploiter_mode else None
+    exploiter_opt = optim.Adam(exploiter_policy.parameters(), lr=args.lr) if exploiter_policy is not None else None
 
     # Compile targets:
     #   * ``compiled_loss_fn`` — the PPO consolidated function (encoder
@@ -1743,6 +2135,29 @@ def train(args: argparse.Namespace) -> None:
     #     keeps the packed forward path, which benchmarks faster there.
     compiled_loss_fn: Optional[Any] = None
     compiled_compressed_loss_fn: Optional[Any] = None
+    def _compile_policy_modules(policy_obj: OrbitWarsPolicy, helper_compile_mode: str) -> None:
+        policy_obj.forward = torch.compile(  # type: ignore[assignment]
+            policy_obj.forward, mode=helper_compile_mode, dynamic=True
+        )
+        policy_obj.forward_dense_rollout = torch.compile(  # type: ignore[assignment]
+            policy_obj.forward_dense_rollout, mode=helper_compile_mode, dynamic=True
+        )
+        if hasattr(policy_obj, "forward_dense_rollout_grouped_population"):
+            policy_obj.forward_dense_rollout_grouped_population = torch.compile(  # type: ignore[assignment]
+                policy_obj.forward_dense_rollout_grouped_population, mode=helper_compile_mode, dynamic=True
+            )
+        policy_obj.target_logits_for_origin_fraction = torch.compile(  # type: ignore[assignment]
+            policy_obj.target_logits_for_origin_fraction, mode=helper_compile_mode, dynamic=True
+        )
+        if hasattr(policy_obj, "target_logits_for_origin_fraction_grouped_population"):
+            policy_obj.target_logits_for_origin_fraction_grouped_population = torch.compile(  # type: ignore[assignment]
+                policy_obj.target_logits_for_origin_fraction_grouped_population,
+                mode=helper_compile_mode,
+                dynamic=True,
+            )
+        policy_obj.fraction_logits = torch.compile(  # type: ignore[assignment]
+            policy_obj.fraction_logits, mode=helper_compile_mode, dynamic=True
+        )
     if args.compile:
         compile_mode = args.compile_mode
         helper_compile_mode = "default" if compile_mode == "reduce-overhead" else compile_mode
@@ -1758,28 +2173,9 @@ def train(args: argparse.Namespace) -> None:
         compiled_compressed_loss_fn = torch.compile(
             compute_ppo_loss_compressed_torch, mode=compile_mode, dynamic=True
         )
-        policy.forward = torch.compile(  # type: ignore[assignment]
-            policy.forward, mode=helper_compile_mode, dynamic=True
-        )
-        policy.forward_dense_rollout = torch.compile(  # type: ignore[assignment]
-            policy.forward_dense_rollout, mode=helper_compile_mode, dynamic=True
-        )
-        if hasattr(policy, "forward_dense_rollout_grouped_population"):
-            policy.forward_dense_rollout_grouped_population = torch.compile(  # type: ignore[assignment]
-                policy.forward_dense_rollout_grouped_population, mode=helper_compile_mode, dynamic=True
-            )
-        policy.target_logits_for_origin_fraction = torch.compile(  # type: ignore[assignment]
-            policy.target_logits_for_origin_fraction, mode=helper_compile_mode, dynamic=True
-        )
-        if hasattr(policy, "target_logits_for_origin_fraction_grouped_population"):
-            policy.target_logits_for_origin_fraction_grouped_population = torch.compile(  # type: ignore[assignment]
-                policy.target_logits_for_origin_fraction_grouped_population,
-                mode=helper_compile_mode,
-                dynamic=True,
-            )
-        policy.fraction_logits = torch.compile(  # type: ignore[assignment]
-            policy.fraction_logits, mode=helper_compile_mode, dynamic=True
-        )
+        _compile_policy_modules(policy, helper_compile_mode)
+        if exploiter_policy is not None:
+            _compile_policy_modules(exploiter_policy, helper_compile_mode)
 
     if mem_dbg:
         n_params = sum(p.numel() for p in policy.parameters())
@@ -1796,8 +2192,8 @@ def train(args: argparse.Namespace) -> None:
     rnd = np.random.default_rng(args.seed)
 
     start_iter = 0
-    rollout_carry: Optional[RolloutCarry] = None
-    rollout_env_seed = args.seed
+    rollout_carry: Any = None
+    rollout_env_seed: Any = args.seed
 
     if resume_path is not None:
         try:
@@ -1811,13 +2207,28 @@ def train(args: argparse.Namespace) -> None:
         _validate_checkpoint_args(ckpt["training_args"], args)
         policy.load_state_dict(ckpt["policy"])
         opt.load_state_dict(ckpt["optimizer"])
+        if exploiter_policy is not None:
+            exploiter_policy.load_state_dict(ckpt["exploiter_policy"])
+            assert exploiter_opt is not None
+            exploiter_opt.load_state_dict(ckpt["exploiter_optimizer"])
         _restore_torch_generator_from_checkpoint(ckpt["torch_rng"], rng)
         rnd.bit_generator.state = ckpt["numpy_rng_state"]
-        rollout_env_seed = int(ckpt["rollout_env_seed"])
+        rollout_env_seed = ckpt["rollout_env_seed"]
         rc = ckpt["rollout_carry"]
-        rollout_carry = _deserialize_rollout_carry(rc) if rc is not None else None
+        if args.exploiter_mode:
+            if rc is None:
+                rollout_carry = None
+            elif isinstance(rc, dict) and "state_b" in rc:
+                rollout_carry = _deserialize_rollout_carry(rc)
+            else:
+                rollout_carry = {
+                    key: (_deserialize_rollout_carry(val) if val is not None else None)
+                    for key, val in dict(rc or {}).items()
+                }
+        else:
+            rollout_carry = _deserialize_rollout_carry(rc) if rc is not None else None
         start_iter = int(ckpt["iteration"])
-        if rollout_carry is not None:
+        if (not args.exploiter_mode) and rollout_carry is not None:
             cfg = rollout_carry.cfg
             heal_sb, heal_seeds, heal_et = heal_terminal_env_slices(
                 rollout_carry.state_b,
@@ -1831,6 +2242,11 @@ def train(args: argparse.Namespace) -> None:
                 episode_turns=heal_et,
                 player_done=rollout_carry.player_done,
                 population_assignments=rollout_carry.population_assignments,
+                policy_row_for_seat=rollout_carry.policy_row_for_seat,
+                controller_assignments=rollout_carry.controller_assignments,
+                main_player_mask=rollout_carry.main_player_mask,
+                env_mode_by_env=rollout_carry.env_mode_by_env,
+                pending_exploiter_terminal=rollout_carry.pending_exploiter_terminal,
             )
             rollout_env_seed += heal_seeds
             if int(rollout_carry.cfg.num_agents) != int(args.num_agents):
@@ -1838,6 +2254,41 @@ def train(args: argparse.Namespace) -> None:
                     f"Checkpoint rollout state is num_agents={rollout_carry.cfg.num_agents} but "
                     f"--num-agents={args.num_agents}; use matching player count to resume."
                 )
+        elif args.exploiter_mode and rollout_carry:
+            if isinstance(rollout_carry, RolloutCarry):
+                seed_state = _normalize_unified_exploiter_rollout_seed_state(rollout_env_seed)
+                rollout_carry, rollout_env_seed = _heal_unified_exploiter_terminal_env_slices(
+                    rollout_carry,
+                    seed_state,
+                )
+            else:
+                healed: dict[str, Optional[RolloutCarry]] = {}
+                seed_map = dict(rollout_env_seed)
+                for key, carry in rollout_carry.items():
+                    if carry is None:
+                        healed[key] = None
+                        continue
+                    heal_sb, heal_seeds, heal_et = heal_terminal_env_slices(
+                        carry.state_b,
+                        carry.cfg,
+                        carry.episode_turns,
+                        int(seed_map[key]),
+                    )
+                    healed[key] = RolloutCarry(
+                        state_b=heal_sb,
+                        cfg=carry.cfg,
+                        episode_turns=heal_et,
+                        player_done=carry.player_done,
+                        population_assignments=carry.population_assignments,
+                        policy_row_for_seat=carry.policy_row_for_seat,
+                        controller_assignments=carry.controller_assignments,
+                        main_player_mask=carry.main_player_mask,
+                        env_mode_by_env=carry.env_mode_by_env,
+                        pending_exploiter_terminal=carry.pending_exploiter_terminal,
+                    )
+                    seed_map[key] = int(seed_map[key]) + int(heal_seeds)
+                rollout_carry = healed
+                rollout_env_seed = seed_map
         print(f"[orbit_wars_pt] resumed at iteration {start_iter}", flush=True)
 
     reset_prefetch: Optional[RolloutResetPrefetch] = None
@@ -1881,6 +2332,8 @@ def train(args: argparse.Namespace) -> None:
             cfg,
             policy,
             opt,
+            exploiter_policy,
+            exploiter_opt,
             compiled_loss_fn,
             compiled_compressed_loss_fn,
             rng,
@@ -1909,12 +2362,14 @@ def _train_loop(
     cfg: OrbitWarsEnvConfig,
     policy: OrbitWarsPolicy,
     opt: torch.optim.Optimizer,
+    exploiter_policy: Optional[OrbitWarsPolicy],
+    exploiter_opt: Optional[torch.optim.Optimizer],
     compiled_loss_fn: Optional[Any],
     compiled_compressed_loss_fn: Optional[Any],
     rng: torch.Generator,
     rnd: np.random.Generator,
-    rollout_carry: Optional[RolloutCarry],
-    rollout_env_seed: int,
+    rollout_carry: Any,
+    rollout_env_seed: Any,
     start_iter: int,
     writer: SummaryWriter,
     ckpt_dir: Path,
@@ -1926,6 +2381,465 @@ def _train_loop(
         if mem_dbg and device.type == "cuda":
             reset_peak_stats(device)
             log_cuda_mem(f"iter {it} start (peak reset)", device)
+
+        if args.exploiter_mode:
+            assert exploiter_policy is not None and exploiter_opt is not None
+            if rollout_carry is None or not isinstance(rollout_carry, RolloutCarry):
+                rollout_carry = None
+            rollout_env_seed = _normalize_unified_exploiter_rollout_seed_state(rollout_env_seed)
+            samples_t0 = time.perf_counter()
+            env_modes = (
+                None
+                if rollout_carry is not None and rollout_carry.env_mode_by_env is not None
+                else _sample_unified_exploiter_env_modes(int(args.num_envs), int(args.seed))
+            )
+
+            cfg_rollout = OrbitWarsEnvConfig(
+                num_agents=4,
+                max_fleets=int(rollout_carry.cfg.max_fleets) if rollout_carry is not None else int(args.max_fleets),
+                episode_seed=args.seed,
+                reward_mode=cfg.reward_mode,
+                reward_ship_mass_share_coef=cfg.reward_ship_mass_share_coef,
+                reward_ship_mass_share_member_coefs=cfg.reward_ship_mass_share_member_coefs,
+                reward_production_share_coef=cfg.reward_production_share_coef,
+                reward_production_share_member_coefs=cfg.reward_production_share_member_coefs,
+                reward_time_bonus_coef=cfg.reward_time_bonus_coef,
+                reward_time_bonus_member_coefs=cfg.reward_time_bonus_member_coefs,
+                normalize_obs_to_p0=cfg.normalize_obs_to_p0,
+            )
+
+            main_host_chunks: list[HostRolloutChunk] = []
+            exploiter_host_chunks: list[HostRolloutChunk] = []
+            if args.rollout_storage == "host":
+                chunk_segments: list[RolloutSegment] = []
+                chunk_timings: list[RolloutTiming] = []
+                chunk_stats: list[RolloutGameStats] = []
+                host_chunk_parts: list[tuple[RolloutSegment, Optional[dict], Optional[dict], Optional[dict], Optional[dict], Optional[dict]]] = []
+                for chunk_i in range(int(args.rollout_host_chunks)):
+                    segment_i, rt_i, rollout_carry, seeds_used, game_stats = collect_parallel_micro_rollouts(
+                        policy,
+                        cfg_rollout,
+                        args.num_envs,
+                        device,
+                        seed_base=rollout_env_seed,
+                        rng=rng,
+                        greedy=False,
+                        ship_speed=args.ship_speed,
+                        max_micro_steps_per_player=args.max_micro_steps,
+                        rollout_micro_horizon=args.rollout_micro_horizon,
+                        carry_in=rollout_carry,
+                        mem_debug=mem_dbg if chunk_i == 0 else 0,
+                        train_iter=it,
+                        amp_dtype=amp_dtype,
+                        min_max_fleets=args.max_fleets,
+                        reset_prefetch=reset_prefetch,
+                        first_hit_n_rays=max(8, int(args.first_hit_n_rays)),
+                        first_hit_ray_chunk_size=max(0, int(args.first_hit_ray_chunk_size)),
+                        first_hit_env_chunk_size=max(0, int(args.first_hit_env_chunk_size)),
+                        first_hit_method=str(args.first_hit_method),
+                        micro_step_penalty=float(args.micro_step_penalty),
+                        sync_policy_timing=bool(args.sync_rollout_timing),
+                        additional_policies=[exploiter_policy],
+                        termination_controller=0,
+                        env_mode_by_env=env_modes,
+                    )
+                    rollout_env_seed = seeds_used
+                    cfg.max_fleets = max(int(cfg.max_fleets), int(rollout_carry.cfg.max_fleets))
+                    samples_i = build_ppo_samples(segment_i, args.gamma, args.lam)
+                    main_selfplay_i = _filter_sample_dict(
+                        samples_i,
+                        policy_id=0,
+                        env_modes=(EXPLOITER_MODE_SELFPLAY_2P, EXPLOITER_MODE_SELFPLAY_4P),
+                    )
+                    main_vs_2p_i = _filter_sample_dict(
+                        samples_i,
+                        policy_id=0,
+                        env_modes=(EXPLOITER_MODE_VS_2P,),
+                    )
+                    main_vs_4p_i = _filter_sample_dict(
+                        samples_i,
+                        policy_id=0,
+                        env_modes=(EXPLOITER_MODE_VS_4P,),
+                    )
+                    exploiter_2p_i = _filter_sample_dict(
+                        samples_i,
+                        policy_id=1,
+                        env_modes=(EXPLOITER_MODE_VS_2P,),
+                    )
+                    exploiter_4p_i = _filter_sample_dict(
+                        samples_i,
+                        policy_id=1,
+                        env_modes=(EXPLOITER_MODE_VS_4P,),
+                    )
+                    host_segment_i = _rollout_segment_to_host(segment_i)
+                    del segment_i
+                    _release_rollout_device_refs(device)
+                    chunk_segments.append(host_segment_i)
+                    chunk_timings.append(rt_i)
+                    chunk_stats.append(game_stats)
+                    host_chunk_parts.append(
+                        (
+                            host_segment_i,
+                            main_selfplay_i,
+                            main_vs_2p_i,
+                            main_vs_4p_i,
+                            exploiter_2p_i,
+                            exploiter_4p_i,
+                        )
+                    )
+                segment = _combine_segments_for_stats(chunk_segments)
+                rt = _combine_rollout_timing(chunk_timings)
+                game_stats = _combine_game_stats(chunk_stats)
+                main_samples = None
+                exploiter_samples = None
+            else:
+                segment, rt, rollout_carry, seeds_used, game_stats = collect_parallel_micro_rollouts(
+                    policy,
+                    cfg_rollout,
+                    args.num_envs,
+                    device,
+                    seed_base=rollout_env_seed,
+                    rng=rng,
+                    greedy=False,
+                    ship_speed=args.ship_speed,
+                    max_micro_steps_per_player=args.max_micro_steps,
+                    rollout_micro_horizon=args.rollout_micro_horizon,
+                    carry_in=rollout_carry,
+                    mem_debug=mem_dbg,
+                    train_iter=it,
+                    amp_dtype=amp_dtype,
+                    min_max_fleets=args.max_fleets,
+                    reset_prefetch=reset_prefetch,
+                    first_hit_n_rays=max(8, int(args.first_hit_n_rays)),
+                    first_hit_ray_chunk_size=max(0, int(args.first_hit_ray_chunk_size)),
+                    first_hit_env_chunk_size=max(0, int(args.first_hit_env_chunk_size)),
+                    first_hit_method=str(args.first_hit_method),
+                    micro_step_penalty=float(args.micro_step_penalty),
+                    sync_policy_timing=bool(args.sync_rollout_timing),
+                    additional_policies=[exploiter_policy],
+                    termination_controller=0,
+                    env_mode_by_env=env_modes,
+                )
+                rollout_env_seed = seeds_used
+                cfg.max_fleets = max(int(cfg.max_fleets), int(rollout_carry.cfg.max_fleets))
+                samples_i = build_ppo_samples(segment, args.gamma, args.lam)
+                main_selfplay_samples = _filter_sample_dict(
+                    samples_i,
+                    policy_id=0,
+                    env_modes=(EXPLOITER_MODE_SELFPLAY_2P, EXPLOITER_MODE_SELFPLAY_4P),
+                )
+                main_vs_2p_samples = _filter_sample_dict(
+                    samples_i,
+                    policy_id=0,
+                    env_modes=(EXPLOITER_MODE_VS_2P,),
+                )
+                main_vs_4p_samples = _filter_sample_dict(
+                    samples_i,
+                    policy_id=0,
+                    env_modes=(EXPLOITER_MODE_VS_4P,),
+                )
+                exploiter_2p_samples = _filter_sample_dict(
+                    samples_i,
+                    policy_id=1,
+                    env_modes=(EXPLOITER_MODE_VS_2P,),
+                )
+                exploiter_4p_samples = _filter_sample_dict(
+                    samples_i,
+                    policy_id=1,
+                    env_modes=(EXPLOITER_MODE_VS_4P,),
+                )
+            samples_s = time.perf_counter() - samples_t0
+
+            total_env_steps = int(segment.env_steps_per_env.sum())
+            total_micro = int(sum(int(segment.write_idx[p].sum()) for p in range(len(segment.bufs))))
+            main_vs_games = int(game_stats.main_vs_exploiter_games)
+            main_vs_wins = int(game_stats.main_vs_exploiter_wins)
+            main_vs_games_2p = int(game_stats.main_vs_exploiter_games_2p)
+            main_vs_wins_2p = int(game_stats.main_vs_exploiter_wins_2p)
+            main_vs_games_4p = int(game_stats.main_vs_exploiter_games_4p)
+            main_vs_wins_4p = int(game_stats.main_vs_exploiter_wins_4p)
+            main_win_rate = (float(main_vs_wins) / float(main_vs_games)) if main_vs_games > 0 else float("nan")
+            main_win_rate_2p = (
+                float(main_vs_wins_2p) / float(main_vs_games_2p)
+                if main_vs_games_2p > 0
+                else float("nan")
+            )
+            main_win_rate_4p = (
+                float(main_vs_wins_4p) / float(main_vs_games_4p)
+                if main_vs_games_4p > 0
+                else float("nan")
+            )
+            skip_main_vs_4p = bool(main_vs_games_4p > 0 and main_win_rate_4p > 0.5)
+            skip_exploiter_4p = bool(main_vs_games_4p > 0 and main_win_rate_4p < 0.125)
+            skip_main_vs_2p = bool(main_vs_games_2p > 0 and main_win_rate_2p > 0.75)
+            skip_exploiter_2p = bool(main_vs_games_2p > 0 and main_win_rate_2p < 0.25)
+
+            if args.rollout_storage == "host":
+                for (
+                    host_segment_i,
+                    main_selfplay_i,
+                    main_vs_2p_i,
+                    main_vs_4p_i,
+                    exploiter_2p_i,
+                    exploiter_4p_i,
+                ) in host_chunk_parts:
+                    main_selected_i = _combine_optional_sample_dicts(
+                        [
+                            main_selfplay_i,
+                            None if skip_main_vs_2p else main_vs_2p_i,
+                            None if skip_main_vs_4p else main_vs_4p_i,
+                        ]
+                    )
+                    exploiter_selected_i = _combine_optional_sample_dicts(
+                        [
+                            None if skip_exploiter_2p else exploiter_2p_i,
+                            None if skip_exploiter_4p else exploiter_4p_i,
+                        ]
+                    )
+                    if main_selected_i is not None:
+                        main_host_chunks.append(HostRolloutChunk(segment=host_segment_i, samples=main_selected_i))
+                    if exploiter_selected_i is not None:
+                        exploiter_host_chunks.append(HostRolloutChunk(segment=host_segment_i, samples=exploiter_selected_i))
+                if main_host_chunks:
+                    _normalize_chunk_advantages(main_host_chunks)
+                if exploiter_host_chunks:
+                    _normalize_chunk_advantages(exploiter_host_chunks)
+            else:
+                main_samples = _combine_optional_sample_dicts(
+                    [
+                        main_selfplay_samples,
+                        None if skip_main_vs_2p else main_vs_2p_samples,
+                        None if skip_main_vs_4p else main_vs_4p_samples,
+                    ]
+                )
+                exploiter_samples = _combine_optional_sample_dicts(
+                    [
+                        None if skip_exploiter_2p else exploiter_2p_samples,
+                        None if skip_exploiter_4p else exploiter_4p_samples,
+                    ]
+                )
+                if main_samples is not None:
+                    normalize_advantages(main_samples)
+                if exploiter_samples is not None:
+                    normalize_advantages(exploiter_samples)
+
+            skip_main = not bool(main_host_chunks) if args.rollout_storage == "host" else (main_samples is None)
+            skip_exploiter = not bool(exploiter_host_chunks) if args.rollout_storage == "host" else (exploiter_samples is None)
+
+            obs_fd = obs_feature_dim_for_num_agents(4)
+            main_loss_parts: list[float] = []
+            exploiter_loss_parts: list[float] = []
+            main_ppo_summary: Optional[dict[str, float]] = None
+            exploiter_ppo_summary: Optional[dict[str, float]] = None
+            main_ppo_timing: Optional[PPOTiming] = None
+            exploiter_ppo_timing: Optional[PPOTiming] = None
+            t_ppo0 = time.perf_counter()
+            if not skip_main and args.rollout_storage == "host":
+                if main_host_chunks:
+                    main_member_stores = _build_host_member_replay_stores(main_host_chunks, 1)
+                    loss_mb_i, ppo_t_i, ppo_stats_i = ppo_iteration_host_staged(
+                        policy,
+                        opt,
+                        main_member_stores,
+                        device,
+                        args.minibatch_size,
+                        args.ppo_epochs,
+                        args.clip_eps,
+                        args.vf_coef,
+                        args.entropy_coef,
+                        args.max_grad_norm,
+                        args.ship_speed,
+                        max(8, int(args.first_hit_n_rays)),
+                        max(0, int(args.first_hit_ray_chunk_size)),
+                        rnd=rnd,
+                        loss_fn=compiled_loss_fn,
+                        compressed_loss_fn=compiled_compressed_loss_fn,
+                        amp_dtype=amp_dtype,
+                        obs_feature_dim=obs_fd,
+                        population_size=1,
+                    )
+                    main_loss_parts.append(float(loss_mb_i))
+                    main_ppo_summary = ppo_stats_i.summary()
+                    main_ppo_timing = ppo_t_i
+            elif not skip_main:
+                if main_samples is not None:
+                    loss_mb_i, ppo_t_i, ppo_stats_i = ppo_iteration(
+                        policy,
+                        opt,
+                        segment,
+                        main_samples,
+                        device,
+                        args.minibatch_size,
+                        args.ppo_epochs,
+                        args.clip_eps,
+                        args.vf_coef,
+                        args.entropy_coef,
+                        args.max_grad_norm,
+                        args.ship_speed,
+                        max(8, int(args.first_hit_n_rays)),
+                        max(0, int(args.first_hit_ray_chunk_size)),
+                        rnd=rnd,
+                        loss_fn=compiled_loss_fn,
+                        compressed_loss_fn=compiled_compressed_loss_fn,
+                        amp_dtype=amp_dtype,
+                        obs_feature_dim=obs_fd,
+                        population_size=1,
+                    )
+                    main_loss_parts.append(float(loss_mb_i))
+                    main_ppo_summary = ppo_stats_i.summary()
+                    main_ppo_timing = ppo_t_i
+            if not skip_exploiter and args.rollout_storage == "host":
+                if exploiter_host_chunks:
+                    exploiter_member_stores = _build_host_member_replay_stores(exploiter_host_chunks, 1)
+                    loss_mb_i, ppo_t_i, ppo_stats_i = ppo_iteration_host_staged(
+                        exploiter_policy,
+                        exploiter_opt,
+                        exploiter_member_stores,
+                        device,
+                        args.minibatch_size,
+                        args.ppo_epochs,
+                        args.clip_eps,
+                        args.vf_coef,
+                        args.entropy_coef,
+                        args.max_grad_norm,
+                        args.ship_speed,
+                        max(8, int(args.first_hit_n_rays)),
+                        max(0, int(args.first_hit_ray_chunk_size)),
+                        rnd=rnd,
+                        loss_fn=compiled_loss_fn,
+                        compressed_loss_fn=compiled_compressed_loss_fn,
+                        amp_dtype=amp_dtype,
+                        obs_feature_dim=obs_fd,
+                        population_size=1,
+                    )
+                    exploiter_loss_parts.append(float(loss_mb_i))
+                    exploiter_ppo_summary = ppo_stats_i.summary()
+                    exploiter_ppo_timing = ppo_t_i
+            elif not skip_exploiter:
+                if exploiter_samples is not None:
+                    loss_mb_i, ppo_t_i, ppo_stats_i = ppo_iteration(
+                        exploiter_policy,
+                        exploiter_opt,
+                        segment,
+                        exploiter_samples,
+                        device,
+                        args.minibatch_size,
+                        args.ppo_epochs,
+                        args.clip_eps,
+                        args.vf_coef,
+                        args.entropy_coef,
+                        args.max_grad_norm,
+                        args.ship_speed,
+                        max(8, int(args.first_hit_n_rays)),
+                        max(0, int(args.first_hit_ray_chunk_size)),
+                        rnd=rnd,
+                        loss_fn=compiled_loss_fn,
+                        compressed_loss_fn=compiled_compressed_loss_fn,
+                        amp_dtype=amp_dtype,
+                        obs_feature_dim=obs_fd,
+                        population_size=1,
+                    )
+                    exploiter_loss_parts.append(float(loss_mb_i))
+                    exploiter_ppo_summary = ppo_stats_i.summary()
+                    exploiter_ppo_timing = ppo_t_i
+
+            iter_dt = max(1e-9, time.perf_counter() - iter_start)
+            ppo_s = time.perf_counter() - t_ppo0
+            mean_main_loss = float(np.mean(main_loss_parts)) if main_loss_parts else float("nan")
+            mean_exploiter_loss = float(np.mean(exploiter_loss_parts)) if exploiter_loss_parts else float("nan")
+            combined_ppo_t = PPOTiming(
+                total_s=(0.0 if main_ppo_timing is None else float(main_ppo_timing.total_s))
+                + (0.0 if exploiter_ppo_timing is None else float(exploiter_ppo_timing.total_s))
+            )
+            total_p0, _, _, mean_r0 = _segment_rollout_counts(segment)
+            num_fleets, mean_fleets_per_env = _fleet_counts_from_state(rollout_carry.state_b)
+            micro_per_sec = total_micro / iter_dt
+            env_per_sec = total_env_steps / iter_dt
+            _print_rollout_pre_ppo(it, args.num_envs, cfg.max_fleets, segment, rt, game_stats)
+            main_ppo_str = (
+                _ppo_stats_str(main_ppo_summary)
+                if main_ppo_summary is not None
+                else "skipped"
+            )
+            exploiter_ppo_str = (
+                _ppo_stats_str(exploiter_ppo_summary)
+                if exploiter_ppo_summary is not None
+                else "skipped"
+            )
+            print(
+                f"iter {it:4d} exploiter_mode envs {args.num_envs} micro_p0 {total_p0:5d} "
+                f"loss_main {mean_main_loss:.4f} loss_exploiter {mean_exploiter_loss:.4f} "
+                f"mean_r0 {mean_r0:.6f} num_fleets {num_fleets} max_fleets {cfg.max_fleets} "
+                f"iter_s {iter_dt:.3f} micro_steps {total_micro} micro/s {micro_per_sec:.1f} "
+                f"env_steps {total_env_steps} env/s {env_per_sec:.1f} "
+                f"| {_rollout_game_stats_str(game_stats)} "
+                f"| samples+gae {samples_s:.3f}s ppo {ppo_s:.3f}s "
+                f"| main_win_rate {main_win_rate:.3f} "
+                f"skip_main {int(skip_main)} skip_exploiter {int(skip_exploiter)} "
+                f"skip_main_2p {int(skip_main_vs_2p)} skip_main_4p {int(skip_main_vs_4p)} "
+                f"skip_exploiter_2p {int(skip_exploiter_2p)} skip_exploiter_4p {int(skip_exploiter_4p)} "
+                f"| ppo_main {main_ppo_str} "
+                f"| ppo_exploiter {exploiter_ppo_str} "
+                f"| {_rollout_timing_str(rt)} | {_ppo_timing_str(combined_ppo_t)}",
+                flush=True,
+            )
+            writer.add_scalar("rollout/micro_steps", float(total_micro), it)
+            writer.add_scalar("train/main_skipped", float(skip_main), it)
+            writer.add_scalar("train/exploiter_skipped", float(skip_exploiter), it)
+            writer.add_scalar("train/main_skip_vs_2p", float(skip_main_vs_2p), it)
+            writer.add_scalar("train/main_skip_vs_4p", float(skip_main_vs_4p), it)
+            writer.add_scalar("train/exploiter_skip_2p", float(skip_exploiter_2p), it)
+            writer.add_scalar("train/exploiter_skip_4p", float(skip_exploiter_4p), it)
+            _log_iter_tensorboard(
+                writer,
+                it,
+                skipped=False,
+                iter_dt=iter_dt,
+                total_env_steps=total_env_steps,
+                mean_r0=mean_r0,
+                num_fleets=num_fleets,
+                mean_fleets_per_env=mean_fleets_per_env,
+                cfg_max_fleets=cfg.max_fleets,
+                game_stats=game_stats,
+                samples_s=samples_s,
+                loss_mb=mean_main_loss if mean_main_loss == mean_main_loss else mean_exploiter_loss,
+                ppo_s=ppo_s,
+                ppo_summary=main_ppo_summary if main_ppo_summary is not None else exploiter_ppo_summary,
+                population_summary=None,
+                rt=rt,
+                ppo_t=combined_ppo_t,
+            )
+            if mean_main_loss == mean_main_loss:
+                writer.add_scalar("ppo_main/loss_mb", mean_main_loss, it)
+            if main_ppo_summary is not None:
+                for k, v in main_ppo_summary.items():
+                    if isinstance(v, float) and v == v:
+                        writer.add_scalar(f"ppo_main/{k}", v, it)
+            if mean_exploiter_loss == mean_exploiter_loss:
+                writer.add_scalar("ppo_exploiter/loss_mb", mean_exploiter_loss, it)
+            if exploiter_ppo_summary is not None:
+                for k, v in exploiter_ppo_summary.items():
+                    if isinstance(v, float) and v == v:
+                        writer.add_scalar(f"ppo_exploiter/{k}", v, it)
+
+            if (it + 1) % args.checkpoint_every == 0:
+                ckpt_path = ckpt_dir / f"iter_{it + 1:08d}.pt"
+                save_checkpoint(
+                    ckpt_path,
+                    next_iteration=it + 1,
+                    policy=policy,
+                    opt=opt,
+                    exploiter_policy=exploiter_policy,
+                    exploiter_opt=exploiter_opt,
+                    rng=rng,
+                    rnd=rnd,
+                    rollout_env_seed=rollout_env_seed,
+                    rollout_carry=rollout_carry,
+                    args=args,
+                )
+                print(f"[orbit_wars_pt] saved checkpoint {ckpt_path}", flush=True)
+            writer.flush()
+            continue
 
         host_chunks: Optional[list[HostRolloutChunk]] = None
         host_member_stores: Optional[list[HostReplayMemberStore]] = None
@@ -2185,6 +3099,8 @@ def _train_loop(
                 next_iteration=it + 1,
                 policy=policy,
                 opt=opt,
+                exploiter_policy=exploiter_policy,
+                exploiter_opt=exploiter_opt,
                 rng=rng,
                 rnd=rnd,
                 rollout_env_seed=rollout_env_seed,
@@ -2250,6 +3166,16 @@ def parse_args() -> argparse.Namespace:
             "Number of rollout population members. 1 keeps pure selfplay. "
             "If >1, the policy shares the trunk and gives each population member its own "
             "final transformer block and output heads."
+        ),
+    )
+    p.add_argument(
+        "--exploiter-mode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Train a second fully disjoint exploiter policy against the main policy. "
+            "Uses four rollout buckets per iteration: main self-play 2p/4p plus "
+            "main-vs-exploiter 2p/4p."
         ),
     )
     p.add_argument(

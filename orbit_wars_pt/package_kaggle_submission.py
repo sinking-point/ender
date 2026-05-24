@@ -21,7 +21,7 @@ import shutil
 import tarfile
 import textwrap
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 
@@ -57,6 +57,22 @@ __all__ = ["agent"]
 """
 
 
+def _infer_policy_player_count(policy_state: Any, training_args: Mapping[str, Any] | None = None) -> int:
+    if training_args is not None:
+        for key in ("policy_player_count", "inference_policy_player_count"):
+            if key in training_args:
+                return int(training_args[key])
+    if isinstance(policy_state, Mapping):
+        w = policy_state.get("feat_proj.weight")
+        if hasattr(w, "shape") and len(w.shape) >= 2:
+            feat_dim = int(w.shape[1])
+            # FEATURE_DIM_MULTI (4p arch) is larger than the original 2p width.
+            return 4 if feat_dim > 32 else 2
+    if training_args is not None and "num_agents" in training_args:
+        return 4 if int(training_args["num_agents"]) > 2 else 2
+    return 2
+
+
 def _write_main_py(
     path: Path,
     *,
@@ -80,14 +96,21 @@ def _write_main_py(
     )
 
 
-def _slim_checkpoint_payload(payload: Any) -> dict[str, Any]:
+def _slim_checkpoint_payload(payload: Any, *, policy_key: str = "policy") -> dict[str, Any]:
     """Drop optimizer / rollout state; keep only what ``load_policy`` needs."""
 
-    if not isinstance(payload, dict) or "policy" not in payload:
-        raise ValueError("Expected a training checkpoint dict with a 'policy' key")
+    if not isinstance(payload, dict) or policy_key not in payload:
+        raise ValueError(f"Expected a training checkpoint dict with a {policy_key!r} key")
+    training_args_in = payload.get("training_args", {})
+    training_args = dict(training_args_in) if isinstance(training_args_in, Mapping) else {}
+    policy_state = payload[policy_key]
+    training_args.setdefault(
+        "policy_player_count",
+        _infer_policy_player_count(policy_state, training_args),
+    )
     slim: dict[str, Any] = {
-        "policy": payload["policy"],
-        "training_args": payload.get("training_args", {}),
+        "policy": policy_state,
+        "training_args": training_args,
     }
     if "version" in payload:
         slim["version"] = payload["version"]
@@ -140,12 +163,19 @@ def _collapse_population_members(
     return out
 
 
-def _write_checkpoint(src: Path, dest: Path, *, slim: bool, keep_member: int | None = None) -> None:
+def _write_checkpoint(
+    src: Path,
+    dest: Path,
+    *,
+    slim: bool,
+    keep_member: int | None = None,
+    policy_key: str = "policy",
+) -> None:
     try:
         payload = torch.load(src, map_location="cpu", weights_only=False)
     except TypeError:
         payload = torch.load(src, map_location="cpu")
-    payload_out = _slim_checkpoint_payload(payload) if slim else payload
+    payload_out = _slim_checkpoint_payload(payload, policy_key=policy_key) if slim else payload
     if not isinstance(payload_out, dict):
         raise ValueError("Expected checkpoint payload to be a dict after loading")
     payload_out = _collapse_population_members(payload_out, keep_member=keep_member)
@@ -181,8 +211,8 @@ def _submission_paths(out: Path) -> tuple[Path, Path | None]:
 
 
 def package_submission(
-    checkpoint_4p: Path,
-    checkpoint_2p: Path,
+    checkpoint_4p: Path | None,
+    checkpoint_2p: Path | None,
     out: Path,
     *,
     greedy: bool = False,
@@ -198,6 +228,8 @@ def package_submission(
 ) -> Path:
     """Write a submission bundle directory; return its path."""
 
+    if checkpoint_4p is None or checkpoint_2p is None:
+        raise ValueError("Both 4p and 2p checkpoints must be resolved before packaging")
     checkpoint_4p = checkpoint_4p.expanduser().resolve()
     checkpoint_2p = checkpoint_2p.expanduser().resolve()
     if not checkpoint_4p.is_file():
@@ -299,14 +331,35 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint-4p",
         type=Path,
-        required=True,
+        default=None,
         help="4-player FFA training checkpoint (.pt) shipped as checkpoint_4p.pt.",
     )
     parser.add_argument(
         "--checkpoint-2p",
         type=Path,
-        required=True,
+        default=None,
         help="2-player training checkpoint (.pt) shipped as checkpoint_2p.pt.",
+    )
+    parser.add_argument(
+        "--checkpoint-main",
+        type=Path,
+        default=None,
+        help=(
+            "One exploiter-mode training checkpoint whose main policy should be used "
+            "for --main-as-4p and/or --main-as-2p."
+        ),
+    )
+    parser.add_argument(
+        "--main-as-4p",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use --checkpoint-main as the packaged 4p policy.",
+    )
+    parser.add_argument(
+        "--main-as-2p",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use --checkpoint-main as the packaged 2p policy.",
     )
     parser.add_argument(
         "--out",
@@ -375,9 +428,24 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    checkpoint_4p = args.checkpoint_4p
+    checkpoint_2p = args.checkpoint_2p
+    if args.main_as_4p:
+        if args.checkpoint_main is None:
+            raise SystemExit("--main-as-4p requires --checkpoint-main")
+        checkpoint_4p = args.checkpoint_main
+    if args.main_as_2p:
+        if args.checkpoint_main is None:
+            raise SystemExit("--main-as-2p requires --checkpoint-main")
+        checkpoint_2p = args.checkpoint_main
+    if checkpoint_4p is None:
+        raise SystemExit("provide --checkpoint-4p, or --checkpoint-main with --main-as-4p")
+    if checkpoint_2p is None:
+        raise SystemExit("provide --checkpoint-2p, or --checkpoint-main with --main-as-2p")
+
     result = package_submission(
-        args.checkpoint_4p,
-        args.checkpoint_2p,
+        checkpoint_4p,
+        checkpoint_2p,
         args.out,
         greedy=bool(args.greedy),
         device=str(args.device),
