@@ -382,6 +382,129 @@ def _heal_unified_exploiter_terminal_env_slices(
     )
 
 
+def _reorder_unified_exploiter_carry_contiguous(carry: RolloutCarry) -> RolloutCarry:
+    mode_arr = None if carry.env_mode_by_env is None else np.asarray(carry.env_mode_by_env, dtype=np.int32).reshape(-1)
+    if mode_arr is None or mode_arr.size == 0:
+        return carry
+    ordered_modes = (
+        EXPLOITER_MODE_SELFPLAY_2P,
+        EXPLOITER_MODE_SELFPLAY_4P,
+        EXPLOITER_MODE_VS_2P,
+        EXPLOITER_MODE_VS_4P,
+    )
+    pieces = [np.flatnonzero(mode_arr == int(mode)).astype(np.int32) for mode in ordered_modes]
+    perm = np.concatenate([idx for idx in pieces if idx.size > 0], axis=0) if pieces else np.zeros((0,), dtype=np.int32)
+    if perm.shape[0] != mode_arr.shape[0]:
+        raise RuntimeError("failed to build contiguous exploiter carry permutation")
+    if np.array_equal(perm, np.arange(mode_arr.shape[0], dtype=np.int32)):
+        return carry
+
+    state_b = jax.tree.map(lambda leaf: leaf[jnp.asarray(perm, dtype=jnp.int32)], carry.state_b)
+
+    def _reorder_cols(arr: Optional[np.ndarray], *, dtype: Optional[np.dtype] = None) -> Optional[np.ndarray]:
+        if arr is None:
+            return None
+        out = np.asarray(arr if dtype is None else np.asarray(arr, dtype=dtype))
+        if out.ndim == 1:
+            return out[perm]
+        return out[:, perm]
+
+    return RolloutCarry(
+        state_b=state_b,
+        cfg=carry.cfg,
+        episode_turns=[carry.episode_turns[int(i)] for i in perm.tolist()],
+        player_done=_reorder_cols(carry.player_done, dtype=np.bool_),
+        population_assignments=_reorder_cols(carry.population_assignments, dtype=np.int32),
+        policy_row_for_seat=_reorder_cols(carry.policy_row_for_seat, dtype=np.int32),
+        controller_assignments=_reorder_cols(carry.controller_assignments, dtype=np.int32),
+        main_player_mask=_reorder_cols(carry.main_player_mask, dtype=np.bool_),
+        env_mode_by_env=_reorder_cols(carry.env_mode_by_env, dtype=np.int32),
+        pending_exploiter_terminal=_reorder_cols(carry.pending_exploiter_terminal, dtype=np.bool_),
+    )
+
+
+def _adversarial_env_range_from_modes(mode_arr: np.ndarray) -> tuple[int, int]:
+    modes = np.asarray(mode_arr, dtype=np.int32).reshape(-1)
+    adv_mask = np.isin(
+        modes,
+        np.asarray((EXPLOITER_MODE_VS_2P, EXPLOITER_MODE_VS_4P), dtype=np.int32),
+    )
+    idx = np.flatnonzero(adv_mask).astype(np.int32)
+    if idx.size == 0:
+        return 0, 0
+    start = int(idx[0])
+    stop = int(idx[-1]) + 1
+    if not np.all(adv_mask[start:stop]):
+        raise RuntimeError("adversarial exploiter envs are not contiguous in carry")
+    return start, stop
+
+
+def _slice_rollout_carry_envs(carry: RolloutCarry, start: int, stop: int) -> RolloutCarry:
+    sl = slice(int(start), int(stop))
+    state_b = jax.tree.map(lambda leaf: leaf[sl], carry.state_b)
+
+    def _slice_arr(arr: Optional[np.ndarray], *, dtype: Optional[np.dtype] = None) -> Optional[np.ndarray]:
+        if arr is None:
+            return None
+        out = np.asarray(arr if dtype is None else np.asarray(arr, dtype=dtype))
+        if out.ndim == 1:
+            return out[sl]
+        return out[:, sl]
+
+    return RolloutCarry(
+        state_b=state_b,
+        cfg=carry.cfg,
+        episode_turns=list(carry.episode_turns[sl]),
+        player_done=_slice_arr(carry.player_done, dtype=np.bool_),
+        population_assignments=_slice_arr(carry.population_assignments, dtype=np.int32),
+        policy_row_for_seat=_slice_arr(carry.policy_row_for_seat, dtype=np.int32),
+        controller_assignments=_slice_arr(carry.controller_assignments, dtype=np.int32),
+        main_player_mask=_slice_arr(carry.main_player_mask, dtype=np.bool_),
+        env_mode_by_env=_slice_arr(carry.env_mode_by_env, dtype=np.int32),
+        pending_exploiter_terminal=_slice_arr(carry.pending_exploiter_terminal, dtype=np.bool_),
+    )
+
+
+def _merge_rollout_carry_envs(base: RolloutCarry, sub: RolloutCarry, start: int, stop: int) -> RolloutCarry:
+    dst_idx = jnp.arange(int(start), int(stop), dtype=jnp.int32)
+    merged_state_b = jax.tree.map(lambda dst, src: dst.at[dst_idx].set(src), base.state_b, sub.state_b)
+
+    def _merge_arr(
+        dst: Optional[np.ndarray],
+        src: Optional[np.ndarray],
+        *,
+        dtype: Optional[np.dtype] = None,
+    ) -> Optional[np.ndarray]:
+        if dst is None or src is None:
+            return dst
+        out = np.asarray(dst if dtype is None else np.asarray(dst, dtype=dtype)).copy()
+        src_arr = np.asarray(src if dtype is None else np.asarray(src, dtype=dtype))
+        if out.ndim == 1:
+            out[start:stop] = src_arr
+        else:
+            out[:, start:stop] = src_arr
+        return out
+
+    episode_turns = list(base.episode_turns)
+    episode_turns[start:stop] = list(sub.episode_turns)
+    return RolloutCarry(
+        state_b=merged_state_b,
+        cfg=sub.cfg,
+        episode_turns=episode_turns,
+        player_done=_merge_arr(base.player_done, sub.player_done, dtype=np.bool_),
+        population_assignments=_merge_arr(base.population_assignments, sub.population_assignments, dtype=np.int32),
+        policy_row_for_seat=_merge_arr(base.policy_row_for_seat, sub.policy_row_for_seat, dtype=np.int32),
+        controller_assignments=_merge_arr(base.controller_assignments, sub.controller_assignments, dtype=np.int32),
+        main_player_mask=_merge_arr(base.main_player_mask, sub.main_player_mask, dtype=np.bool_),
+        env_mode_by_env=_merge_arr(base.env_mode_by_env, sub.env_mode_by_env, dtype=np.int32),
+        pending_exploiter_terminal=_merge_arr(
+            base.pending_exploiter_terminal,
+            sub.pending_exploiter_terminal,
+            dtype=np.bool_,
+        ),
+    )
+
+
 def find_latest_checkpoint(checkpoints_dir: Path) -> Optional[Path]:
     if not checkpoints_dir.is_dir():
         return None
@@ -415,6 +538,8 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "entropy_coef",
         "clip_eps",
         "ppo_epochs",
+        "ppo_epochs_main",
+        "ppo_epochs_exploiter",
         "minibatch_size",
         "ship_speed",
         "reward_mode",
@@ -447,6 +572,16 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "experiment_root",
     )
     return {k: getattr(args, k) for k in keys}
+
+
+def _main_ppo_epochs(args: argparse.Namespace) -> int:
+    val = args.ppo_epochs if args.ppo_epochs_main is None else args.ppo_epochs_main
+    return int(val)
+
+
+def _exploiter_ppo_epochs(args: argparse.Namespace) -> int:
+    val = args.ppo_epochs if args.ppo_epochs_exploiter is None else args.ppo_epochs_exploiter
+    return int(val)
 
 
 # Saved in checkpoints for logging / inspection but safe to change when resuming.
@@ -485,6 +620,7 @@ def save_checkpoint(
     rnd: np.random.Generator,
     rollout_env_seed: Any,
     rollout_carry: Any,
+    skip_main_next_iter: bool,
     args: argparse.Namespace,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -498,6 +634,7 @@ def save_checkpoint(
         "torch_rng": rng.get_state(),
         "numpy_rng_state": rnd.bit_generator.state,
         "rollout_env_seed": rollout_env_seed,
+        "skip_main_next_iter": bool(skip_main_next_iter),
         "rollout_carry": (
             {
                 key: (_serialize_rollout_carry(val) if val is not None else None)
@@ -904,7 +1041,7 @@ def _sample_unified_exploiter_env_modes(num_envs: int, seed: int) -> np.ndarray:
         dtype=np.int32,
     )
     counts[3] = int(num_envs) - int(counts[:3].sum())
-    modes = np.concatenate(
+    return np.concatenate(
         [
             np.full((int(counts[0]),), EXPLOITER_MODE_SELFPLAY_2P, dtype=np.int32),
             np.full((int(counts[1]),), EXPLOITER_MODE_SELFPLAY_4P, dtype=np.int32),
@@ -912,10 +1049,7 @@ def _sample_unified_exploiter_env_modes(num_envs: int, seed: int) -> np.ndarray:
             np.full((int(counts[3]),), EXPLOITER_MODE_VS_4P, dtype=np.int32),
         ],
         axis=0,
-    )
-    rng = np.random.default_rng(np.uint64(seed) + np.uint64(0x94D049BB133111EB))
-    rng.shuffle(modes)
-    return modes.astype(np.int32, copy=False)
+    ).astype(np.int32, copy=False)
 
 
 def _normalize_chunk_advantages(chunks: list[HostRolloutChunk]) -> None:
@@ -2194,6 +2328,7 @@ def train(args: argparse.Namespace) -> None:
     start_iter = 0
     rollout_carry: Any = None
     rollout_env_seed: Any = args.seed
+    skip_main_next_iter = False
 
     if resume_path is not None:
         try:
@@ -2214,6 +2349,7 @@ def train(args: argparse.Namespace) -> None:
         _restore_torch_generator_from_checkpoint(ckpt["torch_rng"], rng)
         rnd.bit_generator.state = ckpt["numpy_rng_state"]
         rollout_env_seed = ckpt["rollout_env_seed"]
+        skip_main_next_iter = bool(ckpt.get("skip_main_next_iter", False))
         rc = ckpt["rollout_carry"]
         if args.exploiter_mode:
             if rc is None:
@@ -2261,6 +2397,7 @@ def train(args: argparse.Namespace) -> None:
                     rollout_carry,
                     seed_state,
                 )
+                rollout_carry = _reorder_unified_exploiter_carry_contiguous(rollout_carry)
             else:
                 healed: dict[str, Optional[RolloutCarry]] = {}
                 seed_map = dict(rollout_env_seed)
@@ -2287,7 +2424,10 @@ def train(args: argparse.Namespace) -> None:
                         pending_exploiter_terminal=carry.pending_exploiter_terminal,
                     )
                     seed_map[key] = int(seed_map[key]) + int(heal_seeds)
-                rollout_carry = healed
+                rollout_carry = {
+                    key: (_reorder_unified_exploiter_carry_contiguous(val) if val is not None else None)
+                    for key, val in healed.items()
+                }
                 rollout_env_seed = seed_map
         print(f"[orbit_wars_pt] resumed at iteration {start_iter}", flush=True)
 
@@ -2340,6 +2480,7 @@ def train(args: argparse.Namespace) -> None:
             rnd,
             rollout_carry,
             rollout_env_seed,
+            skip_main_next_iter,
             start_iter,
             writer,
             ckpt_dir,
@@ -2370,6 +2511,7 @@ def _train_loop(
     rnd: np.random.Generator,
     rollout_carry: Any,
     rollout_env_seed: Any,
+    skip_main_next_iter: bool,
     start_iter: int,
     writer: SummaryWriter,
     ckpt_dir: Path,
@@ -2388,10 +2530,12 @@ def _train_loop(
                 rollout_carry = None
             rollout_env_seed = _normalize_unified_exploiter_rollout_seed_state(rollout_env_seed)
             samples_t0 = time.perf_counter()
+            skip_main_this_iter = bool(skip_main_next_iter)
+            skip_main_next_iter = False
             env_modes = (
                 None
                 if rollout_carry is not None and rollout_carry.env_mode_by_env is not None
-                else _sample_unified_exploiter_env_modes(int(args.num_envs), int(args.seed))
+                else _sample_unified_exploiter_env_modes(int(args.num_envs), int(args.seed) + it)
             )
 
             cfg_rollout = OrbitWarsEnvConfig(
@@ -2408,6 +2552,19 @@ def _train_loop(
                 normalize_obs_to_p0=cfg.normalize_obs_to_p0,
             )
 
+            active_rollout_carry = rollout_carry
+            active_env_modes = env_modes
+            active_num_envs = int(args.num_envs)
+            active_env_range: Optional[tuple[int, int]] = None
+            adversarial_only_rollout = False
+            if skip_main_this_iter and rollout_carry is not None and rollout_carry.env_mode_by_env is not None:
+                range_start, range_stop = _adversarial_env_range_from_modes(rollout_carry.env_mode_by_env)
+                active_env_range = (range_start, range_stop)
+                active_rollout_carry = _slice_rollout_carry_envs(rollout_carry, range_start, range_stop)
+                active_env_modes = None
+                active_num_envs = int(range_stop - range_start)
+                adversarial_only_rollout = True
+
             main_host_chunks: list[HostRolloutChunk] = []
             exploiter_host_chunks: list[HostRolloutChunk] = []
             if args.rollout_storage == "host":
@@ -2416,10 +2573,10 @@ def _train_loop(
                 chunk_stats: list[RolloutGameStats] = []
                 host_chunk_parts: list[tuple[RolloutSegment, Optional[dict], Optional[dict], Optional[dict], Optional[dict], Optional[dict]]] = []
                 for chunk_i in range(int(args.rollout_host_chunks)):
-                    segment_i, rt_i, rollout_carry, seeds_used, game_stats = collect_parallel_micro_rollouts(
+                    segment_i, rt_i, next_rollout_carry_i, seeds_used, game_stats = collect_parallel_micro_rollouts(
                         policy,
                         cfg_rollout,
-                        args.num_envs,
+                        active_num_envs,
                         device,
                         seed_base=rollout_env_seed,
                         rng=rng,
@@ -2427,7 +2584,7 @@ def _train_loop(
                         ship_speed=args.ship_speed,
                         max_micro_steps_per_player=args.max_micro_steps,
                         rollout_micro_horizon=args.rollout_micro_horizon,
-                        carry_in=rollout_carry,
+                        carry_in=active_rollout_carry,
                         mem_debug=mem_dbg if chunk_i == 0 else 0,
                         train_iter=it,
                         amp_dtype=amp_dtype,
@@ -2441,8 +2598,18 @@ def _train_loop(
                         sync_policy_timing=bool(args.sync_rollout_timing),
                         additional_policies=[exploiter_policy],
                         termination_controller=0,
-                        env_mode_by_env=env_modes,
+                        env_mode_by_env=active_env_modes,
                     )
+                    active_rollout_carry = next_rollout_carry_i
+                    if active_env_range is not None and rollout_carry is not None:
+                        rollout_carry = _merge_rollout_carry_envs(
+                            rollout_carry,
+                            next_rollout_carry_i,
+                            active_env_range[0],
+                            active_env_range[1],
+                        )
+                    else:
+                        rollout_carry = next_rollout_carry_i
                     rollout_env_seed = seeds_used
                     cfg.max_fleets = max(int(cfg.max_fleets), int(rollout_carry.cfg.max_fleets))
                     samples_i = build_ppo_samples(segment_i, args.gamma, args.lam)
@@ -2493,10 +2660,10 @@ def _train_loop(
                 main_samples = None
                 exploiter_samples = None
             else:
-                segment, rt, rollout_carry, seeds_used, game_stats = collect_parallel_micro_rollouts(
+                segment, rt, next_rollout_carry, seeds_used, game_stats = collect_parallel_micro_rollouts(
                     policy,
                     cfg_rollout,
-                    args.num_envs,
+                    active_num_envs,
                     device,
                     seed_base=rollout_env_seed,
                     rng=rng,
@@ -2504,7 +2671,7 @@ def _train_loop(
                     ship_speed=args.ship_speed,
                     max_micro_steps_per_player=args.max_micro_steps,
                     rollout_micro_horizon=args.rollout_micro_horizon,
-                    carry_in=rollout_carry,
+                    carry_in=active_rollout_carry,
                     mem_debug=mem_dbg,
                     train_iter=it,
                     amp_dtype=amp_dtype,
@@ -2518,8 +2685,17 @@ def _train_loop(
                     sync_policy_timing=bool(args.sync_rollout_timing),
                     additional_policies=[exploiter_policy],
                     termination_controller=0,
-                    env_mode_by_env=env_modes,
+                    env_mode_by_env=active_env_modes,
                 )
+                if active_env_range is not None and rollout_carry is not None:
+                    rollout_carry = _merge_rollout_carry_envs(
+                        rollout_carry,
+                        next_rollout_carry,
+                        active_env_range[0],
+                        active_env_range[1],
+                    )
+                else:
+                    rollout_carry = next_rollout_carry
                 rollout_env_seed = seeds_used
                 cfg.max_fleets = max(int(cfg.max_fleets), int(rollout_carry.cfg.max_fleets))
                 samples_i = build_ppo_samples(segment, args.gamma, args.lam)
@@ -2573,6 +2749,8 @@ def _train_loop(
             skip_exploiter_4p = bool(main_vs_games_4p > 0 and main_win_rate_4p < 0.125)
             skip_main_vs_2p = bool(main_vs_games_2p > 0 and main_win_rate_2p > 0.75)
             skip_exploiter_2p = bool(main_vs_games_2p > 0 and main_win_rate_2p < 0.25)
+            schedule_main_skip_next = bool(skip_main_vs_2p or skip_main_vs_4p)
+            skip_main_next_iter = bool(schedule_main_skip_next)
 
             if args.rollout_storage == "host":
                 for (
@@ -2583,12 +2761,16 @@ def _train_loop(
                     exploiter_2p_i,
                     exploiter_4p_i,
                 ) in host_chunk_parts:
-                    main_selected_i = _combine_optional_sample_dicts(
-                        [
-                            main_selfplay_i,
-                            None if skip_main_vs_2p else main_vs_2p_i,
-                            None if skip_main_vs_4p else main_vs_4p_i,
-                        ]
+                    main_selected_i = (
+                        None
+                        if skip_main_this_iter
+                        else _combine_optional_sample_dicts(
+                            [
+                                main_selfplay_i,
+                                main_vs_2p_i,
+                                main_vs_4p_i,
+                            ]
+                        )
                     )
                     exploiter_selected_i = _combine_optional_sample_dicts(
                         [
@@ -2605,12 +2787,16 @@ def _train_loop(
                 if exploiter_host_chunks:
                     _normalize_chunk_advantages(exploiter_host_chunks)
             else:
-                main_samples = _combine_optional_sample_dicts(
-                    [
-                        main_selfplay_samples,
-                        None if skip_main_vs_2p else main_vs_2p_samples,
-                        None if skip_main_vs_4p else main_vs_4p_samples,
-                    ]
+                main_samples = (
+                    None
+                    if skip_main_this_iter
+                    else _combine_optional_sample_dicts(
+                        [
+                            main_selfplay_samples,
+                            main_vs_2p_samples,
+                            main_vs_4p_samples,
+                        ]
+                    )
                 )
                 exploiter_samples = _combine_optional_sample_dicts(
                     [
@@ -2643,7 +2829,7 @@ def _train_loop(
                         main_member_stores,
                         device,
                         args.minibatch_size,
-                        args.ppo_epochs,
+                        _main_ppo_epochs(args),
                         args.clip_eps,
                         args.vf_coef,
                         args.entropy_coef,
@@ -2670,7 +2856,7 @@ def _train_loop(
                         main_samples,
                         device,
                         args.minibatch_size,
-                        args.ppo_epochs,
+                        _main_ppo_epochs(args),
                         args.clip_eps,
                         args.vf_coef,
                         args.entropy_coef,
@@ -2697,7 +2883,7 @@ def _train_loop(
                         exploiter_member_stores,
                         device,
                         args.minibatch_size,
-                        args.ppo_epochs,
+                        _exploiter_ppo_epochs(args),
                         args.clip_eps,
                         args.vf_coef,
                         args.entropy_coef,
@@ -2724,7 +2910,7 @@ def _train_loop(
                         exploiter_samples,
                         device,
                         args.minibatch_size,
-                        args.ppo_epochs,
+                        _exploiter_ppo_epochs(args),
                         args.clip_eps,
                         args.vf_coef,
                         args.entropy_coef,
@@ -2767,7 +2953,8 @@ def _train_loop(
                 else "skipped"
             )
             print(
-                f"iter {it:4d} exploiter_mode envs {args.num_envs} micro_p0 {total_p0:5d} "
+                f"iter {it:4d} exploiter_mode envs {args.num_envs} active_envs {active_num_envs} "
+                f"adv_only_rollout {int(adversarial_only_rollout)} micro_p0 {total_p0:5d} "
                 f"loss_main {mean_main_loss:.4f} loss_exploiter {mean_exploiter_loss:.4f} "
                 f"mean_r0 {mean_r0:.6f} num_fleets {num_fleets} max_fleets {cfg.max_fleets} "
                 f"iter_s {iter_dt:.3f} micro_steps {total_micro} micro/s {micro_per_sec:.1f} "
@@ -2776,18 +2963,23 @@ def _train_loop(
                 f"| samples+gae {samples_s:.3f}s ppo {ppo_s:.3f}s "
                 f"| main_win_rate {main_win_rate:.3f} "
                 f"skip_main {int(skip_main)} skip_exploiter {int(skip_exploiter)} "
-                f"skip_main_2p {int(skip_main_vs_2p)} skip_main_4p {int(skip_main_vs_4p)} "
+                f"main_skip_this_iter {int(skip_main_this_iter)} main_skip_next_scheduled {int(schedule_main_skip_next)} "
+                f"main_skip_trigger_2p {int(skip_main_vs_2p)} main_skip_trigger_4p {int(skip_main_vs_4p)} "
                 f"skip_exploiter_2p {int(skip_exploiter_2p)} skip_exploiter_4p {int(skip_exploiter_4p)} "
                 f"| ppo_main {main_ppo_str} "
                 f"| ppo_exploiter {exploiter_ppo_str} "
                 f"| {_rollout_timing_str(rt)} | {_ppo_timing_str(combined_ppo_t)}",
                 flush=True,
             )
+            writer.add_scalar("rollout/active_envs", float(active_num_envs), it)
+            writer.add_scalar("rollout/adversarial_only", float(adversarial_only_rollout), it)
             writer.add_scalar("rollout/micro_steps", float(total_micro), it)
             writer.add_scalar("train/main_skipped", float(skip_main), it)
             writer.add_scalar("train/exploiter_skipped", float(skip_exploiter), it)
-            writer.add_scalar("train/main_skip_vs_2p", float(skip_main_vs_2p), it)
-            writer.add_scalar("train/main_skip_vs_4p", float(skip_main_vs_4p), it)
+            writer.add_scalar("train/main_skip_this_iter", float(skip_main_this_iter), it)
+            writer.add_scalar("train/main_skip_next_scheduled", float(schedule_main_skip_next), it)
+            writer.add_scalar("train/main_skip_trigger_2p", float(skip_main_vs_2p), it)
+            writer.add_scalar("train/main_skip_trigger_4p", float(skip_main_vs_4p), it)
             writer.add_scalar("train/exploiter_skip_2p", float(skip_exploiter_2p), it)
             writer.add_scalar("train/exploiter_skip_4p", float(skip_exploiter_4p), it)
             _log_iter_tensorboard(
@@ -2835,6 +3027,7 @@ def _train_loop(
                     rnd=rnd,
                     rollout_env_seed=rollout_env_seed,
                     rollout_carry=rollout_carry,
+                    skip_main_next_iter=skip_main_next_iter,
                     args=args,
                 )
                 print(f"[orbit_wars_pt] saved checkpoint {ckpt_path}", flush=True)
@@ -3105,6 +3298,7 @@ def _train_loop(
                 rnd=rnd,
                 rollout_env_seed=rollout_env_seed,
                 rollout_carry=rollout_carry,
+                skip_main_next_iter=skip_main_next_iter,
                 args=args,
             )
             print(f"[orbit_wars_pt] saved checkpoint {ckpt_path}", flush=True)
@@ -3235,6 +3429,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--entropy-coef", type=float, default=0.01)
     p.add_argument("--clip-eps", type=float, default=0.2, help="PPO ratio + value clipping ε.")
     p.add_argument("--ppo-epochs", type=int, default=4, help="Passes over rollout data per iteration.")
+    p.add_argument(
+        "--ppo-epochs-main",
+        type=int,
+        default=None,
+        help="Main-policy PPO epochs in exploiter mode. Defaults to --ppo-epochs.",
+    )
+    p.add_argument(
+        "--ppo-epochs-exploiter",
+        type=int,
+        default=None,
+        help="Exploiter-policy PPO epochs in exploiter mode. Defaults to --ppo-epochs.",
+    )
     p.add_argument(
         "--minibatch-size",
         type=int,
