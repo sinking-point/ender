@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from orbit_wars_pt.compressed_observation import CompressedObservationBuffer, decode_observation
 from orbit_wars_pt.constants import (
     ENTITY_CLS,
     FEATURE_DIM,
@@ -900,6 +901,78 @@ class OrbitWarsPolicy(nn.Module):
         padding_mask = ~entity_mask
         h = self._apply_encoder_grouped_population(x, rope_pos, padding_mask)
         return self._compute_outputs_grouped_population(h, owner_idx, features, entity_mask, planet_mask)
+
+    def forward_dense_rollout_compressed(
+        self,
+        token_meta: torch.Tensor,
+        owner_idx_comp: torch.Tensor,
+        production: torch.Tensor,
+        ships_comp: torch.Tensor,
+        velocity: torch.Tensor,
+        xy: torch.Tensor,
+        turn_progress: torch.Tensor,
+        incoming_net: torch.Tensor,
+        incoming_survivor: torch.Tensor,
+        feature_dim: int,
+        population_idx: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        comp = CompressedObservationBuffer(
+            token_meta=token_meta,
+            owner_idx=owner_idx_comp,
+            production=production,
+            ships=ships_comp,
+            velocity=velocity,
+            xy=xy,
+            turn_progress=turn_progress,
+            incoming_net=incoming_net,
+            incoming_survivor=incoming_survivor,
+        )
+        obs = decode_observation(comp, feature_dim=int(feature_dim))
+        return self._forward_dense_fixed(
+            entity_type=obs["entity_type"],
+            owner_idx=obs["owner_idx"],
+            features=obs["features"],
+            rope_pos=obs["rope_pos"],
+            entity_mask=obs["entity_mask"],
+            planet_mask=obs["planet_mask"],
+            population_idx=population_idx,
+        )
+
+    def forward_dense_rollout_grouped_population_compressed(
+        self,
+        token_meta: torch.Tensor,
+        owner_idx_comp: torch.Tensor,
+        production: torch.Tensor,
+        ships_comp: torch.Tensor,
+        velocity: torch.Tensor,
+        xy: torch.Tensor,
+        turn_progress: torch.Tensor,
+        incoming_net: torch.Tensor,
+        incoming_survivor: torch.Tensor,
+        feature_dim: int,
+    ) -> Dict[str, Any]:
+        comp = CompressedObservationBuffer(
+            token_meta=token_meta,
+            owner_idx=owner_idx_comp,
+            production=production,
+            ships=ships_comp,
+            velocity=velocity,
+            xy=xy,
+            turn_progress=turn_progress,
+            incoming_net=incoming_net,
+            incoming_survivor=incoming_survivor,
+        )
+        obs = decode_observation(comp, feature_dim=int(feature_dim))
+        x = self.embed(obs["entity_type"], obs["owner_idx"], obs["features"])
+        padding_mask = ~obs["entity_mask"]
+        h = self._apply_encoder_grouped_population(x, obs["rope_pos"], padding_mask)
+        return self._compute_outputs_grouped_population(
+            h,
+            obs["owner_idx"],
+            obs["features"],
+            obs["entity_mask"],
+            obs["planet_mask"],
+        )
 
     def forward_sorted_population(
         self,

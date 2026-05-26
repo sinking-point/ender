@@ -679,6 +679,20 @@ def _compressed_obs_jax_to_torch(obs_jax: dict[str, jnp.ndarray]) -> CompressedO
     )
 
 
+def _compressed_obs_to_device(comp: CompressedObservationBuffer, device: torch.device) -> CompressedObservationBuffer:
+    return CompressedObservationBuffer(
+        token_meta=comp.token_meta.to(device),
+        owner_idx=comp.owner_idx.to(device),
+        production=comp.production.to(device),
+        ships=comp.ships.to(device),
+        velocity=comp.velocity.to(device),
+        xy=comp.xy.to(device),
+        turn_progress=comp.turn_progress.to(device),
+        incoming_net=comp.incoming_net.to(device),
+        incoming_survivor=comp.incoming_survivor.to(device),
+    )
+
+
 def _merge_controller_outputs(
     controller_outputs: list[tuple[torch.Tensor, dict[str, torch.Tensor]]],
     total_rows: int,
@@ -709,6 +723,39 @@ def _forward_dense_rollout_by_controller(
         obs_slice = {key: value.index_select(0, row_idx) for key, value in active_obs.items()}
         pop_slice = active_population_idx_t.index_select(0, row_idx)
         out = policy.forward_dense_rollout(**obs_slice, population_idx=pop_slice)
+        controller_outputs.append((row_idx, out))
+    return _merge_controller_outputs(controller_outputs, int(active_controller_idx_t.shape[0]))
+
+
+def _forward_dense_rollout_compressed_by_controller(
+    *,
+    policies: list[OrbitWarsPolicy],
+    active_comp: CompressedObservationBuffer,
+    feature_dim: int,
+    active_population_idx_t: torch.Tensor,
+    active_controller_idx_t: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    controller_outputs: list[tuple[torch.Tensor, dict[str, torch.Tensor]]] = []
+    for controller_id in torch.unique(active_controller_idx_t, sorted=True).tolist():
+        row_idx = torch.nonzero(active_controller_idx_t == int(controller_id), as_tuple=False).squeeze(-1)
+        if int(row_idx.numel()) == 0:
+            continue
+        policy = policies[int(controller_id)]
+        comp_slice = index_compressed_observation_rows(active_comp, row_idx)
+        pop_slice = active_population_idx_t.index_select(0, row_idx)
+        out = policy.forward_dense_rollout_compressed(
+            comp_slice.token_meta,
+            comp_slice.owner_idx,
+            comp_slice.production,
+            comp_slice.ships,
+            comp_slice.velocity,
+            comp_slice.xy,
+            comp_slice.turn_progress,
+            comp_slice.incoming_net,
+            comp_slice.incoming_survivor,
+            int(feature_dim),
+            population_idx=pop_slice,
+        )
         controller_outputs.append((row_idx, out))
     return _merge_controller_outputs(controller_outputs, int(active_controller_idx_t.shape[0]))
 

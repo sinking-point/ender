@@ -2363,9 +2363,19 @@ def train(args: argparse.Namespace) -> None:
         policy_obj.forward_dense_rollout = torch.compile(  # type: ignore[assignment]
             policy_obj.forward_dense_rollout, mode=helper_compile_mode, dynamic=True
         )
+        if hasattr(policy_obj, "forward_dense_rollout_compressed"):
+            policy_obj.forward_dense_rollout_compressed = torch.compile(  # type: ignore[assignment]
+                policy_obj.forward_dense_rollout_compressed, mode=helper_compile_mode, dynamic=True
+            )
         if hasattr(policy_obj, "forward_dense_rollout_grouped_population"):
             policy_obj.forward_dense_rollout_grouped_population = torch.compile(  # type: ignore[assignment]
                 policy_obj.forward_dense_rollout_grouped_population, mode=helper_compile_mode, dynamic=True
+            )
+        if hasattr(policy_obj, "forward_dense_rollout_grouped_population_compressed"):
+            policy_obj.forward_dense_rollout_grouped_population_compressed = torch.compile(  # type: ignore[assignment]
+                policy_obj.forward_dense_rollout_grouped_population_compressed,
+                mode=helper_compile_mode,
+                dynamic=True,
             )
         policy_obj.target_logits_for_origin_fraction = torch.compile(  # type: ignore[assignment]
             policy_obj.target_logits_for_origin_fraction, mode=helper_compile_mode, dynamic=True
