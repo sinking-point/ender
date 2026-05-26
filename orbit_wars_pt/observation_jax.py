@@ -59,6 +59,12 @@ _NORMALIZED_OWNER_SLOT_4P = jnp.asarray(
 )
 
 
+def _u16_to_i16_jax(x: jnp.ndarray) -> jnp.ndarray:
+    xi = jnp.asarray(x, dtype=jnp.int32)
+    xi = jnp.clip(xi, 0, 65535)
+    return jnp.where(xi > 32767, xi - 65536, xi).astype(jnp.int16)
+
+
 # ---- Owner remap (matches host ``observation._remap_owner``). ----
 
 
@@ -339,6 +345,93 @@ def _build_observation_one_env(
     }
 
 
+def _build_compressed_observation_one_env(
+    state: OrbitWarsState,
+    ego: int,
+    ship_speed: float,
+    obs_feature_dim: int,
+    normalize_to_p0: bool,
+) -> Dict[str, jnp.ndarray]:
+    del ship_speed
+
+    planets = state.planets
+    planet_active = state.planet_active
+
+    pid = planets[:, 0].astype(jnp.int32)
+    planet_xy = planets[:, 2:4]
+    planet_owner = planets[:, 1]
+    planet_ships = planets[:, 5]
+    planet_prod = planets[:, 6]
+
+    incoming = state.incoming_fleets.astype(jnp.float32)
+    incoming_net_f, survivor_slot = _incoming_interfleet_ego_features(
+        incoming, ego, state.num_agents, normalize_to_p0
+    )
+    obs_qturns = _obs_qturns_to_p0_jax(ego, state.num_agents, normalize_to_p0)
+
+    is_comet_per_planet = jnp.any(state.comet_planet_ids == pid[:, None, None], axis=(1, 2))
+    vx, vy = _planet_velocities_one_env(
+        state.initial_planets,
+        planets,
+        planet_active,
+        state.initial_active,
+        state.angular_velocity,
+        state.step_count,
+        is_comet_per_planet,
+        state.comet_planet_ids,
+        state.comet_paths,
+        state.comet_path_lengths,
+        state.comet_path_index,
+    )
+
+    planet_etype = jnp.where(is_comet_per_planet, ENTITY_COMET, ENTITY_PLANET).astype(jnp.int32)
+    planet_owner_idx = _remap_owner_jax(planet_owner, ego, state.num_agents, normalize_to_p0)
+    vel_xy = _rotate_vec_jax(jnp.stack([vx, vy], axis=-1), obs_qturns) / 5.0
+    rope_xy = _rotate_xy_about_center_jax(planet_xy, obs_qturns)
+    rope_xy = jnp.where(planet_active[:, None], rope_xy / BOARD_SIZE, 0.0)
+
+    cls_type = jnp.asarray([ENTITY_CLS], dtype=jnp.int32)
+    cls_owner = jnp.asarray([1], dtype=jnp.int32)
+    entity_type = jnp.concatenate([cls_type, planet_etype], axis=0)
+    owner_idx = jnp.concatenate([cls_owner, planet_owner_idx], axis=0)
+    entity_mask = jnp.concatenate(
+        [jnp.asarray([True], dtype=jnp.bool_), planet_active],
+        axis=0,
+    )
+    planet_mask = jnp.concatenate(
+        [
+            jnp.zeros((1,), dtype=jnp.bool_),
+            jnp.ones((MAX_PLANETS,), dtype=jnp.bool_),
+        ],
+        axis=0,
+    )
+    token_meta_u16 = (
+        jnp.clip(entity_type, 0, 15).astype(jnp.int32)
+        | (entity_mask.astype(jnp.int32) << 4)
+        | (planet_mask.astype(jnp.int32) << 5)
+    )
+
+    incoming_net = jnp.clip(jnp.round(incoming_net_f * 1000.0), -32768, 32767).astype(jnp.int16)
+    na_i = jnp.asarray(state.num_agents, dtype=jnp.int32)
+    survivor_store = jnp.where(
+        (na_i > 2) & (jnp.asarray(obs_feature_dim, dtype=jnp.int32) == FEATURE_DIM_MULTI),
+        survivor_slot,
+        jnp.zeros_like(survivor_slot),
+    ).astype(jnp.int16)
+
+    return {
+        "token_meta": _u16_to_i16_jax(token_meta_u16),
+        "owner_idx": owner_idx.astype(jnp.int16),
+        "production": _u16_to_i16_jax(jnp.round(jnp.maximum(planet_prod, 0.0))),
+        "ships": _u16_to_i16_jax(jnp.round(planet_ships)),
+        "velocity": vel_xy.astype(jnp.float16),
+        "xy": rope_xy.astype(jnp.float16),
+        "turn_progress": _turn_fraction_jax(state.step_count).astype(jnp.float16),
+        "incoming_net": incoming_net,
+        "incoming_survivor": survivor_store,
+    }
+
+
 @partial(jax.jit, static_argnames=("ego", "ship_speed", "obs_feature_dim", "normalize_to_p0"))
 def build_observation_batched_jax(
     state_b: OrbitWarsState,
@@ -379,5 +472,33 @@ def build_observation_batched_jax_per_ego(
     """
 
     return jax.vmap(_build_observation_one_env, in_axes=(0, 0, None, None, None))(
+        state_b, ego_b, ship_speed, obs_feature_dim, normalize_to_p0
+    )
+
+
+@partial(jax.jit, static_argnames=("ego", "ship_speed", "obs_feature_dim", "normalize_to_p0"))
+def build_compressed_observation_batched_jax(
+    state_b: OrbitWarsState,
+    ego: int,
+    ship_speed: float = 6.0,
+    obs_feature_dim: int = FEATURE_DIM,
+    normalize_to_p0: bool = False,
+) -> Dict[str, jnp.ndarray]:
+    return jax.vmap(
+        lambda s: _build_compressed_observation_one_env(
+            s, ego, ship_speed, obs_feature_dim, normalize_to_p0
+        )
+    )(state_b)
+
+
+@partial(jax.jit, static_argnames=("ship_speed", "obs_feature_dim", "normalize_to_p0"))
+def build_compressed_observation_batched_jax_per_ego(
+    state_b: OrbitWarsState,
+    ego_b: jnp.ndarray,
+    ship_speed: float = 6.0,
+    obs_feature_dim: int = FEATURE_DIM,
+    normalize_to_p0: bool = False,
+) -> Dict[str, jnp.ndarray]:
+    return jax.vmap(_build_compressed_observation_one_env, in_axes=(0, 0, None, None, None))(
         state_b, ego_b, ship_speed, obs_feature_dim, normalize_to_p0
     )

@@ -36,7 +36,6 @@ from jax_orbit_wars import DEFAULT_MAX_ACTIONS, FLEET_ETA, FLEET_TARGET_PLANET, 
 from orbit_wars_pt.reset_prefetch import PrefetchPopMeta, RolloutResetPrefetch
 
 from orbit_wars_pt.batched_env import (
-    obs_jax_to_torch,
     post_step_stats_batched,
     reset_env_at_index,
     reset_envs_at_indices,
@@ -48,10 +47,10 @@ from orbit_wars_pt.batched_env import (
 )
 from orbit_wars_pt.compressed_observation import (
     CompressedObservationBuffer,
-    compress_observation,
     decode_observation,
+    index_compressed_observation_rows,
     init_compressed_observation_buffer,
-    store_compressed_observation_rows,
+    store_precompressed_observation_rows,
 )
 from orbit_wars_pt.constants import (
     BOARD_SIZE,
@@ -79,7 +78,10 @@ from orbit_wars_pt.micro_jax import (
     selected_origin_fraction_targets_batched,
 )
 from orbit_wars_pt.model import OrbitWarsPolicy
-from orbit_wars_pt.observation_jax import build_observation_batched_jax, build_observation_batched_jax_per_ego
+from orbit_wars_pt.observation_jax import (
+    build_compressed_observation_batched_jax,
+    build_compressed_observation_batched_jax_per_ego,
+)
 from orbit_wars_pt.transition_buffer import (
     TorchTransitionBuffer,
     append_active_to_torch_buffer,
@@ -660,6 +662,23 @@ def _sync_rollout_policy_timing(device: torch.device, *jax_values: Any) -> None:
         torch.cuda.synchronize(device)
 
 
+def _compressed_obs_jax_to_torch(obs_jax: dict[str, jnp.ndarray]) -> CompressedObservationBuffer:
+    """Zero-copy JAX -> Torch handoff for compressed observation planes."""
+
+    jax.block_until_ready(obs_jax)
+    return CompressedObservationBuffer(
+        token_meta=torch.from_dlpack(obs_jax["token_meta"]),
+        owner_idx=torch.from_dlpack(obs_jax["owner_idx"]),
+        production=torch.from_dlpack(obs_jax["production"]),
+        ships=torch.from_dlpack(obs_jax["ships"]),
+        velocity=torch.from_dlpack(obs_jax["velocity"]),
+        xy=torch.from_dlpack(obs_jax["xy"]),
+        turn_progress=torch.from_dlpack(obs_jax["turn_progress"]),
+        incoming_net=torch.from_dlpack(obs_jax["incoming_net"]),
+        incoming_survivor=torch.from_dlpack(obs_jax["incoming_survivor"]),
+    )
+
+
 def _merge_controller_outputs(
     controller_outputs: list[tuple[torch.Tensor, dict[str, torch.Tensor]]],
     total_rows: int,
@@ -775,15 +794,15 @@ def _append_synthetic_terminal_rows(
     ):
         raise ValueError("synthetic terminal row metadata shapes must match")
 
-    obs_j = build_observation_batched_jax_per_ego(
+    obs_comp_j = build_compressed_observation_batched_jax_per_ego(
         state_rows,
         jnp.asarray(ego_np, dtype=jnp.int32),
         ship_speed,
         obs_feature_dim,
         normalize_to_p0=normalize_obs_to_p0,
     )
-    obs_t = obs_jax_to_torch(obs_j)
-    obs_t_dev = {key: value.to(device) for key, value in obs_t.items()}
+    obs_comp_t = _compressed_obs_jax_to_torch(obs_comp_j)
+    obs_t_dev = {key: value.to(device) for key, value in decode_observation(obs_comp_t, feature_dim=obs_feature_dim).items()}
     ctrl_t = torch.as_tensor(ctrl_np, device=device, dtype=torch.long)
     pop_t = torch.as_tensor(pop_np, device=device, dtype=torch.long)
     out = _forward_dense_rollout_by_controller(
@@ -834,8 +853,8 @@ def _append_synthetic_terminal_rows(
             zero_i32,
             1,
         )
-        obs_ego = {key: value.index_select(0, row_sel_t) for key, value in obs_t.items()}
-        obs_bufs[ego] = store_compressed_observation_rows(obs_bufs[ego], wr_t, env_t, obs_ego)
+        obs_comp_ego = index_compressed_observation_rows(obs_comp_t, row_sel_t)
+        obs_bufs[ego] = store_precompressed_observation_rows(obs_bufs[ego], wr_t, env_t, obs_comp_ego)
         valid[ego][wr_np, env_sel] = True
         old_logprob[ego][wr_np, env_sel] = 0.0
         old_value[ego][wr_np, env_sel] = value_np[row_sel]
@@ -1122,7 +1141,7 @@ def _run_async_micro_step_multi(
     ego_b_j = jnp.concatenate(ego_rows, axis=0)
 
     t0 = perf_counter()
-    obs_jax = build_observation_batched_jax_per_ego(
+    obs_comp_jax = build_compressed_observation_batched_jax_per_ego(
         virt_b,
         ego_b_j,
         ship_speed,
@@ -1133,11 +1152,11 @@ def _run_async_micro_step_multi(
     timing.obs_build_s += perf_counter() - t0
 
     t0 = perf_counter()
-    obs_torch = obs_jax_to_torch(obs_jax)
+    obs_comp_torch = _compressed_obs_jax_to_torch(obs_comp_jax)
     must_halt_t = torch.from_dlpack(must_halt_j)
-    obs_torch = decode_observation(compress_observation(obs_torch), feature_dim=obs_feature_dim)
-    obs_index = active_idx_t.to(next(iter(obs_torch.values())).device)
-    active_obs = {key: v.index_select(0, obs_index).to(device) for key, v in obs_torch.items()}
+    obs_index = active_idx_t.to(obs_comp_torch.token_meta.device)
+    active_comp = index_compressed_observation_rows(obs_comp_torch, obs_index)
+    active_obs = {key: v.to(device) for key, v in decode_observation(active_comp, feature_dim=obs_feature_dim).items()}
     must_halt_a = must_halt_t.index_select(0, active_idx_t.to(must_halt_t.device)).to(device)
     timing.policy_batch_s += perf_counter() - t0
 
@@ -1364,9 +1383,9 @@ def _run_async_micro_step_multi(
             micro_kp_t,
             max_micro_steps,
         )
-        obs_p_active = {key: v.index_select(0, pos_p_t) for key, v in active_obs.items()}
-        obs_bufs[p] = store_compressed_observation_rows(
-            obs_bufs[p], write_row_t.to(torch.long), active_p_idx_t, obs_p_active
+        comp_p_active = index_compressed_observation_rows(active_comp, pos_p_t)
+        obs_bufs[p] = store_precompressed_observation_rows(
+            obs_bufs[p], write_row_t.to(torch.long), active_p_idx_t, comp_p_active
         )
     t5 = perf_counter()
 
@@ -1503,7 +1522,7 @@ def _run_async_micro_step_multi_grouped_population(
     population_idx_t = torch.div(row_idx_t, int(rows_per_member), rounding_mode="floor").to(torch.int32)
 
     t0 = perf_counter()
-    obs_jax = build_observation_batched_jax_per_ego(
+    obs_comp_jax = build_compressed_observation_batched_jax_per_ego(
         virt_b,
         row_ego_j,
         ship_speed,
@@ -1514,10 +1533,9 @@ def _run_async_micro_step_multi_grouped_population(
     timing.obs_build_s += perf_counter() - t0
 
     t0 = perf_counter()
-    obs_torch = obs_jax_to_torch(obs_jax)
+    obs_comp_torch = _compressed_obs_jax_to_torch(obs_comp_jax)
     must_halt_t = torch.from_dlpack(must_halt_j)
-    obs_torch = decode_observation(compress_observation(obs_torch), feature_dim=obs_feature_dim)
-    full_obs = {key: v.to(device) for key, v in obs_torch.items()}
+    full_obs = {key: v.to(device) for key, v in decode_observation(obs_comp_torch, feature_dim=obs_feature_dim).items()}
     must_halt = must_halt_t.to(device=device, dtype=torch.bool)
     timing.policy_batch_s += perf_counter() - t0
 
@@ -1725,9 +1743,9 @@ def _run_async_micro_step_multi_grouped_population(
             micro_kp_t,
             max_micro_steps,
         )
-        obs_p_active = {key: v.index_select(0, row_sel_t) for key, v in full_obs.items()}
-        obs_bufs[p] = store_compressed_observation_rows(
-            obs_bufs[p], write_row_t.to(torch.long), env_sel_t, obs_p_active
+        comp_p_active = index_compressed_observation_rows(obs_comp_torch, row_sel_t)
+        obs_bufs[p] = store_precompressed_observation_rows(
+            obs_bufs[p], write_row_t.to(torch.long), env_sel_t, comp_p_active
         )
     t5 = perf_counter()
 
@@ -2700,7 +2718,7 @@ def collect_parallel_micro_rollouts(
             assert row_env is not None and row_ego is not None and row_env_j is not None
             t0 = perf_counter()
             policy_state_b = _gather_state_rows(state_b, row_env_j)
-            obs_j = build_observation_batched_jax_per_ego(
+            obs_comp_j = build_compressed_observation_batched_jax_per_ego(
                 policy_state_b,
                 jnp.asarray(row_ego, dtype=jnp.int32),
                 ship_speed,
@@ -2709,7 +2727,8 @@ def collect_parallel_micro_rollouts(
             )
             timing.obs_build_s += perf_counter() - t0
             tb0 = perf_counter()
-            obs_t = decode_observation(compress_observation(obs_jax_to_torch(obs_j)), feature_dim=obs_feature_dim)
+            obs_comp_t = _compressed_obs_jax_to_torch(obs_comp_j)
+            obs_t = decode_observation(obs_comp_t, feature_dim=obs_feature_dim)
             with amp_ctx:
                 out_rows = policy.forward_dense_rollout_grouped_population(**{k: v.to(device) for k, v in obs_t.items()})
             timing.policy_batch_s += perf_counter() - tb0
@@ -2727,7 +2746,7 @@ def collect_parallel_micro_rollouts(
             value_np_per_ego: list[np.ndarray] = []
             for ego in range(n_ego):
                 t0 = perf_counter()
-                obs_j = build_observation_batched_jax(
+                obs_comp_j = build_compressed_observation_batched_jax(
                     state_b,
                     ego,
                     ship_speed,
@@ -2736,7 +2755,7 @@ def collect_parallel_micro_rollouts(
                 )
                 timing.obs_build_s += perf_counter() - t0
                 tb0 = perf_counter()
-                obs_t = decode_observation(compress_observation(obs_jax_to_torch(obs_j)), feature_dim=obs_feature_dim)
+                obs_t = decode_observation(_compressed_obs_jax_to_torch(obs_comp_j), feature_dim=obs_feature_dim)
                 pop_t = torch.as_tensor(population_assignments[ego], device=device, dtype=torch.long)
                 controller_t = torch.as_tensor(controller_assignments[ego], device=device, dtype=torch.long)
                 obs_t_dev = {k: v.to(device) for k, v in obs_t.items()}

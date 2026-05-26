@@ -202,6 +202,45 @@ def store_compressed_observation_rows(
     return dst
 
 
+@torch.no_grad()
+def store_precompressed_observation_rows(
+    dst: CompressedObservationBuffer,
+    row: torch.Tensor,
+    env: torch.Tensor,
+    comp: CompressedObservationBuffer,
+) -> CompressedObservationBuffer:
+    r = row.to(device=dst.token_meta.device, dtype=torch.long)
+    e = env.to(device=dst.token_meta.device, dtype=torch.long)
+    dst.token_meta[r, e, :] = comp.token_meta.to(dst.token_meta.device)
+    dst.owner_idx[r, e, :] = comp.owner_idx.to(dst.owner_idx.device)
+    dst.production[r, e, :] = comp.production.to(dst.production.device)
+    dst.ships[r, e, :] = comp.ships.to(dst.ships.device)
+    dst.velocity[r, e, :, :] = comp.velocity.to(dst.velocity.device)
+    dst.xy[r, e, :, :] = comp.xy.to(dst.xy.device)
+    dst.turn_progress[r, e] = comp.turn_progress.to(dst.turn_progress.device)
+    dst.incoming_net[r, e, :, :] = comp.incoming_net.to(dst.incoming_net.device)
+    dst.incoming_survivor[r, e, :, :] = comp.incoming_survivor.to(dst.incoming_survivor.device)
+    return dst
+
+
+def index_compressed_observation_rows(
+    comp: CompressedObservationBuffer,
+    idx: torch.Tensor,
+) -> CompressedObservationBuffer:
+    ii = idx.to(device=comp.token_meta.device, dtype=torch.long)
+    return CompressedObservationBuffer(
+        token_meta=comp.token_meta.index_select(0, ii),
+        owner_idx=comp.owner_idx.index_select(0, ii),
+        production=comp.production.index_select(0, ii),
+        ships=comp.ships.index_select(0, ii),
+        velocity=comp.velocity.index_select(0, ii),
+        xy=comp.xy.index_select(0, ii),
+        turn_progress=comp.turn_progress.index_select(0, ii),
+        incoming_net=comp.incoming_net.index_select(0, ii),
+        incoming_survivor=comp.incoming_survivor.index_select(0, ii),
+    )
+
+
 def select_compressed_observation(
     src: CompressedObservationBuffer,
     t: torch.Tensor,
