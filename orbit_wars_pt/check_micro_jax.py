@@ -267,7 +267,7 @@ def main() -> None:
 
     # ---- Phase 5 replay smoke test on the gathered minibatch. ----
     device = torch.device("cpu")
-    policy = OrbitWarsPolicy(d_model=72, n_heads=4, n_layers=2).to(device)
+    policy = OrbitWarsPolicy(d_model=72, n_heads=6, n_layers=2).to(device)
     policy.eval()
 
     ego_b_j = mb_player  # player_id == ego in our setup

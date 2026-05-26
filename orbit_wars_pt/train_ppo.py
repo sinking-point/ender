@@ -624,6 +624,8 @@ def save_checkpoint(
     args: argparse.Namespace,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    training_args = _checkpoint_training_args(args)
+    training_args["rope_dims"] = int(getattr(policy, "rope_dims", 2))
     payload = {
         "version": CHECKPOINT_VERSION,
         "iteration": next_iteration,
@@ -643,7 +645,7 @@ def save_checkpoint(
             if isinstance(rollout_carry, dict)
             else (_serialize_rollout_carry(rollout_carry) if rollout_carry is not None else None)
         ),
-        "training_args": _checkpoint_training_args(args),
+        "training_args": training_args,
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, tmp)
@@ -2243,6 +2245,16 @@ def train(args: argparse.Namespace) -> None:
         normalize_obs_to_p0=args.normalize_obs_to_p0,
     )
     policy_feature_agents = 4 if args.exploiter_mode else int(args.num_agents)
+    resume_ckpt: Optional[dict[str, Any]] = None
+    policy_rope_dims = 2
+    if resume_path is not None:
+        try:
+            resume_ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            resume_ckpt = torch.load(resume_path, map_location="cpu")
+        resume_training_args = resume_ckpt.get("training_args", {}) if isinstance(resume_ckpt, dict) else {}
+        if isinstance(resume_training_args, dict):
+            policy_rope_dims = int(resume_training_args.get("rope_dims", 3))
 
     def _make_policy() -> OrbitWarsPolicy:
         return OrbitWarsPolicy(
@@ -2252,6 +2264,7 @@ def train(args: argparse.Namespace) -> None:
             activation_checkpointing=args.activation_checkpointing,
             feature_dim=obs_feature_dim_for_num_agents(policy_feature_agents),
             population_size=args.population_size,
+            rope_dims=policy_rope_dims,
         ).to(device)
 
     policy = _make_policy()
@@ -2331,10 +2344,12 @@ def train(args: argparse.Namespace) -> None:
     skip_main_next_iter = False
 
     if resume_path is not None:
-        try:
-            ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
-        except TypeError:
-            ckpt = torch.load(resume_path, map_location="cpu")
+        ckpt = resume_ckpt
+        if ckpt is None:
+            try:
+                ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
+            except TypeError:
+                ckpt = torch.load(resume_path, map_location="cpu")
         if int(ckpt.get("version", 0)) != CHECKPOINT_VERSION:
             raise RuntimeError(
                 f"Unsupported checkpoint version {ckpt.get('version')!r} (expected {CHECKPOINT_VERSION})"
@@ -3574,7 +3589,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("--max-grad-norm", type=float, default=0.5)
-    p.add_argument("--d-model", type=int, default=384)
+    p.add_argument("--d-model", type=int, default=192)
     p.add_argument("--n-heads", type=int, default=8)
     p.add_argument("--n-layers", type=int, default=4)
     p.add_argument(

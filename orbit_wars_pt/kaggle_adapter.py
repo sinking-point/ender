@@ -3137,6 +3137,7 @@ def _infer_policy_kwargs(payload: Any) -> dict[str, Any]:
         "n_layers": int(training_args.get("n_layers", 4)),
         "activation_checkpointing": False,
         "population_size": int(training_args.get("population_size", 1)),
+        "rope_dims": int(training_args.get("rope_dims", 3)),
     }
     if isinstance(policy_state, Mapping):
         w = policy_state.get("feat_proj.weight")

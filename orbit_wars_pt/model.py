@@ -1,4 +1,4 @@
-"""Transformer policy with 3D RoPE (x, y, time) and Orbit Wars action heads."""
+"""Transformer policy with configurable spatial RoPE and Orbit Wars action heads."""
 
 from __future__ import annotations
 
@@ -39,26 +39,38 @@ def apply_rope_1d(x: torch.Tensor, pos: torch.Tensor, base: float = 10000.0) -> 
     return out
 
 
-def apply_rope_3d(q: torch.Tensor, k: torch.Tensor, rope_pos: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Split head dimensions into three chunks for spatial x,y and temporal t."""
+def apply_rope_nd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    rope_pos: torch.Tensor,
+    *,
+    rope_dims: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Split head dims across ``rope_dims`` coordinates and apply 1D RoPE per chunk."""
 
     d_h = q.shape[-1]
-    assert d_h % 6 == 0, "head_dim must be divisible by 6 for 3D RoPE chunks"
-    c = d_h // 3
-    qx, qy, qt = q[..., :c], q[..., c : 2 * c], q[..., 2 * c :]
-    kx, ky, kt = k[..., :c], k[..., c : 2 * c], k[..., 2 * c :]
-    px = rope_pos[..., 0]
-    py = rope_pos[..., 1]
-    pt = rope_pos[..., 2]
-    qx = apply_rope_1d(qx, px)
-    kx = apply_rope_1d(kx, px)
-    qy = apply_rope_1d(qy, py)
-    ky = apply_rope_1d(ky, py)
-    qt = apply_rope_1d(qt, pt)
-    kt = apply_rope_1d(kt, pt)
-    q_out = torch.cat([qx, qy, qt], dim=-1)
-    k_out = torch.cat([kx, ky, kt], dim=-1)
-    return q_out, k_out
+    if rope_dims not in (2, 3):
+        raise ValueError(f"rope_dims must be 2 or 3, got {rope_dims}")
+    chunk = d_h // rope_dims
+    if d_h % rope_dims != 0 or chunk % 2 != 0:
+        raise AssertionError(
+            f"head_dim must be divisible by {rope_dims} and each chunk must be even; "
+            f"got head_dim={d_h}, rope_dims={rope_dims}"
+        )
+    if rope_pos.shape[-1] < rope_dims:
+        raise ValueError(
+            f"rope_pos last dim {rope_pos.shape[-1]} is smaller than rope_dims={rope_dims}"
+        )
+
+    q_chunks = q.split(chunk, dim=-1)
+    k_chunks = k.split(chunk, dim=-1)
+    q_out = []
+    k_out = []
+    for i in range(rope_dims):
+        pos_i = rope_pos[..., i]
+        q_out.append(apply_rope_1d(q_chunks[i], pos_i))
+        k_out.append(apply_rope_1d(k_chunks[i], pos_i))
+    return torch.cat(q_out, dim=-1), torch.cat(k_out, dim=-1)
 
 
 class RoPEAttention(nn.Module):
@@ -72,11 +84,12 @@ class RoPEAttention(nn.Module):
     when a key_padding_mask is supplied.
     """
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
+    def __init__(self, d_model: int, n_heads: int, *, rope_dims: int, dropout: float = 0.0):
         super().__init__()
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
+        self.rope_dims = int(rope_dims)
         self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
         self.proj = nn.Linear(d_model, d_model)
         self.dropout_p = float(dropout)
@@ -94,8 +107,8 @@ class RoPEAttention(nn.Module):
         b, l, _ = x.shape
         qkv = self.qkv(x).reshape(b, l, 3, self.n_heads, self.d_head).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-        r = rope_pos[:, None, :, :].expand(b, self.n_heads, l, 3)
-        q, k = apply_rope_3d(q, k, r)
+        r = rope_pos[:, None, :, : self.rope_dims].expand(b, self.n_heads, l, self.rope_dims)
+        q, k = apply_rope_nd(q, k, r, rope_dims=self.rope_dims)
 
         # SDPA mask convention is ``True = participate``; ours is
         # ``True = masked``, so invert. Shape: ``[B, 1, 1, L_packed]``
@@ -117,10 +130,18 @@ class RoPEAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, mlp_ratio: float = 4.0, dropout: float = 0.0):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        *,
+        rope_dims: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+    ):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.attn = RoPEAttention(d_model, n_heads, dropout=dropout)
+        self.attn = RoPEAttention(d_model, n_heads, rope_dims=rope_dims, dropout=dropout)
         self.norm2 = nn.LayerNorm(d_model)
         hidden = int(d_model * mlp_ratio)
         self.mlp = nn.Sequential(
@@ -155,9 +176,9 @@ def _make_target_pick_head(d_model: int) -> nn.Sequential:
 class OrbitWarsPopulationTail(nn.Module):
     """One population member's private final block + output heads."""
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
+    def __init__(self, d_model: int, n_heads: int, *, rope_dims: int, dropout: float = 0.0):
         super().__init__()
-        self.block = TransformerBlock(d_model, n_heads, dropout=dropout)
+        self.block = TransformerBlock(d_model, n_heads, rope_dims=rope_dims, dropout=dropout)
         self.norm_f = nn.LayerNorm(d_model)
         self.pair_q = nn.Linear(d_model, d_model // 2, bias=False)
         self.pair_k = nn.Linear(d_model, d_model // 2, bias=False)
@@ -181,11 +202,22 @@ class OrbitWarsPolicy(nn.Module):
         dropout: float = 0.0,
         activation_checkpointing: bool = False,
         population_size: int = 1,
+        rope_dims: int = 2,
     ):
         super().__init__()
-        assert (d_model // n_heads) % 6 == 0
+        head_dim = d_model // n_heads
+        if d_model % n_heads != 0:
+            raise AssertionError(f"d_model {d_model} must be divisible by n_heads {n_heads}")
+        rope_dims = int(rope_dims)
+        if rope_dims not in (2, 3):
+            raise ValueError(f"rope_dims must be 2 or 3, got {rope_dims}")
+        if head_dim % (2 * rope_dims) != 0:
+            raise AssertionError(
+                f"head_dim {head_dim} must be divisible by {2 * rope_dims} for rope_dims={rope_dims}"
+            )
         self.d_model = d_model
         self.n_heads = n_heads
+        self.rope_dims = rope_dims
         self.activation_checkpointing = activation_checkpointing
         self.population_size = int(population_size)
         if self.population_size < 1:
@@ -197,7 +229,7 @@ class OrbitWarsPolicy(nn.Module):
 
         if self.population_size == 1:
             self.blocks = nn.ModuleList(
-                [TransformerBlock(d_model, n_heads, dropout=dropout) for _ in range(n_layers)]
+                [TransformerBlock(d_model, n_heads, rope_dims=rope_dims, dropout=dropout) for _ in range(n_layers)]
             )
             self.norm_f = nn.LayerNorm(d_model)
             self.pair_q = nn.Linear(d_model, d_model // 2, bias=False)
@@ -211,10 +243,13 @@ class OrbitWarsPolicy(nn.Module):
         else:
             shared_layers = max(0, int(n_layers) - 1)
             self.shared_blocks = nn.ModuleList(
-                [TransformerBlock(d_model, n_heads, dropout=dropout) for _ in range(shared_layers)]
+                [TransformerBlock(d_model, n_heads, rope_dims=rope_dims, dropout=dropout) for _ in range(shared_layers)]
             )
             self.population_tails = nn.ModuleList(
-                [OrbitWarsPopulationTail(d_model, n_heads, dropout=dropout) for _ in range(self.population_size)]
+                [
+                    OrbitWarsPopulationTail(d_model, n_heads, rope_dims=rope_dims, dropout=dropout)
+                    for _ in range(self.population_size)
+                ]
             )
 
         self.register_buffer("_frac_const", torch.tensor(FRACTIONS, dtype=torch.float32))
@@ -759,7 +794,7 @@ class OrbitWarsPolicy(nn.Module):
 
         pack_idx_d = pack_idx.unsqueeze(-1).expand(b, L_packed, self.d_model)
         x_packed = torch.gather(x_dense, 1, pack_idx_d)
-        pack_idx_r = pack_idx.unsqueeze(-1).expand(b, L_packed, 3)
+        pack_idx_r = pack_idx.unsqueeze(-1).expand(b, L_packed, rope_pos.shape[-1])
         rope_packed = torch.gather(rope_pos, 1, pack_idx_r)
 
         # ``True = pad/masked`` for keys past each sample's active count.
@@ -887,7 +922,7 @@ class OrbitWarsPolicy(nn.Module):
         pack_idx = pack_idx_full[:, :L_packed]
         pack_idx_d = pack_idx.unsqueeze(-1).expand(b, L_packed, self.d_model)
         x_packed = torch.gather(x_dense, 1, pack_idx_d)
-        pack_idx_r = pack_idx.unsqueeze(-1).expand(b, L_packed, 3)
+        pack_idx_r = pack_idx.unsqueeze(-1).expand(b, L_packed, rope_pos.shape[-1])
         rope_packed = torch.gather(rope_pos, 1, pack_idx_r)
         arange = torch.arange(L_packed, device=counts.device)
         padding_mask = arange[None, :] >= counts[:, None]
@@ -923,7 +958,7 @@ class OrbitWarsPolicy(nn.Module):
         pack_idx = pack_idx_full[:, :L_packed]
         pack_idx_d = pack_idx.unsqueeze(-1).expand(b, L_packed, self.d_model)
         x_packed = torch.gather(x_dense, 1, pack_idx_d)
-        pack_idx_r = pack_idx.unsqueeze(-1).expand(b, L_packed, 3)
+        pack_idx_r = pack_idx.unsqueeze(-1).expand(b, L_packed, rope_pos.shape[-1])
         rope_packed = torch.gather(rope_pos, 1, pack_idx_r)
         arange = torch.arange(L_packed, device=counts.device)
         padding_mask = arange[None, :] >= counts[:, None]
