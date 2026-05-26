@@ -293,6 +293,49 @@ def _copy_state_slices_between(
 
 
 @jax.jit
+def _refresh_virt_from_state_masked_non_grouped(
+    virt_b: OrbitWarsState,
+    state_b: OrbitWarsState,
+    ready_mask: jnp.ndarray,
+) -> OrbitWarsState:
+    """Refresh only stepped env rows in non-grouped ``virt_b`` from ``state_b``."""
+
+    num_rows = int(virt_b.planets.shape[0])
+    num_envs = int(state_b.planets.shape[0])
+    if num_envs <= 0:
+        return virt_b
+    row_env = jnp.mod(jnp.arange(num_rows, dtype=jnp.int32), jnp.asarray(num_envs, dtype=jnp.int32))
+
+    def _blend(virt_leaf: jnp.ndarray, state_leaf: jnp.ndarray) -> jnp.ndarray:
+        refreshed = state_leaf[row_env]
+        mask = ready_mask[row_env]
+        for _ in range(virt_leaf.ndim - 1):
+            mask = mask[..., None]
+        return jnp.where(mask, refreshed, virt_leaf)
+
+    return jax.tree.map(_blend, virt_b, state_b)
+
+
+@jax.jit
+def _refresh_virt_from_state_masked_grouped(
+    virt_b: OrbitWarsState,
+    state_b: OrbitWarsState,
+    row_env: jnp.ndarray,
+    ready_mask: jnp.ndarray,
+) -> OrbitWarsState:
+    """Refresh only stepped rows in grouped-population ``virt_b`` from ``state_b``."""
+
+    def _blend(virt_leaf: jnp.ndarray, state_leaf: jnp.ndarray) -> jnp.ndarray:
+        refreshed = state_leaf[row_env]
+        mask = ready_mask[row_env]
+        for _ in range(virt_leaf.ndim - 1):
+            mask = mask[..., None]
+        return jnp.where(mask, refreshed, virt_leaf)
+
+    return jax.tree.map(_blend, virt_b, state_b)
+
+
+@jax.jit
 def _gather_state_rows(
     state_b: OrbitWarsState,
     row_env_idx: jnp.ndarray,
@@ -2524,6 +2567,7 @@ def collect_parallel_micro_rollouts(
                 t_book0 = perf_counter()
                 step_env_t = torch.as_tensor(step_envs, dtype=torch.long, device=device)
                 micro_k_dev[:, step_env_t] = 0
+                ready_mask_j = jnp.asarray(ready_mask, dtype=jnp.bool_)
                 _reset_prefetch_resync(
                     reset_prefetch,
                     seed_base,
@@ -2536,26 +2580,17 @@ def collect_parallel_micro_rollouts(
                     assert policy_row_for_seat is not None
                     row_env, row_ego = _invert_policy_row_mapping(policy_row_for_seat)
                     row_env_j = jnp.asarray(row_env, dtype=jnp.int32)
-                    step_rows = np.flatnonzero(np.isin(row_env, step_envs)).astype(np.int32)
-                    if step_rows.size:
-                        virt_b = _copy_state_slices_between(
-                            virt_b,
-                            jnp.asarray(step_rows, dtype=jnp.int32),
-                            state_b,
-                            jnp.asarray(row_env[step_rows], dtype=jnp.int32),
-                        )
-                else:
-                    actual_idx_j = jnp.asarray(step_envs, dtype=jnp.int32)
-                    virt_dst_idx_j = jnp.concatenate(
-                        [actual_idx_j + jnp.asarray(k * num_envs, dtype=jnp.int32) for k in range(n_ego)],
-                        axis=0,
-                    )
-                    virt_src_idx_j = jnp.concatenate([actual_idx_j] * n_ego, axis=0)
-                    virt_b = _copy_state_slices_between(
+                    virt_b = _refresh_virt_from_state_masked_grouped(
                         virt_b,
-                        virt_dst_idx_j,
                         state_b,
-                        virt_src_idx_j,
+                        row_env_j,
+                        ready_mask_j,
+                    )
+                else:
+                    virt_b = _refresh_virt_from_state_masked_non_grouped(
+                        virt_b,
+                        state_b,
+                        ready_mask_j,
                     )
                 if sync_policy_timing:
                     _sync_rollout_policy_timing(device, virt_b)
