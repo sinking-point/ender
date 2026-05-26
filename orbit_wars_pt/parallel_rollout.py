@@ -39,6 +39,7 @@ from orbit_wars_pt.batched_env import (
     obs_jax_to_torch,
     post_step_stats_batched,
     reset_env_at_index,
+    reset_envs_at_indices,
     reward_delta_from_state_pair_batched,
     reward_mix_ratios_batched,
     stack_initial_states,
@@ -2281,6 +2282,9 @@ def collect_parallel_micro_rollouts(
                 t_py0 = perf_counter()
                 done_envs: list[int] = []
                 done_env_seed: dict[int, int] = {}
+                reset_envs_apply: list[int] = []
+                reset_fresh_states: list[Any] = []
+                reset_total_s = 0.0
                 for env_i in step_envs:
                     env_i = int(env_i)
                     env_steps_per_env[env_i] += 1
@@ -2412,9 +2416,8 @@ def collect_parallel_micro_rollouts(
                                     sid, int(mode_arr[env_i]), int(cfg.max_fleets)
                                 )
                                 fresh_np = jax.device_get(state_i)
-                            state_b = reset_env_at_index(
-                                state_b, env_i, sid, cfg, fresh_np=fresh_np
-                            )
+                            reset_envs_apply.append(env_i)
+                            reset_fresh_states.append(fresh_np)
                             controller_assignments[:, env_i] = ctrl_i.astype(np.int32, copy=False)
                             main_player_mask[:, env_i] = main_i.astype(np.bool_, copy=False)
                         elif reset_prefetch is not None:
@@ -2431,19 +2434,21 @@ def collect_parallel_micro_rollouts(
                                 init_phase=False,
                                 active_seat_count=int(cfg.num_agents),
                             )
-                            state_b = reset_env_at_index(state_b, env_i, sid, cfg, fresh_np=fresh_np)
+                            reset_envs_apply.append(env_i)
+                            reset_fresh_states.append(fresh_np)
                         else:
                             sid = int(seed_base + seeds_consumed)
-                            state_b = reset_env_at_index(state_b, env_i, sid, cfg)
+                            state_i = jow.reset_from_reference(sid, int(cfg.num_agents), max_fleets=int(cfg.max_fleets))
+                            reset_envs_apply.append(env_i)
+                            reset_fresh_states.append(jax.device_get(state_i))
                         reset_dt = perf_counter() - t_reset0
-                        timing.env_reset_s += reset_dt
+                        reset_total_s += reset_dt
                         timing.env_reset_count += 1
                         if mode_arr is not None:
                             if active_seat_count == 2:
                                 timing.env_reset_mode_2p_count += 1
                             elif active_seat_count == 4:
                                 timing.env_reset_mode_4p_count += 1
-                        t_py0 += reset_dt
                         seeds_consumed += 1
                         done_env_seed[env_i] = sid
                         if first_reset_event is None:
@@ -2467,6 +2472,18 @@ def collect_parallel_micro_rollouts(
                     reward_idx[:, env_i] = -1
                     if horizon_fired:
                         segment_done[env_i] = True
+                if reset_envs_apply:
+                    t_reset_apply0 = perf_counter()
+                    state_b = reset_envs_at_indices(
+                        state_b,
+                        np.asarray(reset_envs_apply, dtype=np.int32),
+                        reset_fresh_states,
+                    )
+                    if sync_policy_timing:
+                        _sync_rollout_policy_timing(device, state_b)
+                    reset_total_s += perf_counter() - t_reset_apply0
+                timing.env_reset_s += reset_total_s
+                t_py0 += reset_total_s
                 if grouped_population_rollout and done_envs:
                     assert policy_row_for_seat is not None
                     done_envs_np = np.asarray(done_envs, dtype=np.int32)

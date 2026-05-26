@@ -70,6 +70,40 @@ def reset_env_at_index(
     return jax.tree.map(scatter, state_b, fresh)
 
 
+@jax.jit
+def _scatter_state_rows(
+    state_b: OrbitWarsState,
+    env_idx: jnp.ndarray,
+    fresh_b: OrbitWarsState,
+) -> OrbitWarsState:
+    return jax.tree.map(lambda dst, src: dst.at[env_idx].set(src), state_b, fresh_b)
+
+
+def reset_envs_at_indices(
+    state_b: OrbitWarsState,
+    env_idx: np.ndarray,
+    fresh_states: List[Any],
+) -> OrbitWarsState:
+    """Replace multiple batch slices in one scatter.
+
+    ``fresh_states`` may contain NumPy-backed or JAX-backed ``OrbitWarsState`` trees.
+    """
+
+    env_np = np.asarray(env_idx, dtype=np.int32).reshape(-1)
+    if env_np.size == 0:
+        return state_b
+    if len(fresh_states) != int(env_np.size):
+        raise ValueError(
+            f"fresh_states length {len(fresh_states)} must equal env_idx size {int(env_np.size)}"
+        )
+    env_j = jnp.asarray(env_np, dtype=jnp.int32)
+    fresh_b = jax.tree.map(
+        lambda *xs: jnp.stack([jnp.asarray(x) for x in xs], axis=0),
+        *fresh_states,
+    )
+    return _scatter_state_rows(state_b, env_j, fresh_b)
+
+
 def heal_terminal_env_slices(
     state_b: OrbitWarsState,
     cfg: OrbitWarsEnvConfig,
