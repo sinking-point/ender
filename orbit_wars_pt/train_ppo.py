@@ -1059,16 +1059,18 @@ def _filter_sample_dict(
 
 
 def _sample_unified_exploiter_env_modes(num_envs: int, seed: int) -> np.ndarray:
-    counts = np.asarray(
-        [
-            int(num_envs * 0.2),
-            int(num_envs * 0.2),
-            int(num_envs * 0.6),
-            0,
-        ],
-        dtype=np.int32,
-    )
-    counts[3] = int(num_envs) - int(counts[:3].sum())
+    del seed
+    # Target env-mode ratio 1:1:3:1 for
+    #   selfplay_2p : selfplay_4p : vs_2p : vs_4p
+    # so that both policies see an approximately 1:1 ratio of 2p to 4p seats.
+    base = np.asarray([1, 1, 3, 1], dtype=np.int32)
+    total_weight = int(base.sum())
+    counts = (base * (int(num_envs) // total_weight)).astype(np.int32, copy=False)
+    rem = int(num_envs) - int(counts.sum())
+    if rem > 0:
+        frac = (base.astype(np.float64) * float(num_envs) / float(total_weight)) - counts.astype(np.float64)
+        order = np.argsort(-frac, kind="stable")
+        counts[order[:rem]] += 1
     return np.concatenate(
         [
             np.full((int(counts[0]),), EXPLOITER_MODE_SELFPLAY_2P, dtype=np.int32),
