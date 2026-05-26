@@ -29,6 +29,7 @@ import torch
 _SUBMISSION_PACKAGE_FILES = (
     "__init__.py",
     "constants.py",
+    "compressed_observation.py",
     "geometry.py",
     "interval_geometry_np.py",
     "orthogonal_geometry_np.py",
