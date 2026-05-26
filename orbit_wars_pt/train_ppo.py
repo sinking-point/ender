@@ -1037,7 +1037,7 @@ def _sample_unified_exploiter_env_modes(num_envs: int, seed: int) -> np.ndarray:
         [
             int(num_envs * 0.2),
             int(num_envs * 0.2),
-            int(num_envs * 0.2),
+            int(num_envs * 0.6),
             0,
         ],
         dtype=np.int32,
