@@ -37,9 +37,12 @@ from orbit_wars_pt.reset_prefetch import PrefetchPopMeta, RolloutResetPrefetch
 
 from orbit_wars_pt.batched_env import (
     obs_jax_to_torch,
+    post_step_stats_batched,
     reset_env_at_index,
+    reward_delta_from_state_pair_batched,
+    reward_mix_ratios_batched,
     stack_initial_states,
-    step_env_with_scores_batched,
+    step_env_batched,
 )
 from orbit_wars_pt.compressed_observation import (
     CompressedObservationBuffer,
@@ -452,12 +455,18 @@ class RolloutTiming:
     init_s: float = 0.0
     env_step_s: float = 0.0
     env_prep_s: float = 0.0
+    env_state_gather_s: float = 0.0
+    env_coef_s: float = 0.0
     env_step_core_s: float = 0.0
+    env_reward_s: float = 0.0
+    env_post_stats_s: float = 0.0
+    env_host_transfer_s: float = 0.0
     env_reset_s: float = 0.0
     env_reset_count: int = 0
     env_reset_mode_2p_count: int = 0
     env_reset_mode_4p_count: int = 0
     env_bookkeeping_s: float = 0.0
+    env_state_scatter_s: float = 0.0
     env_python_s: float = 0.0
     reset_prefetch_pop_s: float = 0.0
     reset_prefetch_pop_init_s: float = 0.0
@@ -2186,8 +2195,13 @@ def collect_parallel_micro_rollouts(
                 actions_bucket[~bucket_mask, :, :, 5] = 500.0
                 timing.env_prep_s += perf_counter() - t_prep0
 
-                t_core0 = perf_counter()
+                t_gather0 = perf_counter()
                 state_bucket = jax.tree.map(lambda leaf: leaf[idx_j], state_b)
+                if sync_policy_timing:
+                    _sync_rollout_policy_timing(device, state_bucket)
+                timing.env_state_gather_s += perf_counter() - t_gather0
+
+                t_coef0 = perf_counter()
                 ship_reward_coef_bucket = _reward_coef_matrix_for_population(
                     population_assignments[:, bucket_idx],
                     cfg.reward_ship_mass_share_coef,
@@ -2206,16 +2220,43 @@ def collect_parallel_micro_rollouts(
                     cfg.reward_time_bonus_member_coefs,
                     int(cfg.num_agents),
                 )
-                next_bucket, dr_jax, alive_post_jax, s0_post, s1_post = (
-                    step_env_with_scores_batched(
-                        state_bucket,
-                        actions_bucket,
-                        reward_ship_mass_share_coef=ship_reward_coef_bucket,
-                        reward_production_share_coef=production_reward_coef_bucket,
-                        reward_time_bonus_coef=time_reward_coef_bucket,
-                    )
+                timing.env_coef_s += perf_counter() - t_coef0
+                t_reward0 = perf_counter()
+                ratios_pre_jax = reward_mix_ratios_batched(
+                    state_bucket,
+                    reward_ship_mass_share_coef=ship_reward_coef_bucket,
+                    reward_production_share_coef=production_reward_coef_bucket,
                 )
-                min_garrison_jax = jnp.min(next_bucket.planets[:, :, jow.PLANET_SHIPS])
+                if sync_policy_timing:
+                    _sync_rollout_policy_timing(device, ratios_pre_jax)
+                timing.env_reward_s += perf_counter() - t_reward0
+
+                t_core0 = perf_counter()
+                next_bucket = step_env_batched(state_bucket, actions_bucket)
+                if sync_policy_timing:
+                    _sync_rollout_policy_timing(device, next_bucket)
+                timing.env_step_core_s += perf_counter() - t_core0
+
+                t_reward1 = perf_counter()
+                dr_jax = reward_delta_from_state_pair_batched(
+                    state_bucket,
+                    next_bucket,
+                    ratios_pre_jax,
+                    reward_ship_mass_share_coef=ship_reward_coef_bucket,
+                    reward_production_share_coef=production_reward_coef_bucket,
+                    reward_time_bonus_coef=time_reward_coef_bucket,
+                )
+                if sync_policy_timing:
+                    _sync_rollout_policy_timing(device, dr_jax)
+                timing.env_reward_s += perf_counter() - t_reward1
+
+                t_stats0 = perf_counter()
+                alive_post_jax, s0_post, s1_post, min_garrison_jax = post_step_stats_batched(next_bucket)
+                if sync_policy_timing:
+                    _sync_rollout_policy_timing(device, alive_post_jax, s0_post, s1_post, min_garrison_jax)
+                timing.env_post_stats_s += perf_counter() - t_stats0
+
+                t_host0 = perf_counter()
                 dr_np, alive_post_np, done_np, step_count_np, rewards_np, s0_fin_np, s1_fin_np, min_garrison_np = jax.device_get(
                     (
                         dr_jax,
@@ -2228,6 +2269,7 @@ def collect_parallel_micro_rollouts(
                         min_garrison_jax,
                     )
                 )
+                timing.env_host_transfer_s += perf_counter() - t_host0
                 dr_np = np.asarray(dr_np)
                 alive_post_np = np.asarray(alive_post_np, dtype=np.bool_)
                 done_np = np.asarray(done_np)
@@ -2241,10 +2283,13 @@ def collect_parallel_micro_rollouts(
                         f"negative env-step garrison detected after step_env_with_scores_batched: "
                         f"min_garrison={min_garrison:+g}"
                     )
-                timing.env_step_core_s += perf_counter() - t_core0
                 t_book0 = perf_counter()
                 state_b = _scatter_state_bucket(state_b, idx_j, next_bucket, mask_j)
-                timing.env_bookkeeping_s += perf_counter() - t_book0
+                if sync_policy_timing:
+                    _sync_rollout_policy_timing(device, state_b)
+                scatter_dt = perf_counter() - t_book0
+                timing.env_state_scatter_s += scatter_dt
+                timing.env_bookkeeping_s += scatter_dt
 
                 t_py0 = perf_counter()
                 done_envs: list[int] = []
@@ -2508,6 +2553,8 @@ def collect_parallel_micro_rollouts(
                         state_b,
                         virt_src_idx_j,
                     )
+                if sync_policy_timing:
+                    _sync_rollout_policy_timing(device, virt_b)
                 timing.env_bookkeeping_s += perf_counter() - t_book0
                 timing.env_step_s += perf_counter() - t0
                 continue

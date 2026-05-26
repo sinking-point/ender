@@ -273,6 +273,73 @@ def step_env_with_scores_batched(
 
 
 @jax.jit
+def step_env_batched(
+    state: OrbitWarsState,
+    actions: jnp.ndarray,
+) -> OrbitWarsState:
+    """Step a bucket and return only the next state."""
+
+    return _vmapped_step(state, actions, _DEFAULT_STEP_CFG)
+
+
+@jax.jit
+def reward_mix_ratios_batched(
+    state: OrbitWarsState,
+    reward_ship_mass_share_coef: jnp.ndarray,
+    reward_production_share_coef: jnp.ndarray,
+) -> jnp.ndarray:
+    """Per-env mixed reward ratios for all four players, shape ``[N, 4]``."""
+
+    ship_coef = jnp.asarray(reward_ship_mass_share_coef, dtype=jnp.float32)
+    prod_coef = jnp.asarray(reward_production_share_coef, dtype=jnp.float32)
+    return ship_coef * jax.vmap(_ship_mass_ratios_four_core)(
+        state.planets, state.planet_active, state.incoming_fleets
+    ) + prod_coef * jax.vmap(_production_ratios_four_core)(state.planets, state.planet_active)
+
+
+@jax.jit
+def reward_delta_from_state_pair_batched(
+    state: OrbitWarsState,
+    next_state: OrbitWarsState,
+    ratios_pre: jnp.ndarray,
+    reward_ship_mass_share_coef: jnp.ndarray,
+    reward_production_share_coef: jnp.ndarray,
+    reward_time_bonus_coef: jnp.ndarray,
+) -> jnp.ndarray:
+    """Reward deltas for one env-step bucket given pre-step reward ratios."""
+
+    ratios_post = reward_mix_ratios_batched(
+        next_state,
+        reward_ship_mass_share_coef,
+        reward_production_share_coef,
+    )
+    dr = ratios_post - ratios_pre
+    time_coef = jnp.asarray(reward_time_bonus_coef, dtype=jnp.float32)
+    timeout_turn = jnp.maximum(_DEFAULT_STEP_CFG.episode_steps - 2, 1).astype(jnp.float32)
+    pre_turn = state.step_count.astype(jnp.float32)
+    time_bonus_scale = jnp.clip(1.0 - pre_turn / timeout_turn, 0.0, 1.0)
+    timeout_done = state.step_count >= (_DEFAULT_STEP_CFG.episode_steps - 2)
+    win_mask = next_state.done[:, None] & (~timeout_done[:, None]) & (next_state.rewards > 0.0)
+    return dr + time_coef * win_mask.astype(jnp.float32) * time_bonus_scale[:, None]
+
+
+@jax.jit
+def post_step_stats_batched(
+    next_state: OrbitWarsState,
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Post-step alive mask, ship totals, and min garrison for a stepped bucket."""
+
+    s0_post, s1_post = jax.vmap(_ship_totals_p01_core)(
+        next_state.planets, next_state.planet_active, next_state.incoming_fleets
+    )
+    alive_post = jax.vmap(_player_alive_four_core)(
+        next_state.planets, next_state.planet_active, next_state.incoming_fleets
+    )
+    min_garrison = jnp.min(next_state.planets[:, :, jow.PLANET_SHIPS])
+    return alive_post, s0_post, s1_post, min_garrison
+
+
+@jax.jit
 def inactive_fleet_count_batched(state: OrbitWarsState) -> jnp.ndarray:
     """Per-env count of inactive fleet slots, ``[num_envs]`` int32."""
 

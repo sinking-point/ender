@@ -1369,12 +1369,18 @@ def _combine_rollout_timing(items: list[RolloutTiming]) -> RolloutTiming:
         out.init_s += rt.init_s
         out.env_step_s += rt.env_step_s
         out.env_prep_s += rt.env_prep_s
+        out.env_state_gather_s += rt.env_state_gather_s
+        out.env_coef_s += rt.env_coef_s
         out.env_step_core_s += rt.env_step_core_s
+        out.env_reward_s += rt.env_reward_s
+        out.env_post_stats_s += rt.env_post_stats_s
+        out.env_host_transfer_s += rt.env_host_transfer_s
         out.env_reset_s += rt.env_reset_s
         out.env_reset_count += rt.env_reset_count
         out.env_reset_mode_2p_count += rt.env_reset_mode_2p_count
         out.env_reset_mode_4p_count += rt.env_reset_mode_4p_count
         out.env_bookkeeping_s += rt.env_bookkeeping_s
+        out.env_state_scatter_s += rt.env_state_scatter_s
         out.env_python_s += rt.env_python_s
         out.reset_prefetch_pop_s += rt.reset_prefetch_pop_s
         out.reset_prefetch_pop_init_s += rt.reset_prefetch_pop_init_s
@@ -1475,7 +1481,12 @@ def _rollout_timing_str(rt: RolloutTiming) -> str:
     unacc_loop = max(0.0, rt.loop_s - rt.accounted_loop_s())
     env_accounted = (
         rt.env_prep_s
+        + rt.env_state_gather_s
+        + rt.env_coef_s
         + rt.env_step_core_s
+        + rt.env_reward_s
+        + rt.env_post_stats_s
+        + rt.env_host_transfer_s
         + rt.env_reset_s
         + rt.env_bookkeeping_s
         + rt.env_python_s
@@ -1485,10 +1496,12 @@ def _rollout_timing_str(rt: RolloutTiming) -> str:
     reset_prefetch_wait_n = rt.reset_prefetch_wait_n
     return (
         f"rollout_wall {rt.wall_s:.3f}s loop {rt.loop_s:.3f}s "
-        f"env_step {rt.env_step_s:.3f}s env_prep {rt.env_prep_s:.3f}s env_core {rt.env_step_core_s:.3f}s "
+        f"env_step {rt.env_step_s:.3f}s env_prep {rt.env_prep_s:.3f}s "
+        f"env_gather {rt.env_state_gather_s:.3f}s env_coef {rt.env_coef_s:.3f}s env_core {rt.env_step_core_s:.3f}s "
+        f"env_reward {rt.env_reward_s:.3f}s env_post {rt.env_post_stats_s:.3f}s env_xfer {rt.env_host_transfer_s:.3f}s "
         f"env_reset {rt.env_reset_s:.3f}s"
         f"(n {rt.env_reset_count} 2p {rt.env_reset_mode_2p_count} 4p {rt.env_reset_mode_4p_count}) "
-        f"env_book {rt.env_bookkeeping_s:.3f}s env_py {rt.env_python_s:.3f}s "
+        f"env_book {rt.env_bookkeeping_s:.3f}s(scatter {rt.env_state_scatter_s:.3f}) env_py {rt.env_python_s:.3f}s "
         f"prefetch_pop {rt.reset_prefetch_pop_s:.3f}s"
         f"(init {rt.reset_prefetch_pop_init_s:.3f} ep {rt.reset_prefetch_pop_episode_s:.3f} "
         f"hit {reset_prefetch_hit_n} wait {reset_prefetch_wait_n} fb {rt.reset_prefetch_fallback_n} "
@@ -2147,12 +2160,18 @@ def _log_iter_tensorboard(
         writer.add_scalar("timing/rollout_loop_s", rt.loop_s, it)
         writer.add_scalar("timing/env_step_s", rt.env_step_s, it)
         writer.add_scalar("timing/env_prep_s", rt.env_prep_s, it)
+        writer.add_scalar("timing/env_state_gather_s", rt.env_state_gather_s, it)
+        writer.add_scalar("timing/env_coef_s", rt.env_coef_s, it)
         writer.add_scalar("timing/env_step_core_s", rt.env_step_core_s, it)
+        writer.add_scalar("timing/env_reward_s", rt.env_reward_s, it)
+        writer.add_scalar("timing/env_post_stats_s", rt.env_post_stats_s, it)
+        writer.add_scalar("timing/env_host_transfer_s", rt.env_host_transfer_s, it)
         writer.add_scalar("timing/env_reset_s", rt.env_reset_s, it)
         writer.add_scalar("timing/env_reset_count", float(rt.env_reset_count), it)
         writer.add_scalar("timing/env_reset_mode_2p_count", float(rt.env_reset_mode_2p_count), it)
         writer.add_scalar("timing/env_reset_mode_4p_count", float(rt.env_reset_mode_4p_count), it)
         writer.add_scalar("timing/env_bookkeeping_s", rt.env_bookkeeping_s, it)
+        writer.add_scalar("timing/env_state_scatter_s", rt.env_state_scatter_s, it)
         writer.add_scalar("timing/env_python_s", rt.env_python_s, it)
         writer.add_scalar("timing/reset_prefetch_pop_s", rt.reset_prefetch_pop_s, it)
         writer.add_scalar("timing/reset_prefetch_pop_init_s", rt.reset_prefetch_pop_init_s, it)
