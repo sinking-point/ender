@@ -93,6 +93,33 @@ class HostReplayMemberStore:
     old_value: torch.Tensor
 
 
+@dataclass
+class SamplePrepTiming:
+    """Wall-time breakdown for the pre-PPO sample/host-staging phase."""
+
+    chunk_collect_s: float = 0.0
+    chunk_gae_s: float = 0.0
+    chunk_filter_s: float = 0.0
+    chunk_host_transfer_s: float = 0.0
+    chunk_release_s: float = 0.0
+    post_chunk_combine_s: float = 0.0
+    final_select_s: float = 0.0
+    advantage_norm_s: float = 0.0
+    total_s: float = 0.0
+
+    def accounted_s(self) -> float:
+        return (
+            self.chunk_collect_s
+            + self.chunk_gae_s
+            + self.chunk_filter_s
+            + self.chunk_host_transfer_s
+            + self.chunk_release_s
+            + self.post_chunk_combine_s
+            + self.final_select_s
+            + self.advantage_norm_s
+        )
+
+
 def _sanitize_experiment_name(name: str) -> str:
     name = name.strip()
     if not name:
@@ -978,7 +1005,6 @@ def _release_rollout_device_refs(device: torch.device) -> None:
     reduce process-level ``nvidia-smi`` usage.  It does make dead arrays
     collectable/reusable before PPO builds its backward graph.
     """
-
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -1493,6 +1519,18 @@ def _ppo_timing_str(pt: PPOTiming) -> str:
     )
 
 
+def _sample_prep_timing_str(st: SamplePrepTiming) -> str:
+    unacc = max(0.0, st.total_s - st.accounted_s())
+    return (
+        f"samples_wall {st.total_s:.3f}s "
+        f"chunk_collect {st.chunk_collect_s:.3f}s gae {st.chunk_gae_s:.3f}s "
+        f"filter {st.chunk_filter_s:.3f}s host_xfer {st.chunk_host_transfer_s:.3f}s "
+        f"release {st.chunk_release_s:.3f}s post_combine {st.post_chunk_combine_s:.3f}s "
+        f"final_select {st.final_select_s:.3f}s adv_norm {st.advantage_norm_s:.3f}s "
+        f"unaccounted {unacc:.3f}s"
+    )
+
+
 def _population_metric_summary(
     *,
     samples: Optional[dict],
@@ -1964,6 +2002,7 @@ def _log_iter_tensorboard(
     cfg_max_fleets: int,
     game_stats: Optional[RolloutGameStats] = None,
     samples_s: float = 0.0,
+    sample_prep_t: Optional[SamplePrepTiming] = None,
     loss_mb: float = 0.0,
     ppo_s: float = 0.0,
     ppo_summary: Optional[dict] = None,
@@ -2083,6 +2122,20 @@ def _log_iter_tensorboard(
         writer.flush()
         return
     writer.add_scalar("time/samples_gae_seconds", samples_s, it)
+    if sample_prep_t is not None:
+        writer.add_scalar("timing/sample_prep_chunk_collect_s", sample_prep_t.chunk_collect_s, it)
+        writer.add_scalar("timing/sample_prep_chunk_gae_s", sample_prep_t.chunk_gae_s, it)
+        writer.add_scalar("timing/sample_prep_chunk_filter_s", sample_prep_t.chunk_filter_s, it)
+        writer.add_scalar("timing/sample_prep_chunk_host_transfer_s", sample_prep_t.chunk_host_transfer_s, it)
+        writer.add_scalar("timing/sample_prep_chunk_release_s", sample_prep_t.chunk_release_s, it)
+        writer.add_scalar("timing/sample_prep_post_chunk_combine_s", sample_prep_t.post_chunk_combine_s, it)
+        writer.add_scalar("timing/sample_prep_final_select_s", sample_prep_t.final_select_s, it)
+        writer.add_scalar("timing/sample_prep_adv_norm_s", sample_prep_t.advantage_norm_s, it)
+        writer.add_scalar(
+            "timing/sample_prep_unaccounted_s",
+            max(0.0, sample_prep_t.total_s - sample_prep_t.accounted_s()),
+            it,
+        )
     writer.add_scalar("time/ppo_seconds", ppo_s, it)
     writer.add_scalar("ppo/loss_mb", loss_mb, it)
     assert ppo_summary is not None
@@ -2545,6 +2598,7 @@ def _train_loop(
                 rollout_carry = None
             rollout_env_seed = _normalize_unified_exploiter_rollout_seed_state(rollout_env_seed)
             samples_t0 = time.perf_counter()
+            sample_prep_t = SamplePrepTiming()
             skip_main_this_iter = bool(skip_main_next_iter)
             skip_main_next_iter = False
             env_modes = (
@@ -2588,6 +2642,7 @@ def _train_loop(
                 chunk_stats: list[RolloutGameStats] = []
                 host_chunk_parts: list[tuple[RolloutSegment, Optional[dict], Optional[dict], Optional[dict], Optional[dict], Optional[dict]]] = []
                 for chunk_i in range(int(args.rollout_host_chunks)):
+                    t0 = time.perf_counter()
                     segment_i, rt_i, next_rollout_carry_i, seeds_used, game_stats = collect_parallel_micro_rollouts(
                         policy,
                         cfg_rollout,
@@ -2615,6 +2670,7 @@ def _train_loop(
                         termination_controller=0,
                         env_mode_by_env=active_env_modes,
                     )
+                    sample_prep_t.chunk_collect_s += time.perf_counter() - t0
                     active_rollout_carry = next_rollout_carry_i
                     if active_env_range is not None and rollout_carry is not None:
                         rollout_carry = _merge_rollout_carry_envs(
@@ -2627,7 +2683,10 @@ def _train_loop(
                         rollout_carry = next_rollout_carry_i
                     rollout_env_seed = seeds_used
                     cfg.max_fleets = max(int(cfg.max_fleets), int(rollout_carry.cfg.max_fleets))
+                    t0 = time.perf_counter()
                     samples_i = build_ppo_samples(segment_i, args.gamma, args.lam)
+                    sample_prep_t.chunk_gae_s += time.perf_counter() - t0
+                    t0 = time.perf_counter()
                     main_selfplay_i = _filter_sample_dict(
                         samples_i,
                         policy_id=0,
@@ -2653,9 +2712,11 @@ def _train_loop(
                         policy_id=1,
                         env_modes=(EXPLOITER_MODE_VS_4P,),
                     )
+                    sample_prep_t.chunk_filter_s += time.perf_counter() - t0
+                    t0 = time.perf_counter()
                     host_segment_i = _rollout_segment_to_host(segment_i)
+                    sample_prep_t.chunk_host_transfer_s += time.perf_counter() - t0
                     del segment_i
-                    _release_rollout_device_refs(device)
                     chunk_segments.append(host_segment_i)
                     chunk_timings.append(rt_i)
                     chunk_stats.append(game_stats)
@@ -2669,9 +2730,11 @@ def _train_loop(
                             exploiter_4p_i,
                         )
                     )
+                t0 = time.perf_counter()
                 segment = _combine_segments_for_stats(chunk_segments)
                 rt = _combine_rollout_timing(chunk_timings)
                 game_stats = _combine_game_stats(chunk_stats)
+                sample_prep_t.post_chunk_combine_s += time.perf_counter() - t0
                 main_samples = None
                 exploiter_samples = None
             else:
@@ -2713,7 +2776,10 @@ def _train_loop(
                     rollout_carry = next_rollout_carry
                 rollout_env_seed = seeds_used
                 cfg.max_fleets = max(int(cfg.max_fleets), int(rollout_carry.cfg.max_fleets))
+                t0 = time.perf_counter()
                 samples_i = build_ppo_samples(segment, args.gamma, args.lam)
+                sample_prep_t.chunk_gae_s += time.perf_counter() - t0
+                t0 = time.perf_counter()
                 main_selfplay_samples = _filter_sample_dict(
                     samples_i,
                     policy_id=0,
@@ -2739,6 +2805,7 @@ def _train_loop(
                     policy_id=1,
                     env_modes=(EXPLOITER_MODE_VS_4P,),
                 )
+                sample_prep_t.chunk_filter_s += time.perf_counter() - t0
             samples_s = time.perf_counter() - samples_t0
 
             total_env_steps = int(segment.env_steps_per_env.sum())
@@ -2768,6 +2835,7 @@ def _train_loop(
             skip_main_next_iter = bool(schedule_main_skip_next)
 
             if args.rollout_storage == "host":
+                t0 = time.perf_counter()
                 for (
                     host_segment_i,
                     main_selfplay_i,
@@ -2797,10 +2865,13 @@ def _train_loop(
                         main_host_chunks.append(HostRolloutChunk(segment=host_segment_i, samples=main_selected_i))
                     if exploiter_selected_i is not None:
                         exploiter_host_chunks.append(HostRolloutChunk(segment=host_segment_i, samples=exploiter_selected_i))
+                sample_prep_t.final_select_s += time.perf_counter() - t0
+                t0 = time.perf_counter()
                 if main_host_chunks:
                     _normalize_chunk_advantages(main_host_chunks)
                 if exploiter_host_chunks:
                     _normalize_chunk_advantages(exploiter_host_chunks)
+                sample_prep_t.advantage_norm_s += time.perf_counter() - t0
             else:
                 main_samples = (
                     None
@@ -2823,6 +2894,11 @@ def _train_loop(
                     normalize_advantages(main_samples)
                 if exploiter_samples is not None:
                     normalize_advantages(exploiter_samples)
+            if args.rollout_storage == "host":
+                t0 = time.perf_counter()
+                _release_rollout_device_refs(device)
+                sample_prep_t.chunk_release_s += time.perf_counter() - t0
+            sample_prep_t.total_s = samples_s
 
             skip_main = not bool(main_host_chunks) if args.rollout_storage == "host" else (main_samples is None)
             skip_exploiter = not bool(exploiter_host_chunks) if args.rollout_storage == "host" else (exploiter_samples is None)
@@ -2946,6 +3022,8 @@ def _train_loop(
 
             iter_dt = max(1e-9, time.perf_counter() - iter_start)
             ppo_s = time.perf_counter() - t_ppo0
+            if args.rollout_storage == "host":
+                _release_rollout_device_refs(device)
             mean_main_loss = float(np.mean(main_loss_parts)) if main_loss_parts else float("nan")
             mean_exploiter_loss = float(np.mean(exploiter_loss_parts)) if exploiter_loss_parts else float("nan")
             combined_ppo_t = PPOTiming(
@@ -2976,6 +3054,7 @@ def _train_loop(
                 f"env_steps {total_env_steps} env/s {env_per_sec:.1f} "
                 f"| {_rollout_game_stats_str(game_stats)} "
                 f"| samples+gae {samples_s:.3f}s ppo {ppo_s:.3f}s "
+                f"| {_sample_prep_timing_str(sample_prep_t)} "
                 f"| main_win_rate {main_win_rate:.3f} "
                 f"skip_main {int(skip_main)} skip_exploiter {int(skip_exploiter)} "
                 f"main_skip_this_iter {int(skip_main_this_iter)} main_skip_next_scheduled {int(schedule_main_skip_next)} "
@@ -3009,6 +3088,7 @@ def _train_loop(
                 cfg_max_fleets=cfg.max_fleets,
                 game_stats=game_stats,
                 samples_s=samples_s,
+                sample_prep_t=sample_prep_t,
                 loss_mb=mean_main_loss if mean_main_loss == mean_main_loss else mean_exploiter_loss,
                 ppo_s=ppo_s,
                 ppo_summary=main_ppo_summary if main_ppo_summary is not None else exploiter_ppo_summary,
