@@ -283,6 +283,25 @@ def step_env_batched(
 
 
 @jax.jit
+def step_env_masked_batched(
+    state: OrbitWarsState,
+    actions: jnp.ndarray,
+    apply_mask: jnp.ndarray,
+) -> OrbitWarsState:
+    """Step a full batch and keep non-applied envs unchanged."""
+
+    stepped = _vmapped_step(state, actions, _DEFAULT_STEP_CFG)
+
+    def _blend(old_leaf: jnp.ndarray, new_leaf: jnp.ndarray) -> jnp.ndarray:
+        mask = apply_mask.astype(jnp.bool_)
+        for _ in range(old_leaf.ndim - 1):
+            mask = mask[..., None]
+        return jnp.where(mask, new_leaf, old_leaf)
+
+    return jax.tree.map(_blend, state, stepped)
+
+
+@jax.jit
 def reward_mix_ratios_batched(
     state: OrbitWarsState,
     reward_ship_mass_share_coef: jnp.ndarray,

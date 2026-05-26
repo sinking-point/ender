@@ -43,6 +43,7 @@ from orbit_wars_pt.batched_env import (
     reward_mix_ratios_batched,
     stack_initial_states,
     step_env_batched,
+    step_env_masked_batched,
 )
 from orbit_wars_pt.compressed_observation import (
     CompressedObservationBuffer,
@@ -2184,38 +2185,30 @@ def collect_parallel_micro_rollouts(
                 t0 = perf_counter()
                 t_prep0 = perf_counter()
                 step_envs = np.flatnonzero(ready_mask).astype(np.int32)
-                bucket_idx, bucket_mask = _unique_padded_indices(step_envs, num_envs)
-                idx_j = jnp.asarray(bucket_idx, dtype=jnp.int32)
-                mask_j = jnp.asarray(bucket_mask, dtype=jnp.bool_)
-                actions_bucket = pending_actions[bucket_idx].copy()
-                actions_bucket[~bucket_mask] = 0.0
-                actions_bucket[~bucket_mask, :, :, 2] = -1.0
-                actions_bucket[~bucket_mask, :, :, 3] = 500.0
-                actions_bucket[~bucket_mask, :, :, 4] = -1.0
-                actions_bucket[~bucket_mask, :, :, 5] = 500.0
+                ready_mask_j = jnp.asarray(ready_mask, dtype=jnp.bool_)
+                actions_bucket = pending_actions.copy()
+                actions_bucket[~ready_mask] = 0.0
+                actions_bucket[~ready_mask, :, :, 2] = -1.0
+                actions_bucket[~ready_mask, :, :, 3] = 500.0
+                actions_bucket[~ready_mask, :, :, 4] = -1.0
+                actions_bucket[~ready_mask, :, :, 5] = 500.0
                 timing.env_prep_s += perf_counter() - t_prep0
-
-                t_gather0 = perf_counter()
-                state_bucket = jax.tree.map(lambda leaf: leaf[idx_j], state_b)
-                if sync_policy_timing:
-                    _sync_rollout_policy_timing(device, state_bucket)
-                timing.env_state_gather_s += perf_counter() - t_gather0
 
                 t_coef0 = perf_counter()
                 ship_reward_coef_bucket = _reward_coef_matrix_for_population(
-                    population_assignments[:, bucket_idx],
+                    population_assignments,
                     cfg.reward_ship_mass_share_coef,
                     cfg.reward_ship_mass_share_member_coefs,
                     int(cfg.num_agents),
                 )
                 production_reward_coef_bucket = _reward_coef_matrix_for_population(
-                    population_assignments[:, bucket_idx],
+                    population_assignments,
                     cfg.reward_production_share_coef,
                     cfg.reward_production_share_member_coefs,
                     int(cfg.num_agents),
                 )
                 time_reward_coef_bucket = _reward_coef_matrix_for_population(
-                    population_assignments[:, bucket_idx],
+                    population_assignments,
                     cfg.reward_time_bonus_coef,
                     cfg.reward_time_bonus_member_coefs,
                     int(cfg.num_agents),
@@ -2223,7 +2216,7 @@ def collect_parallel_micro_rollouts(
                 timing.env_coef_s += perf_counter() - t_coef0
                 t_reward0 = perf_counter()
                 ratios_pre_jax = reward_mix_ratios_batched(
-                    state_bucket,
+                    state_b,
                     reward_ship_mass_share_coef=ship_reward_coef_bucket,
                     reward_production_share_coef=production_reward_coef_bucket,
                 )
@@ -2232,14 +2225,14 @@ def collect_parallel_micro_rollouts(
                 timing.env_reward_s += perf_counter() - t_reward0
 
                 t_core0 = perf_counter()
-                next_bucket = step_env_batched(state_bucket, actions_bucket)
+                next_bucket = step_env_masked_batched(state_b, actions_bucket, ready_mask_j)
                 if sync_policy_timing:
                     _sync_rollout_policy_timing(device, next_bucket)
                 timing.env_step_core_s += perf_counter() - t_core0
 
                 t_reward1 = perf_counter()
                 dr_jax = reward_delta_from_state_pair_batched(
-                    state_bucket,
+                    state_b,
                     next_bucket,
                     ratios_pre_jax,
                     reward_ship_mass_share_coef=ship_reward_coef_bucket,
@@ -2283,26 +2276,20 @@ def collect_parallel_micro_rollouts(
                         f"negative env-step garrison detected after step_env_with_scores_batched: "
                         f"min_garrison={min_garrison:+g}"
                     )
-                t_book0 = perf_counter()
-                state_b = _scatter_state_bucket(state_b, idx_j, next_bucket, mask_j)
-                if sync_policy_timing:
-                    _sync_rollout_policy_timing(device, state_b)
-                scatter_dt = perf_counter() - t_book0
-                timing.env_state_scatter_s += scatter_dt
-                timing.env_bookkeeping_s += scatter_dt
+                state_b = next_bucket
 
                 t_py0 = perf_counter()
                 done_envs: list[int] = []
                 done_env_seed: dict[int, int] = {}
-                for local_i, env_i in enumerate(step_envs):
+                for env_i in step_envs:
                     env_i = int(env_i)
                     env_steps_per_env[env_i] += 1
                     episode_turns[env_i] += 1
                     main_dead = bool(
                         versus_controller_rollout
-                        and np.any(main_player_mask[:, env_i] & (~alive_post_np[local_i, : int(cfg.num_agents)]))
+                        and np.any(main_player_mask[:, env_i] & (~alive_post_np[env_i, : int(cfg.num_agents)]))
                     )
-                    env_done_now = bool(done_np[local_i]) or main_dead
+                    env_done_now = bool(done_np[env_i]) or main_dead
                     main_policy_win: Optional[bool] = None
                     if versus_controller_rollout and env_done_now:
                         main_slots = np.flatnonzero(main_player_mask[:, env_i]).astype(np.int32)
@@ -2310,19 +2297,19 @@ def collect_parallel_micro_rollouts(
                         if main_dead:
                             main_policy_win = False
                         else:
-                            main_policy_win = bool(float(rewards_np[local_i, main_slot]) > 0.0)
-                        timeout_step = int(step_count_np[local_i]) >= episode_timeout_step_count
+                            main_policy_win = bool(float(rewards_np[env_i, main_slot]) > 0.0)
+                        timeout_step = int(step_count_np[env_i]) >= episode_timeout_step_count
                         time_bonus = 0.0
                         if (not timeout_step) and (not bool(main_policy_win)):
                             timeout_turn = max(1.0, float(episode_lim - 2))
-                            pre_turn = max(0.0, float(step_count_np[local_i]) - 1.0)
+                            pre_turn = max(0.0, float(step_count_np[env_i]) - 1.0)
                             time_bonus = float(cfg.reward_time_bonus_coef) * max(0.0, 1.0 - (pre_turn / timeout_turn))
                     synthetic_dead_exploiters: list[int] = []
                     for p in range(n_ego):
                         if reward_idx[p, env_i] >= 0:
-                            seat_dead = not bool(alive_post_np[local_i, p])
+                            seat_dead = not bool(alive_post_np[env_i, p])
                             local_done = env_done_now or seat_dead
-                            delta_r = float(dr_np[local_i, p])
+                            delta_r = float(dr_np[env_i, p])
                             if versus_controller_rollout and int(controller_assignments[p, env_i]) == 1:
                                 delta_r = 0.0
                                 if env_done_now and main_policy_win is not None:
@@ -2334,7 +2321,7 @@ def collect_parallel_micro_rollouts(
                             done[p][reward_idx[p, env_i], env_i] = local_done or bool(
                                 done[p][reward_idx[p, env_i], env_i]
                             )
-                        if not bool(alive_post_np[local_i, p]):
+                        if not bool(alive_post_np[env_i, p]):
                             player_done[p, env_i] = True
                         if (
                             env_done_now
@@ -2347,7 +2334,7 @@ def collect_parallel_micro_rollouts(
                         row_count = len(synthetic_dead_exploiters)
                         term_state = _gather_state_rows(
                             next_bucket,
-                            jnp.asarray([local_i] * row_count, dtype=jnp.int32),
+                            jnp.asarray([env_i] * row_count, dtype=jnp.int32),
                         )
                         synthetic_reward = (
                             np.full(
@@ -2386,15 +2373,15 @@ def collect_parallel_micro_rollouts(
                         ] = False
                     if env_done_now:
                         done_envs.append(env_i)
-                        sc_i = int(step_count_np[local_i])
+                        sc_i = int(step_count_np[env_i])
                         game_stats.record_completion(
                             step_limit=sc_i >= episode_timeout_step_count,
-                            ships_p0=float(s0_fin_np[local_i]),
-                            ships_p1=float(s1_fin_np[local_i]),
+                            ships_p0=float(s0_fin_np[env_i]),
+                            ships_p1=float(s1_fin_np[env_i]),
                             episode_turns=int(episode_turns[env_i]),
-                            reward0=float(rewards_np[local_i, 0]),
-                            reward1=float(rewards_np[local_i, 1]),
-                            reward_by_player=np.asarray(rewards_np[local_i, : int(cfg.num_agents)]),
+                            reward0=float(rewards_np[env_i, 0]),
+                            reward1=float(rewards_np[env_i, 1]),
+                            reward_by_player=np.asarray(rewards_np[env_i, : int(cfg.num_agents)]),
                             population_assignment=np.asarray(population_assignments[: int(cfg.num_agents), env_i]),
                             main_policy_win=main_policy_win,
                             env_mode=None if mode_arr is None else int(mode_arr[env_i]),
