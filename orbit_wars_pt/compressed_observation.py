@@ -13,12 +13,16 @@ import torch
 
 from orbit_wars_pt.constants import (
     BOARD_SIZE,
+    BLOCKED_FRAC_FEATURES,
     CENTER,
     FEATURE_DIM,
+    FEATURE_DIM_ABORT,
     FEATURE_DIM_MULTI,
+    FEATURE_DIM_MULTI_ABORT,
     INCOMING_SURVIVOR_FLAT,
     INCOMING_TA_BINS,
     MAX_PLANETS,
+    NUM_FRACTIONS,
     NUM_OWNER_SLOTS,
 )
 
@@ -42,6 +46,7 @@ class CompressedObservationBuffer(NamedTuple):
     turn_progress: torch.Tensor
     incoming_net: torch.Tensor
     incoming_survivor: torch.Tensor
+    origin_frac_blocked: torch.Tensor
 
 
 def _u16_to_i16(x: torch.Tensor) -> torch.Tensor:
@@ -81,6 +86,11 @@ def init_compressed_observation_buffer(
         incoming_survivor=torch.zeros(
             (H_buf, num_envs, MAX_PLANETS, INCOMING_TA_BINS),
             dtype=torch.int16,
+            device=device,
+        ),
+        origin_frac_blocked=torch.zeros(
+            (H_buf, num_envs, MAX_PLANETS, NUM_FRACTIONS),
+            dtype=torch.bool,
             device=device,
         ),
     )
@@ -124,6 +134,11 @@ def _obs_to_compressed_planes(obs: dict[str, torch.Tensor]) -> CompressedObserva
         turn_progress=turn_progress,
         incoming_net=incoming_net,
         incoming_survivor=incoming_survivor,
+        origin_frac_blocked=torch.zeros(
+            (obs["features"].shape[0], MAX_PLANETS, NUM_FRACTIONS),
+            dtype=torch.bool,
+            device=obs["features"].device,
+        ),
     )
 
 
@@ -141,8 +156,9 @@ def decode_observation(
     planet_mask = (token_meta & _META_PLANET_MASK) != 0
     owner_idx = comp.owner_idx.to(torch.long)
 
-    if feature_dim not in (FEATURE_DIM, FEATURE_DIM_MULTI):
-        raise ValueError(f"feature_dim must be {FEATURE_DIM} or {FEATURE_DIM_MULTI}, got {feature_dim}")
+    valid_dims = (FEATURE_DIM, FEATURE_DIM_ABORT, FEATURE_DIM_MULTI, FEATURE_DIM_MULTI_ABORT)
+    if feature_dim not in valid_dims:
+        raise ValueError(f"feature_dim must be one of {valid_dims}, got {feature_dim}")
     prefix_shape = comp.token_meta.shape[:-1]
     device = comp.token_meta.device
     features = torch.zeros((*prefix_shape, SEQ_LEN, feature_dim), dtype=torch.float32, device=device)
@@ -157,13 +173,16 @@ def decode_observation(
     planet_f[..., 4] = entity_mask[..., 1 : 1 + MAX_PLANETS].to(torch.float32)
     planet_f[..., 5] = (1.0 + torch.log(prod_for_radius)) / 10.0
     planet_f[..., 8 : 8 + INCOMING_TA_BINS] = comp.incoming_net.to(torch.float32) / 1000.0
-    if feature_dim == FEATURE_DIM_MULTI:
+    is_multi = feature_dim in (FEATURE_DIM_MULTI, FEATURE_DIM_MULTI_ABORT)
+    if is_multi:
         idx = comp.incoming_survivor.to(torch.long).clamp(0, NUM_OWNER_SLOTS - 1)
         oh = torch.nn.functional.one_hot(idx, NUM_OWNER_SLOTS).to(dtype=torch.float32, device=device)
         planet_f[
             ...,
             8 + INCOMING_TA_BINS : 8 + INCOMING_TA_BINS + INCOMING_SURVIVOR_FLAT,
         ] = oh.reshape(*prefix_shape, MAX_PLANETS, INCOMING_SURVIVOR_FLAT)
+    if feature_dim in (FEATURE_DIM_ABORT, FEATURE_DIM_MULTI_ABORT):
+        planet_f[..., -BLOCKED_FRAC_FEATURES:] = comp.origin_frac_blocked.to(torch.float32)
     features[..., 0, 6] = comp.turn_progress.to(torch.float32)
 
     rope_pos[..., 0, 0] = CENTER / BOARD_SIZE
@@ -199,6 +218,7 @@ def store_compressed_observation_rows(
     dst.turn_progress[r, e] = comp.turn_progress.to(dst.turn_progress.device)
     dst.incoming_net[r, e, :, :] = comp.incoming_net.to(dst.incoming_net.device)
     dst.incoming_survivor[r, e, :, :] = comp.incoming_survivor.to(dst.incoming_survivor.device)
+    dst.origin_frac_blocked[r, e, :, :] = comp.origin_frac_blocked.to(dst.origin_frac_blocked.device)
     return dst
 
 
@@ -220,6 +240,7 @@ def store_precompressed_observation_rows(
     dst.turn_progress[r, e] = comp.turn_progress.to(dst.turn_progress.device)
     dst.incoming_net[r, e, :, :] = comp.incoming_net.to(dst.incoming_net.device)
     dst.incoming_survivor[r, e, :, :] = comp.incoming_survivor.to(dst.incoming_survivor.device)
+    dst.origin_frac_blocked[r, e, :, :] = comp.origin_frac_blocked.to(dst.origin_frac_blocked.device)
     return dst
 
 
@@ -238,6 +259,7 @@ def index_compressed_observation_rows(
         turn_progress=comp.turn_progress.index_select(0, ii),
         incoming_net=comp.incoming_net.index_select(0, ii),
         incoming_survivor=comp.incoming_survivor.index_select(0, ii),
+        origin_frac_blocked=comp.origin_frac_blocked.index_select(0, ii),
     )
 
 
@@ -260,6 +282,7 @@ def select_compressed_observation(
         turn_progress=src.turn_progress[tt, nn].to(device),
         incoming_net=src.incoming_net[tt, nn].to(device),
         incoming_survivor=src.incoming_survivor[tt, nn].to(device),
+        origin_frac_blocked=src.origin_frac_blocked[tt, nn].to(device),
     )
 
 

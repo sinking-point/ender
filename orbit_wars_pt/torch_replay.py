@@ -155,6 +155,9 @@ def _select_multi_compressed_observation(
     incoming_survivor = torch.zeros(
         (bsz,) + first.incoming_survivor.shape[2:], device=device, dtype=first.incoming_survivor.dtype
     )
+    origin_frac_blocked = torch.zeros(
+        (bsz,) + first.origin_frac_blocked.shape[2:], device=device, dtype=first.origin_frac_blocked.dtype
+    )
 
     for p, obs in enumerate(obs_bufs):
         m = player == p
@@ -170,6 +173,7 @@ def _select_multi_compressed_observation(
         turn_progress[m] = obs.turn_progress[tp, np_].to(device)
         incoming_net[m] = obs.incoming_net[tp, np_].to(device)
         incoming_survivor[m] = obs.incoming_survivor[tp, np_].to(device)
+        origin_frac_blocked[m] = obs.origin_frac_blocked[tp, np_].to(device)
 
     return CompressedObservationBuffer(
         token_meta=token_meta,
@@ -181,6 +185,7 @@ def _select_multi_compressed_observation(
         turn_progress=turn_progress,
         incoming_net=incoming_net,
         incoming_survivor=incoming_survivor,
+        origin_frac_blocked=origin_frac_blocked,
     )
 
 
@@ -205,6 +210,7 @@ def _gather_transition_fields_for_players(
     pair_flat_acc = torch.zeros((bsz, bufs[0].pair_flat.shape[-1]), device=storage_device, dtype=torch.int32)
     frac_acc = torch.zeros((bsz, bufs[0].frac_idx.shape[-1]), device=storage_device, dtype=torch.int32)
     halt_action = torch.zeros((bsz,), device=storage_device, dtype=torch.long)
+    target_abort = torch.zeros((bsz,), device=storage_device, dtype=torch.bool)
     no_valid_pairs = torch.zeros((bsz,), device=storage_device, dtype=torch.bool)
     no_valid_fracs = torch.zeros((bsz,), device=storage_device, dtype=torch.bool)
     must_halt_no_ships = torch.zeros((bsz,), device=storage_device, dtype=torch.bool)
@@ -222,6 +228,7 @@ def _gather_transition_fields_for_players(
         pair_flat_acc[m] = buf.pair_flat[tp, np_, :]
         frac_acc[m] = buf.frac_idx[tp, np_, :]
         halt_action[m] = buf.halt_action[tp, np_].to(torch.long)
+        target_abort[m] = buf.target_abort[tp, np_]
         no_valid_pairs[m] = buf.no_valid_pairs[tp, np_]
         no_valid_fracs[m] = buf.no_valid_fracs[tp, np_]
         must_halt_no_ships[m] = buf.must_halt_no_ships[tp, np_]
@@ -232,6 +239,7 @@ def _gather_transition_fields_for_players(
 
     actions = {
         "halt_action": halt_action.to(out_device, dtype=torch.long),
+        "target_abort": target_abort.to(out_device, dtype=torch.bool),
         "pair_flat": pair_flat_acc[row, phase.to(storage_device)].to(out_device, dtype=torch.long),
         "frac_idx": frac_acc[row, phase.to(storage_device)].to(out_device, dtype=torch.long),
         "no_valid_pairs": no_valid_pairs.to(out_device, dtype=torch.bool),
@@ -276,6 +284,7 @@ def select_stored_observation_minibatch_torch(
         device=out_device,
     )
     obs = decode_observation(comp, feature_dim=obs_feature_dim)
+    obs["origin_frac_blocked"] = comp.origin_frac_blocked.to(out_device)
 
     actions = _gather_transition_fields_for_players(
         bufs,

@@ -28,13 +28,16 @@ import jax_orbit_wars as jow
 from jax_orbit_wars import OrbitWarsState
 
 from orbit_wars_pt.constants import (
+    BLOCKED_FRAC_FEATURES,
     BOARD_SIZE,
     CENTER,
     ENTITY_CLS,
     ENTITY_COMET,
     ENTITY_PLANET,
     FEATURE_DIM,
+    FEATURE_DIM_ABORT,
     FEATURE_DIM_MULTI,
+    FEATURE_DIM_MULTI_ABORT,
     INCOMING_SURVIVOR_FLAT,
     INCOMING_TA_BINS,
     MAX_PLANETS,
@@ -288,7 +291,7 @@ def _build_observation_one_env(
     vel_xy = _rotate_vec_jax(jnp.stack([vx, vy], axis=-1), obs_qturns)
     rope_xy = _rotate_xy_about_center_jax(planet_xy, obs_qturns)
 
-    assert obs_feature_dim in (FEATURE_DIM, FEATURE_DIM_MULTI)
+    assert obs_feature_dim in (FEATURE_DIM, FEATURE_DIM_ABORT, FEATURE_DIM_MULTI, FEATURE_DIM_MULTI_ABORT)
     planet_features = jnp.zeros((MAX_PLANETS, obs_feature_dim), dtype=jnp.float32)
     planet_features = planet_features.at[:, 0].set(jnp.log1p(jnp.maximum(planet_prod, 0.0)))
     planet_features = planet_features.at[:, 1].set(planet_ships / 1000.0)
@@ -298,13 +301,17 @@ def _build_observation_one_env(
     planet_features = planet_features.at[:, 5].set(planet_r / 10.0)
     planet_features = planet_features.at[:, 8 : 8 + INCOMING_TA_BINS].set(incoming_net)
     na_i = jnp.asarray(state.num_agents, dtype=jnp.int32)
-    if obs_feature_dim == FEATURE_DIM_MULTI:
+    if obs_feature_dim in (FEATURE_DIM_MULTI, FEATURE_DIM_MULTI_ABORT):
         oh = jax.nn.one_hot(survivor_slot, NUM_OWNER_SLOTS, axis=-1)
         oh_flat = oh.reshape(MAX_PLANETS, INCOMING_SURVIVOR_FLAT).astype(jnp.float32)
         surv_write = jnp.where(na_i > 2, oh_flat, jnp.zeros_like(oh_flat))
         planet_features = planet_features.at[
             :, 8 + INCOMING_TA_BINS : 8 + INCOMING_TA_BINS + INCOMING_SURVIVOR_FLAT
         ].set(surv_write)
+    if obs_feature_dim in (FEATURE_DIM_ABORT, FEATURE_DIM_MULTI_ABORT):
+        planet_features = planet_features.at[:, -BLOCKED_FRAC_FEATURES:].set(
+            state.origin_frac_blocked.astype(jnp.float32)
+        )
 
     planet_xy_for_rope = jnp.where(planet_active[:, None], rope_xy, 0.0)
     planet_rope = jnp.zeros((MAX_PLANETS, 3), dtype=jnp.float32)
@@ -414,7 +421,11 @@ def _build_compressed_observation_one_env(
     incoming_net = jnp.clip(jnp.round(incoming_net_f * 1000.0), -32768, 32767).astype(jnp.int16)
     na_i = jnp.asarray(state.num_agents, dtype=jnp.int32)
     survivor_store = jnp.where(
-        (na_i > 2) & (jnp.asarray(obs_feature_dim, dtype=jnp.int32) == FEATURE_DIM_MULTI),
+        (na_i > 2)
+        & (
+            (jnp.asarray(obs_feature_dim, dtype=jnp.int32) == FEATURE_DIM_MULTI)
+            | (jnp.asarray(obs_feature_dim, dtype=jnp.int32) == FEATURE_DIM_MULTI_ABORT)
+        ),
         survivor_slot,
         jnp.zeros_like(survivor_slot),
     ).astype(jnp.int16)
@@ -429,6 +440,7 @@ def _build_compressed_observation_one_env(
         "turn_progress": _turn_fraction_jax(state.step_count).astype(jnp.float16),
         "incoming_net": incoming_net,
         "incoming_survivor": survivor_store,
+        "origin_frac_blocked": state.origin_frac_blocked.astype(jnp.bool_),
     }
 
 

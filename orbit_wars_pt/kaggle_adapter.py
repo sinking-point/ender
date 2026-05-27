@@ -22,11 +22,13 @@ import torch
 
 from orbit_wars_pt.constants import (
     BOARD_SIZE,
+    BLOCKED_FRAC_FEATURES,
     CENTER,
     ENTITY_CLS,
     ENTITY_COMET,
     ENTITY_PLANET,
     FEATURE_DIM_MULTI,
+    FEATURE_DIM_MULTI_ABORT,
     FRACTIONS,
     INCOMING_SURVIVOR_FLAT,
     INCOMING_TA_BINS,
@@ -857,6 +859,7 @@ class OrbitWarsState(NamedTuple):
     planet_active: np.ndarray
     initial_planets: np.ndarray
     initial_active: np.ndarray
+    origin_frac_blocked: np.ndarray
     fleets: np.ndarray
     fleet_active: np.ndarray
     incoming_fleets: np.ndarray
@@ -907,7 +910,10 @@ def _check_4p_adapter_sanity(
         return
 
     policy_fd = _policy_feature_dim(policy)
-    expected_fd = obs_feature_dim_for_num_agents(policy_player_count)
+    expected_fd = obs_feature_dim_for_num_agents(
+        policy_player_count,
+        target_abort_enabled=bool(getattr(policy, "target_abort_enabled", False)),
+    )
     if policy_fd != expected_fd:
         _adapter_warn_once(
             seen,
@@ -2617,6 +2623,7 @@ def _obs_tensors_for_state(
     device: torch.device,
     *,
     policy_player_count: Optional[int] = None,
+    target_abort_enabled: bool = False,
     normalize_obs_to_p0: bool = False,
 ) -> dict[str, torch.Tensor]:
     planets = np.asarray(state.planets)
@@ -2624,6 +2631,9 @@ def _obs_tensors_for_state(
     initial_planets = np.asarray(state.initial_planets)
     initial_active = np.asarray(state.initial_active)
     incoming_fleets = np.asarray(state.incoming_fleets)
+    origin_frac_blocked = np.asarray(
+        getattr(state, "origin_frac_blocked", np.zeros((MAX_PLANETS, BLOCKED_FRAC_FEATURES), dtype=np.bool_))
+    )
     angular_velocity = float(np.asarray(state.angular_velocity))
     step_count = int(np.asarray(state.step_count))
     num_agents = int(np.asarray(state.num_agents))
@@ -2634,7 +2644,7 @@ def _obs_tensors_for_state(
 
     entity_type = np.zeros((1 + MAX_PLANETS,), dtype=np.int64)
     owner_idx = np.zeros((1 + MAX_PLANETS,), dtype=np.int64)
-    fdim = obs_feature_dim_for_num_agents(player_count)
+    fdim = obs_feature_dim_for_num_agents(player_count, target_abort_enabled=target_abort_enabled)
     features = np.zeros((1 + MAX_PLANETS, fdim), dtype=np.float32)
     rope_pos = np.zeros((1 + MAX_PLANETS, 3), dtype=np.float32)
     entity_mask = np.zeros((1 + MAX_PLANETS,), dtype=np.bool_)
@@ -2689,11 +2699,13 @@ def _obs_tensors_for_state(
         features[j, 4] = float(active)
         features[j, 5] = float(planets[i, 4]) / 10.0
         features[j, 8 : 8 + INCOMING_TA_BINS] = incoming_net[i].astype(np.float32)
-        if fdim == FEATURE_DIM_MULTI and player_count > 2:
+        if fdim in (FEATURE_DIM_MULTI, FEATURE_DIM_MULTI_ABORT) and player_count > 2:
             oh = np.eye(NUM_OWNER_SLOTS, dtype=np.float32)[survivor_slot[i]]
             features[
                 j, 8 + INCOMING_TA_BINS : 8 + INCOMING_TA_BINS + INCOMING_SURVIVOR_FLAT
             ] = oh.reshape(INCOMING_SURVIVOR_FLAT)
+        if bool(target_abort_enabled):
+            features[j, -BLOCKED_FRAC_FEATURES:] = origin_frac_blocked[i].astype(np.float32)
         if active:
             px, py = _rotate_xy_about_center_np(float(planets[i, 2]), float(planets[i, 3]), obs_qturns)
             rope_pos[j, 0] = px / BOARD_SIZE
@@ -2738,156 +2750,189 @@ def _build_turn_actions_torch_only(
 ) -> list[list[float]]:
     planets = np.array(np.asarray(state.planets), copy=True)
     incoming_fleets = np.array(np.asarray(state.incoming_fleets), copy=True)
+    origin_frac_blocked = np.array(
+        np.asarray(getattr(state, "origin_frac_blocked", np.zeros((MAX_PLANETS, len(FRACTIONS)), dtype=np.bool_))),
+        copy=True,
+    )
     planet_active = np.asarray(state.planet_active).astype(bool)
     actions: list[list[float]] = []
     planned_launches: list[PlannedLaunchAction] = []
     micro_idx = 0
 
-    for _ in range(max_micro_steps):
-        if timing is not None:
-            timing.micro_iters += 1
+    with torch.inference_mode():
+        for _ in range(max_micro_steps):
+            if timing is not None:
+                timing.micro_iters += 1
 
-        t0 = perf_counter()
-        virt = state._replace(planets=planets, incoming_fleets=incoming_fleets)
-        batch = _obs_tensors_for_state(
-            virt,
-            ego_player,
-            device,
-            policy_player_count=policy_player_count,
-            normalize_obs_to_p0=normalize_obs_to_p0,
-        )
-        if timing is not None:
-            timing.micro_obs_tensors_s += perf_counter() - t0
+            t0 = perf_counter()
+            virt = state._replace(
+                planets=planets,
+                incoming_fleets=incoming_fleets,
+                origin_frac_blocked=origin_frac_blocked,
+            )
+            batch = _obs_tensors_for_state(
+                virt,
+                ego_player,
+                device,
+                policy_player_count=policy_player_count,
+                target_abort_enabled=bool(getattr(policy, "target_abort_enabled", False)),
+                normalize_obs_to_p0=normalize_obs_to_p0,
+            )
+            if timing is not None:
+                timing.micro_obs_tensors_s += perf_counter() - t0
 
-        t0 = perf_counter()
-        population_idx = None
-        if population_member is not None:
-            population_idx = torch.tensor([int(population_member)], device=device, dtype=torch.long)
-        out = policy(**batch, population_idx=population_idx)
-        if timing is not None:
-            timing.micro_policy_forward_s += perf_counter() - t0
+            t0 = perf_counter()
+            population_idx = None
+            if population_member is not None:
+                population_idx = torch.tensor([int(population_member)], device=device, dtype=torch.long)
+            out = policy(**batch, population_idx=population_idx)
+            if timing is not None:
+                timing.micro_policy_forward_s += perf_counter() - t0
 
-        t0 = perf_counter()
-        halt_logits = out["halt_logits"][0]
-        if greedy:
-            halt_action = int(torch.argmax(halt_logits, dim=-1).item())
-        else:
-            halt_probs = torch.softmax(halt_logits, dim=-1)
-            halt_action = int(torch.multinomial(halt_probs, 1, generator=rng).item())
-        if halt_action == 1:
+            t0 = perf_counter()
+            halt_logits = out["halt_logits"][0]
+            if greedy:
+                halt_action = int(torch.argmax(halt_logits, dim=-1).item())
+            else:
+                halt_probs = torch.softmax(halt_logits, dim=-1)
+                halt_action = int(torch.multinomial(halt_probs, 1, generator=rng).item())
+            if halt_action == 1:
+                if timing is not None:
+                    timing.micro_post_forward_s += perf_counter() - t0
+                break
+
+            flat_mask = out["origin_frac_mask"].flatten(start_dim=1)[0]
+            if not bool(flat_mask.any().item()):
+                if timing is not None:
+                    timing.micro_post_forward_s += perf_counter() - t0
+                break
+            flat_logits = out["origin_frac_logits"].flatten(start_dim=1)[0]
+            masked_origin_frac = flat_logits.masked_fill(~flat_mask, -1e4)
+            if greedy:
+                origin_frac_flat = int(torch.argmax(masked_origin_frac).item())
+            else:
+                origin_frac_probs = torch.softmax(masked_origin_frac, dim=-1)
+                origin_frac_flat = int(torch.multinomial(origin_frac_probs, 1, generator=rng).item())
+            o_idx = origin_frac_flat // len(FRACTIONS)
+            frac_idx = origin_frac_flat % len(FRACTIONS)
             if timing is not None:
                 timing.micro_post_forward_s += perf_counter() - t0
-            break
 
-        flat_mask = out["origin_frac_mask"].flatten(start_dim=1)[0]
-        if not bool(flat_mask.any().item()):
+            t0 = perf_counter()
+            target_timing = timing.micro_target if timing is not None else None
+            ray_angle, ray_valid, ray_hit_tick, true_planet, true_hit_tick, refine_jobs = _first_hit_targets_np(
+                virt,
+                int(o_idx),
+                int(frac_idx),
+                ship_speed=ship_speed,
+                horizon=INCOMING_TA_BINS,
+                n_rays=n_rays,
+                samples_per_span=samples_per_span,
+                target_method=target_method,
+                target_timing=target_timing,
+                game_step=int(game_step),
+                micro_idx=int(micro_idx),
+                ego_player=int(ego_player),
+                launch_geometry=launch_geometry,
+                refine_boundaries=False,
+                phase="microstep",
+                return_jobs=True,
+            )
             if timing is not None:
-                timing.micro_post_forward_s += perf_counter() - t0
-            break
-        flat_logits = out["origin_frac_logits"].flatten(start_dim=1)[0]
-        masked_origin_frac = flat_logits.masked_fill(~flat_mask, -1e4)
-        if greedy:
-            origin_frac_flat = int(torch.argmax(masked_origin_frac).item())
-        else:
-            origin_frac_probs = torch.softmax(masked_origin_frac, dim=-1)
-            origin_frac_flat = int(torch.multinomial(origin_frac_probs, 1, generator=rng).item())
-        o_idx = origin_frac_flat // len(FRACTIONS)
-        frac_idx = origin_frac_flat % len(FRACTIONS)
-        if timing is not None:
-            timing.micro_post_forward_s += perf_counter() - t0
+                timing.micro_raycast_s += perf_counter() - t0
 
-        t0 = perf_counter()
-        target_timing = timing.micro_target if timing is not None else None
-        ray_angle, ray_valid, ray_hit_tick, true_planet, true_hit_tick, refine_jobs = _first_hit_targets_np(
-            virt,
-            int(o_idx),
-            int(frac_idx),
-            ship_speed=ship_speed,
-            horizon=INCOMING_TA_BINS,
-            n_rays=n_rays,
-            samples_per_span=samples_per_span,
-            target_method=target_method,
-            target_timing=target_timing,
-            game_step=int(game_step),
-            micro_idx=int(micro_idx),
-            ego_player=int(ego_player),
-            launch_geometry=launch_geometry,
-            refine_boundaries=False,
-            phase="microstep",
-            return_jobs=True,
-        )
-        if timing is not None:
-            timing.micro_raycast_s += perf_counter() - t0
-
-        t0 = perf_counter()
-        target_logits = policy.target_logits_for_origin_fraction(
-            out["planet_hidden"],
-            torch.tensor([o_idx], device=device, dtype=torch.long),
-            torch.tensor([frac_idx], device=device, dtype=torch.long),
-            fleet_size=torch.tensor(
-                [float(_planned_send(float(planets[o_idx, 5]), int(frac_idx)))],
-                device=device,
-                dtype=torch.float32,
-            ),
-            target_eta=torch.from_numpy(ray_hit_tick[None, :]).to(device=device, dtype=torch.float32),
-            target_ships=torch.from_numpy(planets[None, :, 5]).to(device=device, dtype=torch.float32),
-            population_idx=population_idx,
-        )[0]
-        target_mask = out["pair_mask"][0, o_idx].clone()
-        ray_valid_t = torch.from_numpy(ray_valid).to(device=device, dtype=torch.bool)
-        target_mask &= ray_valid_t
-        if not bool(target_mask.any().item()):
+            t0 = perf_counter()
+            target_logits = policy.target_logits_for_origin_fraction(
+                out["planet_hidden"],
+                torch.tensor([o_idx], device=device, dtype=torch.long),
+                torch.tensor([frac_idx], device=device, dtype=torch.long),
+                fleet_size=torch.tensor(
+                    [float(_planned_send(float(planets[o_idx, 5]), int(frac_idx)))],
+                    device=device,
+                    dtype=torch.float32,
+                ),
+                target_eta=torch.from_numpy(ray_hit_tick[None, :]).to(device=device, dtype=torch.float32),
+                target_ships=torch.from_numpy(planets[None, :, 5]).to(device=device, dtype=torch.float32),
+                population_idx=population_idx,
+            )[0]
+            abort_logits_all = out.get("abort_logits")
+            abort_logit = None
+            if abort_logits_all is not None:
+                abort_logit = abort_logits_all[
+                    0,
+                    int(o_idx),
+                    int(frac_idx),
+                ].reshape(1)
+            target_mask = out["pair_mask"][0, o_idx].clone()
+            ray_valid_t = torch.from_numpy(ray_valid).to(device=device, dtype=torch.bool)
+            target_mask &= ray_valid_t
+            if abort_logit is not None:
+                combined_target = torch.cat([target_logits.masked_fill(~target_mask, -1e4), abort_logit.reshape(1)], dim=0)
+                if greedy:
+                    target_choice = int(torch.argmax(combined_target).item())
+                else:
+                    target_probs = torch.softmax(combined_target, dim=-1)
+                    target_choice = int(torch.multinomial(target_probs, 1, generator=rng).item())
+                if target_choice == MAX_PLANETS:
+                    origin_frac_blocked[int(o_idx), int(frac_idx)] = True
+                    micro_idx += 1
+                    if timing is not None:
+                        timing.micro_target_s += perf_counter() - t0
+                    continue
+                d_idx = int(target_choice)
+            else:
+                if not bool(target_mask.any().item()):
+                    if timing is not None:
+                        timing.micro_target_s += perf_counter() - t0
+                    break
+                masked_target = target_logits.masked_fill(~target_mask, -1e4)
+                if greedy:
+                    d_idx = int(torch.argmax(masked_target).item())
+                else:
+                    target_probs = torch.softmax(masked_target, dim=-1)
+                    d_idx = int(torch.multinomial(target_probs, 1, generator=rng).item())
             if timing is not None:
                 timing.micro_target_s += perf_counter() - t0
-            break
-        masked_target = target_logits.masked_fill(~target_mask, -1e4)
-        if greedy:
-            d_idx = int(torch.argmax(masked_target).item())
-        else:
-            target_probs = torch.softmax(masked_target, dim=-1)
-            d_idx = int(torch.multinomial(target_probs, 1, generator=rng).item())
-        if timing is not None:
-            timing.micro_target_s += perf_counter() - t0
 
-        t0 = perf_counter()
-        ships_avail = float(planets[o_idx, 5])
-        send = _planned_send(ships_avail, int(frac_idx))
-        if send <= 0:
-            if timing is not None:
-                timing.micro_book_s += perf_counter() - t0
-            break
-        angle = float(ray_angle[d_idx])
-        actions.append([float(planets[o_idx, 0]), float(angle), int(send)])
-        planned_launches.append(
-            PlannedLaunchAction(
-                action_index=len(actions) - 1,
-                micro_idx=int(micro_idx),
-                origin_slot=int(o_idx),
-                frac_idx=int(frac_idx),
-                target_slot=int(d_idx),
-                planned_send=int(send),
-                policy_hit_tick=float(ray_hit_tick[d_idx]),
-                coarse_angle=float(angle),
-                planets_snapshot=np.array(planets, copy=True),
-                refine_job=refine_jobs[d_idx],
+            t0 = perf_counter()
+            ships_avail = float(planets[o_idx, 5])
+            send = _planned_send(ships_avail, int(frac_idx))
+            if send <= 0:
+                if timing is not None:
+                    timing.micro_book_s += perf_counter() - t0
+                break
+            angle = float(ray_angle[d_idx])
+            actions.append([float(planets[o_idx, 0]), float(angle), int(send)])
+            planned_launches.append(
+                PlannedLaunchAction(
+                    action_index=len(actions) - 1,
+                    micro_idx=int(micro_idx),
+                    origin_slot=int(o_idx),
+                    frac_idx=int(frac_idx),
+                    target_slot=int(d_idx),
+                    planned_send=int(send),
+                    policy_hit_tick=float(ray_hit_tick[d_idx]),
+                    coarse_angle=float(angle),
+                    planets_snapshot=np.array(planets, copy=True),
+                    refine_job=refine_jobs[d_idx],
+                )
             )
-        )
-        micro_idx += 1
-        apply_micro_launch_in_place(
-            planets,
-            incoming_fleets,
-            ego_player=int(ego_player),
-            origin_slot=int(o_idx),
-            send=int(send),
-            true_target_slot=int(true_planet[d_idx]),
-            true_hit_tick=float(true_hit_tick[d_idx]),
-        )
-        if not planet_active[o_idx] or planets[o_idx, 5] < 1.0:
+            micro_idx += 1
+            apply_micro_launch_in_place(
+                planets,
+                incoming_fleets,
+                ego_player=int(ego_player),
+                origin_slot=int(o_idx),
+                send=int(send),
+                true_target_slot=int(true_planet[d_idx]),
+                true_hit_tick=float(true_hit_tick[d_idx]),
+            )
+            if not planet_active[o_idx] or planets[o_idx, 5] < 1.0:
+                if timing is not None:
+                    timing.micro_book_s += perf_counter() - t0
+                continue
             if timing is not None:
                 timing.micro_book_s += perf_counter() - t0
-            continue
-        if timing is not None:
-            timing.micro_book_s += perf_counter() - t0
 
     if target_method == "interval" and planned_launches:
         _refine_interval_launches_in_place(
@@ -3111,6 +3156,7 @@ def observation_to_state(
         planet_active=planet_active,
         initial_planets=initial_planets,
         initial_active=initial_active,
+        origin_frac_blocked=np.zeros((MAX_PLANETS, len(FRACTIONS)), dtype=np.bool_),
         fleets=fleets,
         fleet_active=fleet_active,
         incoming_fleets=incoming_fleets,
@@ -3143,6 +3189,7 @@ def _infer_policy_kwargs(payload: Any) -> dict[str, Any]:
         "population_size": int(training_args.get("population_size", 1)),
         "rope_dims": int(training_args.get("rope_dims", 3)),
         "value_head_count": int(training_args.get("value_head_count", 1)),
+        "target_abort_enabled": bool(training_args.get("target_abort_enabled", False)),
     }
     if isinstance(policy_state, Mapping):
         w = policy_state.get("feat_proj.weight")
@@ -3154,6 +3201,8 @@ def _infer_policy_kwargs(payload: Any) -> dict[str, Any]:
         shared_layer_ids = []
         pop_ids = []
         for key in policy_state:
+            if "abort_head." in str(key):
+                kwargs["target_abort_enabled"] = True
             if key.startswith("blocks."):
                 try:
                     layer_ids.append(int(key.split(".")[1]))

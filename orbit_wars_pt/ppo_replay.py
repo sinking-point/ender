@@ -43,10 +43,12 @@ def _compute_logp_value_entropy_torch(
     rope_pos: torch.Tensor,
     entity_mask: torch.Tensor,
     planet_mask: torch.Tensor,
+    origin_frac_blocked: Optional[torch.Tensor],
     target_valid: torch.Tensor,
     target_overflow: torch.Tensor,
     target_hit_tick: torch.Tensor,
     halt_action: torch.Tensor,
+    target_abort: torch.Tensor,
     pair_flat: torch.Tensor,
     frac_idx: torch.Tensor,
     no_valid_pairs: torch.Tensor,
@@ -98,6 +100,7 @@ def _compute_logp_value_entropy_torch(
             rope_pos=rope_pos,
             entity_mask=entity_mask,
             planet_mask=planet_mask,
+            origin_frac_blocked=origin_frac_blocked,
             population_idx=population_idx,
             origin_idx=o_idx,
             frac_idx=frac_idx,
@@ -114,6 +117,7 @@ def _compute_logp_value_entropy_torch(
             rope_pos=rope_pos,
             entity_mask=entity_mask,
             planet_mask=planet_mask,
+            origin_frac_blocked=origin_frac_blocked,
             population_idx=population_idx,
             value_head_idx=value_head_idx,
         )
@@ -143,18 +147,26 @@ def _compute_logp_value_entropy_torch(
 
     if "target_logits" in out:
         target_logits = out["target_logits"]
-    target_mask = (
-        out["pair_mask"][n_idx, o_idx, :]
-        & target_valid
-        & ~target_overflow[:, None].to(dtype=torch.bool)
-    )
-    masked_target = target_logits.masked_fill(~target_mask, -1e4)
-    target_lp = torch.log_softmax(masked_target, dim=-1)
-    new_target_logp = target_lp.gather(1, d_idx[:, None]).squeeze(-1)
-    new_target_entropy = -(target_lp.exp() * target_lp).sum(dim=-1)
+    target_mask = out["pair_mask"][n_idx, o_idx, :] & target_valid & ~target_overflow[:, None].to(dtype=torch.bool)
+    if policy.target_abort_enabled:
+        abort_logits = out["abort_logits"][n_idx, o_idx, frac_idx]
+        combined_target_logits = torch.cat([target_logits.masked_fill(~target_mask, -1e4), abort_logits[:, None]], dim=-1)
+        target_lp = torch.log_softmax(combined_target_logits, dim=-1)
+        target_choice = torch.where(
+            target_abort.to(device=halt_action.device, dtype=torch.bool),
+            torch.full_like(d_idx, MAX_PLANETS),
+            d_idx,
+        )
+        new_target_logp = target_lp.gather(1, target_choice[:, None]).squeeze(-1)
+        new_target_entropy = -(target_lp.exp() * target_lp).sum(dim=-1)
+    else:
+        masked_target = target_logits.masked_fill(~target_mask, -1e4)
+        target_lp = torch.log_softmax(masked_target, dim=-1)
+        new_target_logp = target_lp.gather(1, d_idx[:, None]).squeeze(-1)
+        new_target_entropy = -(target_lp.exp() * target_lp).sum(dim=-1)
 
     origin_frac_used = (halt_action == 0) & ~no_valid_fracs
-    target_used = origin_frac_used & ~no_valid_pairs
+    target_used = origin_frac_used if policy.target_abort_enabled else (origin_frac_used & ~no_valid_pairs)
 
     new_logp = (
         new_halt_logp
@@ -190,10 +202,12 @@ def compute_ppo_loss_torch(
     rope_pos: torch.Tensor,
     entity_mask: torch.Tensor,
     planet_mask: torch.Tensor,
+    origin_frac_blocked: Optional[torch.Tensor],
     target_valid: torch.Tensor,
     target_overflow: torch.Tensor,
     target_hit_tick: torch.Tensor,
     halt_action: torch.Tensor,
+    target_abort: torch.Tensor,
     pair_flat: torch.Tensor,
     frac_idx: torch.Tensor,
     no_valid_pairs: torch.Tensor,
@@ -267,10 +281,12 @@ def compute_ppo_loss_torch(
         rope_pos,
         entity_mask,
         planet_mask,
+        origin_frac_blocked,
         target_valid,
         target_overflow,
         target_hit_tick,
         halt_action,
+        target_abort,
         pair_flat,
         frac_idx,
         no_valid_pairs,
@@ -410,11 +426,13 @@ def compute_ppo_loss_compressed_torch(
     turn_progress: torch.Tensor,
     incoming_net: torch.Tensor,
     incoming_survivor: torch.Tensor,
+    origin_frac_blocked: torch.Tensor,
     feature_dim: int,
     target_valid: torch.Tensor,
     target_overflow: torch.Tensor,
     target_hit_tick: torch.Tensor,
     halt_action: torch.Tensor,
+    target_abort: torch.Tensor,
     pair_flat: torch.Tensor,
     frac_idx: torch.Tensor,
     no_valid_pairs: torch.Tensor,
@@ -441,6 +459,7 @@ def compute_ppo_loss_compressed_torch(
         turn_progress=turn_progress,
         incoming_net=incoming_net,
         incoming_survivor=incoming_survivor,
+        origin_frac_blocked=origin_frac_blocked.to(device=token_meta.device, dtype=torch.bool),
     )
     obs = decode_observation(comp, feature_dim=int(feature_dim))
     return compute_ppo_loss_torch(
@@ -451,10 +470,12 @@ def compute_ppo_loss_compressed_torch(
         obs["rope_pos"],
         obs["entity_mask"],
         obs["planet_mask"],
+        comp.origin_frac_blocked,
         target_valid,
         target_overflow,
         target_hit_tick,
         halt_action,
+        target_abort,
         pair_flat,
         frac_idx,
         no_valid_pairs,
@@ -617,10 +638,12 @@ def replay_logprob_value_entropy_jax(
         obs_torch["rope_pos"],
         obs_torch["entity_mask"],
         obs_torch["planet_mask"],
+        None,
         target_valid_t,
         target_overflow_t,
         target_hit_tick_t,
         halt_action_t,
+        torch.zeros_like(halt_action_t, dtype=torch.bool),
         pair_flat_t,
         frac_idx_t,
         no_valid_pairs_t,
@@ -720,10 +743,12 @@ def replay_ppo_loss(
             obs_torch["rope_pos"],
             obs_torch["entity_mask"],
             obs_torch["planet_mask"],
+            None,
             target_valid_t,
             target_overflow_t,
             target_hit_tick_t,
             halt_action_t,
+            torch.zeros_like(halt_action_t, dtype=torch.bool),
             pair_flat_t,
             frac_idx_t,
             no_valid_pairs_t,

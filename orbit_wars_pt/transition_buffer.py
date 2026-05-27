@@ -40,6 +40,7 @@ class TransitionBuffer(NamedTuple):
     fleet_eta: jnp.ndarray
     slot: jnp.ndarray
     halt_action: jnp.ndarray
+    target_abort: jnp.ndarray
     pair_flat: jnp.ndarray
     frac_idx: jnp.ndarray
     no_valid_pairs: jnp.ndarray
@@ -66,6 +67,7 @@ class TorchTransitionBuffer(NamedTuple):
     fleet_eta: torch.Tensor
     slot: torch.Tensor
     halt_action: torch.Tensor
+    target_abort: torch.Tensor
     pair_flat: torch.Tensor
     frac_idx: torch.Tensor
     no_valid_pairs: torch.Tensor
@@ -90,6 +92,7 @@ def init_transition_buffer(num_envs: int, H_buf: int, max_micro_steps: int) -> T
         fleet_eta=jnp.zeros((H_buf, num_envs, m), dtype=jnp.float32),
         slot=jnp.full((H_buf, num_envs, m), -1, dtype=jnp.int32),
         halt_action=jnp.zeros((H_buf, num_envs), dtype=jnp.int32),
+        target_abort=jnp.zeros((H_buf, num_envs), dtype=jnp.bool_),
         pair_flat=jnp.zeros((H_buf, num_envs, m), dtype=jnp.int32),
         frac_idx=jnp.zeros((H_buf, num_envs, m), dtype=jnp.int32),
         no_valid_pairs=jnp.zeros((H_buf, num_envs), dtype=jnp.bool_),
@@ -120,6 +123,7 @@ def init_torch_transition_buffer(
         fleet_eta=torch.zeros((H_buf, num_envs, m), dtype=torch.float32, device=device),
         slot=torch.full((H_buf, num_envs, m), -1, dtype=torch.int32, device=device),
         halt_action=torch.zeros((H_buf, num_envs), dtype=torch.int32, device=device),
+        target_abort=torch.zeros((H_buf, num_envs), dtype=torch.bool, device=device),
         pair_flat=torch.zeros((H_buf, num_envs, m), dtype=torch.int32, device=device),
         frac_idx=torch.zeros((H_buf, num_envs, m), dtype=torch.int32, device=device),
         no_valid_pairs=torch.zeros((H_buf, num_envs), dtype=torch.bool, device=device),
@@ -142,6 +146,7 @@ def append_to_torch_buffer(
     fleet_eta_now: torch.Tensor,
     slot_now: torch.Tensor,
     halt_action: torch.Tensor,
+    target_abort: torch.Tensor,
     pair_flat: torch.Tensor,
     frac_idx: torch.Tensor,
     no_valid_pairs: torch.Tensor,
@@ -209,6 +214,7 @@ def append_to_torch_buffer(
     buf.pair_flat[row, env, :] = new_pf[active_b]
     buf.frac_idx[row, env, :] = new_fi[active_b]
     buf.halt_action[row, env] = halt_action.to(device=device, dtype=torch.int32)[active_b]
+    buf.target_abort[row, env] = target_abort.to(device=device, dtype=torch.bool)[active_b]
     buf.no_valid_pairs[row, env] = no_valid_pairs.to(device=device, dtype=torch.bool)[active_b]
     buf.no_valid_fracs[row, env] = no_valid_fracs.to(device=device, dtype=torch.bool)[active_b]
     buf.must_halt_no_ships[row, env] = must_halt_no_ships.to(device=device, dtype=torch.bool)[active_b]
@@ -230,6 +236,7 @@ def append_active_to_torch_buffer(
     fleet_eta_now: torch.Tensor,
     slot_now: torch.Tensor,
     halt_action: torch.Tensor,
+    target_abort: torch.Tensor,
     pair_flat: torch.Tensor,
     frac_idx: torch.Tensor,
     no_valid_pairs: torch.Tensor,
@@ -292,6 +299,7 @@ def append_active_to_torch_buffer(
     buf.pair_flat[row, env, :] = new_pf
     buf.frac_idx[row, env, :] = new_fi
     buf.halt_action[row, env] = halt_action.to(device=device, dtype=torch.int32)
+    buf.target_abort[row, env] = target_abort.to(device=device, dtype=torch.bool)
     buf.no_valid_pairs[row, env] = no_valid_pairs.to(device=device, dtype=torch.bool)
     buf.no_valid_fracs[row, env] = no_valid_fracs.to(device=device, dtype=torch.bool)
     buf.must_halt_no_ships[row, env] = must_halt_no_ships.to(device=device, dtype=torch.bool)
@@ -323,6 +331,7 @@ def append_to_buffer(
     fleet_eta_now,
     slot_now,
     halt_action,
+    target_abort,
     pair_flat,
     frac_idx,
     no_valid_pairs,
@@ -371,6 +380,7 @@ def append_to_buffer(
     out_fi = _scatter_rows(buf.frac_idx, new_fi)
 
     out_ha = buf.halt_action.at[write_row, n_idx].set(halt_action.astype(jnp.int32))
+    out_ta = buf.target_abort.at[write_row, n_idx].set(target_abort.astype(jnp.bool_))
     out_nvp = buf.no_valid_pairs.at[write_row, n_idx].set(no_valid_pairs.astype(jnp.bool_))
     out_nvf = buf.no_valid_fracs.at[write_row, n_idx].set(no_valid_fracs.astype(jnp.bool_))
     out_mh = buf.must_halt_no_ships.at[write_row, n_idx].set(must_halt_no_ships.astype(jnp.bool_))
@@ -398,6 +408,7 @@ def append_to_buffer(
         fleet_eta=out_fleet_eta,
         slot=out_slot,
         halt_action=out_ha,
+        target_abort=out_ta,
         pair_flat=out_pf,
         frac_idx=out_fi,
         no_valid_pairs=out_nvp,

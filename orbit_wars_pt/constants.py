@@ -38,6 +38,9 @@ NUM_ENTITY_TYPES = 4
 # Five dispatch fractions: 20% .. 100%
 FRACTIONS = (0.2, 0.4, 0.6, 0.8, 1.0)
 NUM_FRACTIONS = len(FRACTIONS)
+BLOCKED_FRAC_FEATURES = NUM_FRACTIONS
+FEATURE_DIM_ABORT = FEATURE_DIM + BLOCKED_FRAC_FEATURES
+FEATURE_DIM_MULTI_ABORT = FEATURE_DIM_MULTI + BLOCKED_FRAC_FEATURES
 
 # Owner ids after ego-remap (semantic aliases; indices must match ``NUM_OWNER_SLOTS``).
 OWNER_NEUTRAL = 0
@@ -47,7 +50,9 @@ OWNER_ENEMY_2 = 3
 OWNER_ENEMY_3 = 4
 
 
-def obs_feature_dim_for_num_agents(num_agents: int) -> int:
+def obs_feature_dim_for_num_agents(num_agents: int, target_abort_enabled: bool = False) -> int:
     """Policy/observation feature width: 2p keeps the original 32-dim layout."""
 
-    return FEATURE_DIM_MULTI if int(num_agents) > 2 else FEATURE_DIM
+    if int(num_agents) > 2:
+        return FEATURE_DIM_MULTI_ABORT if bool(target_abort_enabled) else FEATURE_DIM_MULTI
+    return FEATURE_DIM_ABORT if bool(target_abort_enabled) else FEATURE_DIM

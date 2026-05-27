@@ -131,6 +131,7 @@ def build_constructed_state(*, step_count: int) -> jow.OrbitWarsState:
         planet_active=jnp.asarray(active),
         initial_planets=jnp.asarray(planets),
         initial_active=jnp.asarray(active),
+        origin_frac_blocked=jnp.zeros((jow.MAX_PLANETS, 5), dtype=jnp.bool_),
         fleets=jnp.zeros((jow.DEFAULT_MAX_FLEETS, jow.FLEET_ROW_WIDTH), dtype=jnp.float32),
         fleet_active=jnp.zeros((jow.DEFAULT_MAX_FLEETS,), dtype=bool),
         incoming_fleets=jnp.zeros((2, jow.MAX_PLANETS, INCOMING_TA_BINS), dtype=jnp.uint16),

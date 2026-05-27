@@ -583,6 +583,19 @@ class RolloutTiming:
     micro_apply_buf_append_s: float = 0.0
     micro_apply_obs_store_s: float = 0.0
     micro_apply_numpy_s: float = 0.0
+    micro_prep_non_grouped_s: float = 0.0
+    micro_prep_grouped_s: float = 0.0
+    micro_post_apply_extract_s: float = 0.0
+    micro_post_apply_host_bookkeeping_s: float = 0.0
+    micro_post_apply_row_stats_s: float = 0.0
+    micro_post_apply_pending_actions_s: float = 0.0
+    micro_post_apply_halt_block_indices_s: float = 0.0
+    micro_post_apply_device_index_s: float = 0.0
+    bootstrap_obs_build_s: float = 0.0
+    bootstrap_policy_batch_s: float = 0.0
+    bootstrap_policy_forward_s: float = 0.0
+    loop_control_s: float = 0.0
+    loop_post_micro_s: float = 0.0
     state_unstack_s: float = 0.0
     loop_s: float = 0.0
     wall_s: float = 0.0
@@ -596,6 +609,13 @@ class RolloutTiming:
             + self.policy_batch_s
             + self.policy_forward_s
             + self.micro_apply_s
+            + self.micro_prep_non_grouped_s
+            + self.micro_prep_grouped_s
+            + self.micro_post_apply_extract_s
+            + self.micro_post_apply_host_bookkeeping_s
+            + self.micro_post_apply_device_index_s
+            + self.loop_control_s
+            + self.loop_post_micro_s
             + self.state_unstack_s
         )
 
@@ -702,17 +722,26 @@ def _sync_rollout_policy_timing(device: torch.device, *jax_values: Any) -> None:
 def _compressed_obs_jax_to_torch(obs_jax: dict[str, jnp.ndarray]) -> CompressedObservationBuffer:
     """Zero-copy JAX -> Torch handoff for compressed observation planes."""
 
-    jax.block_until_ready(obs_jax)
+    production = torch.from_dlpack(obs_jax["production"])
     return CompressedObservationBuffer(
         token_meta=torch.from_dlpack(obs_jax["token_meta"]),
         owner_idx=torch.from_dlpack(obs_jax["owner_idx"]),
-        production=torch.from_dlpack(obs_jax["production"]),
+        production=production,
         ships=torch.from_dlpack(obs_jax["ships"]),
         velocity=torch.from_dlpack(obs_jax["velocity"]),
         xy=torch.from_dlpack(obs_jax["xy"]),
         turn_progress=torch.from_dlpack(obs_jax["turn_progress"]),
         incoming_net=torch.from_dlpack(obs_jax["incoming_net"]),
         incoming_survivor=torch.from_dlpack(obs_jax["incoming_survivor"]),
+        origin_frac_blocked=(
+            torch.from_dlpack(obs_jax["origin_frac_blocked"])
+            if "origin_frac_blocked" in obs_jax
+            else torch.zeros(
+                obs_jax["production"].shape[:-1] + (MAX_PLANETS, len(FRACTIONS)),
+                dtype=torch.bool,
+                device=production.device,
+            )
+        ),
     )
 
 
@@ -727,6 +756,7 @@ def _compressed_obs_to_device(comp: CompressedObservationBuffer, device: torch.d
         turn_progress=comp.turn_progress.to(device),
         incoming_net=comp.incoming_net.to(device),
         incoming_survivor=comp.incoming_survivor.to(device),
+        origin_frac_blocked=comp.origin_frac_blocked.to(device),
     )
 
 
@@ -937,6 +967,7 @@ def _append_synthetic_terminal_rows(
             zero_f32,
             minus_one_i32,
             true_bool.to(torch.int32),
+            false_bool,
             zero_i32,
             zero_i32,
             true_bool,
@@ -1210,6 +1241,7 @@ def _run_async_micro_step_multi(
 ) -> tuple[OrbitWarsState, List[TorchTransitionBuffer], List[CompressedObservationBuffer]]:
     """Run one micro decision for every pending egocentric row in a ``n_ego * num_envs`` JAX batch."""
 
+    t_prep0 = perf_counter()
     players_active = [np.flatnonzero(pending[p]).astype(np.int32) for p in range(n_ego)]
     n_list = [int(x.size) for x in players_active]
     offsets: list[int] = []
@@ -1247,6 +1279,7 @@ def _run_async_micro_step_multi(
     active_population_idx_t = torch.as_tensor(active_population_idx, device=device, dtype=torch.long)
     active_controller_idx_t = torch.as_tensor(active_controller_idx, device=device, dtype=torch.long)
     active_value_head_idx_t = torch.as_tensor(active_value_head_idx, device=device, dtype=torch.long)
+    timing.micro_prep_non_grouped_s += perf_counter() - t_prep0
 
     ego_rows = [jnp.full((num_envs,), p, dtype=jnp.int32) for p in range(n_ego)]
     ego_b_j = jnp.concatenate(ego_rows, axis=0)
@@ -1391,25 +1424,43 @@ def _run_async_micro_step_multi(
         active_population_idx_t=active_population_idx_t,
         active_controller_idx_t=active_controller_idx_t,
     )
+    abort_logits_all = out.get("abort_logits")
+    abort_logits = None
+    if abort_logits_all is not None:
+        abort_logits = abort_logits_all[n_a_idx, o_idx, frac_idx]
     target_mask = out["pair_mask"][n_a_idx, o_idx, :] & target_valid_t & ~target_overflow_t[:, None]
     any_valid_target = target_mask.any(dim=-1)
-    masked_target = target_logits.masked_fill(~target_mask, -1e4)
-    target_lp = torch.log_softmax(masked_target, dim=-1)
-    safe_target = torch.where(any_valid_target[:, None], masked_target, torch.zeros_like(masked_target))
-    if greedy:
-        d_idx = safe_target.argmax(dim=-1)
+    target_abort = torch.zeros((n_active,), dtype=torch.bool, device=device)
+    if abort_logits is not None:
+        combined_target = torch.cat([target_logits.masked_fill(~target_mask, -1e4), abort_logits[:, None]], dim=-1)
+        target_lp = torch.log_softmax(combined_target, dim=-1)
+        if greedy:
+            target_choice = combined_target.argmax(dim=-1)
+        else:
+            target_choice = torch.multinomial(torch.softmax(combined_target, dim=-1), 1, generator=rng).squeeze(-1)
+        target_abort = target_choice == MAX_PLANETS
+        d_idx = target_choice.clamp_max(MAX_PLANETS - 1)
+        target_logp = target_lp.gather(1, target_choice[:, None]).squeeze(-1)
     else:
-        d_idx = torch.multinomial(torch.softmax(safe_target, dim=-1), 1, generator=rng).squeeze(-1)
-    target_logp = target_lp.gather(1, d_idx[:, None]).squeeze(-1)
+        masked_target = target_logits.masked_fill(~target_mask, -1e4)
+        target_lp = torch.log_softmax(masked_target, dim=-1)
+        safe_target = torch.where(any_valid_target[:, None], masked_target, torch.zeros_like(masked_target))
+        if greedy:
+            d_idx = safe_target.argmax(dim=-1)
+        else:
+            d_idx = torch.multinomial(torch.softmax(safe_target, dim=-1), 1, generator=rng).squeeze(-1)
+        target_logp = target_lp.gather(1, d_idx[:, None]).squeeze(-1)
     pair_flat = o_idx * P + d_idx
     policy_fleet_eta = target_hit_tick_t[n_a_idx, d_idx]
     true_d_idx = target_true_planet_t[n_a_idx, d_idx].to(torch.long).clamp(0, P - 1)
     true_fleet_eta = target_true_hit_tick_t[n_a_idx, d_idx]
 
-    dispatch_used = origin_frac_used & any_valid_target
-    total_logp = halt_logp + origin_frac_used.float() * origin_frac_logp + dispatch_used.float() * target_logp
+    dispatch_used = origin_frac_used & (~target_abort) & any_valid_target
+    target_decision_used = origin_frac_used if abort_logits is not None else dispatch_used
+    total_logp = halt_logp + origin_frac_used.float() * origin_frac_logp + target_decision_used.float() * target_logp
     values_active = out["value"].float()
-    halt_now = ~dispatch_used
+    apply_halt_now = ~dispatch_used
+    stop_now = (halt_action == 1) | ((halt_action == 0) & ~any_valid_origin_frac)
     if sync_policy_timing:
         _sync_rollout_policy_timing(device)
     t_target = perf_counter()
@@ -1422,11 +1473,13 @@ def _run_async_micro_step_multi(
     pair_flat_all = torch.zeros(total_env_rows, dtype=torch.int32, device=device)
     frac_idx_all = torch.zeros(total_env_rows, dtype=torch.int32, device=device)
     fleet_eta_all = torch.zeros(total_env_rows, dtype=torch.float32, device=device)
+    target_abort_all = torch.zeros(total_env_rows, dtype=torch.bool, device=device)
 
-    halt_now_all.index_copy_(0, active_idx_t, halt_now)
+    halt_now_all.index_copy_(0, active_idx_t, apply_halt_now)
     pair_flat_all.index_copy_(0, active_idx_t, pair_flat.to(torch.int32))
     frac_idx_all.index_copy_(0, active_idx_t, frac_idx.to(torch.int32))
     fleet_eta_all.index_copy_(0, active_idx_t, policy_fleet_eta.to(torch.float32))
+    target_abort_all.index_copy_(0, active_idx_t, target_abort)
     if sync_policy_timing:
         _sync_rollout_policy_timing(device)
     t_scatter = perf_counter()
@@ -1438,10 +1491,11 @@ def _run_async_micro_step_multi(
     pair_flat_j = jax.dlpack.from_dlpack(pair_flat_all.contiguous().detach())
     frac_idx_j = jax.dlpack.from_dlpack(frac_idx_all.contiguous().detach())
     fleet_eta_j = jax.dlpack.from_dlpack(fleet_eta_all.contiguous().detach())
+    target_abort_j = jax.dlpack.from_dlpack(target_abort_all.contiguous().detach())
     t1 = perf_counter()
 
     virt_b, oid_j, send_j, dispatched_j, slot_j = apply_micro_step_batched_per_ego(
-        virt_b, ego_b_j, halt_now_j, pair_flat_j, frac_idx_j, fleet_eta_j
+        virt_b, ego_b_j, halt_now_j, pair_flat_j, frac_idx_j, fleet_eta_j, target_abort_j
     )
     t2 = perf_counter()
 
@@ -1477,11 +1531,12 @@ def _run_async_micro_step_multi(
         bufs[p] = append_active_to_torch_buffer(
             bufs[p],
             active_p_idx_t,
-            halt_now.index_select(0, pos_p_t),
+            apply_halt_now.index_select(0, pos_p_t),
             send_t.index_select(0, active_p_rows_t),
             policy_fleet_eta.index_select(0, pos_p_t),
             slot_t.index_select(0, active_p_rows_t),
             halt_action.index_select(0, pos_p_t).to(torch.int32),
+            target_abort.index_select(0, pos_p_t),
             pair_flat.index_select(0, pos_p_t).to(torch.int32),
             frac_idx.index_select(0, pos_p_t).to(torch.int32),
             (origin_frac_used & ~any_valid_target).index_select(0, pos_p_t),
@@ -1513,14 +1568,17 @@ def _run_async_micro_step_multi(
     t7 = perf_counter()
     _accum_micro_apply_breakdown(timing, t0, t1, t2, t3, t3a, t3b, t4, t5, t6, t7)
 
+    t_post0 = perf_counter()
     total_logp_np = total_logp.detach().cpu().numpy()
     values_np = values_active.detach().cpu().numpy()
-    halt_now_np = halt_now.detach().cpu().numpy()
+    stop_now_np = stop_now.detach().cpu().numpy()
     d_idx_np = d_idx.detach().cpu().numpy()
     true_d_idx_np = true_d_idx.detach().cpu().numpy()
     true_fleet_eta_np = true_fleet_eta.detach().cpu().numpy()
     policy_fleet_eta_np = policy_fleet_eta.detach().cpu().numpy()
+    timing.micro_post_apply_extract_s += perf_counter() - t_post0
 
+    t_post1 = perf_counter()
     for p in range(n_ego):
         ap = players_active[p]
         n_p = n_list[p]
@@ -1535,7 +1593,10 @@ def _run_async_micro_step_multi(
             reward[p][rows_np, ap] -= float(micro_step_penalty) * dispatched_np[offset : offset + n_p].astype(
                 np.float32
             )
+    t_post2 = perf_counter()
+    timing.micro_post_apply_row_stats_s += t_post2 - t_post1
 
+    t_post3 = perf_counter()
     for p in range(n_ego):
         ap = players_active[p]
         n_p = n_list[p]
@@ -1545,7 +1606,6 @@ def _run_async_micro_step_multi(
         for local_j, env_i in enumerate(ap):
             j_arr = offset + local_j
             env_i = int(env_i)
-            reward_idx[p, env_i] = int(widx[env_i])
             if bool(dispatched_np[j_arr]):
                 ac = int(pending_action_count[p, env_i])
                 if ac < pending_actions.shape[2]:
@@ -1556,13 +1616,29 @@ def _run_async_micro_step_multi(
                     pending_actions[env_i, p, ac, 4] = float(d_idx_np[j_arr])
                     pending_actions[env_i, p, ac, 5] = float(policy_fleet_eta_np[j_arr])
                 pending_action_count[p, env_i] = ac + 1
-            if bool(halt_now_np[j_arr]):
-                halted[p, env_i] = True
-            widx[env_i] += 1
-            micro_arr[env_i] += 1
-            if micro_arr[env_i] >= max_micro_steps:
-                halted[p, env_i] = True
+    t_post4 = perf_counter()
+    timing.micro_post_apply_pending_actions_s += t_post4 - t_post3
 
+    t_post5 = perf_counter()
+    for p in range(n_ego):
+        ap = players_active[p]
+        n_p = n_list[p]
+        offset = offsets[p]
+        widx = write_idx[p]
+        micro_arr = micro_k[p]
+        if n_p == 0:
+            continue
+        stop_mask = stop_now_np[offset : offset + n_p].astype(np.bool_, copy=False)
+        reward_idx[p, ap] = widx[ap]
+        halted[p, ap] |= stop_mask
+        widx[ap] += 1
+        micro_arr[ap] += 1
+        halted[p, ap] |= micro_arr[ap] >= max_micro_steps
+    t_post6 = perf_counter()
+    timing.micro_post_apply_halt_block_indices_s += t_post6 - t_post5
+    timing.micro_post_apply_host_bookkeeping_s += t_post6 - t_post1
+
+    t_post7 = perf_counter()
     for p in range(n_ego):
         ap = players_active[p]
         n_p = n_list[p]
@@ -1571,6 +1647,7 @@ def _run_async_micro_step_multi(
         active_p_idx_t = torch.as_tensor(ap, device=device, dtype=torch.long)
         micro_k_dev[p, active_p_idx_t] = micro_k_dev[p, active_p_idx_t] + 1
         write_idx_dev[p][active_p_idx_t] = write_idx_dev[p][active_p_idx_t] + 1
+    timing.micro_post_apply_device_index_s += perf_counter() - t_post7
 
     return virt_b, bufs, obs_bufs
 
@@ -1598,7 +1675,7 @@ def _run_async_micro_step_multi_grouped_population(
     pending_action_count: np.ndarray,
     reward_idx: np.ndarray,
     halted: np.ndarray,
-    policy: OrbitWarsPolicy,
+    policies: list[OrbitWarsPolicy],
     device: torch.device,
     rng: Optional[torch.Generator],
     greedy: bool,
@@ -1615,6 +1692,9 @@ def _run_async_micro_step_multi_grouped_population(
     sync_policy_timing: bool = False,
 ) -> tuple[OrbitWarsState, List[TorchTransitionBuffer], List[CompressedObservationBuffer]]:
     """Run one fixed-shape grouped-population microstep over all policy rows."""
+
+    t_prep0 = perf_counter()
+    policy = policies[0]
 
     total_rows = int(virt_b.planets.shape[0])
     if total_rows == 0:
@@ -1633,6 +1713,7 @@ def _run_async_micro_step_multi_grouped_population(
     row_ego_j = jnp.asarray(row_ego_np, dtype=jnp.int32)
     pending_t = torch.as_tensor(pending_rows, device=device, dtype=torch.bool)
     population_idx_t = torch.div(row_idx_t, int(rows_per_member), rounding_mode="floor").to(torch.int32)
+    timing.micro_prep_grouped_s += perf_counter() - t_prep0
 
     t0 = perf_counter()
     obs_comp_jax = build_compressed_observation_batched_jax_per_ego(
@@ -1759,30 +1840,53 @@ def _run_async_micro_step_multi_grouped_population(
         target_eta=target_hit_tick_t,
         target_ships=planet_ships,
     )
+    abort_logits_all = out.get("abort_logits")
+    abort_logits = None
+    if abort_logits_all is not None:
+        abort_logits = abort_logits_all[n_idx, o_idx, frac_idx]
     target_mask = out["pair_mask"][n_idx, o_idx, :] & target_valid_t & ~target_overflow_t[:, None]
     any_valid_target = target_mask.any(dim=-1)
-    masked_target = target_logits.masked_fill(~target_mask, -1e4)
-    target_lp = torch.log_softmax(masked_target, dim=-1)
-    safe_target = torch.where(any_valid_target[:, None], masked_target, torch.zeros_like(masked_target))
-    if greedy:
-        d_idx = safe_target.argmax(dim=-1)
+    target_abort = torch.zeros((total_rows,), dtype=torch.bool, device=device)
+    if abort_logits is not None:
+        combined_target = torch.cat([target_logits.masked_fill(~target_mask, -1e4), abort_logits[:, None]], dim=-1)
+        target_lp = torch.log_softmax(combined_target, dim=-1)
+        if greedy:
+            target_choice = combined_target.argmax(dim=-1)
+        else:
+            target_choice = torch.multinomial(torch.softmax(combined_target, dim=-1), 1, generator=rng).squeeze(-1)
+        target_abort = target_choice == MAX_PLANETS
+        d_idx = target_choice.clamp_max(MAX_PLANETS - 1)
+        target_logp = target_lp.gather(1, target_choice[:, None]).squeeze(-1)
     else:
-        d_idx = torch.multinomial(torch.softmax(safe_target, dim=-1), 1, generator=rng).squeeze(-1)
-    target_logp = target_lp.gather(1, d_idx[:, None]).squeeze(-1)
+        masked_target = target_logits.masked_fill(~target_mask, -1e4)
+        target_lp = torch.log_softmax(masked_target, dim=-1)
+        safe_target = torch.where(any_valid_target[:, None], masked_target, torch.zeros_like(masked_target))
+        if greedy:
+            d_idx = safe_target.argmax(dim=-1)
+        else:
+            d_idx = torch.multinomial(torch.softmax(safe_target, dim=-1), 1, generator=rng).squeeze(-1)
+        target_logp = target_lp.gather(1, d_idx[:, None]).squeeze(-1)
     pair_flat = o_idx * MAX_PLANETS + d_idx
     policy_fleet_eta = target_hit_tick_t[n_idx, d_idx]
     true_d_idx = target_true_planet_t[n_idx, d_idx].to(torch.long).clamp(0, MAX_PLANETS - 1)
     true_fleet_eta = target_true_hit_tick_t[n_idx, d_idx]
 
-    dispatch_used = origin_frac_used & any_valid_target
+    dispatch_used = origin_frac_used & (~target_abort) & any_valid_target
     total_logp = torch.where(
         pending_t,
-        halt_logp + origin_frac_used.float() * origin_frac_logp + dispatch_used.float() * target_logp,
+        halt_logp
+        + origin_frac_used.float() * origin_frac_logp
+        + (origin_frac_used if abort_logits is not None else dispatch_used).float() * target_logp,
         torch.zeros_like(halt_logp),
     )
     values_all = out["value"].float()
-    halt_now = ~dispatch_used
-    halt_now = torch.where(pending_t, halt_now, torch.ones_like(halt_now))
+    apply_halt_now = ~dispatch_used
+    apply_halt_now = torch.where(pending_t, apply_halt_now, torch.ones_like(apply_halt_now))
+    stop_now = torch.where(
+        pending_t,
+        (halt_action == 1) | ((halt_action == 0) & ~any_valid_origin_frac),
+        torch.ones_like(halt_action, dtype=torch.bool),
+    )
     if sync_policy_timing:
         _sync_rollout_policy_timing(device)
     t_target = perf_counter()
@@ -1798,14 +1902,15 @@ def _run_async_micro_step_multi_grouped_population(
     timing.policy_forward_s += t_scatter - t0
 
     t0 = perf_counter()
-    halt_now_j = jax.dlpack.from_dlpack(halt_now.to(torch.bool).contiguous().detach())
+    halt_now_j = jax.dlpack.from_dlpack(apply_halt_now.to(torch.bool).contiguous().detach())
     pair_flat_j = jax.dlpack.from_dlpack(pair_flat.to(torch.int32).contiguous().detach())
     frac_idx_j = jax.dlpack.from_dlpack(frac_idx.to(torch.int32).contiguous().detach())
     fleet_eta_j = jax.dlpack.from_dlpack(policy_fleet_eta.to(torch.float32).contiguous().detach())
+    target_abort_j = jax.dlpack.from_dlpack(target_abort.to(torch.bool).contiguous().detach())
     t1 = perf_counter()
 
     virt_b, oid_j, send_j, dispatched_j, slot_j = apply_micro_step_batched_per_ego(
-        virt_b, row_ego_j, halt_now_j, pair_flat_j, frac_idx_j, fleet_eta_j
+        virt_b, row_ego_j, halt_now_j, pair_flat_j, frac_idx_j, fleet_eta_j, target_abort_j
     )
     t2 = perf_counter()
 
@@ -1838,11 +1943,12 @@ def _run_async_micro_step_multi_grouped_population(
         bufs[p] = append_active_to_torch_buffer(
             bufs[p],
             env_sel_t,
-            halt_now.index_select(0, row_sel_t),
+            apply_halt_now.index_select(0, row_sel_t),
             send_t.index_select(0, row_sel_t),
             policy_fleet_eta.index_select(0, row_sel_t),
             slot_t.index_select(0, row_sel_t),
             halt_action.index_select(0, row_sel_t).to(torch.int32),
+            target_abort.index_select(0, row_sel_t),
             pair_flat.index_select(0, row_sel_t).to(torch.int32),
             frac_idx.index_select(0, row_sel_t).to(torch.int32),
             (origin_frac_used & ~any_valid_target).index_select(0, row_sel_t),
@@ -1871,14 +1977,17 @@ def _run_async_micro_step_multi_grouped_population(
     t7 = perf_counter()
     _accum_micro_apply_breakdown(timing, t0, t1, t2, t3, t3a, t3b, t4, t5, t6, t7)
 
+    t_post0 = perf_counter()
     total_logp_np = total_logp.detach().cpu().numpy()
     values_np = values_all.detach().cpu().numpy()
-    halt_now_np = halt_now.detach().cpu().numpy()
+    stop_now_np = stop_now.detach().cpu().numpy()
     d_idx_np = d_idx.detach().cpu().numpy()
     true_d_idx_np = true_d_idx.detach().cpu().numpy()
     true_fleet_eta_np = true_fleet_eta.detach().cpu().numpy()
     policy_fleet_eta_np = policy_fleet_eta.detach().cpu().numpy()
+    timing.micro_post_apply_extract_s += perf_counter() - t_post0
 
+    t_post1 = perf_counter()
     for p in range(n_ego):
         row_sel = np.flatnonzero(pending_rows & (row_ego_np == p)).astype(np.int32)
         if row_sel.size == 0:
@@ -1890,7 +1999,10 @@ def _run_async_micro_step_multi_grouped_population(
         old_value[p][rows_np, env_sel] = values_np[row_sel]
         if micro_step_penalty != 0.0:
             reward[p][rows_np, env_sel] -= float(micro_step_penalty) * dispatched_np[row_sel].astype(np.float32)
+    t_post2 = perf_counter()
+    timing.micro_post_apply_row_stats_s += t_post2 - t_post1
 
+    t_post3 = perf_counter()
     for p in range(n_ego):
         row_sel = np.flatnonzero(pending_rows & (row_ego_np == p)).astype(np.int32)
         if row_sel.size == 0:
@@ -1900,7 +2012,6 @@ def _run_async_micro_step_multi_grouped_population(
         micro_arr = micro_k[p]
         for row in row_sel:
             env_i = int(row_env_np[row])
-            reward_idx[p, env_i] = int(widx[env_i])
             if bool(dispatched_np[row]):
                 ac = int(pending_action_count[p, env_i])
                 if ac < pending_actions.shape[2]:
@@ -1911,16 +2022,37 @@ def _run_async_micro_step_multi_grouped_population(
                     pending_actions[env_i, p, ac, 4] = float(d_idx_np[row])
                     pending_actions[env_i, p, ac, 5] = float(policy_fleet_eta_np[row])
                 pending_action_count[p, env_i] = ac + 1
-            if bool(halt_now_np[row]):
-                halted[p, env_i] = True
-            widx[env_i] += 1
-            micro_arr[env_i] += 1
-            if micro_arr[env_i] >= max_micro_steps:
-                halted[p, env_i] = True
+    t_post4 = perf_counter()
+    timing.micro_post_apply_pending_actions_s += t_post4 - t_post3
 
+    t_post5 = perf_counter()
+    for p in range(n_ego):
+        row_sel = np.flatnonzero(pending_rows & (row_ego_np == p)).astype(np.int32)
+        if row_sel.size == 0:
+            continue
+        env_sel = row_env_np[row_sel]
+        widx = write_idx[p]
+        micro_arr = micro_k[p]
+        reward_idx[p, env_sel] = widx[env_sel]
+        halted[p, env_sel] |= stop_now_np[row_sel].astype(np.bool_, copy=False)
+        widx[env_sel] += 1
+        micro_arr[env_sel] += 1
+        halted[p, env_sel] |= micro_arr[env_sel] >= max_micro_steps
+
+    t_post6 = perf_counter()
+    timing.micro_post_apply_halt_block_indices_s += t_post6 - t_post5
+    timing.micro_post_apply_host_bookkeeping_s += t_post6 - t_post1
+
+    t_post7 = perf_counter()
+    for p in range(n_ego):
+        row_sel = np.flatnonzero(pending_rows & (row_ego_np == p)).astype(np.int32)
+        if row_sel.size == 0:
+            continue
+        env_sel = row_env_np[row_sel]
         env_sel_t = torch.as_tensor(env_sel, device=device, dtype=torch.long)
         micro_k_dev[p, env_sel_t] = micro_k_dev[p, env_sel_t] + 1
         write_idx_dev[p][env_sel_t] = write_idx_dev[p][env_sel_t] + 1
+    timing.micro_post_apply_device_index_s += perf_counter() - t_post7
 
     return virt_b, bufs, obs_bufs
 
@@ -2338,7 +2470,9 @@ def collect_parallel_micro_rollouts(
         while outer < max_outer_iters:
             outer += 1
 
+            t_ctrl0 = perf_counter()
             if horizon_fired and np.all(segment_done):
+                timing.loop_control_s += perf_counter() - t_ctrl0
                 break
 
             ready_mask = (~segment_done) & np.all(halted | player_done, axis=0)
@@ -2357,6 +2491,7 @@ def collect_parallel_micro_rollouts(
             # every remaining player is already halted.
             ready_step_threshold = max(2, num_envs // 4)
             should_step = ready_count >= ready_step_threshold or (ready_count > 0 and pending_total == 0)
+            timing.loop_control_s += perf_counter() - t_ctrl0
             if should_step:
                 t0 = perf_counter()
                 t_prep0 = perf_counter()
@@ -2737,8 +2872,11 @@ def collect_parallel_micro_rollouts(
                 timing.env_step_s += perf_counter() - t0
                 continue
 
+            t_ctrl1 = perf_counter()
             if pending_total == 0:
+                timing.loop_control_s += perf_counter() - t_ctrl1
                 break
+            timing.loop_control_s += perf_counter() - t_ctrl1
 
             if grouped_population_rollout:
                 assert row_env is not None and row_ego is not None and pending_rows is not None
@@ -2819,12 +2957,16 @@ def collect_parallel_micro_rollouts(
                     main_player_mask=main_player_mask,
                     population_assignments=population_assignments,
                 )
+            t_post0 = perf_counter()
             if profile_rollout and device.type == "cuda" and not logged_first_policy_fwd:
                 log_cuda_mem("rollout after first batched policy forward", device)
                 logged_first_policy_fwd = True
 
             if any(np.any(write_idx[p] >= rollout_micro_horizon) for p in range(n_ego)):
                 horizon_fired = True
+            if sync_policy_timing:
+                _sync_rollout_policy_timing(device)
+            timing.loop_post_micro_s += perf_counter() - t_post0
 
     timing.loop_s = perf_counter() - t_loop0
     timing.outer_iters = outer
@@ -2836,63 +2978,62 @@ def collect_parallel_micro_rollouts(
     bootstrap = [np.zeros((num_envs,), dtype=np.float32) for _ in range(n_ego)]
     bootstrap_valid = [np.zeros((num_envs,), dtype=np.bool_) for _ in range(n_ego)]
     if horizon_fired:
-        if grouped_population_rollout:
-            assert row_env is not None and row_ego is not None and row_env_j is not None
-            t0 = perf_counter()
-            policy_state_b = _gather_state_rows(state_b, row_env_j)
-            obs_comp_j = build_compressed_observation_batched_jax_per_ego(
-                policy_state_b,
-                jnp.asarray(row_ego, dtype=jnp.int32),
-                ship_speed,
-                obs_feature_dim,
-                normalize_to_p0=cfg.normalize_obs_to_p0,
-            )
-            timing.obs_build_s += perf_counter() - t0
-            tb0 = perf_counter()
-            obs_comp_t = _compressed_obs_jax_to_torch(obs_comp_j)
-            obs_t = decode_observation(obs_comp_t, feature_dim=obs_feature_dim)
-            with amp_ctx:
-                out_rows = policy.forward_dense_rollout_grouped_population(**{k: v.to(device) for k, v in obs_t.items()})
-            timing.policy_batch_s += perf_counter() - tb0
-            tf0 = perf_counter()
-            value_np_rows = out_rows["value"].float().detach().cpu().numpy()
-            timing.policy_forward_s += perf_counter() - tf0
-            for row in range(value_np_rows.shape[0]):
-                env_i = int(row_env[row])
-                ego = int(row_ego[row])
-                last_t = int(write_idx[ego][env_i]) - 1
-                if last_t >= 0 and not bool(done[ego][last_t, env_i]):
-                    bootstrap[ego][env_i] = float(value_np_rows[row])
-                    bootstrap_valid[ego][env_i] = True
-        else:
-            value_np_per_ego: list[np.ndarray] = []
-            for ego in range(n_ego):
+        with torch.inference_mode(), amp_ctx:
+            if grouped_population_rollout:
+                assert row_env is not None and row_ego is not None and row_env_j is not None
                 t0 = perf_counter()
-                obs_comp_j = build_compressed_observation_batched_jax(
-                    state_b,
-                    ego,
+                policy_state_b = _gather_state_rows(state_b, row_env_j)
+                obs_comp_j = build_compressed_observation_batched_jax_per_ego(
+                    policy_state_b,
+                    jnp.asarray(row_ego, dtype=jnp.int32),
                     ship_speed,
                     obs_feature_dim,
                     normalize_to_p0=cfg.normalize_obs_to_p0,
                 )
-                timing.obs_build_s += perf_counter() - t0
+                timing.bootstrap_obs_build_s += perf_counter() - t0
                 tb0 = perf_counter()
-                obs_t = decode_observation(_compressed_obs_jax_to_torch(obs_comp_j), feature_dim=obs_feature_dim)
-                pop_t = torch.as_tensor(population_assignments[ego], device=device, dtype=torch.long)
-                controller_t = torch.as_tensor(controller_assignments[ego], device=device, dtype=torch.long)
-                value_head_idx_t = torch.as_tensor(
-                    _relative_main_value_head_idx_for_rows(
-                        ego_idx=np.full((num_envs,), ego, dtype=np.int32),
-                        env_idx=np.arange(num_envs, dtype=np.int32),
-                        controller_assignments=controller_assignments,
-                        main_player_mask=main_player_mask,
-                        normalize_obs_to_p0=cfg.normalize_obs_to_p0,
-                    ),
-                    device=device,
-                    dtype=torch.long,
-                )
-                obs_t_dev = {k: v.to(device) for k, v in obs_t.items()}
-                with amp_ctx:
+                obs_comp_t = _compressed_obs_jax_to_torch(obs_comp_j)
+                obs_t = decode_observation(obs_comp_t, feature_dim=obs_feature_dim)
+                out_rows = policy.forward_dense_rollout_grouped_population(**{k: v.to(device) for k, v in obs_t.items()})
+                timing.bootstrap_policy_batch_s += perf_counter() - tb0
+                tf0 = perf_counter()
+                value_np_rows = out_rows["value"].float().detach().cpu().numpy()
+                timing.bootstrap_policy_forward_s += perf_counter() - tf0
+                for row in range(value_np_rows.shape[0]):
+                    env_i = int(row_env[row])
+                    ego = int(row_ego[row])
+                    last_t = int(write_idx[ego][env_i]) - 1
+                    if last_t >= 0 and not bool(done[ego][last_t, env_i]):
+                        bootstrap[ego][env_i] = float(value_np_rows[row])
+                        bootstrap_valid[ego][env_i] = True
+            else:
+                value_np_per_ego: list[np.ndarray] = []
+                for ego in range(n_ego):
+                    t0 = perf_counter()
+                    obs_comp_j = build_compressed_observation_batched_jax(
+                        state_b,
+                        ego,
+                        ship_speed,
+                        obs_feature_dim,
+                        normalize_to_p0=cfg.normalize_obs_to_p0,
+                    )
+                    timing.bootstrap_obs_build_s += perf_counter() - t0
+                    tb0 = perf_counter()
+                    obs_t = decode_observation(_compressed_obs_jax_to_torch(obs_comp_j), feature_dim=obs_feature_dim)
+                    pop_t = torch.as_tensor(population_assignments[ego], device=device, dtype=torch.long)
+                    controller_t = torch.as_tensor(controller_assignments[ego], device=device, dtype=torch.long)
+                    value_head_idx_t = torch.as_tensor(
+                        _relative_main_value_head_idx_for_rows(
+                            ego_idx=np.full((num_envs,), ego, dtype=np.int32),
+                            env_idx=np.arange(num_envs, dtype=np.int32),
+                            controller_assignments=controller_assignments,
+                            main_player_mask=main_player_mask,
+                            normalize_obs_to_p0=cfg.normalize_obs_to_p0,
+                        ),
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    obs_t_dev = {k: v.to(device) for k, v in obs_t.items()}
                     out_e = _forward_dense_rollout_by_controller(
                         policies=policies,
                         active_obs=obs_t_dev,
@@ -2900,17 +3041,17 @@ def collect_parallel_micro_rollouts(
                         active_controller_idx_t=controller_t,
                         active_value_head_idx_t=value_head_idx_t,
                     )
-                timing.policy_batch_s += perf_counter() - tb0
-                tf0 = perf_counter()
-                value_np_per_ego.append(out_e["value"].float().detach().cpu().numpy())
-                timing.policy_forward_s += perf_counter() - tf0
+                    timing.bootstrap_policy_batch_s += perf_counter() - tb0
+                    tf0 = perf_counter()
+                    value_np_per_ego.append(out_e["value"].float().detach().cpu().numpy())
+                    timing.bootstrap_policy_forward_s += perf_counter() - tf0
 
-            for i in range(num_envs):
-                for ego in range(n_ego):
-                    last_t = int(write_idx[ego][i]) - 1
-                    if last_t >= 0 and not bool(done[ego][last_t, i]):
-                        bootstrap[ego][i] = float(value_np_per_ego[ego][i])
-                        bootstrap_valid[ego][i] = True
+                for i in range(num_envs):
+                    for ego in range(n_ego):
+                        last_t = int(write_idx[ego][i]) - 1
+                        if last_t >= 0 and not bool(done[ego][last_t, i]):
+                            bootstrap[ego][i] = float(value_np_per_ego[ego][i])
+                            bootstrap_valid[ego][i] = True
 
     segment = RolloutSegment(
         bufs=bufs,

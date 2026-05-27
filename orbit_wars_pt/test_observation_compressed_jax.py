@@ -66,6 +66,7 @@ def _dispatch_real_fleet(
         pair_flat,
         frac,
         eta,
+        jnp.zeros_like(halt_now),
     )
     dispatched = bool(np.asarray(jax.device_get(dispatched_j))[0])
     send = float(np.asarray(jax.device_get(send_j))[0])

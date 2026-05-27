@@ -54,6 +54,7 @@ def kaggle_np_state_to_jax(np_state) -> jow.OrbitWarsState:
         planet_active=jnp.asarray(np_state.planet_active),
         initial_planets=jnp.asarray(np_state.initial_planets),
         initial_active=jnp.asarray(np_state.initial_active),
+        origin_frac_blocked=jnp.asarray(np_state.origin_frac_blocked),
         fleets=jnp.asarray(np_state.fleets),
         fleet_active=jnp.asarray(np_state.fleet_active),
         incoming_fleets=jnp.asarray(np_state.incoming_fleets),

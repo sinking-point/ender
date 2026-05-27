@@ -32,7 +32,7 @@ import jax.numpy as jnp
 
 from orbit_wars_pt.batched_env import heal_terminal_env_slices, reset_env_at_index
 from orbit_wars_pt.env_wrapper import OrbitWarsEnvConfig
-from orbit_wars_pt.constants import FEATURE_DIM, INCOMING_TA_BINS, MAX_PLANETS, obs_feature_dim_for_num_agents
+from orbit_wars_pt.constants import FEATURE_DIM, FRACTIONS, INCOMING_TA_BINS, MAX_PLANETS, obs_feature_dim_for_num_agents
 from orbit_wars_pt.exploiter_reset import (
     build_unified_exploiter_reset,
     unified_exploiter_active_seat_count,
@@ -591,6 +591,7 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "max_fleets",
         "num_agents",
         "population_size",
+        "target_abort_enabled",
         "exploiter_mode",
         "activation_checkpointing",
         "device",
@@ -1281,6 +1282,7 @@ def _build_host_member_replay_stores(
                 turn_progress=torch.zeros((0,), dtype=torch.float16),
                 incoming_net=torch.zeros((0, MAX_PLANETS, INCOMING_TA_BINS), dtype=torch.int16),
                 incoming_survivor=torch.zeros((0, MAX_PLANETS, INCOMING_TA_BINS), dtype=torch.int16),
+                origin_frac_blocked=torch.zeros((0, MAX_PLANETS, len(FRACTIONS)), dtype=torch.bool),
             )
             actions = {}
             adv = torch.zeros((0,), dtype=torch.float32)
@@ -1473,6 +1475,19 @@ def _combine_rollout_timing(items: list[RolloutTiming]) -> RolloutTiming:
         out.micro_apply_buf_append_s += rt.micro_apply_buf_append_s
         out.micro_apply_obs_store_s += rt.micro_apply_obs_store_s
         out.micro_apply_numpy_s += rt.micro_apply_numpy_s
+        out.micro_prep_non_grouped_s += rt.micro_prep_non_grouped_s
+        out.micro_prep_grouped_s += rt.micro_prep_grouped_s
+        out.micro_post_apply_extract_s += rt.micro_post_apply_extract_s
+        out.micro_post_apply_host_bookkeeping_s += rt.micro_post_apply_host_bookkeeping_s
+        out.micro_post_apply_row_stats_s += rt.micro_post_apply_row_stats_s
+        out.micro_post_apply_pending_actions_s += rt.micro_post_apply_pending_actions_s
+        out.micro_post_apply_halt_block_indices_s += rt.micro_post_apply_halt_block_indices_s
+        out.micro_post_apply_device_index_s += rt.micro_post_apply_device_index_s
+        out.bootstrap_obs_build_s += rt.bootstrap_obs_build_s
+        out.bootstrap_policy_batch_s += rt.bootstrap_policy_batch_s
+        out.bootstrap_policy_forward_s += rt.bootstrap_policy_forward_s
+        out.loop_control_s += rt.loop_control_s
+        out.loop_post_micro_s += rt.loop_post_micro_s
         out.state_unstack_s += rt.state_unstack_s
         out.loop_s += rt.loop_s
         out.wall_s += rt.wall_s
@@ -1539,7 +1554,7 @@ def _combine_segments_for_stats(segments: list[RolloutSegment]) -> RolloutSegmen
 
 
 def _rollout_timing_str(rt: RolloutTiming) -> str:
-    unacc_loop = max(0.0, rt.loop_s - rt.accounted_loop_s())
+    unacc_loop = rt.loop_s - rt.accounted_loop_s()
     env_accounted = (
         rt.env_prep_s
         + rt.env_state_gather_s
@@ -1573,10 +1588,17 @@ def _rollout_timing_str(rt: RolloutTiming) -> str:
         f"pt_batch {rt.policy_batch_s:.3f}s pt_fwd {rt.policy_forward_s:.3f}s "
         f"(model {rt.policy_model_s:.3f} org {rt.policy_sample_origin_s:.3f} rays {rt.policy_raycast_s:.3f} "
         f"target {rt.policy_target_s:.3f} scat {rt.policy_scatter_s:.3f}) "
+        f"prep_ng {rt.micro_prep_non_grouped_s:.3f}s prep_g {rt.micro_prep_grouped_s:.3f}s "
         f"micro_apply {rt.micro_apply_s:.3f}s "
         f"(dj {rt.micro_apply_dlpack_in_s:.3f} jax {rt.micro_apply_jax_s:.3f} jp {rt.micro_apply_dlpack_out_s:.3f} "
         f"prep {rt.micro_apply_torch_prep_s:.3f}(act {rt.micro_prep_active_s:.3f} wr {rt.micro_prep_wr_mk_s:.3f} val {rt.micro_prep_validate_s:.3f}) "
         f"app {rt.micro_apply_buf_append_s:.3f} obs_store {rt.micro_apply_obs_store_s:.3f} np {rt.micro_apply_numpy_s:.3f}) "
+        f"post_apply(ext {rt.micro_post_apply_extract_s:.3f} host {rt.micro_post_apply_host_bookkeeping_s:.3f}"
+        f"(stats {rt.micro_post_apply_row_stats_s:.3f} pend {rt.micro_post_apply_pending_actions_s:.3f} "
+        f"idx {rt.micro_post_apply_halt_block_indices_s:.3f}) dev {rt.micro_post_apply_device_index_s:.3f}) "
+        f"bootstrap(obs {rt.bootstrap_obs_build_s:.3f} batch {rt.bootstrap_policy_batch_s:.3f} "
+        f"fwd {rt.bootstrap_policy_forward_s:.3f}) "
+        f"ctrl {rt.loop_control_s:.3f}s post_micro {rt.loop_post_micro_s:.3f}s "
         f"unstack {rt.state_unstack_s:.3f}s init {rt.init_s:.3f}s unaccounted_loop {unacc_loop:.3f}s outer {rt.outer_iters}"
     )
 
@@ -1674,6 +1696,79 @@ def _segment_rollout_counts(segment: RolloutSegment) -> Tuple[int, int, int, flo
     return total_p0, total_micro, total_env_steps, mean_r0
 
 
+def _segment_abort_summary(segment: RolloutSegment) -> dict[str, float]:
+    total_rows = 0
+    launch_actions = 0
+    origin_frac_used = 0
+    target_abort = 0
+    no_valid_pairs = 0
+    no_valid_fracs = 0
+    must_halt_no_ships = 0
+    dispatches = 0
+
+    num_players = len(segment.bufs)
+    num_envs = int(segment.valid[0].shape[1]) if segment.valid else 0
+    for player in range(num_players):
+        buf = segment.bufs[player]
+        halt_np = np.asarray(buf.halt_action.detach().cpu(), dtype=np.int32)
+        abort_np = np.asarray(buf.target_abort.detach().cpu(), dtype=np.bool_)
+        no_pairs_np = np.asarray(buf.no_valid_pairs.detach().cpu(), dtype=np.bool_)
+        no_fracs_np = np.asarray(buf.no_valid_fracs.detach().cpu(), dtype=np.bool_)
+        must_halt_np = np.asarray(buf.must_halt_no_ships.detach().cpu(), dtype=np.bool_)
+        write_idx = segment.write_idx[player]
+        for env_i in range(num_envs):
+            T = int(write_idx[env_i])
+            if T <= 0:
+                continue
+            rows = slice(0, T)
+            total_rows += T
+            halt_rows = halt_np[rows, env_i]
+            abort_rows = abort_np[rows, env_i]
+            no_pairs_rows = no_pairs_np[rows, env_i]
+            no_fracs_rows = no_fracs_np[rows, env_i]
+            must_halt_rows = must_halt_np[rows, env_i]
+
+            launch_mask = halt_rows == 0
+            origin_used_mask = launch_mask & ~no_fracs_rows
+            abort_used_mask = abort_rows & origin_used_mask
+            dispatch_mask = origin_used_mask & ~abort_used_mask & ~no_pairs_rows
+
+            launch_actions += int(launch_mask.sum())
+            origin_frac_used += int(origin_used_mask.sum())
+            target_abort += int(abort_used_mask.sum())
+            no_valid_pairs += int(no_pairs_rows.sum())
+            no_valid_fracs += int(no_fracs_rows.sum())
+            must_halt_no_ships += int(must_halt_rows.sum())
+            dispatches += int(dispatch_mask.sum())
+
+    total_rows_f = float(max(1, total_rows))
+    launch_actions_f = float(max(1, launch_actions))
+    origin_frac_used_f = float(max(1, origin_frac_used))
+    target_abort_f = float(max(1, target_abort))
+    return {
+        "count_rows": float(total_rows),
+        "count_launch_actions": float(launch_actions),
+        "count_origin_frac_used": float(origin_frac_used),
+        "count_target_abort": float(target_abort),
+        "count_no_valid_pairs": float(no_valid_pairs),
+        "count_no_valid_fracs": float(no_valid_fracs),
+        "count_must_halt_no_ships": float(must_halt_no_ships),
+        "count_dispatches": float(dispatches),
+        "p_launch_action": float(launch_actions) / total_rows_f,
+        "p_origin_frac_used": float(origin_frac_used) / total_rows_f,
+        "p_target_abort": float(target_abort) / total_rows_f,
+        "p_target_abort_given_launch": float(target_abort) / launch_actions_f,
+        "p_target_abort_given_origin_frac": float(target_abort) / origin_frac_used_f,
+        "p_no_valid_pairs": float(no_valid_pairs) / total_rows_f,
+        "p_no_valid_pairs_given_origin_frac": float(no_valid_pairs) / origin_frac_used_f,
+        "p_no_valid_fracs": float(no_valid_fracs) / total_rows_f,
+        "p_must_halt_no_ships": float(must_halt_no_ships) / total_rows_f,
+        "p_dispatch": float(dispatches) / total_rows_f,
+        "p_dispatch_given_origin_frac": float(dispatches) / origin_frac_used_f,
+        "p_no_valid_pairs_given_abort": float(no_valid_pairs) / target_abort_f,
+    }
+
+
 def _fleet_counts_from_state(state_b: OrbitWarsState) -> Tuple[int, float]:
     """Return total and per-env mean nonempty incoming-arrival buckets."""
 
@@ -1760,11 +1855,13 @@ def _torch_ppo_loss_from_replay(
                 obs.turn_progress.to(device=adv.device),
                 obs.incoming_net.to(device=adv.device),
                 obs.incoming_survivor.to(device=adv.device),
+                obs.origin_frac_blocked.to(device=adv.device),
                 int(obs_feature_dim),
                 target_valid,
                 target_overflow,
                 target_hit_tick,
                 actions["halt_action"].to(device=adv.device, dtype=torch.long),
+                actions["target_abort"].to(device=adv.device, dtype=torch.bool),
                 actions["pair_flat"].to(device=adv.device, dtype=torch.long),
                 actions["frac_idx"].to(device=adv.device, dtype=torch.long),
                 actions["no_valid_pairs"].to(device=adv.device, dtype=torch.bool),
@@ -1790,10 +1887,12 @@ def _torch_ppo_loss_from_replay(
             obs["rope_pos"].to(device=adv.device, dtype=torch.float32),
             obs["entity_mask"].to(device=adv.device, dtype=torch.bool),
             obs["planet_mask"].to(device=adv.device, dtype=torch.bool),
+            None if "origin_frac_blocked" not in obs else obs["origin_frac_blocked"].to(device=adv.device, dtype=torch.bool),
             target_valid,
             target_overflow,
             target_hit_tick,
             actions["halt_action"].to(device=adv.device, dtype=torch.long),
+            actions["target_abort"].to(device=adv.device, dtype=torch.bool),
             actions["pair_flat"].to(device=adv.device, dtype=torch.long),
             actions["frac_idx"].to(device=adv.device, dtype=torch.long),
             actions["no_valid_pairs"].to(device=adv.device, dtype=torch.bool),
@@ -2083,6 +2182,7 @@ def _log_iter_tensorboard(
     ppo_s: float = 0.0,
     ppo_summary: Optional[dict] = None,
     population_summary: Optional[dict[str, float]] = None,
+    abort_summary: Optional[dict[str, float]] = None,
     rt: Optional[RolloutTiming] = None,
     ppo_t: Optional[PPOTiming] = None,
 ) -> None:
@@ -2193,6 +2293,9 @@ def _log_iter_tensorboard(
     if population_summary is not None:
         for k, v in population_summary.items():
             writer.add_scalar(f"population/{k}", v, it)
+    if abort_summary is not None:
+        for k, v in abort_summary.items():
+            writer.add_scalar(f"abort/{k}", v, it)
     writer.add_scalar("train/skipped_empty_rollout", 1.0 if skipped else 0.0, it)
     if skipped:
         writer.flush()
@@ -2257,9 +2360,26 @@ def _log_iter_tensorboard(
         writer.add_scalar("timing/micro_prep_active_s", rt.micro_prep_active_s, it)
         writer.add_scalar("timing/micro_prep_wr_mk_s", rt.micro_prep_wr_mk_s, it)
         writer.add_scalar("timing/micro_prep_validate_s", rt.micro_prep_validate_s, it)
+        writer.add_scalar("timing/micro_prep_non_grouped_s", rt.micro_prep_non_grouped_s, it)
+        writer.add_scalar("timing/micro_prep_grouped_s", rt.micro_prep_grouped_s, it)
         writer.add_scalar("timing/micro_apply_buf_append_s", rt.micro_apply_buf_append_s, it)
         writer.add_scalar("timing/micro_apply_obs_store_s", rt.micro_apply_obs_store_s, it)
         writer.add_scalar("timing/micro_apply_numpy_s", rt.micro_apply_numpy_s, it)
+        writer.add_scalar("timing/micro_post_apply_extract_s", rt.micro_post_apply_extract_s, it)
+        writer.add_scalar(
+            "timing/micro_post_apply_host_bookkeeping_s", rt.micro_post_apply_host_bookkeeping_s, it
+        )
+        writer.add_scalar("timing/micro_post_apply_row_stats_s", rt.micro_post_apply_row_stats_s, it)
+        writer.add_scalar("timing/micro_post_apply_pending_actions_s", rt.micro_post_apply_pending_actions_s, it)
+        writer.add_scalar(
+            "timing/micro_post_apply_halt_block_indices_s", rt.micro_post_apply_halt_block_indices_s, it
+        )
+        writer.add_scalar("timing/micro_post_apply_device_index_s", rt.micro_post_apply_device_index_s, it)
+        writer.add_scalar("timing/bootstrap_obs_build_s", rt.bootstrap_obs_build_s, it)
+        writer.add_scalar("timing/bootstrap_policy_batch_s", rt.bootstrap_policy_batch_s, it)
+        writer.add_scalar("timing/bootstrap_policy_forward_s", rt.bootstrap_policy_forward_s, it)
+        writer.add_scalar("timing/loop_control_s", rt.loop_control_s, it)
+        writer.add_scalar("timing/loop_post_micro_s", rt.loop_post_micro_s, it)
     if ppo_t is not None:
         writer.add_scalar("timing/ppo_total_s", ppo_t.total_s, it)
 
@@ -2399,9 +2519,13 @@ def train(args: argparse.Namespace) -> None:
             n_heads=args.n_heads,
             n_layers=args.n_layers,
             activation_checkpointing=args.activation_checkpointing,
-            feature_dim=obs_feature_dim_for_num_agents(policy_feature_agents),
+            feature_dim=obs_feature_dim_for_num_agents(
+                policy_feature_agents,
+                target_abort_enabled=bool(args.target_abort_enabled),
+            ),
             population_size=args.population_size,
             rope_dims=policy_rope_dims,
+            target_abort_enabled=bool(args.target_abort_enabled),
             value_head_count=(
                 int(policy_value_head_count) if value_head_count is None else int(value_head_count)
             ),
@@ -3017,7 +3141,7 @@ def _train_loop(
             skip_main = not bool(main_host_chunks) if args.rollout_storage == "host" else (main_samples is None)
             skip_exploiter = not bool(exploiter_host_chunks) if args.rollout_storage == "host" else (exploiter_samples is None)
 
-            obs_fd = obs_feature_dim_for_num_agents(4)
+            obs_fd = obs_feature_dim_for_num_agents(4, target_abort_enabled=bool(args.target_abort_enabled))
             main_loss_parts: list[float] = []
             exploiter_loss_parts: list[float] = []
             main_ppo_summary: Optional[dict[str, float]] = None
@@ -3140,6 +3264,7 @@ def _train_loop(
                 _release_rollout_device_refs(device)
             mean_main_loss = float(np.mean(main_loss_parts)) if main_loss_parts else float("nan")
             mean_exploiter_loss = float(np.mean(exploiter_loss_parts)) if exploiter_loss_parts else float("nan")
+            abort_summary = _segment_abort_summary(segment)
             combined_ppo_t = PPOTiming(
                 total_s=(0.0 if main_ppo_timing is None else float(main_ppo_timing.total_s))
                 + (0.0 if exploiter_ppo_timing is None else float(exploiter_ppo_timing.total_s))
@@ -3207,6 +3332,7 @@ def _train_loop(
                 ppo_s=ppo_s,
                 ppo_summary=main_ppo_summary if main_ppo_summary is not None else exploiter_ppo_summary,
                 population_summary=None,
+                abort_summary=abort_summary,
                 rt=rt,
                 ppo_t=combined_ppo_t,
             )
@@ -3371,6 +3497,7 @@ def _train_loop(
             game_stats=game_stats,
             population_size=int(args.population_size),
         )
+        abort_summary = _segment_abort_summary(segment)
 
         if mem_dbg and device.type == "cuda":
             log_cuda_mem(f"iter {it} after rollouts", device)
@@ -3398,6 +3525,7 @@ def _train_loop(
                 cfg_max_fleets=cfg.max_fleets,
                 game_stats=game_stats,
                 population_summary=population_summary,
+                abort_summary=abort_summary,
             )
         else:
             if mem_dbg and device.type == "cuda":
@@ -3407,7 +3535,10 @@ def _train_loop(
                 )
 
             t_ppo0 = time.perf_counter()
-            obs_fd = obs_feature_dim_for_num_agents(int(cfg.num_agents))
+            obs_fd = obs_feature_dim_for_num_agents(
+                int(cfg.num_agents),
+                target_abort_enabled=bool(args.target_abort_enabled),
+            )
             if host_chunks is not None:
                 loss_mb, ppo_t, ppo_stats = ppo_iteration_host_staged(
                     policy,
@@ -3490,6 +3621,7 @@ def _train_loop(
                 ppo_s=ppo_s,
                 ppo_summary=ppo_stats.summary(),
                 population_summary=population_summary,
+                abort_summary=abort_summary,
                 rt=rt,
                 ppo_t=ppo_t,
             )
@@ -3786,6 +3918,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--d-model", type=int, default=192)
     p.add_argument("--n-heads", type=int, default=8)
     p.add_argument("--n-layers", type=int, default=4)
+    p.add_argument(
+        "--target-abort-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable target-stage abort with per-turn origin/fraction blocking.",
+    )
     p.add_argument(
         "--activation-checkpointing",
         action=argparse.BooleanOptionalAction,

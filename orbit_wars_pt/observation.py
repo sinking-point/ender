@@ -12,10 +12,13 @@ from jax_orbit_wars import FLEET_ETA, FLEET_OWNER, FLEET_SHIPS, FLEET_TARGET_PLA
 
 from orbit_wars_pt.constants import (
     BOARD_SIZE,
+    BLOCKED_FRAC_FEATURES,
     CENTER,
     ENTITY_CLS,
     ENTITY_COMET,
+    FEATURE_DIM_ABORT,
     FEATURE_DIM_MULTI,
+    FEATURE_DIM_MULTI_ABORT,
     INCOMING_SURVIVOR_FLAT,
     INCOMING_TA_BINS,
     ENTITY_PLANET,
@@ -101,6 +104,7 @@ def build_observation(
     *,
     max_fleet_tokens: int = MAX_FLEET_TOKENS,
     ship_speed: float = 6.0,
+    target_abort_enabled: bool = False,
 ) -> ObservationBatch:
     """Builds a padded entity sequence `[CLS] + planets + fleets` from a JAX `OrbitWarsState` or numpy views."""
 
@@ -109,6 +113,9 @@ def build_observation(
     initial_planets = np.asarray(state.initial_planets)
     initial_active = np.asarray(state.initial_active)
     incoming_fleets = np.asarray(state.incoming_fleets)
+    origin_frac_blocked = np.asarray(
+        getattr(state, "origin_frac_blocked", np.zeros((MAX_PLANETS, BLOCKED_FRAC_FEATURES), dtype=np.bool_))
+    )
     angular_velocity = float(np.asarray(state.angular_velocity))
     step_count = int(np.asarray(state.step_count))
     num_agents = int(np.asarray(state.num_agents))
@@ -133,7 +140,7 @@ def build_observation(
 
     cls_turn = _cls_turn_fraction(step_count)
     incoming = incoming_fleets.astype(np.float32)
-    fdim = obs_feature_dim_for_num_agents(num_agents)
+    fdim = obs_feature_dim_for_num_agents(num_agents, target_abort_enabled=target_abort_enabled)
     incoming_net, survivor_slot = _incoming_interfleet_np(incoming, int(ego_player), num_agents)
 
     cls_feat = np.zeros((fdim,), dtype=np.float32)
@@ -185,11 +192,13 @@ def build_observation(
         feat[4] = np.float32(active)
         feat[5] = np.float32(planet_r[i] / 10.0)
         feat[8 : 8 + INCOMING_TA_BINS] = incoming_net[i].astype(np.float32)
-        if fdim == FEATURE_DIM_MULTI and num_agents > 2:
+        if fdim in (FEATURE_DIM_MULTI, FEATURE_DIM_MULTI_ABORT) and num_agents > 2:
             oh = np.eye(NUM_OWNER_SLOTS, dtype=np.float32)[survivor_slot[i]]
             feat[
                 8 + INCOMING_TA_BINS : 8 + INCOMING_TA_BINS + INCOMING_SURVIVOR_FLAT
             ] = oh.reshape(INCOMING_SURVIVOR_FLAT)
+        if fdim in (FEATURE_DIM_ABORT, FEATURE_DIM_MULTI_ABORT):
+            feat[-BLOCKED_FRAC_FEATURES:] = origin_frac_blocked[i].astype(np.float32)
 
         xy = planet_xy[i] if active else np.zeros((2,), dtype=np.float64)
         rope = np.array([float(xy[0]) / BOARD_SIZE, float(xy[1]) / BOARD_SIZE, 0.0], dtype=np.float32)

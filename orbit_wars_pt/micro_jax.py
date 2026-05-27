@@ -695,6 +695,7 @@ def _per_env_apply_one(
     pair_flat: jnp.ndarray,
     frac_idx: jnp.ndarray,
     fleet_eta: jnp.ndarray,
+    target_abort: jnp.ndarray,
 ):
     """Single env update; vmap'd over the leading axis.
 
@@ -717,7 +718,8 @@ def _per_env_apply_one(
 
     oid = state.planets[o_idx, PLANET_ID]
 
-    update_state = ~halt_now
+    abort_now = target_abort.astype(jnp.bool_)
+    update_state = (~halt_now) & (~abort_now)
 
     ship_col = state.planets[:, PLANET_SHIPS]
     ship_col_after = ship_col.at[o_idx].add(-jnp.where(update_state, send, 0.0))
@@ -736,10 +738,13 @@ def _per_env_apply_one(
     new_incoming = jnp.minimum(incoming_u32, jnp.asarray(65535, dtype=jnp.uint32)).astype(
         state.incoming_fleets.dtype
     )
+    blocked = state.origin_frac_blocked
+    blocked = blocked.at[o_idx.astype(jnp.int32), frac_idx.astype(jnp.int32)].set(abort_now)
 
     new_state = state._replace(
         planets=new_planets,
         incoming_fleets=new_incoming,
+        origin_frac_blocked=blocked,
     )
 
     slot_out = jnp.full((), -1, dtype=jnp.int32)
@@ -754,6 +759,7 @@ def apply_micro_step_batched(
     pair_flat: jnp.ndarray,
     frac_idx: jnp.ndarray,
     fleet_eta: jnp.ndarray,
+    target_abort: jnp.ndarray,
 ):
     """Vmap'd over ``num_envs``.
 
@@ -761,8 +767,8 @@ def apply_micro_step_batched(
     is a scalar broadcast across envs. ``slot`` is the fleet row written, or ``-1``.
     """
 
-    return jax.vmap(_per_env_apply_one, in_axes=(0, None, 0, 0, 0, 0))(
-        state, ego, halt_now, pair_flat, frac_idx, fleet_eta
+    return jax.vmap(_per_env_apply_one, in_axes=(0, None, 0, 0, 0, 0, 0))(
+        state, ego, halt_now, pair_flat, frac_idx, fleet_eta, target_abort
     )
 
 
@@ -774,14 +780,15 @@ def apply_micro_step_batched_per_ego(
     pair_flat: jnp.ndarray,
     frac_idx: jnp.ndarray,
     fleet_eta: jnp.ndarray,
+    target_abort: jnp.ndarray,
 ):
     """Per-row ego variant of ``apply_micro_step_batched``.
 
     Returns ``(new_state, oid[B], send[B], dispatched[B], slot[B])``.
     """
 
-    return jax.vmap(_per_env_apply_one, in_axes=(0, 0, 0, 0, 0, 0))(
-        state, ego_b, halt_now, pair_flat, frac_idx, fleet_eta
+    return jax.vmap(_per_env_apply_one, in_axes=(0, 0, 0, 0, 0, 0, 0))(
+        state, ego_b, halt_now, pair_flat, frac_idx, fleet_eta, target_abort
     )
 
 
@@ -793,6 +800,7 @@ def apply_micro_step_batched_masked(
     pair_flat: jnp.ndarray,
     frac_idx: jnp.ndarray,
     fleet_eta: jnp.ndarray,
+    target_abort: jnp.ndarray,
     apply: jnp.ndarray,
 ):
     """Like ``apply_micro_step_batched`` but per-batch ``ego_b`` and optional ``apply`` mask.
@@ -801,8 +809,8 @@ def apply_micro_step_batched_masked(
     whether micro-step ``b`` runs; otherwise that slice is unchanged.
     """
 
-    new_state, _, _, _, _ = jax.vmap(_per_env_apply_one, in_axes=(0, 0, 0, 0, 0, 0))(
-        state, ego_b, halt_now, pair_flat, frac_idx, fleet_eta
+    new_state, _, _, _, _ = jax.vmap(_per_env_apply_one, in_axes=(0, 0, 0, 0, 0, 0, 0))(
+        state, ego_b, halt_now, pair_flat, frac_idx, fleet_eta, target_abort
     )
 
     def _blend(new_leaf, old_leaf):

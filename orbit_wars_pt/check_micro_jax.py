@@ -101,6 +101,7 @@ def main() -> None:
         pair_flat,
         frac_idx,
         fleet_eta,
+        jnp.zeros_like(halt_now),
     )
     post_planets = np.asarray(jax.device_get(new_state.planets))
     oid_np, send_np, dispatched_np = jax.device_get((oid_j, send_j, dispatched_j))
@@ -136,6 +137,7 @@ def main() -> None:
         pair_flat[:1],
         frac_idx[:1],
         fleet_eta[:1],
+        jnp.zeros((1,), dtype=jnp.bool_),
     )
     pair_flat_1 = pair_flat[:1]
     frac_idx_1 = frac_idx[:1]

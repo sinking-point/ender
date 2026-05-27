@@ -66,6 +66,7 @@ class OrbitWarsState(NamedTuple):
     planet_active: jnp.ndarray  # [MAX_PLANETS], bool
     initial_planets: jnp.ndarray  # [MAX_PLANETS, 7], float32
     initial_active: jnp.ndarray  # [MAX_PLANETS], bool
+    origin_frac_blocked: jnp.ndarray  # [MAX_PLANETS, 5], bool
     fleets: jnp.ndarray  # [max_fleets, FLEET_ROW_WIDTH], float32
     fleet_active: jnp.ndarray  # [max_fleets], bool
     incoming_fleets: jnp.ndarray  # [num_agents, MAX_PLANETS, INCOMING_TA_BINS], uint16
@@ -191,6 +192,7 @@ def reset_from_reference(
         planet_active=planet_active,
         initial_planets=initial_planets,
         initial_active=initial_active,
+        origin_frac_blocked=jnp.zeros((MAX_PLANETS, 5), dtype=bool),
         fleets=jnp.zeros((max_fleets, FLEET_ROW_WIDTH), dtype=jnp.float32),
         fleet_active=jnp.zeros((max_fleets,), dtype=bool),
         incoming_fleets=jnp.zeros((num_agents, MAX_PLANETS, INCOMING_TA_BINS), dtype=jnp.uint16),

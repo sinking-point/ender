@@ -97,6 +97,7 @@ def main() -> None:
         jnp.asarray(pair_flat[:, 0]),
         jnp.asarray(frac_idx[:, 0]),
         jnp.asarray(fleet_eta[:, 0]),
+        jnp.zeros_like(jnp.asarray(micro_halt[:, 0])),
     )
     del state_after
     send[:, 0] = np.asarray(jax.device_get(send0))
