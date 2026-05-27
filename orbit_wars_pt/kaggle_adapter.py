@@ -37,7 +37,11 @@ from orbit_wars_pt.constants import (
     obs_feature_dim_for_num_agents,
 )
 from orbit_wars_pt.geometry import estimate_time_to_hit, planet_pred_velocity
-from orbit_wars_pt.model import OrbitWarsPolicy
+from orbit_wars_pt.model import (
+    OrbitWarsPolicy,
+    adapt_legacy_value_heads_for_model,
+    infer_value_head_count_from_state_dict,
+)
 
 
 DEFAULT_CHECKPOINT = "checkpoint.pt"
@@ -3138,12 +3142,14 @@ def _infer_policy_kwargs(payload: Any) -> dict[str, Any]:
         "activation_checkpointing": False,
         "population_size": int(training_args.get("population_size", 1)),
         "rope_dims": int(training_args.get("rope_dims", 3)),
+        "value_head_count": int(training_args.get("value_head_count", 1)),
     }
     if isinstance(policy_state, Mapping):
         w = policy_state.get("feat_proj.weight")
         if hasattr(w, "shape") and len(w.shape) >= 2:
             kwargs["d_model"] = int(w.shape[0])
             kwargs["feature_dim"] = int(w.shape[1])
+        kwargs["value_head_count"] = int(infer_value_head_count_from_state_dict(policy_state))
         layer_ids = []
         shared_layer_ids = []
         pop_ids = []
@@ -3267,7 +3273,8 @@ def load_policy(
         policy_state = payload
         payload_for_kwargs = payload
     policy = OrbitWarsPolicy(**_infer_policy_kwargs(payload_for_kwargs)).to(torch_device)
-    policy.load_state_dict(policy_state)
+    policy_state_adapted, _ = adapt_legacy_value_heads_for_model(policy_state, policy)
+    policy.load_state_dict(policy_state_adapted)
     policy.eval()
     training_args = dict(_checkpoint_training_args(payload))
     training_args.setdefault(

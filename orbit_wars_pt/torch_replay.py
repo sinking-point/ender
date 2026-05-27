@@ -209,6 +209,7 @@ def _gather_transition_fields_for_players(
     no_valid_fracs = torch.zeros((bsz,), device=storage_device, dtype=torch.bool)
     must_halt_no_ships = torch.zeros((bsz,), device=storage_device, dtype=torch.bool)
     population_idx = torch.zeros((bsz,), device=storage_device, dtype=torch.long)
+    value_head_idx = torch.zeros((bsz,), device=storage_device, dtype=torch.long)
     tpr = torch.zeros((bsz, MAX_PLANETS), device=storage_device, dtype=torch.bool)
     tht = torch.zeros((bsz, MAX_PLANETS), device=storage_device, dtype=torch.float32)
 
@@ -225,6 +226,7 @@ def _gather_transition_fields_for_players(
         no_valid_fracs[m] = buf.no_valid_fracs[tp, np_]
         must_halt_no_ships[m] = buf.must_halt_no_ships[tp, np_]
         population_idx[m] = buf.population_idx[tp, np_].to(torch.long)
+        value_head_idx[m] = buf.value_head_idx[tp, np_].to(torch.long)
         tpr[m] = buf.target_planet_reachable[tp, np_, :]
         tht[m] = buf.target_hit_tick[tp, np_, :]
 
@@ -236,6 +238,7 @@ def _gather_transition_fields_for_players(
         "no_valid_fracs": no_valid_fracs.to(out_device, dtype=torch.bool),
         "must_halt_no_ships": must_halt_no_ships.to(out_device, dtype=torch.bool),
         "population_idx": population_idx.to(out_device, dtype=torch.long),
+        "value_head_idx": value_head_idx.to(out_device, dtype=torch.long),
         "target_planet_reachable": tpr.to(out_device, dtype=torch.bool),
         "target_hit_tick": tht.to(out_device, dtype=torch.float32),
         "ego": player.to(out_device),

@@ -53,6 +53,7 @@ def _compute_logp_value_entropy_torch(
     no_valid_fracs: torch.Tensor,
     population_idx: Optional[torch.Tensor] = None,
     member_counts: Optional[torch.Tensor] = None,
+    value_head_idx: Optional[torch.Tensor] = None,
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor,
     torch.Tensor, torch.Tensor, torch.Tensor,
@@ -103,6 +104,7 @@ def _compute_logp_value_entropy_torch(
             fleet_size=fleet_size,
             target_eta=target_hit_tick,
             target_ships=ships,
+            value_head_idx=value_head_idx,
         )
     else:
         out = policy(
@@ -113,6 +115,7 @@ def _compute_logp_value_entropy_torch(
             entity_mask=entity_mask,
             planet_mask=planet_mask,
             population_idx=population_idx,
+            value_head_idx=value_head_idx,
         )
         ph = out["planet_hidden"]
         target_logits = policy.target_logits_for_origin_fraction(
@@ -205,6 +208,7 @@ def compute_ppo_loss_torch(
     entropy_coef: float,
     population_idx: Optional[torch.Tensor] = None,
     member_counts: Optional[torch.Tensor] = None,
+    value_head_idx: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Full PPO scalar loss + diagnostics on one minibatch.
 
@@ -273,6 +277,7 @@ def compute_ppo_loss_torch(
         no_valid_fracs,
         population_idx,
         member_counts,
+        value_head_idx,
     )
 
     log_ratio = new_logp - old_logp
@@ -424,6 +429,7 @@ def compute_ppo_loss_compressed_torch(
     entropy_coef: float,
     population_idx: Optional[torch.Tensor] = None,
     member_counts: Optional[torch.Tensor] = None,
+    value_head_idx: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     comp = CompressedObservationBuffer(
         token_meta=token_meta,
@@ -463,6 +469,7 @@ def compute_ppo_loss_compressed_torch(
         entropy_coef,
         population_idx,
         member_counts,
+        value_head_idx,
     )
 
 

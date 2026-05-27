@@ -44,7 +44,10 @@ from orbit_wars_pt.gpu_mem import (
     torch_param_bytes,
 )
 from orbit_wars_pt.jax_setup import configure_jax_for_training
-from orbit_wars_pt.model import OrbitWarsPolicy
+from orbit_wars_pt.model import (
+    OrbitWarsPolicy,
+    adapt_legacy_value_heads_for_model,
+)
 from orbit_wars_pt.parallel_rollout import (
     EXPLOITER_MODE_SELFPLAY_2P,
     EXPLOITER_MODE_SELFPLAY_4P,
@@ -70,7 +73,7 @@ from orbit_wars_pt.compressed_observation import (
 
 from jax_orbit_wars import OrbitWarsState
 
-CHECKPOINT_VERSION = 6
+CHECKPOINT_VERSION = 7
 
 
 @dataclass
@@ -653,6 +656,9 @@ def save_checkpoint(
     path.parent.mkdir(parents=True, exist_ok=True)
     training_args = _checkpoint_training_args(args)
     training_args["rope_dims"] = int(getattr(policy, "rope_dims", 2))
+    training_args["value_head_count"] = int(getattr(policy, "value_head_count", 1))
+    if exploiter_policy is not None:
+        training_args["exploiter_value_head_count"] = int(getattr(exploiter_policy, "value_head_count", 1))
     payload = {
         "version": CHECKPOINT_VERSION,
         "iteration": next_iteration,
@@ -677,6 +683,59 @@ def save_checkpoint(
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, tmp)
     tmp.replace(path)
+
+
+def _expand_legacy_optimizer_value_head_state(
+    saved_opt_state: Dict[str, Any],
+    *,
+    model: OrbitWarsPolicy,
+    opt: torch.optim.Optimizer,
+) -> tuple[Dict[str, Any], bool]:
+    """Expand Adam moments for migrated critic heads to match ``model`` shapes."""
+
+    if not isinstance(saved_opt_state, dict):
+        return saved_opt_state, False
+    state = saved_opt_state.get("state")
+    param_groups = saved_opt_state.get("param_groups")
+    if not isinstance(state, dict) or not isinstance(param_groups, list):
+        return saved_opt_state, False
+    current_opt_state = opt.state_dict()
+    current_groups = current_opt_state.get("param_groups", [])
+    if len(param_groups) != len(current_groups):
+        return saved_opt_state, False
+
+    named_params = list(model.named_parameters())
+    param_ids: list[int] = []
+    for group in current_groups:
+        param_ids.extend(int(pid) for pid in group.get("params", []))
+    if len(param_ids) != len(named_params):
+        return saved_opt_state, False
+
+    out_state = {k: dict(v) if isinstance(v, dict) else v for k, v in state.items()}
+    migrated = False
+    for (name, param), pid in zip(named_params, param_ids):
+        if not (name.endswith("value_head.weight") or name.endswith("value_head.bias")):
+            continue
+        entry = out_state.get(pid)
+        if not isinstance(entry, dict):
+            continue
+        for state_key, state_val in list(entry.items()):
+            if not isinstance(state_val, torch.Tensor):
+                continue
+            src_shape = tuple(int(x) for x in state_val.shape)
+            tgt_shape = tuple(int(x) for x in param.shape)
+            if src_shape == tgt_shape:
+                continue
+            if name.endswith("value_head.weight") and src_shape == (1, tgt_shape[1]) and len(tgt_shape) == 2 and tgt_shape[0] > 1:
+                entry[state_key] = state_val.repeat(tgt_shape[0], 1)
+                migrated = True
+            elif name.endswith("value_head.bias") and src_shape == (1,) and tgt_shape[0] > 1:
+                entry[state_key] = state_val.repeat(tgt_shape[0])
+                migrated = True
+
+    out = dict(saved_opt_state)
+    out["state"] = out_state
+    return out, migrated
 
 
 def _restore_torch_generator_from_checkpoint(saved: Any, rng: torch.Generator) -> None:
@@ -1720,6 +1779,7 @@ def _torch_ppo_loss_from_replay(
                 entropy_coef,
                 actions["population_idx"].to(device=adv.device, dtype=torch.long),
                 member_counts,
+                actions["value_head_idx"].to(device=adv.device, dtype=torch.long),
             )
         fn = loss_fn if loss_fn is not None else compute_ppo_loss_torch
         return fn(
@@ -1748,6 +1808,7 @@ def _torch_ppo_loss_from_replay(
             entropy_coef,
             actions["population_idx"].to(device=adv.device, dtype=torch.long),
             member_counts,
+            actions["value_head_idx"].to(device=adv.device, dtype=torch.long),
         )
 
 
@@ -2330,7 +2391,9 @@ def train(args: argparse.Namespace) -> None:
         if isinstance(resume_training_args, dict):
             policy_rope_dims = int(resume_training_args.get("rope_dims", 3))
 
-    def _make_policy() -> OrbitWarsPolicy:
+    policy_value_head_count = 3 if args.exploiter_mode else 1
+
+    def _make_policy(*, value_head_count: Optional[int] = None) -> OrbitWarsPolicy:
         return OrbitWarsPolicy(
             d_model=args.d_model,
             n_heads=args.n_heads,
@@ -2339,6 +2402,9 @@ def train(args: argparse.Namespace) -> None:
             feature_dim=obs_feature_dim_for_num_agents(policy_feature_agents),
             population_size=args.population_size,
             rope_dims=policy_rope_dims,
+            value_head_count=(
+                int(policy_value_head_count) if value_head_count is None else int(value_head_count)
+            ),
         ).to(device)
 
     policy = _make_policy()
@@ -2434,17 +2500,34 @@ def train(args: argparse.Namespace) -> None:
                 ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
             except TypeError:
                 ckpt = torch.load(resume_path, map_location="cpu")
-        if int(ckpt.get("version", 0)) != CHECKPOINT_VERSION:
+        ckpt_version = int(ckpt.get("version", 0))
+        if ckpt_version not in (6, CHECKPOINT_VERSION):
             raise RuntimeError(
-                f"Unsupported checkpoint version {ckpt.get('version')!r} (expected {CHECKPOINT_VERSION})"
+                f"Unsupported checkpoint version {ckpt.get('version')!r} (expected 6 or {CHECKPOINT_VERSION})"
             )
         _validate_checkpoint_args(ckpt["training_args"], args)
-        policy.load_state_dict(ckpt["policy"])
-        opt.load_state_dict(ckpt["optimizer"])
+        policy_state, _ = adapt_legacy_value_heads_for_model(ckpt["policy"], policy)
+        policy.load_state_dict(policy_state)
+        opt_state, _ = _expand_legacy_optimizer_value_head_state(ckpt["optimizer"], model=policy, opt=opt)
+        opt.load_state_dict(opt_state)
         if exploiter_policy is not None:
-            exploiter_policy.load_state_dict(ckpt["exploiter_policy"])
+            exploiter_state, migrated_exploiter = adapt_legacy_value_heads_for_model(
+                ckpt["exploiter_policy"],
+                exploiter_policy,
+            )
+            exploiter_policy.load_state_dict(exploiter_state)
             assert exploiter_opt is not None
-            exploiter_opt.load_state_dict(ckpt["exploiter_optimizer"])
+            exploiter_opt_state, opt_migrated = _expand_legacy_optimizer_value_head_state(
+                ckpt["exploiter_optimizer"],
+                model=exploiter_policy,
+                opt=exploiter_opt,
+            )
+            exploiter_opt.load_state_dict(exploiter_opt_state)
+            if migrated_exploiter or opt_migrated:
+                print(
+                    "[orbit_wars_pt] migrated legacy exploiter critic checkpoint to 3 egocentric value heads",
+                    flush=True,
+                )
         _restore_torch_generator_from_checkpoint(ckpt["torch_rng"], rng)
         rnd.bit_generator.state = ckpt["numpy_rng_state"]
         rollout_env_seed = ckpt["rollout_env_seed"]

@@ -61,6 +61,8 @@ def _run_steps(
             tensors["target_pr"],
             tensors["target_hit_tick"],
             tensors["population_idx"],
+            tensors["policy_id"],
+            tensors["value_head_idx"],
             wr,
             mk,
             active,
@@ -111,6 +113,8 @@ def main() -> None:
         "target_pr": torch.zeros((N, P), dtype=torch.bool, device=device),
         "target_hit_tick": torch.zeros((N, P), dtype=torch.float32, device=device),
         "population_idx": torch.zeros((N,), dtype=torch.int32, device=device),
+        "policy_id": torch.zeros((N,), dtype=torch.int32, device=device),
+        "value_head_idx": torch.zeros((N,), dtype=torch.int32, device=device),
     }
 
     wr0 = max(1, H // 4)

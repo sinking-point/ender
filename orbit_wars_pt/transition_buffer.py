@@ -50,6 +50,7 @@ class TransitionBuffer(NamedTuple):
     phase_micro_idx: jnp.ndarray
     population_idx: jnp.ndarray
     policy_id: jnp.ndarray
+    value_head_idx: jnp.ndarray
 
 
 class TorchTransitionBuffer(NamedTuple):
@@ -75,6 +76,7 @@ class TorchTransitionBuffer(NamedTuple):
     phase_micro_idx: torch.Tensor
     population_idx: torch.Tensor
     policy_id: torch.Tensor
+    value_head_idx: torch.Tensor
 
 
 def init_transition_buffer(num_envs: int, H_buf: int, max_micro_steps: int) -> TransitionBuffer:
@@ -98,6 +100,7 @@ def init_transition_buffer(num_envs: int, H_buf: int, max_micro_steps: int) -> T
         phase_micro_idx=jnp.zeros((H_buf, num_envs), dtype=jnp.int32),
         population_idx=jnp.zeros((H_buf, num_envs), dtype=jnp.int32),
         policy_id=jnp.zeros((H_buf, num_envs), dtype=jnp.int32),
+        value_head_idx=jnp.zeros((H_buf, num_envs), dtype=jnp.int32),
     )
 
 
@@ -127,6 +130,7 @@ def init_torch_transition_buffer(
         phase_micro_idx=torch.zeros((H_buf, num_envs), dtype=torch.int32, device=device),
         population_idx=torch.zeros((H_buf, num_envs), dtype=torch.int32, device=device),
         policy_id=torch.zeros((H_buf, num_envs), dtype=torch.int32, device=device),
+        value_head_idx=torch.zeros((H_buf, num_envs), dtype=torch.int32, device=device),
     )
 
 
@@ -147,6 +151,7 @@ def append_to_torch_buffer(
     target_hit_tick_now: torch.Tensor,
     population_idx: torch.Tensor,
     policy_id: torch.Tensor,
+    value_head_idx: torch.Tensor,
     write_row: torch.Tensor,
     micro_k: torch.Tensor,
     active: torch.Tensor,
@@ -212,6 +217,7 @@ def append_to_torch_buffer(
     buf.phase_micro_idx[row, env] = micro_k.to(device=device, dtype=torch.int32)[active_b]
     buf.population_idx[row, env] = population_idx.to(device=device, dtype=torch.int32)[active_b]
     buf.policy_id[row, env] = policy_id.to(device=device, dtype=torch.int32)[active_b]
+    buf.value_head_idx[row, env] = value_head_idx.to(device=device, dtype=torch.int32)[active_b]
     return buf
 
 
@@ -233,6 +239,7 @@ def append_active_to_torch_buffer(
     target_hit_tick_now: torch.Tensor,
     population_idx: torch.Tensor,
     policy_id: torch.Tensor,
+    value_head_idx: torch.Tensor,
     write_row: torch.Tensor,
     micro_k: torch.Tensor,
     max_micro_steps: int,
@@ -293,6 +300,7 @@ def append_active_to_torch_buffer(
     buf.phase_micro_idx[row, env] = micro_k.to(device=device, dtype=torch.int32)
     buf.population_idx[row, env] = population_idx.to(device=device, dtype=torch.int32)
     buf.policy_id[row, env] = policy_id.to(device=device, dtype=torch.int32)
+    buf.value_head_idx[row, env] = value_head_idx.to(device=device, dtype=torch.int32)
     return buf
 
 
@@ -324,6 +332,7 @@ def append_to_buffer(
     target_hit_tick_now,
     population_idx,
     policy_id,
+    value_head_idx,
     write_row: jnp.ndarray,
     micro_k: jnp.ndarray,
     active: jnp.ndarray,
@@ -379,6 +388,9 @@ def append_to_buffer(
     old_policy = buf.policy_id[write_row, n_idx]
     new_policy = jnp.where(active, policy_id.astype(jnp.int32), old_policy)
     out_policy = buf.policy_id.at[write_row, n_idx].set(new_policy)
+    old_value_head = buf.value_head_idx[write_row, n_idx]
+    new_value_head = jnp.where(active, value_head_idx.astype(jnp.int32), old_value_head)
+    out_value_head = buf.value_head_idx.at[write_row, n_idx].set(new_value_head)
 
     return TransitionBuffer(
         micro_halt_now=out_halt,
@@ -396,6 +408,7 @@ def append_to_buffer(
         phase_micro_idx=out_pm,
         population_idx=out_pop,
         policy_id=out_policy,
+        value_head_idx=out_value_head,
     )
 
 

@@ -79,6 +79,7 @@ from orbit_wars_pt.micro_jax import (
 )
 from orbit_wars_pt.model import OrbitWarsPolicy
 from orbit_wars_pt.observation_jax import (
+    _NORMALIZED_OWNER_SLOT_4P,
     build_compressed_observation_batched_jax,
     build_compressed_observation_batched_jax_per_ego,
 )
@@ -255,6 +256,42 @@ def _sample_main_player_mask_for_env(
         return out
     out = np.asarray(controller_assignments, dtype=np.int32) == int(termination_controller)
     return out.astype(np.bool_)
+
+
+def _relative_main_value_head_idx_for_rows(
+    *,
+    ego_idx: np.ndarray,
+    env_idx: np.ndarray,
+    controller_assignments: Optional[np.ndarray],
+    main_player_mask: Optional[np.ndarray],
+    normalize_obs_to_p0: bool,
+) -> np.ndarray:
+    """Critic-only egocentric main-opponent index: 0=p1, 1=p2, 2=p3."""
+
+    ego_np = np.asarray(ego_idx, dtype=np.int32).reshape(-1)
+    env_np = np.asarray(env_idx, dtype=np.int32).reshape(-1)
+    if ego_np.shape != env_np.shape:
+        raise ValueError("ego_idx and env_idx must have matching shape")
+    out = np.zeros_like(ego_np, dtype=np.int32)
+    if controller_assignments is None or main_player_mask is None:
+        return out
+    norm_table = np.asarray(jax.device_get(_NORMALIZED_OWNER_SLOT_4P), dtype=np.int32)
+    for i, (ego, env_i) in enumerate(zip(ego_np.tolist(), env_np.tolist())):
+        ctrl_col = np.asarray(controller_assignments[:, env_i], dtype=np.int32)
+        if ego < 0 or ego >= ctrl_col.shape[0] or int(ctrl_col[ego]) != 1:
+            continue
+        if int(np.count_nonzero(ctrl_col >= 0)) <= 2:
+            out[i] = 0
+            continue
+        main_slots = np.flatnonzero(np.asarray(main_player_mask[:, env_i], dtype=np.bool_))
+        if main_slots.size != 1:
+            continue
+        main_abs = int(main_slots[0])
+        if bool(normalize_obs_to_p0):
+            out[i] = int(norm_table[int(np.clip(ego, 0, 3)), int(np.clip(main_abs, 0, 3))] - 2)
+        else:
+            out[i] = int(main_abs if main_abs < ego else main_abs - 1)
+    return np.clip(out, 0, 2).astype(np.int32, copy=False)
 
 
 @jax.jit
@@ -713,6 +750,7 @@ def _forward_dense_rollout_by_controller(
     active_obs: dict[str, torch.Tensor],
     active_population_idx_t: torch.Tensor,
     active_controller_idx_t: torch.Tensor,
+    active_value_head_idx_t: Optional[torch.Tensor] = None,
 ) -> dict[str, torch.Tensor]:
     controller_outputs: list[tuple[torch.Tensor, dict[str, torch.Tensor]]] = []
     for controller_id in torch.unique(active_controller_idx_t, sorted=True).tolist():
@@ -722,7 +760,12 @@ def _forward_dense_rollout_by_controller(
         policy = policies[int(controller_id)]
         obs_slice = {key: value.index_select(0, row_idx) for key, value in active_obs.items()}
         pop_slice = active_population_idx_t.index_select(0, row_idx)
-        out = policy.forward_dense_rollout(**obs_slice, population_idx=pop_slice)
+        value_head_slice = None if active_value_head_idx_t is None else active_value_head_idx_t.index_select(0, row_idx)
+        out = policy.forward_dense_rollout(
+            **obs_slice,
+            population_idx=pop_slice,
+            value_head_idx=value_head_slice,
+        )
         controller_outputs.append((row_idx, out))
     return _merge_controller_outputs(controller_outputs, int(active_controller_idx_t.shape[0]))
 
@@ -734,6 +777,7 @@ def _forward_dense_rollout_compressed_by_controller(
     feature_dim: int,
     active_population_idx_t: torch.Tensor,
     active_controller_idx_t: torch.Tensor,
+    active_value_head_idx_t: Optional[torch.Tensor] = None,
 ) -> dict[str, torch.Tensor]:
     controller_outputs: list[tuple[torch.Tensor, dict[str, torch.Tensor]]] = []
     for controller_id in torch.unique(active_controller_idx_t, sorted=True).tolist():
@@ -743,6 +787,7 @@ def _forward_dense_rollout_compressed_by_controller(
         policy = policies[int(controller_id)]
         comp_slice = index_compressed_observation_rows(active_comp, row_idx)
         pop_slice = active_population_idx_t.index_select(0, row_idx)
+        value_head_slice = None if active_value_head_idx_t is None else active_value_head_idx_t.index_select(0, row_idx)
         out = policy.forward_dense_rollout_compressed(
             comp_slice.token_meta,
             comp_slice.owner_idx,
@@ -755,6 +800,7 @@ def _forward_dense_rollout_compressed_by_controller(
             comp_slice.incoming_survivor,
             int(feature_dim),
             population_idx=pop_slice,
+            value_head_idx=value_head_slice,
         )
         controller_outputs.append((row_idx, out))
     return _merge_controller_outputs(controller_outputs, int(active_controller_idx_t.shape[0]))
@@ -814,6 +860,7 @@ def _append_synthetic_terminal_rows(
     env_idx: np.ndarray,
     controller_idx: np.ndarray,
     population_idx: np.ndarray,
+    value_head_idx: np.ndarray,
     terminal_reward: np.ndarray,
     ship_speed: float,
     obs_feature_dim: int,
@@ -835,9 +882,10 @@ def _append_synthetic_terminal_rows(
     env_np = np.asarray(env_idx, dtype=np.int32).reshape(-1)
     ctrl_np = np.asarray(controller_idx, dtype=np.int32).reshape(-1)
     pop_np = np.asarray(population_idx, dtype=np.int32).reshape(-1)
+    value_head_np = np.asarray(value_head_idx, dtype=np.int32).reshape(-1)
     rew_np = np.asarray(terminal_reward, dtype=np.float32).reshape(-1)
     if not (
-        ego_np.shape == env_np.shape == ctrl_np.shape == pop_np.shape == rew_np.shape
+        ego_np.shape == env_np.shape == ctrl_np.shape == pop_np.shape == value_head_np.shape == rew_np.shape
     ):
         raise ValueError("synthetic terminal row metadata shapes must match")
 
@@ -852,11 +900,13 @@ def _append_synthetic_terminal_rows(
     obs_t_dev = {key: value.to(device) for key, value in decode_observation(obs_comp_t, feature_dim=obs_feature_dim).items()}
     ctrl_t = torch.as_tensor(ctrl_np, device=device, dtype=torch.long)
     pop_t = torch.as_tensor(pop_np, device=device, dtype=torch.long)
+    value_head_t = torch.as_tensor(value_head_np, device=device, dtype=torch.long)
     out = _forward_dense_rollout_by_controller(
         policies=policies,
         active_obs=obs_t_dev,
         active_population_idx_t=pop_t,
         active_controller_idx_t=ctrl_t,
+        active_value_head_idx_t=value_head_t,
     )
     value_np = out["value"].float().detach().cpu().numpy().astype(np.float32, copy=False)
 
@@ -896,6 +946,7 @@ def _append_synthetic_terminal_rows(
             target_hit_tick,
             torch.as_tensor(pop_np[row_sel], device=device, dtype=torch.int32),
             torch.as_tensor(ctrl_np[row_sel], device=device, dtype=torch.int32),
+            torch.as_tensor(value_head_np[row_sel], device=device, dtype=torch.int32),
             wr_t,
             zero_i32,
             1,
@@ -1155,6 +1206,7 @@ def _run_async_micro_step_multi(
     normalize_obs_to_p0: bool = False,
     sync_policy_timing: bool = False,
     controller_assignments: Optional[np.ndarray] = None,
+    main_player_mask: Optional[np.ndarray] = None,
 ) -> tuple[OrbitWarsState, List[TorchTransitionBuffer], List[CompressedObservationBuffer]]:
     """Run one micro decision for every pending egocentric row in a ``n_ego * num_envs`` JAX batch."""
 
@@ -1180,9 +1232,21 @@ def _run_async_micro_step_multi(
         active_controller_idx = np.concatenate(
             [controller_assignments[p, players_active[p]] for p in range(n_ego)]
         ).astype(np.int64)
+    active_env_idx = np.concatenate([players_active[p] for p in range(n_ego)]).astype(np.int32)
+    active_ego_idx = np.concatenate(
+        [np.full((int(players_active[p].size),), p, dtype=np.int32) for p in range(n_ego)]
+    ).astype(np.int32)
+    active_value_head_idx = _relative_main_value_head_idx_for_rows(
+        ego_idx=active_ego_idx,
+        env_idx=active_env_idx,
+        controller_assignments=controller_assignments,
+        main_player_mask=main_player_mask,
+        normalize_obs_to_p0=normalize_obs_to_p0,
+    ).astype(np.int64, copy=False)
     active_idx_t = torch.as_tensor(active_rows, device=device, dtype=torch.long)
     active_population_idx_t = torch.as_tensor(active_population_idx, device=device, dtype=torch.long)
     active_controller_idx_t = torch.as_tensor(active_controller_idx, device=device, dtype=torch.long)
+    active_value_head_idx_t = torch.as_tensor(active_value_head_idx, device=device, dtype=torch.long)
 
     ego_rows = [jnp.full((num_envs,), p, dtype=jnp.int32) for p in range(n_ego)]
     ego_b_j = jnp.concatenate(ego_rows, axis=0)
@@ -1215,6 +1279,7 @@ def _run_async_micro_step_multi(
         active_obs=active_obs,
         active_population_idx_t=active_population_idx_t,
         active_controller_idx_t=active_controller_idx_t,
+        active_value_head_idx_t=active_value_head_idx_t,
     )
     if sync_policy_timing:
         _sync_rollout_policy_timing(device)
@@ -1426,6 +1491,7 @@ def _run_async_micro_step_multi(
             target_hit_tick_t.index_select(0, pos_p_t).to(torch.float32),
             active_population_idx_t.index_select(0, pos_p_t).to(torch.int32),
             active_controller_idx_t.index_select(0, pos_p_t).to(torch.int32),
+            active_value_head_idx_t.index_select(0, pos_p_t).to(torch.int32),
             write_row_t,
             micro_kp_t,
             max_micro_steps,
@@ -1785,6 +1851,7 @@ def _run_async_micro_step_multi_grouped_population(
             (target_valid_t & ~target_overflow_t[:, None]).index_select(0, row_sel_t).to(torch.bool),
             target_hit_tick_t.index_select(0, row_sel_t).to(torch.float32),
             population_idx_t.index_select(0, row_sel_t),
+            torch.zeros_like(population_idx_t.index_select(0, row_sel_t), dtype=torch.int32),
             torch.zeros_like(population_idx_t.index_select(0, row_sel_t), dtype=torch.int32),
             write_row_t,
             micro_kp_t,
@@ -2465,6 +2532,13 @@ def collect_parallel_micro_rollouts(
                             population_idx=population_assignments[
                                 np.asarray(synthetic_dead_exploiters, dtype=np.int32), env_i
                             ].astype(np.int32, copy=False),
+                            value_head_idx=_relative_main_value_head_idx_for_rows(
+                                ego_idx=np.asarray(synthetic_dead_exploiters, dtype=np.int32),
+                                env_idx=np.full((row_count,), env_i, dtype=np.int32),
+                                controller_assignments=controller_assignments,
+                                main_player_mask=main_player_mask,
+                                normalize_obs_to_p0=cfg.normalize_obs_to_p0,
+                            ),
                             terminal_reward=synthetic_reward,
                             ship_speed=ship_speed,
                             obs_feature_dim=obs_feature_dim,
@@ -2742,6 +2816,7 @@ def collect_parallel_micro_rollouts(
                     normalize_obs_to_p0=cfg.normalize_obs_to_p0,
                     sync_policy_timing=sync_policy_timing,
                     controller_assignments=controller_assignments,
+                    main_player_mask=main_player_mask,
                     population_assignments=population_assignments,
                 )
             if profile_rollout and device.type == "cuda" and not logged_first_policy_fwd:
@@ -2805,6 +2880,17 @@ def collect_parallel_micro_rollouts(
                 obs_t = decode_observation(_compressed_obs_jax_to_torch(obs_comp_j), feature_dim=obs_feature_dim)
                 pop_t = torch.as_tensor(population_assignments[ego], device=device, dtype=torch.long)
                 controller_t = torch.as_tensor(controller_assignments[ego], device=device, dtype=torch.long)
+                value_head_idx_t = torch.as_tensor(
+                    _relative_main_value_head_idx_for_rows(
+                        ego_idx=np.full((num_envs,), ego, dtype=np.int32),
+                        env_idx=np.arange(num_envs, dtype=np.int32),
+                        controller_assignments=controller_assignments,
+                        main_player_mask=main_player_mask,
+                        normalize_obs_to_p0=cfg.normalize_obs_to_p0,
+                    ),
+                    device=device,
+                    dtype=torch.long,
+                )
                 obs_t_dev = {k: v.to(device) for k, v in obs_t.items()}
                 with amp_ctx:
                     out_e = _forward_dense_rollout_by_controller(
@@ -2812,6 +2898,7 @@ def collect_parallel_micro_rollouts(
                         active_obs=obs_t_dev,
                         active_population_idx_t=pop_t,
                         active_controller_idx_t=controller_t,
+                        active_value_head_idx_t=value_head_idx_t,
                     )
                 timing.policy_batch_s += perf_counter() - tb0
                 tf0 = perf_counter()

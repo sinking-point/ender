@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from collections import OrderedDict
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -177,7 +178,15 @@ def _make_target_pick_head(d_model: int) -> nn.Sequential:
 class OrbitWarsPopulationTail(nn.Module):
     """One population member's private final block + output heads."""
 
-    def __init__(self, d_model: int, n_heads: int, *, rope_dims: int, dropout: float = 0.0):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        *,
+        rope_dims: int,
+        dropout: float = 0.0,
+        value_head_count: int = 1,
+    ):
         super().__init__()
         self.block = TransformerBlock(d_model, n_heads, rope_dims=rope_dims, dropout=dropout)
         self.norm_f = nn.LayerNorm(d_model)
@@ -188,7 +197,48 @@ class OrbitWarsPopulationTail(nn.Module):
         self.time_proj = nn.Linear(1, 32)
         self.frac_heads = nn.ModuleList([nn.Linear(d_model * 2 + 32, 1) for _ in range(NUM_FRACTIONS)])
         self.halt_head = nn.Linear(d_model, 2)
-        self.value_head = nn.Linear(d_model, 1)
+        self.value_head = nn.Linear(d_model, int(value_head_count))
+
+
+def infer_value_head_count_from_state_dict(state: Mapping[str, Any]) -> int:
+    """Infer critic output width from the first value-head weight in ``state``."""
+
+    for key, value in state.items():
+        if not str(key).endswith("value_head.weight"):
+            continue
+        shape = getattr(value, "shape", None)
+        if shape is not None and len(shape) >= 2 and int(shape[0]) >= 1:
+            return int(shape[0])
+    return 1
+
+
+def adapt_legacy_value_heads_for_model(
+    state: Mapping[str, Any],
+    model: nn.Module,
+) -> tuple[OrderedDict[str, Any], bool]:
+    """Expand legacy single-output critic heads to match ``model`` critic widths."""
+
+    target_state = model.state_dict()
+    out = OrderedDict(state.items())
+    migrated = False
+    for key, target_tensor in target_state.items():
+        if not str(key).endswith("value_head.weight") and not str(key).endswith("value_head.bias"):
+            continue
+        if key not in out:
+            continue
+        src = out[key]
+        src_shape = tuple(int(x) for x in getattr(src, "shape", ()))
+        tgt_shape = tuple(int(x) for x in getattr(target_tensor, "shape", ()))
+        if src_shape == tgt_shape:
+            continue
+        if str(key).endswith("value_head.weight") and src_shape == (1, tgt_shape[1]) and len(tgt_shape) == 2 and tgt_shape[0] > 1:
+            out[key] = src.repeat(tgt_shape[0], 1)
+            migrated = True
+            continue
+        if str(key).endswith("value_head.bias") and src_shape == (1,) and tgt_shape[0] > 1:
+            out[key] = src.repeat(tgt_shape[0])
+            migrated = True
+    return out, migrated
 
 
 class OrbitWarsPolicy(nn.Module):
@@ -204,6 +254,7 @@ class OrbitWarsPolicy(nn.Module):
         activation_checkpointing: bool = False,
         population_size: int = 1,
         rope_dims: int = 2,
+        value_head_count: int = 1,
     ):
         super().__init__()
         head_dim = d_model // n_heads
@@ -221,8 +272,11 @@ class OrbitWarsPolicy(nn.Module):
         self.rope_dims = rope_dims
         self.activation_checkpointing = activation_checkpointing
         self.population_size = int(population_size)
+        self.value_head_count = int(value_head_count)
         if self.population_size < 1:
             raise ValueError(f"population_size must be >= 1, got {self.population_size}")
+        if self.value_head_count < 1:
+            raise ValueError(f"value_head_count must be >= 1, got {self.value_head_count}")
         self.type_emb = nn.Embedding(NUM_ENTITY_TYPES, d_model)
         self.owner_emb = nn.Embedding(NUM_OWNER_SLOTS, d_model)
         self.feat_proj = nn.Linear(feature_dim, d_model)
@@ -240,7 +294,7 @@ class OrbitWarsPolicy(nn.Module):
             self.time_proj = nn.Linear(1, 32)
             self.frac_heads = nn.ModuleList([nn.Linear(d_model * 2 + 32, 1) for _ in range(NUM_FRACTIONS)])
             self.halt_head = nn.Linear(d_model, 2)
-            self.value_head = nn.Linear(d_model, 1)
+            self.value_head = nn.Linear(d_model, self.value_head_count)
         else:
             shared_layers = max(0, int(n_layers) - 1)
             self.shared_blocks = nn.ModuleList(
@@ -248,7 +302,13 @@ class OrbitWarsPolicy(nn.Module):
             )
             self.population_tails = nn.ModuleList(
                 [
-                    OrbitWarsPopulationTail(d_model, n_heads, rope_dims=rope_dims, dropout=dropout)
+                    OrbitWarsPopulationTail(
+                        d_model,
+                        n_heads,
+                        rope_dims=rope_dims,
+                        dropout=dropout,
+                        value_head_count=self.value_head_count,
+                    )
                     for _ in range(self.population_size)
                 ]
             )
@@ -404,11 +464,22 @@ class OrbitWarsPolicy(nn.Module):
         origin_frac_head: nn.Linear,
         halt_head: nn.Linear,
         value_head: nn.Linear,
+        value_head_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         b = h.shape[0]
         cls_h = h[:, 0, :]
         halt_logits = halt_head(cls_h)
-        value = value_head(cls_h).squeeze(-1)
+        value_all = value_head(cls_h)
+        if int(value_all.shape[-1]) == 1:
+            value = value_all.squeeze(-1)
+        else:
+            if value_head_idx is None:
+                value = value_all[:, 0]
+            else:
+                value = value_all.gather(
+                    1,
+                    value_head_idx.to(device=value_all.device, dtype=torch.long).reshape(-1, 1),
+                ).squeeze(-1)
 
         planet_h = h[:, 1 : 1 + MAX_PLANETS, :]
         pq = pair_q(planet_h)
@@ -459,6 +530,7 @@ class OrbitWarsPolicy(nn.Module):
         halt_head: nn.Linear,
         value_head: nn.Linear,
         target_pick_head: nn.Module,
+        value_head_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         out = self._compute_outputs_single(
             h,
@@ -471,6 +543,7 @@ class OrbitWarsPolicy(nn.Module):
             origin_frac_head=origin_frac_head,
             halt_head=halt_head,
             value_head=value_head,
+            value_head_idx=value_head_idx,
         )
         planet_hidden = out["planet_hidden"]
         fleet_scalar = (fleet_size.to(device=planet_hidden.device, dtype=planet_hidden.dtype) / 1000.0).reshape(-1, 1, 1)
@@ -491,6 +564,7 @@ class OrbitWarsPolicy(nn.Module):
         entity_mask: torch.Tensor,
         planet_mask: torch.Tensor,
         population_idx: torch.Tensor,
+        value_head_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         batch_size = int(h.shape[0])
         outputs: Optional[Dict[str, Any]] = None
@@ -510,6 +584,7 @@ class OrbitWarsPolicy(nn.Module):
                 origin_frac_head=tail.origin_frac_head,
                 halt_head=tail.halt_head,
                 value_head=tail.value_head,
+                value_head_idx=None if value_head_idx is None else value_head_idx.index_select(0, member_rows),
             )
             if outputs is None:
                 outputs = {
@@ -544,6 +619,7 @@ class OrbitWarsPolicy(nn.Module):
         features: torch.Tensor,
         entity_mask: torch.Tensor,
         planet_mask: torch.Tensor,
+        value_head_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         if self.population_size == 1:
             return self._compute_outputs_single(
@@ -557,6 +633,7 @@ class OrbitWarsPolicy(nn.Module):
                 origin_frac_head=self.origin_frac_head,
                 halt_head=self.halt_head,
                 value_head=self.value_head,
+                value_head_idx=value_head_idx,
             )
 
         group_size = self._population_group_size(int(h.shape[0]))
@@ -582,6 +659,7 @@ class OrbitWarsPolicy(nn.Module):
                 origin_frac_head=tail.origin_frac_head,
                 halt_head=tail.halt_head,
                 value_head=tail.value_head,
+                value_head_idx=None if value_head_idx is None else value_head_idx[start:stop],
             )
             halt_logits.append(out_m["halt_logits"])
             value.append(out_m["value"])
@@ -607,6 +685,7 @@ class OrbitWarsPolicy(nn.Module):
         entity_mask: torch.Tensor,
         planet_mask: torch.Tensor,
         member_counts: torch.Tensor,
+        value_head_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         if self.population_size == 1:
             return self._compute_outputs_single(
@@ -620,6 +699,7 @@ class OrbitWarsPolicy(nn.Module):
                 origin_frac_head=self.origin_frac_head,
                 halt_head=self.halt_head,
                 value_head=self.value_head,
+                value_head_idx=value_head_idx,
             )
 
         outputs: Dict[str, Any] = {"hidden": h}
@@ -647,6 +727,7 @@ class OrbitWarsPolicy(nn.Module):
                 origin_frac_head=tail.origin_frac_head,
                 halt_head=tail.halt_head,
                 value_head=tail.value_head,
+                value_head_idx=None if value_head_idx is None else value_head_idx[start:stop],
             )
             halt_logits.append(out_m["halt_logits"])
             value.append(out_m["value"])
@@ -678,6 +759,7 @@ class OrbitWarsPolicy(nn.Module):
         target_eta: torch.Tensor,
         target_ships: torch.Tensor,
         member_counts: torch.Tensor,
+        value_head_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         if self.population_size == 1:
             return self._compute_ppo_outputs_single(
@@ -697,6 +779,7 @@ class OrbitWarsPolicy(nn.Module):
                 halt_head=self.halt_head,
                 value_head=self.value_head,
                 target_pick_head=self.target_pick_head,
+                value_head_idx=value_head_idx,
             )
 
         outputs: Dict[str, Any] = {"hidden": h}
@@ -731,6 +814,7 @@ class OrbitWarsPolicy(nn.Module):
                 halt_head=tail.halt_head,
                 value_head=tail.value_head,
                 target_pick_head=tail.target_pick_head,
+                value_head_idx=None if value_head_idx is None else value_head_idx[start:stop],
             )
             halt_logits.append(out_m["halt_logits"])
             value.append(out_m["value"])
@@ -760,6 +844,7 @@ class OrbitWarsPolicy(nn.Module):
         entity_mask: torch.Tensor,
         planet_mask: torch.Tensor,
         population_idx: Optional[torch.Tensor] = None,
+        value_head_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """Returns logits and masks for action decoding.
 
@@ -826,8 +911,17 @@ class OrbitWarsPolicy(nn.Module):
                 origin_frac_head=self.origin_frac_head,
                 halt_head=self.halt_head,
                 value_head=self.value_head,
+                value_head_idx=value_head_idx,
             )
-        return self._compute_outputs_population(h, owner_idx, features, entity_mask, planet_mask, pop)
+        return self._compute_outputs_population(
+            h,
+            owner_idx,
+            features,
+            entity_mask,
+            planet_mask,
+            pop,
+            value_head_idx=value_head_idx,
+        )
 
     def _forward_dense_fixed(
         self,
@@ -838,6 +932,7 @@ class OrbitWarsPolicy(nn.Module):
         entity_mask: torch.Tensor,
         planet_mask: torch.Tensor,
         population_idx: Optional[torch.Tensor] = None,
+        value_head_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """Fixed-length dense path shared by rollout and PPO."""
 
@@ -857,8 +952,17 @@ class OrbitWarsPolicy(nn.Module):
                 origin_frac_head=self.origin_frac_head,
                 halt_head=self.halt_head,
                 value_head=self.value_head,
+                value_head_idx=value_head_idx,
             )
-        return self._compute_outputs_population(h, owner_idx, features, entity_mask, planet_mask, pop)
+        return self._compute_outputs_population(
+            h,
+            owner_idx,
+            features,
+            entity_mask,
+            planet_mask,
+            pop,
+            value_head_idx=value_head_idx,
+        )
 
     def forward_dense_rollout(
         self,
@@ -869,6 +973,7 @@ class OrbitWarsPolicy(nn.Module):
         entity_mask: torch.Tensor,
         planet_mask: torch.Tensor,
         population_idx: Optional[torch.Tensor] = None,
+        value_head_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """Fixed-length rollout forward path.
 
@@ -884,6 +989,7 @@ class OrbitWarsPolicy(nn.Module):
             entity_mask=entity_mask,
             planet_mask=planet_mask,
             population_idx=population_idx,
+            value_head_idx=value_head_idx,
         )
 
     def forward_dense_rollout_grouped_population(
@@ -894,13 +1000,21 @@ class OrbitWarsPolicy(nn.Module):
         rope_pos: torch.Tensor,
         entity_mask: torch.Tensor,
         planet_mask: torch.Tensor,
+        value_head_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """Fixed-length rollout forward path for contiguous per-member batch chunks."""
 
         x = self.embed(entity_type, owner_idx, features)
         padding_mask = ~entity_mask
         h = self._apply_encoder_grouped_population(x, rope_pos, padding_mask)
-        return self._compute_outputs_grouped_population(h, owner_idx, features, entity_mask, planet_mask)
+        return self._compute_outputs_grouped_population(
+            h,
+            owner_idx,
+            features,
+            entity_mask,
+            planet_mask,
+            value_head_idx=value_head_idx,
+        )
 
     def forward_dense_rollout_compressed(
         self,
@@ -915,6 +1029,7 @@ class OrbitWarsPolicy(nn.Module):
         incoming_survivor: torch.Tensor,
         feature_dim: int,
         population_idx: Optional[torch.Tensor] = None,
+        value_head_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         comp = CompressedObservationBuffer(
             token_meta=token_meta,
@@ -936,6 +1051,7 @@ class OrbitWarsPolicy(nn.Module):
             entity_mask=obs["entity_mask"],
             planet_mask=obs["planet_mask"],
             population_idx=population_idx,
+            value_head_idx=value_head_idx,
         )
 
     def forward_dense_rollout_grouped_population_compressed(
@@ -950,6 +1066,7 @@ class OrbitWarsPolicy(nn.Module):
         incoming_net: torch.Tensor,
         incoming_survivor: torch.Tensor,
         feature_dim: int,
+        value_head_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         comp = CompressedObservationBuffer(
             token_meta=token_meta,
@@ -972,6 +1089,7 @@ class OrbitWarsPolicy(nn.Module):
             obs["features"],
             obs["entity_mask"],
             obs["planet_mask"],
+            value_head_idx=value_head_idx,
         )
 
     def forward_sorted_population(
@@ -983,6 +1101,7 @@ class OrbitWarsPolicy(nn.Module):
         entity_mask: torch.Tensor,
         planet_mask: torch.Tensor,
         population_idx: torch.Tensor,
+        value_head_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """Packed forward assuming rows are already contiguous by population member."""
 
@@ -1003,7 +1122,15 @@ class OrbitWarsPolicy(nn.Module):
         h_packed = self._apply_encoder_sorted_population(x_packed, rope_packed, padding_mask, member_counts)
         h = torch.zeros(b, l, self.d_model, dtype=h_packed.dtype, device=h_packed.device)
         h = h.scatter(1, pack_idx_d, h_packed)
-        return self._compute_outputs_sorted_population(h, owner_idx, features, entity_mask, planet_mask, member_counts)
+        return self._compute_outputs_sorted_population(
+            h,
+            owner_idx,
+            features,
+            entity_mask,
+            planet_mask,
+            member_counts,
+            value_head_idx=value_head_idx,
+        )
 
     def forward_ppo_sorted_population(
         self,
@@ -1019,6 +1146,7 @@ class OrbitWarsPolicy(nn.Module):
         fleet_size: torch.Tensor,
         target_eta: torch.Tensor,
         target_ships: torch.Tensor,
+        value_head_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """PPO-specific sorted forward that computes all private outputs in one member loop."""
 
@@ -1051,6 +1179,7 @@ class OrbitWarsPolicy(nn.Module):
             target_eta,
             target_ships,
             member_counts,
+            value_head_idx=value_head_idx,
         )
 
     def target_logits_for_origin_fraction(
