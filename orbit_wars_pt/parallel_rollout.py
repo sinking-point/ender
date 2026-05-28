@@ -882,6 +882,22 @@ def _target_logits_by_controller(
     return out
 
 
+def _assert_write_cursors_in_sync(
+    write_idx: list[np.ndarray],
+    write_idx_dev: list[torch.Tensor],
+    n_ego: int,
+) -> None:
+    for p in range(n_ego):
+        dev = write_idx_dev[p].detach().cpu().numpy()
+        if not np.array_equal(dev, write_idx[p]):
+            mism = np.flatnonzero(dev != write_idx[p])
+            e0 = int(mism[0])
+            raise RuntimeError(
+                f"write cursor desync ego={p}: {mism.size} env(s) differ; "
+                f"first env={e0} host={int(write_idx[p][e0])} dev={int(dev[e0])}"
+            )
+
+
 @torch.no_grad()
 def _append_synthetic_terminal_rows(
     *,
@@ -899,6 +915,7 @@ def _append_synthetic_terminal_rows(
     bufs: list[TorchTransitionBuffer],
     obs_bufs: list[CompressedObservationBuffer],
     write_idx: list[np.ndarray],
+    write_idx_dev: list[torch.Tensor],
     valid: list[np.ndarray],
     old_logprob: list[np.ndarray],
     old_value: list[np.ndarray],
@@ -948,9 +965,9 @@ def _append_synthetic_terminal_rows(
         env_sel = env_np[row_ids].astype(np.int32, copy=False)
         row_sel = np.asarray(row_ids, dtype=np.int32)
         row_sel_t = torch.as_tensor(row_sel, device=device, dtype=torch.long)
-        wr_np = write_idx[ego][env_sel].astype(np.int32, copy=False)
-        wr_t = torch.as_tensor(wr_np, device=device, dtype=torch.long)
         env_t = torch.as_tensor(env_sel, device=device, dtype=torch.long)
+        write_row_t = write_idx_dev[ego].index_select(0, env_t)
+        wr_np = write_row_t.detach().cpu().numpy().astype(np.int32, copy=False)
         count = int(row_sel.shape[0])
         zero_i32 = torch.zeros((count,), device=device, dtype=torch.int32)
         minus_one_i32 = torch.full((count,), -1, device=device, dtype=torch.int32)
@@ -978,18 +995,21 @@ def _append_synthetic_terminal_rows(
             torch.as_tensor(pop_np[row_sel], device=device, dtype=torch.int32),
             torch.as_tensor(ctrl_np[row_sel], device=device, dtype=torch.int32),
             torch.as_tensor(value_head_np[row_sel], device=device, dtype=torch.int32),
-            wr_t,
+            write_row_t,
             zero_i32,
             1,
         )
         obs_comp_ego = index_compressed_observation_rows(obs_comp_t, row_sel_t)
-        obs_bufs[ego] = store_precompressed_observation_rows(obs_bufs[ego], wr_t, env_t, obs_comp_ego)
+        obs_bufs[ego] = store_precompressed_observation_rows(
+            obs_bufs[ego], write_row_t.to(torch.long), env_t, obs_comp_ego
+        )
         valid[ego][wr_np, env_sel] = True
         old_logprob[ego][wr_np, env_sel] = 0.0
         old_value[ego][wr_np, env_sel] = value_np[row_sel]
         reward[ego][wr_np, env_sel] += rew_np[row_sel]
         done[ego][wr_np, env_sel] = True
         write_idx[ego][env_sel] += 1
+        write_idx_dev[ego][env_t] = write_idx_dev[ego][env_t] + 1
 
 
 def _selected_origin_fraction_targets_batched_maybe_chunked(
@@ -2682,6 +2702,7 @@ def collect_parallel_micro_rollouts(
                             bufs=bufs,
                             obs_bufs=obs_bufs,
                             write_idx=write_idx,
+                            write_idx_dev=write_idx_dev,
                             valid=valid,
                             old_logprob=old_logprob,
                             old_value=old_value,
@@ -2971,6 +2992,8 @@ def collect_parallel_micro_rollouts(
     timing.loop_s = perf_counter() - t_loop0
     timing.outer_iters = outer
     timing.wall_s = perf_counter() - t_wall0
+
+    _assert_write_cursors_in_sync(write_idx, write_idx_dev, n_ego)
 
     if profile_rollout:
         log_cuda_mem("rollout exit (segment finished)", device)
