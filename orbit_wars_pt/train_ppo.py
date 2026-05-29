@@ -94,6 +94,7 @@ class HostReplayMemberStore:
     returns: torch.Tensor
     old_logprob: torch.Tensor
     old_value: torch.Tensor
+    policy_loss_mask: torch.Tensor
 
 
 @dataclass
@@ -1006,22 +1007,39 @@ def _ppo_stats_str(s: dict) -> str:
     )
 
 
+def _advantage_norm_stat_select(group: np.ndarray, pmask: Optional[np.ndarray]) -> np.ndarray:
+    """Rows used to compute advantage mean/std for ``group``.
+
+    Restrict statistics to policy-trained (unmasked) rows so a value-only mode
+    pooled into the same batch doesn't skew the trained mode's normalization.
+    If the whole group is value-only the masked rows' advantages are unused, so
+    fall back to the full group just to keep the statistics finite.
+    """
+
+    if pmask is None:
+        return group
+    stat_sel = group & (pmask != 0.0)
+    return stat_sel if np.any(stat_sel) else group
+
+
 def normalize_advantages(samples: dict) -> None:
     a = samples["advantages"]
     if a.size == 0:
         return
+    pmask = samples.get("policy_loss_mask", None)
+    pmask = None if pmask is None else np.asarray(pmask, dtype=np.float32)
     pop_idx = samples.get("population_idx", None)
-    if pop_idx is None:
-        samples["advantages"] = ((a - a.mean()) / (a.std() + 1e-8)).astype(np.float32)
-        return
     out = a.astype(np.float32, copy=True)
-    pop_idx = np.asarray(pop_idx, dtype=np.int32)
-    for member in np.unique(pop_idx):
-        mask = pop_idx == int(member)
-        if not np.any(mask):
+    if pop_idx is None:
+        groups = [np.ones((a.shape[0],), dtype=np.bool_)]
+    else:
+        pop_idx = np.asarray(pop_idx, dtype=np.int32)
+        groups = [pop_idx == int(member) for member in np.unique(pop_idx)]
+    for group in groups:
+        if not np.any(group):
             continue
-        vals = a[mask]
-        out[mask] = ((vals - vals.mean()) / (vals.std() + 1e-8)).astype(np.float32)
+        vals = a[_advantage_norm_stat_select(group, pmask)]
+        out[group] = ((a[group] - vals.mean()) / (vals.std() + 1e-8)).astype(np.float32)
     samples["advantages"] = out
 
 
@@ -1082,6 +1100,23 @@ def _combine_optional_sample_dicts(sample_dicts: list[Optional[dict]]) -> Option
     if len(parts) == 1:
         return parts[0]
     return _concat_sample_dicts(parts)
+
+
+def _with_policy_loss_mask(samples: Optional[dict], *, train_policy: bool) -> Optional[dict]:
+    """Tag a per-mode sample dict with a per-row ``policy_loss_mask``.
+
+    ``train_policy=False`` rows keep contributing to the value loss but are
+    excluded from the policy-surrogate / entropy terms (value-only training).
+    Used to keep a dominated exploiter game mode in the mixed PPO batch
+    without pushing its policy further, instead of dropping it entirely.
+    """
+
+    if not samples:
+        return None
+    n = int(np.asarray(samples["advantages"]).shape[0])
+    out = dict(samples)
+    out["policy_loss_mask"] = np.full((n,), 1.0 if train_policy else 0.0, dtype=np.float32)
+    return out
 
 
 def _filter_sample_dict(
@@ -1145,13 +1180,17 @@ def _sample_unified_exploiter_env_modes(num_envs: int, seed: int) -> np.ndarray:
 def _normalize_chunk_advantages(chunks: list[HostRolloutChunk]) -> None:
     adv = np.concatenate([c.samples["advantages"] for c in chunks])
     pop = np.concatenate([c.samples["population_idx"] for c in chunks]).astype(np.int32)
+    if all("policy_loss_mask" in c.samples for c in chunks):
+        pmask = np.concatenate([c.samples["policy_loss_mask"] for c in chunks]).astype(np.float32)
+    else:
+        pmask = None
     out = adv.astype(np.float32, copy=True)
     for member in np.unique(pop):
-        mask = pop == int(member)
-        if not np.any(mask):
+        group = pop == int(member)
+        if not np.any(group):
             continue
-        vals = adv[mask]
-        out[mask] = ((vals - vals.mean()) / (vals.std() + 1e-8)).astype(np.float32)
+        vals = adv[_advantage_norm_stat_select(group, pmask)]
+        out[group] = ((adv[group] - vals.mean()) / (vals.std() + 1e-8)).astype(np.float32)
     offset = 0
     for chunk in chunks:
         size = int(chunk.samples["advantages"].shape[0])
@@ -1233,6 +1272,7 @@ def _build_host_member_replay_stores(
     ret_parts: list[list[torch.Tensor]] = [[] for _ in range(pop_n)]
     old_lp_parts: list[list[torch.Tensor]] = [[] for _ in range(pop_n)]
     old_v_parts: list[list[torch.Tensor]] = [[] for _ in range(pop_n)]
+    pmask_parts: list[list[torch.Tensor]] = [[] for _ in range(pop_n)]
 
     for chunk in chunks:
         samples = chunk.samples
@@ -1251,6 +1291,10 @@ def _build_host_member_replay_stores(
         ret_t = torch.as_tensor(samples["returns"], dtype=torch.float32)
         old_lp_t = torch.as_tensor(samples["old_logprob"], dtype=torch.float32)
         old_v_t = torch.as_tensor(samples["old_value"], dtype=torch.float32)
+        if "policy_loss_mask" in samples:
+            pmask_t = torch.as_tensor(samples["policy_loss_mask"], dtype=torch.float32)
+        else:
+            pmask_t = torch.ones((int(adv_t.shape[0]),), dtype=torch.float32)
         for member in range(pop_n):
             member_rows = torch.nonzero(pop_idx == member, as_tuple=False).squeeze(-1)
             if int(member_rows.numel()) == 0:
@@ -1261,6 +1305,7 @@ def _build_host_member_replay_stores(
             ret_parts[member].append(ret_t.index_select(0, member_rows))
             old_lp_parts[member].append(old_lp_t.index_select(0, member_rows))
             old_v_parts[member].append(old_v_t.index_select(0, member_rows))
+            pmask_parts[member].append(pmask_t.index_select(0, member_rows))
 
     stores: list[HostReplayMemberStore] = []
     for member in range(pop_n):
@@ -1271,6 +1316,7 @@ def _build_host_member_replay_stores(
             ret = torch.cat(ret_parts[member], dim=0)
             old_lp = torch.cat(old_lp_parts[member], dim=0)
             old_v = torch.cat(old_v_parts[member], dim=0)
+            pmask = torch.cat(pmask_parts[member], dim=0)
         else:
             obs = CompressedObservationBuffer(
                 token_meta=torch.zeros((0, 1 + MAX_PLANETS), dtype=torch.int16),
@@ -1289,6 +1335,7 @@ def _build_host_member_replay_stores(
             ret = torch.zeros((0,), dtype=torch.float32)
             old_lp = torch.zeros((0,), dtype=torch.float32)
             old_v = torch.zeros((0,), dtype=torch.float32)
+            pmask = torch.zeros((0,), dtype=torch.float32)
         stores.append(
             HostReplayMemberStore(
                 obs=obs,
@@ -1297,6 +1344,7 @@ def _build_host_member_replay_stores(
                 returns=ret,
                 old_logprob=old_lp,
                 old_value=old_v,
+                policy_loss_mask=pmask,
             )
         )
     return stores
@@ -1831,6 +1879,7 @@ def _torch_ppo_loss_from_replay(
     amp_dtype: Optional[torch.dtype],
     member_counts: Optional[torch.Tensor] = None,
     obs_feature_dim: int = FEATURE_DIM,
+    policy_loss_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     del ship_speed
     target_valid = actions["target_planet_reachable"].to(device=adv.device, dtype=torch.bool)
@@ -1877,6 +1926,7 @@ def _torch_ppo_loss_from_replay(
                 actions["population_idx"].to(device=adv.device, dtype=torch.long),
                 member_counts,
                 actions["value_head_idx"].to(device=adv.device, dtype=torch.long),
+                policy_loss_mask,
             )
         fn = loss_fn if loss_fn is not None else compute_ppo_loss_torch
         return fn(
@@ -1908,6 +1958,7 @@ def _torch_ppo_loss_from_replay(
             actions["population_idx"].to(device=adv.device, dtype=torch.long),
             member_counts,
             actions["value_head_idx"].to(device=adv.device, dtype=torch.long),
+            policy_loss_mask,
         )
 
 
@@ -1948,6 +1999,7 @@ def ppo_iteration(
     n_idx = samples["n_idx"]
     old_logprob = samples["old_logprob"]
     old_value = samples["old_value"]
+    policy_loss_mask_all = samples.get("policy_loss_mask", None)
 
     n = advantages.shape[0]
     total_loss_sum = 0.0
@@ -1979,6 +2031,11 @@ def ppo_iteration(
             ret_t = torch.as_tensor(returns[mb_idx], device=device, dtype=torch.float32)
             old_logp = torch.as_tensor(old_logprob[mb_idx], device=device, dtype=torch.float32)
             old_v = torch.as_tensor(old_value[mb_idx], device=device, dtype=torch.float32)
+            policy_loss_mask = (
+                None
+                if policy_loss_mask_all is None
+                else torch.as_tensor(policy_loss_mask_all[mb_idx], device=device, dtype=torch.float32)
+            )
             member_counts = _population_member_counts_torch(actions["population_idx"], population_size)
             timing.gather_s += perf_counter() - t0
 
@@ -2000,6 +2057,7 @@ def ppo_iteration(
                 amp_dtype=amp_dtype,
                 member_counts=member_counts,
                 obs_feature_dim=obs_feature_dim,
+                policy_loss_mask=policy_loss_mask,
             )
             timing.compiled_loss_s += perf_counter() - t0
 
@@ -2076,6 +2134,7 @@ def ppo_iteration_host_staged(
                     returns=store.returns.index_select(0, perm),
                     old_logprob=store.old_logprob.index_select(0, perm),
                     old_value=store.old_value.index_select(0, perm),
+                    policy_loss_mask=store.policy_loss_mask.index_select(0, perm),
                 )
             else:
                 shuffled = store
@@ -2099,6 +2158,7 @@ def ppo_iteration_host_staged(
             ret_parts: list[torch.Tensor] = []
             old_lp_parts: list[torch.Tensor] = []
             old_v_parts: list[torch.Tensor] = []
+            pmask_parts: list[torch.Tensor] = []
             for member in range(max(1, int(population_size))):
                 start, stop = batch_ranges[member][batch_i]
                 if stop <= start:
@@ -2111,6 +2171,7 @@ def ppo_iteration_host_staged(
                 ret_parts.append(store.returns.index_select(0, sl))
                 old_lp_parts.append(store.old_logprob.index_select(0, sl))
                 old_v_parts.append(store.old_value.index_select(0, sl))
+                pmask_parts.append(store.policy_loss_mask.index_select(0, sl))
             if not obs_parts:
                 continue
             obs = _concat_compressed_parts(obs_parts)
@@ -2120,6 +2181,7 @@ def ppo_iteration_host_staged(
             ret_t = torch.cat(ret_parts, dim=0).to(device=device, dtype=torch.float32)
             old_logp = torch.cat(old_lp_parts, dim=0).to(device=device, dtype=torch.float32)
             old_v = torch.cat(old_v_parts, dim=0).to(device=device, dtype=torch.float32)
+            policy_loss_mask = torch.cat(pmask_parts, dim=0).to(device=device, dtype=torch.float32)
             member_counts = _population_member_counts_torch(actions["population_idx"], population_size)
             timing.gather_s += perf_counter() - t0
 
@@ -2141,6 +2203,7 @@ def ppo_iteration_host_staged(
                 amp_dtype=amp_dtype,
                 member_counts=member_counts,
                 obs_feature_dim=obs_feature_dim,
+                policy_loss_mask=policy_loss_mask,
             )
             timing.compiled_loss_s += perf_counter() - t0
 
@@ -3066,9 +3129,12 @@ def _train_loop(
                 else float("nan")
             )
             skip_main_vs_4p = bool(main_vs_games_4p > 0 and main_win_rate_4p > 0.5)
-            skip_exploiter_4p = bool(main_vs_games_4p > 0 and main_win_rate_4p < 0.125)
+            # Below threshold the exploiter already dominates this mode: keep its
+            # samples in the mixed PPO batch but train only the value head on them
+            # (mask the policy loss) instead of dropping them entirely.
+            mask_exploiter_policy_4p = bool(main_vs_games_4p > 0 and main_win_rate_4p < 0.125)
             skip_main_vs_2p = bool(main_vs_games_2p > 0 and main_win_rate_2p > 0.75)
-            skip_exploiter_2p = bool(main_vs_games_2p > 0 and main_win_rate_2p < 0.25)
+            mask_exploiter_policy_2p = bool(main_vs_games_2p > 0 and main_win_rate_2p < 0.25)
             schedule_main_skip_next = bool(skip_main_vs_2p or skip_main_vs_4p)
             skip_main_next_iter = bool(schedule_main_skip_next)
 
@@ -3095,8 +3161,8 @@ def _train_loop(
                     )
                     exploiter_selected_i = _combine_optional_sample_dicts(
                         [
-                            None if skip_exploiter_2p else exploiter_2p_i,
-                            None if skip_exploiter_4p else exploiter_4p_i,
+                            _with_policy_loss_mask(exploiter_2p_i, train_policy=not mask_exploiter_policy_2p),
+                            _with_policy_loss_mask(exploiter_4p_i, train_policy=not mask_exploiter_policy_4p),
                         ]
                     )
                     if main_selected_i is not None:
@@ -3124,8 +3190,8 @@ def _train_loop(
                 )
                 exploiter_samples = _combine_optional_sample_dicts(
                     [
-                        None if skip_exploiter_2p else exploiter_2p_samples,
-                        None if skip_exploiter_4p else exploiter_4p_samples,
+                        _with_policy_loss_mask(exploiter_2p_samples, train_policy=not mask_exploiter_policy_2p),
+                        _with_policy_loss_mask(exploiter_4p_samples, train_policy=not mask_exploiter_policy_4p),
                     ]
                 )
                 if main_samples is not None:
@@ -3298,7 +3364,7 @@ def _train_loop(
                 f"skip_main {int(skip_main)} skip_exploiter {int(skip_exploiter)} "
                 f"main_skip_this_iter {int(skip_main_this_iter)} main_skip_next_scheduled {int(schedule_main_skip_next)} "
                 f"main_skip_trigger_2p {int(skip_main_vs_2p)} main_skip_trigger_4p {int(skip_main_vs_4p)} "
-                f"skip_exploiter_2p {int(skip_exploiter_2p)} skip_exploiter_4p {int(skip_exploiter_4p)} "
+                f"mask_exploiter_policy_2p {int(mask_exploiter_policy_2p)} mask_exploiter_policy_4p {int(mask_exploiter_policy_4p)} "
                 f"| ppo_main {main_ppo_str} "
                 f"| ppo_exploiter {exploiter_ppo_str} "
                 f"| {_rollout_timing_str(rt)} | {_ppo_timing_str(combined_ppo_t)}",
@@ -3313,8 +3379,8 @@ def _train_loop(
             writer.add_scalar("train/main_skip_next_scheduled", float(schedule_main_skip_next), it)
             writer.add_scalar("train/main_skip_trigger_2p", float(skip_main_vs_2p), it)
             writer.add_scalar("train/main_skip_trigger_4p", float(skip_main_vs_4p), it)
-            writer.add_scalar("train/exploiter_skip_2p", float(skip_exploiter_2p), it)
-            writer.add_scalar("train/exploiter_skip_4p", float(skip_exploiter_4p), it)
+            writer.add_scalar("train/exploiter_mask_policy_2p", float(mask_exploiter_policy_2p), it)
+            writer.add_scalar("train/exploiter_mask_policy_4p", float(mask_exploiter_policy_4p), it)
             _log_iter_tensorboard(
                 writer,
                 it,

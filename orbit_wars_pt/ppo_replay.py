@@ -223,6 +223,7 @@ def compute_ppo_loss_torch(
     population_idx: Optional[torch.Tensor] = None,
     member_counts: Optional[torch.Tensor] = None,
     value_head_idx: Optional[torch.Tensor] = None,
+    policy_loss_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Full PPO scalar loss + diagnostics on one minibatch.
 
@@ -301,7 +302,15 @@ def compute_ppo_loss_torch(
     surr1 = ratio * adv
     surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv
     # No policy gradient through halt when the env forced halt (no owned ships).
+    # ``policy_loss_mask`` additionally zeroes the policy-surrogate / entropy
+    # contribution for rows we only want to train the value head on (e.g. an
+    # exploiter game mode whose win rate is past the skip threshold). The value
+    # loss below stays over *all* rows, so the critic is still trained on them.
+    # Folding the mask into ``w_pi`` makes the surrogate/entropy/diagnostic
+    # reductions an unmasked-mean automatically (denominator ``w_pi.sum()``).
     w_pi = (~must_halt_no_ships).to(dtype=torch.float32)
+    if policy_loss_mask is not None:
+        w_pi = w_pi * policy_loss_mask.to(dtype=w_pi.dtype)
     v_clipped = old_v + (new_value - old_v).clamp(-clip_eps, clip_eps)
     value_err = torch.max((new_value - returns).pow(2), (v_clipped - returns).pow(2))
 
@@ -448,6 +457,7 @@ def compute_ppo_loss_compressed_torch(
     population_idx: Optional[torch.Tensor] = None,
     member_counts: Optional[torch.Tensor] = None,
     value_head_idx: Optional[torch.Tensor] = None,
+    policy_loss_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     comp = CompressedObservationBuffer(
         token_meta=token_meta,
@@ -491,6 +501,7 @@ def compute_ppo_loss_compressed_torch(
         population_idx,
         member_counts,
         value_head_idx,
+        policy_loss_mask,
     )
 
 
