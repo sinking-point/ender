@@ -75,6 +75,23 @@ from jax_orbit_wars import OrbitWarsState
 
 CHECKPOINT_VERSION = 7
 
+# Exploiter mode: main-vs-exploiter win rate is smoothed with a mild EMA before
+# it is compared against the skip/mask thresholds, so per-iteration sampling
+# noise does not cause the throttle to chatter. Alpha is the weight on the newest
+# observation (higher = less smoothing); 0.3 is a mild amount of smoothing.
+MAIN_WINRATE_EMA_ALPHA = 0.3
+# Upper thresholds: when the (smoothed) main win rate exceeds these, main training
+# is frozen for the next iteration so the exploiter can catch up. They are set so
+# main is never allowed to advance past a dead-even matchup against the exploiter
+# (50% in 2p, 25% in 4p == uniform skill across the 4 seats).
+MAIN_SKIP_WINRATE_2P = 0.5
+MAIN_SKIP_WINRATE_4P = 0.25
+# Lower thresholds: when the (smoothed) main win rate drops below these, the
+# exploiter already dominates this mode, so its policy loss is masked (value head
+# only) to let main recover.
+EXPLOITER_MASK_WINRATE_2P = 0.25
+EXPLOITER_MASK_WINRATE_4P = 0.125
+
 
 @dataclass
 class HostRolloutChunk:
@@ -654,6 +671,8 @@ def save_checkpoint(
     rollout_carry: Any,
     skip_main_next_iter: bool,
     args: argparse.Namespace,
+    main_win_rate_2p_ema: Optional[float] = None,
+    main_win_rate_4p_ema: Optional[float] = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     training_args = _checkpoint_training_args(args)
@@ -672,6 +691,8 @@ def save_checkpoint(
         "numpy_rng_state": rnd.bit_generator.state,
         "rollout_env_seed": rollout_env_seed,
         "skip_main_next_iter": bool(skip_main_next_iter),
+        "main_win_rate_2p_ema": (None if main_win_rate_2p_ema is None else float(main_win_rate_2p_ema)),
+        "main_win_rate_4p_ema": (None if main_win_rate_4p_ema is None else float(main_win_rate_4p_ema)),
         "rollout_carry": (
             {
                 key: (_serialize_rollout_carry(val) if val is not None else None)
@@ -2679,6 +2700,8 @@ def train(args: argparse.Namespace) -> None:
     rollout_carry: Any = None
     rollout_env_seed: Any = args.seed
     skip_main_next_iter = False
+    main_win_rate_2p_ema: Optional[float] = None
+    main_win_rate_4p_ema: Optional[float] = None
 
     if resume_path is not None:
         ckpt = resume_ckpt
@@ -2719,6 +2742,10 @@ def train(args: argparse.Namespace) -> None:
         rnd.bit_generator.state = ckpt["numpy_rng_state"]
         rollout_env_seed = ckpt["rollout_env_seed"]
         skip_main_next_iter = bool(ckpt.get("skip_main_next_iter", False))
+        _ema_2p = ckpt.get("main_win_rate_2p_ema")
+        _ema_4p = ckpt.get("main_win_rate_4p_ema")
+        main_win_rate_2p_ema = None if _ema_2p is None else float(_ema_2p)
+        main_win_rate_4p_ema = None if _ema_4p is None else float(_ema_4p)
         rc = ckpt["rollout_carry"]
         if args.exploiter_mode:
             if rc is None:
@@ -2850,6 +2877,8 @@ def train(args: argparse.Namespace) -> None:
             rollout_carry,
             rollout_env_seed,
             skip_main_next_iter,
+            main_win_rate_2p_ema,
+            main_win_rate_4p_ema,
             start_iter,
             writer,
             ckpt_dir,
@@ -2881,6 +2910,8 @@ def _train_loop(
     rollout_carry: Any,
     rollout_env_seed: Any,
     skip_main_next_iter: bool,
+    main_win_rate_2p_ema: Optional[float],
+    main_win_rate_4p_ema: Optional[float],
     start_iter: int,
     writer: SummaryWriter,
     ckpt_dir: Path,
@@ -3128,13 +3159,42 @@ def _train_loop(
                 if main_vs_games_4p > 0
                 else float("nan")
             )
-            skip_main_vs_4p = bool(main_vs_games_4p > 0 and main_win_rate_4p > 0.5)
+            # Smooth the per-iteration win rates with a mild EMA before comparing
+            # to the skip/mask thresholds so sampling noise does not chatter the
+            # throttle. The EMA state persists across checkpoints.
+            if main_vs_games_2p > 0:
+                main_win_rate_2p_ema = (
+                    main_win_rate_2p
+                    if main_win_rate_2p_ema is None
+                    else (
+                        MAIN_WINRATE_EMA_ALPHA * main_win_rate_2p
+                        + (1.0 - MAIN_WINRATE_EMA_ALPHA) * main_win_rate_2p_ema
+                    )
+                )
+            if main_vs_games_4p > 0:
+                main_win_rate_4p_ema = (
+                    main_win_rate_4p
+                    if main_win_rate_4p_ema is None
+                    else (
+                        MAIN_WINRATE_EMA_ALPHA * main_win_rate_4p
+                        + (1.0 - MAIN_WINRATE_EMA_ALPHA) * main_win_rate_4p_ema
+                    )
+                )
+            skip_main_vs_4p = bool(
+                main_win_rate_4p_ema is not None and main_win_rate_4p_ema > MAIN_SKIP_WINRATE_4P
+            )
             # Below threshold the exploiter already dominates this mode: keep its
             # samples in the mixed PPO batch but train only the value head on them
             # (mask the policy loss) instead of dropping them entirely.
-            mask_exploiter_policy_4p = bool(main_vs_games_4p > 0 and main_win_rate_4p < 0.125)
-            skip_main_vs_2p = bool(main_vs_games_2p > 0 and main_win_rate_2p > 0.75)
-            mask_exploiter_policy_2p = bool(main_vs_games_2p > 0 and main_win_rate_2p < 0.25)
+            mask_exploiter_policy_4p = bool(
+                main_win_rate_4p_ema is not None and main_win_rate_4p_ema < EXPLOITER_MASK_WINRATE_4P
+            )
+            skip_main_vs_2p = bool(
+                main_win_rate_2p_ema is not None and main_win_rate_2p_ema > MAIN_SKIP_WINRATE_2P
+            )
+            mask_exploiter_policy_2p = bool(
+                main_win_rate_2p_ema is not None and main_win_rate_2p_ema < EXPLOITER_MASK_WINRATE_2P
+            )
             schedule_main_skip_next = bool(skip_main_vs_2p or skip_main_vs_4p)
             skip_main_next_iter = bool(schedule_main_skip_next)
 
@@ -3361,6 +3421,8 @@ def _train_loop(
                 f"| samples+gae {samples_s:.3f}s ppo {ppo_s:.3f}s "
                 f"| {_sample_prep_timing_str(sample_prep_t)} "
                 f"| main_win_rate {main_win_rate:.3f} "
+                f"wr2p_ema {('nan' if main_win_rate_2p_ema is None else f'{main_win_rate_2p_ema:.3f}')} "
+                f"wr4p_ema {('nan' if main_win_rate_4p_ema is None else f'{main_win_rate_4p_ema:.3f}')} "
                 f"skip_main {int(skip_main)} skip_exploiter {int(skip_exploiter)} "
                 f"main_skip_this_iter {int(skip_main_this_iter)} main_skip_next_scheduled {int(schedule_main_skip_next)} "
                 f"main_skip_trigger_2p {int(skip_main_vs_2p)} main_skip_trigger_4p {int(skip_main_vs_4p)} "
@@ -3379,6 +3441,10 @@ def _train_loop(
             writer.add_scalar("train/main_skip_next_scheduled", float(schedule_main_skip_next), it)
             writer.add_scalar("train/main_skip_trigger_2p", float(skip_main_vs_2p), it)
             writer.add_scalar("train/main_skip_trigger_4p", float(skip_main_vs_4p), it)
+            if main_win_rate_2p_ema is not None:
+                writer.add_scalar("exploiter/main_win_rate_2p_ema", float(main_win_rate_2p_ema), it)
+            if main_win_rate_4p_ema is not None:
+                writer.add_scalar("exploiter/main_win_rate_4p_ema", float(main_win_rate_4p_ema), it)
             writer.add_scalar("train/exploiter_mask_policy_2p", float(mask_exploiter_policy_2p), it)
             writer.add_scalar("train/exploiter_mask_policy_4p", float(mask_exploiter_policy_4p), it)
             _log_iter_tensorboard(
@@ -3430,6 +3496,8 @@ def _train_loop(
                     rollout_carry=rollout_carry,
                     skip_main_next_iter=skip_main_next_iter,
                     args=args,
+                    main_win_rate_2p_ema=main_win_rate_2p_ema,
+                    main_win_rate_4p_ema=main_win_rate_4p_ema,
                 )
                 print(f"[orbit_wars_pt] saved checkpoint {ckpt_path}", flush=True)
             writer.flush()
