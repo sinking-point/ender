@@ -898,7 +898,6 @@ def _assert_write_cursors_in_sync(
             )
 
 
-@torch.no_grad()
 def _append_synthetic_terminal_rows(
     *,
     state_rows: OrbitWarsState,
@@ -956,6 +955,7 @@ def _append_synthetic_terminal_rows(
         active_value_head_idx_t=value_head_t,
     )
     value_np = out["value"].float().detach().cpu().numpy().astype(np.float32, copy=False)
+    del out
 
     by_player: dict[int, list[int]] = {}
     for row_i, ego in enumerate(ego_np.tolist()):
@@ -1481,6 +1481,19 @@ def _run_async_micro_step_multi(
     values_active = out["value"].float()
     apply_halt_now = ~dispatch_used
     stop_now = (halt_action == 1) | ((halt_action == 0) & ~any_valid_origin_frac)
+    total_logp = total_logp.detach()
+    values_active = values_active.detach()
+    halt_action = halt_action.detach()
+    target_abort = target_abort.detach()
+    pair_flat = pair_flat.detach()
+    frac_idx = frac_idx.detach()
+    o_idx = o_idx.detach()
+    d_idx = d_idx.detach()
+    origin_frac_used = origin_frac_used.detach()
+    apply_halt_now = apply_halt_now.detach()
+    stop_now = stop_now.detach()
+    policy_fleet_eta = policy_fleet_eta.detach()
+    del out
     if sync_policy_timing:
         _sync_rollout_policy_timing(device)
     t_target = perf_counter()
@@ -1907,6 +1920,20 @@ def _run_async_micro_step_multi_grouped_population(
         (halt_action == 1) | ((halt_action == 0) & ~any_valid_origin_frac),
         torch.ones_like(halt_action, dtype=torch.bool),
     )
+    total_logp = total_logp.detach()
+    values_all = values_all.detach()
+    halt_action = halt_action.detach()
+    target_abort = target_abort.detach()
+    pair_flat = pair_flat.detach()
+    frac_idx = frac_idx.detach()
+    o_idx = o_idx.detach()
+    d_idx = d_idx.detach()
+    origin_frac_used = origin_frac_used.detach()
+    apply_halt_now = apply_halt_now.detach()
+    stop_now = stop_now.detach()
+    policy_fleet_eta = policy_fleet_eta.detach()
+    pending_t = pending_t.detach()
+    del out
     if sync_policy_timing:
         _sync_rollout_policy_timing(device)
     t_target = perf_counter()
@@ -2486,7 +2513,10 @@ def collect_parallel_micro_rollouts(
     # row count BEFORE the reset (i.e. the first post-reset row index).
     first_reset_event: Optional[Tuple[int, int, np.ndarray]] = None
 
-    with torch.inference_mode(), amp_ctx:
+    # Keep grad mode consistent for torch.compile policy forwards (inference_mode /
+    # no_grad elsewhere caused grad_mode guard failures and recompiles). Detach
+    # stored logprob/value immediately after compute (see micro-step helpers).
+    with amp_ctx:
         while outer < max_outer_iters:
             outer += 1
 
@@ -3001,7 +3031,7 @@ def collect_parallel_micro_rollouts(
     bootstrap = [np.zeros((num_envs,), dtype=np.float32) for _ in range(n_ego)]
     bootstrap_valid = [np.zeros((num_envs,), dtype=np.bool_) for _ in range(n_ego)]
     if horizon_fired:
-        with torch.inference_mode(), amp_ctx:
+        with amp_ctx:
             if grouped_population_rollout:
                 assert row_env is not None and row_ego is not None and row_env_j is not None
                 t0 = perf_counter()
@@ -3021,6 +3051,7 @@ def collect_parallel_micro_rollouts(
                 timing.bootstrap_policy_batch_s += perf_counter() - tb0
                 tf0 = perf_counter()
                 value_np_rows = out_rows["value"].float().detach().cpu().numpy()
+                del out_rows
                 timing.bootstrap_policy_forward_s += perf_counter() - tf0
                 for row in range(value_np_rows.shape[0]):
                     env_i = int(row_env[row])
@@ -3067,6 +3098,7 @@ def collect_parallel_micro_rollouts(
                     timing.bootstrap_policy_batch_s += perf_counter() - tb0
                     tf0 = perf_counter()
                     value_np_per_ego.append(out_e["value"].float().detach().cpu().numpy())
+                    del out_e
                     timing.bootstrap_policy_forward_s += perf_counter() - tf0
 
                 for i in range(num_envs):

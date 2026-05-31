@@ -29,7 +29,7 @@ import torch
 
 from orbit_wars_pt.batched_env import obs_jax_to_torch
 from orbit_wars_pt.compressed_observation import CompressedObservationBuffer, decode_observation
-from orbit_wars_pt.constants import FRACTIONS, MAX_PLANETS
+from orbit_wars_pt.constants import FEATURE_DIM, FRACTIONS, MAX_PLANETS
 from orbit_wars_pt.micro_jax import selected_origin_fraction_targets_batched
 from orbit_wars_pt.model import OrbitWarsPolicy
 from orbit_wars_pt.observation_jax import build_observation_batched_jax_per_ego
@@ -186,6 +186,9 @@ def _compute_logp_value_entropy_torch(
         new_logp,
         out["value"].float(),
         new_entropy,
+        new_halt_logp,
+        new_origin_frac_logp,
+        new_target_logp,
         new_halt_entropy,
         new_origin_frac_entropy,
         new_target_entropy,
@@ -224,6 +227,7 @@ def compute_ppo_loss_torch(
     member_counts: Optional[torch.Tensor] = None,
     value_head_idx: Optional[torch.Tensor] = None,
     policy_loss_mask: Optional[torch.Tensor] = None,
+    check_rollout_logp: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Full PPO scalar loss + diagnostics on one minibatch.
 
@@ -269,6 +273,9 @@ def compute_ppo_loss_torch(
         new_logp,
         new_value,
         new_entropy,
+        new_halt_logp,
+        new_origin_frac_logp,
+        new_target_logp,
         new_halt_entropy,
         new_origin_frac_entropy,
         new_target_entropy,
@@ -404,6 +411,9 @@ def compute_ppo_loss_torch(
             (new_target_entropy * w_target).sum() / w_target_sum.clamp(min=1.0),
             nan,
         )
+        logp_diff = (new_logp - old_logp).abs()
+        rollout_logp_max_abs_diff = logp_diff.max()
+        rollout_logp_mean_abs_diff = logp_diff.mean()
 
     stats: Dict[str, torch.Tensor] = {
         "loss_pi": loss_pi.detach(),
@@ -420,7 +430,17 @@ def compute_ppo_loss_torch(
         "ret_sum": ret_sum,
         "ret_sq_sum": ret_sq_sum,
         "count": count,
+        "rollout_logp_max_abs_diff": rollout_logp_max_abs_diff,
+        "rollout_logp_mean_abs_diff": rollout_logp_mean_abs_diff,
     }
+    if check_rollout_logp:
+        stats["rollout_logp_new"] = new_logp.detach().float().cpu()
+        stats["rollout_logp_halt"] = new_halt_logp.detach().float().cpu()
+        stats["rollout_logp_origin_frac"] = new_origin_frac_logp.detach().float().cpu()
+        stats["rollout_logp_target"] = new_target_logp.detach().float().cpu()
+        stats["rollout_logp_origin_frac_used"] = origin_frac_used.detach().cpu()
+        stats["rollout_logp_target_used"] = target_used.detach().cpu()
+        stats["rollout_logp_diff"] = logp_diff.detach().float().cpu()
     return loss, stats
 
 
@@ -458,6 +478,7 @@ def compute_ppo_loss_compressed_torch(
     member_counts: Optional[torch.Tensor] = None,
     value_head_idx: Optional[torch.Tensor] = None,
     policy_loss_mask: Optional[torch.Tensor] = None,
+    check_rollout_logp: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     comp = CompressedObservationBuffer(
         token_meta=token_meta,
@@ -502,6 +523,7 @@ def compute_ppo_loss_compressed_torch(
         member_counts,
         value_head_idx,
         policy_loss_mask,
+        check_rollout_logp,
     )
 
 

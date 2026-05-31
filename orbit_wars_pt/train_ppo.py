@@ -69,6 +69,7 @@ from orbit_wars_pt.torch_replay import (
 from orbit_wars_pt.compressed_observation import (
     CompressedObservationBuffer,
     compressed_observation_to_host,
+    decode_observation,
 )
 
 from jax_orbit_wars import OrbitWarsState
@@ -101,6 +102,14 @@ class HostRolloutChunk:
     samples: dict
 
 
+# First-minibatch check: replay log π(a|s) from the PPO loss forward vs rollout old_logprob.
+# Only policy-training rows are checked (see ``_rollout_logp_check_mask``). Failures are
+# non-fatal warnings with optional debug dumps.
+ROLLOUT_LOGP_CHECK_MAX_ABS_DIFF = 0.05
+ROLLOUT_LOGP_CHECK_MEAN_ABS_DIFF = 0.005
+ROLLOUT_LOGP_CHECK_P99_ABS_DIFF = 0.03
+
+
 @dataclass
 class HostReplayMemberStore:
     """Flattened host-side PPO replay for one population member."""
@@ -112,6 +121,11 @@ class HostReplayMemberStore:
     old_logprob: torch.Tensor
     old_value: torch.Tensor
     policy_loss_mask: torch.Tensor
+    players: torch.Tensor
+    t_idx: torch.Tensor
+    n_idx: torch.Tensor
+    policy_id: torch.Tensor
+    env_mode: torch.Tensor
 
 
 @dataclass
@@ -1294,6 +1308,11 @@ def _build_host_member_replay_stores(
     old_lp_parts: list[list[torch.Tensor]] = [[] for _ in range(pop_n)]
     old_v_parts: list[list[torch.Tensor]] = [[] for _ in range(pop_n)]
     pmask_parts: list[list[torch.Tensor]] = [[] for _ in range(pop_n)]
+    players_parts: list[list[torch.Tensor]] = [[] for _ in range(pop_n)]
+    t_idx_parts: list[list[torch.Tensor]] = [[] for _ in range(pop_n)]
+    n_idx_parts: list[list[torch.Tensor]] = [[] for _ in range(pop_n)]
+    policy_id_parts: list[list[torch.Tensor]] = [[] for _ in range(pop_n)]
+    env_mode_parts: list[list[torch.Tensor]] = [[] for _ in range(pop_n)]
 
     for chunk in chunks:
         samples = chunk.samples
@@ -1312,6 +1331,11 @@ def _build_host_member_replay_stores(
         ret_t = torch.as_tensor(samples["returns"], dtype=torch.float32)
         old_lp_t = torch.as_tensor(samples["old_logprob"], dtype=torch.float32)
         old_v_t = torch.as_tensor(samples["old_value"], dtype=torch.float32)
+        players_t = torch.as_tensor(samples["players"], dtype=torch.int32)
+        t_idx_t = torch.as_tensor(samples["t_idx"], dtype=torch.int32)
+        n_idx_t = torch.as_tensor(samples["n_idx"], dtype=torch.int32)
+        policy_id_t = torch.as_tensor(samples["policy_id"], dtype=torch.int32)
+        env_mode_t = torch.as_tensor(samples["env_mode"], dtype=torch.int32)
         if "policy_loss_mask" in samples:
             pmask_t = torch.as_tensor(samples["policy_loss_mask"], dtype=torch.float32)
         else:
@@ -1327,6 +1351,11 @@ def _build_host_member_replay_stores(
             old_lp_parts[member].append(old_lp_t.index_select(0, member_rows))
             old_v_parts[member].append(old_v_t.index_select(0, member_rows))
             pmask_parts[member].append(pmask_t.index_select(0, member_rows))
+            players_parts[member].append(players_t.index_select(0, member_rows))
+            t_idx_parts[member].append(t_idx_t.index_select(0, member_rows))
+            n_idx_parts[member].append(n_idx_t.index_select(0, member_rows))
+            policy_id_parts[member].append(policy_id_t.index_select(0, member_rows))
+            env_mode_parts[member].append(env_mode_t.index_select(0, member_rows))
 
     stores: list[HostReplayMemberStore] = []
     for member in range(pop_n):
@@ -1338,6 +1367,11 @@ def _build_host_member_replay_stores(
             old_lp = torch.cat(old_lp_parts[member], dim=0)
             old_v = torch.cat(old_v_parts[member], dim=0)
             pmask = torch.cat(pmask_parts[member], dim=0)
+            players = torch.cat(players_parts[member], dim=0)
+            t_idx = torch.cat(t_idx_parts[member], dim=0)
+            n_idx = torch.cat(n_idx_parts[member], dim=0)
+            policy_id = torch.cat(policy_id_parts[member], dim=0)
+            env_mode = torch.cat(env_mode_parts[member], dim=0)
         else:
             obs = CompressedObservationBuffer(
                 token_meta=torch.zeros((0, 1 + MAX_PLANETS), dtype=torch.int16),
@@ -1357,6 +1391,11 @@ def _build_host_member_replay_stores(
             old_lp = torch.zeros((0,), dtype=torch.float32)
             old_v = torch.zeros((0,), dtype=torch.float32)
             pmask = torch.zeros((0,), dtype=torch.float32)
+            players = torch.zeros((0,), dtype=torch.int32)
+            t_idx = torch.zeros((0,), dtype=torch.int32)
+            n_idx = torch.zeros((0,), dtype=torch.int32)
+            policy_id = torch.zeros((0,), dtype=torch.int32)
+            env_mode = torch.zeros((0,), dtype=torch.int32)
         stores.append(
             HostReplayMemberStore(
                 obs=obs,
@@ -1366,6 +1405,11 @@ def _build_host_member_replay_stores(
                 old_logprob=old_lp,
                 old_value=old_v,
                 policy_loss_mask=pmask,
+                players=players,
+                t_idx=t_idx,
+                n_idx=n_idx,
+                policy_id=policy_id,
+                env_mode=env_mode,
             )
         )
     return stores
@@ -1882,6 +1926,395 @@ def _print_rollout_pre_ppo(
     )
 
 
+def _rollout_logp_check_mask(
+    actions: dict[str, torch.Tensor],
+    policy_loss_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Rows where rollout ``old_logprob`` must match PPO ``new_logp`` for policy training."""
+    must_halt = actions["must_halt_no_ships"].detach().cpu().bool()
+    check = ~must_halt
+    if policy_loss_mask is not None:
+        check &= policy_loss_mask.detach().cpu() > 0.0
+    return check
+
+
+def _rollout_logp_check_metrics(
+    old_logp: torch.Tensor,
+    new_logp: torch.Tensor,
+    check_mask: torch.Tensor,
+) -> tuple[float, float, float, int, int, torch.Tensor, torch.Tensor]:
+    old_cpu = old_logp.detach().float().cpu()
+    new_cpu = new_logp.detach().float().cpu()
+    mask = check_mask.detach().cpu().bool()
+    old_checked = old_cpu[mask]
+    new_checked = new_cpu[mask]
+    diff = (new_checked - old_checked).abs()
+    nonfinite = int((~torch.isfinite(old_checked)).sum().item() + (~torch.isfinite(new_checked)).sum().item())
+    max_abs_diff = float(diff.max().item()) if int(diff.numel()) > 0 else 0.0
+    mean_abs_diff = float(diff.mean().item()) if int(diff.numel()) > 0 else 0.0
+    if int(diff.numel()) == 0:
+        p99_abs_diff = 0.0
+        worst = 0
+    else:
+        p99_abs_diff = float(torch.quantile(diff, 0.99).item())
+        worst_local = int(diff.argmax().item())
+        checked_idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+        worst = int(checked_idx[worst_local].item())
+    return max_abs_diff, mean_abs_diff, p99_abs_diff, nonfinite, worst, diff, mask
+
+
+def _rollout_logp_check_failed(
+    *,
+    max_abs_diff: float,
+    mean_abs_diff: float,
+    p99_abs_diff: float,
+    nonfinite: int,
+) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    if nonfinite > 0:
+        reasons.append(f"nonfinite old/new logp rows={nonfinite}")
+    if max_abs_diff > ROLLOUT_LOGP_CHECK_MAX_ABS_DIFF:
+        reasons.append(
+            f"max_abs_diff={max_abs_diff:.6g} > {ROLLOUT_LOGP_CHECK_MAX_ABS_DIFF:g}"
+        )
+    if mean_abs_diff > ROLLOUT_LOGP_CHECK_MEAN_ABS_DIFF:
+        reasons.append(
+            f"mean_abs_diff={mean_abs_diff:.6g} > {ROLLOUT_LOGP_CHECK_MEAN_ABS_DIFF:g}"
+        )
+    if p99_abs_diff > ROLLOUT_LOGP_CHECK_P99_ABS_DIFF:
+        reasons.append(
+            f"p99_abs_diff={p99_abs_diff:.6g} > {ROLLOUT_LOGP_CHECK_P99_ABS_DIFF:g}"
+        )
+    return bool(reasons), reasons
+
+
+def _select_rows_cpu(t: torch.Tensor, row_idx: torch.Tensor) -> np.ndarray:
+    if int(row_idx.numel()) == 0:
+        return np.asarray([], dtype=t.detach().cpu().numpy().dtype)
+    return t.detach().cpu()[row_idx].numpy()
+
+
+def _tensor_cpu_numpy(t: torch.Tensor) -> np.ndarray:
+    return t.detach().cpu().numpy()
+
+
+def _amp_dtype_name(amp_dtype: Optional[torch.dtype]) -> str:
+    if amp_dtype is None:
+        return ""
+    return str(amp_dtype).replace("torch.", "")
+
+
+def _dump_ppo_loss_mb_inputs_npz(
+    path: Path,
+    *,
+    meta: dict[str, object],
+    old_logp: torch.Tensor,
+    mb_stats: dict[str, torch.Tensor],
+    obs: dict[str, torch.Tensor] | CompressedObservationBuffer,
+    actions: dict[str, torch.Tensor],
+    advantages: torch.Tensor,
+    returns: torch.Tensor,
+    old_value: torch.Tensor,
+    policy_loss_mask: Optional[torch.Tensor],
+    players: Optional[torch.Tensor],
+    t_idx: Optional[torch.Tensor],
+    n_idx: Optional[torch.Tensor],
+    policy_id: Optional[torch.Tensor],
+    env_mode: Optional[torch.Tensor],
+    obs_feature_dim: int,
+    clip_eps: float,
+    vf_coef: float,
+    entropy_coef: float,
+    member_counts: Optional[torch.Tensor],
+    amp_dtype: Optional[torch.dtype],
+) -> None:
+    """Dump the full minibatch tensors passed into the PPO loss for exact replay."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, np.ndarray] = {}
+    for key, value in meta.items():
+        if isinstance(value, (str, int, float, bool)):
+            payload[f"meta_{key}"] = np.asarray(value)
+
+    payload["meta_amp_dtype"] = np.asarray(_amp_dtype_name(amp_dtype))
+    payload["meta_clip_eps"] = np.asarray(float(clip_eps))
+    payload["meta_vf_coef"] = np.asarray(float(vf_coef))
+    payload["meta_entropy_coef"] = np.asarray(float(entropy_coef))
+    payload["meta_obs_feature_dim"] = np.asarray(int(obs_feature_dim))
+
+    payload["old_logprob"] = _tensor_cpu_numpy(old_logp)
+    payload["new_logprob"] = _tensor_cpu_numpy(mb_stats["rollout_logp_new"])
+    payload["logprob_diff"] = _tensor_cpu_numpy(mb_stats["rollout_logp_diff"])
+    payload["halt_logprob"] = _tensor_cpu_numpy(mb_stats["rollout_logp_halt"])
+    payload["origin_frac_logprob"] = _tensor_cpu_numpy(mb_stats["rollout_logp_origin_frac"])
+    payload["target_logprob"] = _tensor_cpu_numpy(mb_stats["rollout_logp_target"])
+    payload["origin_frac_used"] = _tensor_cpu_numpy(mb_stats["rollout_logp_origin_frac_used"])
+    payload["target_used"] = _tensor_cpu_numpy(mb_stats["rollout_logp_target_used"])
+    payload["advantages"] = _tensor_cpu_numpy(advantages)
+    payload["returns"] = _tensor_cpu_numpy(returns)
+    payload["old_value"] = _tensor_cpu_numpy(old_value)
+    if policy_loss_mask is not None:
+        payload["policy_loss_mask"] = _tensor_cpu_numpy(policy_loss_mask)
+
+    for key, value in actions.items():
+        payload[f"action_{key}"] = _tensor_cpu_numpy(value)
+
+    if players is not None:
+        payload["players"] = _tensor_cpu_numpy(players)
+    if t_idx is not None:
+        payload["t_idx"] = _tensor_cpu_numpy(t_idx)
+    if n_idx is not None:
+        payload["n_idx"] = _tensor_cpu_numpy(n_idx)
+    if policy_id is not None:
+        payload["policy_id"] = _tensor_cpu_numpy(policy_id)
+    if env_mode is not None:
+        payload["env_mode"] = _tensor_cpu_numpy(env_mode)
+    if member_counts is not None:
+        payload["member_counts"] = _tensor_cpu_numpy(member_counts)
+
+    if isinstance(obs, CompressedObservationBuffer):
+        obs_host = compressed_observation_to_host(obs)
+        for field in obs_host._fields:
+            payload[f"obs_comp_{field}"] = _tensor_cpu_numpy(getattr(obs_host, field))
+        decoded = decode_observation(obs_host, feature_dim=int(obs_feature_dim))
+        for key, value in decoded.items():
+            payload[f"obs_{key}"] = _tensor_cpu_numpy(value)
+    else:
+        for key, value in obs.items():
+            payload[f"obs_{key}"] = _tensor_cpu_numpy(value)
+
+    np.savez_compressed(path, **payload)
+
+
+def _dump_logp_mismatch_npz(
+    path: Path,
+    *,
+    meta: dict[str, object],
+    row_idx: torch.Tensor,
+    old_logp: torch.Tensor,
+    mb_stats: dict[str, torch.Tensor],
+    obs: dict[str, torch.Tensor] | CompressedObservationBuffer,
+    actions: dict[str, torch.Tensor],
+    advantages: torch.Tensor,
+    returns: torch.Tensor,
+    old_value: torch.Tensor,
+    policy_loss_mask: Optional[torch.Tensor],
+    players: Optional[torch.Tensor],
+    t_idx: Optional[torch.Tensor],
+    n_idx: Optional[torch.Tensor],
+    policy_id: Optional[torch.Tensor],
+    env_mode: Optional[torch.Tensor],
+    obs_feature_dim: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    idx = row_idx.detach().cpu().long()
+    payload: dict[str, np.ndarray] = {}
+    for key, value in meta.items():
+        if isinstance(value, (str, int, float, bool)):
+            payload[f"meta_{key}"] = np.asarray(value)
+
+    payload["row_idx"] = idx.numpy()
+    payload["old_logprob"] = _select_rows_cpu(old_logp, idx)
+    payload["new_logprob"] = _select_rows_cpu(mb_stats["rollout_logp_new"], idx)
+    payload["logprob_diff"] = _select_rows_cpu(mb_stats["rollout_logp_diff"], idx)
+    payload["halt_logprob"] = _select_rows_cpu(mb_stats["rollout_logp_halt"], idx)
+    payload["origin_frac_logprob"] = _select_rows_cpu(mb_stats["rollout_logp_origin_frac"], idx)
+    payload["target_logprob"] = _select_rows_cpu(mb_stats["rollout_logp_target"], idx)
+    payload["origin_frac_used"] = _select_rows_cpu(mb_stats["rollout_logp_origin_frac_used"], idx)
+    payload["target_used"] = _select_rows_cpu(mb_stats["rollout_logp_target_used"], idx)
+    payload["advantages"] = _select_rows_cpu(advantages, idx)
+    payload["returns"] = _select_rows_cpu(returns, idx)
+    payload["old_value"] = _select_rows_cpu(old_value, idx)
+    if policy_loss_mask is not None:
+        payload["policy_loss_mask"] = _select_rows_cpu(policy_loss_mask, idx)
+
+    for key, value in actions.items():
+        payload[f"action_{key}"] = _select_rows_cpu(value, idx)
+
+    if players is not None:
+        payload["players"] = _select_rows_cpu(players, idx)
+    if t_idx is not None:
+        payload["t_idx"] = _select_rows_cpu(t_idx, idx)
+    if n_idx is not None:
+        payload["n_idx"] = _select_rows_cpu(n_idx, idx)
+    if policy_id is not None:
+        payload["policy_id"] = _select_rows_cpu(policy_id, idx)
+    if env_mode is not None:
+        payload["env_mode"] = _select_rows_cpu(env_mode, idx)
+
+    if isinstance(obs, CompressedObservationBuffer):
+        obs_host = compressed_observation_to_host(obs)
+        for field in obs_host._fields:
+            payload[f"obs_comp_{field}"] = _select_rows_cpu(getattr(obs_host, field), idx)
+        decoded = decode_observation(obs_host, feature_dim=int(obs_feature_dim))
+        for key, value in decoded.items():
+            payload[f"obs_{key}"] = _select_rows_cpu(value, idx)
+    else:
+        for key, value in obs.items():
+            payload[f"obs_{key}"] = _select_rows_cpu(value, idx)
+
+    np.savez_compressed(path, **payload)
+
+
+def _verify_rollout_logp_from_loss(
+    *,
+    mb_stats: dict[str, torch.Tensor],
+    old_logp: torch.Tensor,
+    obs: dict[str, torch.Tensor] | CompressedObservationBuffer,
+    actions: dict[str, torch.Tensor],
+    advantages: torch.Tensor,
+    returns: torch.Tensor,
+    old_value: torch.Tensor,
+    policy_loss_mask: Optional[torch.Tensor],
+    players: Optional[torch.Tensor],
+    t_idx: Optional[torch.Tensor],
+    n_idx: Optional[torch.Tensor],
+    policy_id: Optional[torch.Tensor],
+    env_mode: Optional[torch.Tensor],
+    obs_feature_dim: int,
+    dump_dir: Optional[Path],
+    policy_label: str,
+    train_iter: int,
+    clip_eps: float,
+    vf_coef: float,
+    entropy_coef: float,
+    population_size: int,
+    member_counts: Optional[torch.Tensor],
+    amp_dtype: Optional[torch.dtype],
+) -> None:
+    if int(old_logp.numel()) == 0:
+        return
+    check_mask = _rollout_logp_check_mask(actions, policy_loss_mask)
+    n_checked = int(check_mask.sum().item())
+    n_skipped = int(old_logp.numel()) - n_checked
+    if n_checked == 0:
+        return
+    new_logp = mb_stats["rollout_logp_new"]
+    max_abs_diff, mean_abs_diff, p99_abs_diff, nonfinite, worst, diff_checked, check_mask_cpu = (
+        _rollout_logp_check_metrics(old_logp, new_logp, check_mask)
+    )
+    failed, reasons = _rollout_logp_check_failed(
+        max_abs_diff=max_abs_diff,
+        mean_abs_diff=mean_abs_diff,
+        p99_abs_diff=p99_abs_diff,
+        nonfinite=nonfinite,
+    )
+    if not failed:
+        return
+
+    old_cpu = old_logp.detach().float().cpu()
+    new_cpu = new_logp.detach().float().cpu()
+    checked_idx = torch.nonzero(check_mask_cpu, as_tuple=False).squeeze(-1)
+    row_bad = (~torch.isfinite(old_cpu[check_mask_cpu])) | (~torch.isfinite(new_cpu[check_mask_cpu]))
+    row_bad |= diff_checked > ROLLOUT_LOGP_CHECK_P99_ABS_DIFF
+    mismatch_idx = checked_idx[row_bad]
+    if int(mismatch_idx.numel()) == 0:
+        mismatch_idx = checked_idx[diff_checked.argmax().unsqueeze(0)]
+    dump_path: Optional[Path] = None
+    full_dump_path: Optional[Path] = None
+    if dump_dir is not None:
+        dump_path = (
+            dump_dir
+            / f"logp_mismatch_iter{int(train_iter):08d}_{policy_label}_mb0.npz"
+        )
+        full_dump_path = (
+            dump_dir
+            / f"logp_mismatch_iter{int(train_iter):08d}_{policy_label}_mb0_full.npz"
+        )
+        mismatch_meta = {
+            "dump_kind": "logp_mismatch_rows",
+            "train_iter": int(train_iter),
+            "policy_label": policy_label,
+            "minibatch": 0,
+            "epoch": 0,
+            "max_abs_diff_limit": float(ROLLOUT_LOGP_CHECK_MAX_ABS_DIFF),
+            "mean_abs_diff_limit": float(ROLLOUT_LOGP_CHECK_MEAN_ABS_DIFF),
+            "p99_abs_diff_limit": float(ROLLOUT_LOGP_CHECK_P99_ABS_DIFF),
+            "n_rows": int(old_cpu.numel()),
+            "n_checked": n_checked,
+            "n_skipped": n_skipped,
+            "n_dump_rows": int(mismatch_idx.numel()),
+            "nonfinite_rows": nonfinite,
+            "max_abs_diff": max_abs_diff,
+            "mean_abs_diff": mean_abs_diff,
+            "p99_abs_diff": p99_abs_diff,
+            "worst_idx": worst,
+        }
+        _dump_logp_mismatch_npz(
+            dump_path,
+            meta=mismatch_meta,
+            row_idx=mismatch_idx,
+            old_logp=old_logp,
+            mb_stats=mb_stats,
+            obs=obs,
+            actions=actions,
+            advantages=advantages,
+            returns=returns,
+            old_value=old_value,
+            policy_loss_mask=policy_loss_mask,
+            players=players,
+            t_idx=t_idx,
+            n_idx=n_idx,
+            policy_id=policy_id,
+            env_mode=env_mode,
+            obs_feature_dim=obs_feature_dim,
+        )
+        _dump_ppo_loss_mb_inputs_npz(
+            full_dump_path,
+            meta={
+                "dump_kind": "ppo_loss_mb_full",
+                "train_iter": int(train_iter),
+                "policy_label": policy_label,
+                "minibatch": 0,
+                "epoch": 0,
+                "max_abs_diff_limit": float(ROLLOUT_LOGP_CHECK_MAX_ABS_DIFF),
+                "mean_abs_diff_limit": float(ROLLOUT_LOGP_CHECK_MEAN_ABS_DIFF),
+                "p99_abs_diff_limit": float(ROLLOUT_LOGP_CHECK_P99_ABS_DIFF),
+                "population_size": int(population_size),
+                "n_rows": int(old_cpu.numel()),
+                "n_checked": n_checked,
+                "n_skipped": n_skipped,
+                "n_dump_rows": int(mismatch_idx.numel()),
+                "nonfinite_rows": nonfinite,
+                "max_abs_diff": max_abs_diff,
+                "mean_abs_diff": mean_abs_diff,
+                "p99_abs_diff": p99_abs_diff,
+                "worst_idx": worst,
+            },
+            old_logp=old_logp,
+            mb_stats=mb_stats,
+            obs=obs,
+            actions=actions,
+            advantages=advantages,
+            returns=returns,
+            old_value=old_value,
+            policy_loss_mask=policy_loss_mask,
+            players=players,
+            t_idx=t_idx,
+            n_idx=n_idx,
+            policy_id=policy_id,
+            env_mode=env_mode,
+            obs_feature_dim=obs_feature_dim,
+            clip_eps=clip_eps,
+            vf_coef=vf_coef,
+            entropy_coef=entropy_coef,
+            member_counts=member_counts,
+            amp_dtype=amp_dtype,
+        )
+    dump_msg = ""
+    if dump_path is not None:
+        dump_msg = f" dump={dump_path} full_dump={full_dump_path}"
+    print(
+        "[orbit_wars_pt] WARNING PPO loss forward logp mismatch vs rollout old_logprob on "
+        f"{n_checked} policy rows ({n_skipped} skipped): "
+        f"max_abs_diff={max_abs_diff:.6g} mean_abs_diff={mean_abs_diff:.6g} "
+        f"p99_abs_diff={p99_abs_diff:.6g} at idx={worst} "
+        f"(new={float(new_cpu[worst]):.6g}, old={float(old_cpu[worst]):.6g}); "
+        f"failed: {'; '.join(reasons)}"
+        f"{dump_msg}",
+        flush=True,
+    )
+
+
 def _torch_ppo_loss_from_replay(
     *,
     obs: dict[str, torch.Tensor] | CompressedObservationBuffer,
@@ -1901,6 +2334,7 @@ def _torch_ppo_loss_from_replay(
     member_counts: Optional[torch.Tensor] = None,
     obs_feature_dim: int = FEATURE_DIM,
     policy_loss_mask: Optional[torch.Tensor] = None,
+    check_rollout_logp: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     del ship_speed
     target_valid = actions["target_planet_reachable"].to(device=adv.device, dtype=torch.bool)
@@ -1948,6 +2382,7 @@ def _torch_ppo_loss_from_replay(
                 member_counts,
                 actions["value_head_idx"].to(device=adv.device, dtype=torch.long),
                 policy_loss_mask,
+                check_rollout_logp,
             )
         fn = loss_fn if loss_fn is not None else compute_ppo_loss_torch
         return fn(
@@ -1980,6 +2415,7 @@ def _torch_ppo_loss_from_replay(
             member_counts,
             actions["value_head_idx"].to(device=adv.device, dtype=torch.long),
             policy_loss_mask,
+            check_rollout_logp,
         )
 
 
@@ -2005,6 +2441,9 @@ def ppo_iteration(
     amp_dtype: Optional[torch.dtype] = None,
     obs_feature_dim: int,
     population_size: int,
+    logp_check_dump_dir: Optional[Path] = None,
+    logp_check_label: str = "policy",
+    logp_check_iter: int = 0,
 ) -> Tuple[float, PPOTiming, PPOStats]:
     """Multiple epochs of clipped PPO surrogate with minibatches.
 
@@ -2020,6 +2459,8 @@ def ppo_iteration(
     n_idx = samples["n_idx"]
     old_logprob = samples["old_logprob"]
     old_value = samples["old_value"]
+    policy_id = samples.get("policy_id")
+    env_mode = samples.get("env_mode")
     policy_loss_mask_all = samples.get("policy_loss_mask", None)
 
     n = advantages.shape[0]
@@ -2028,6 +2469,7 @@ def ppo_iteration(
     timing = PPOTiming()
     stats = PPOStats()
     t_total0 = perf_counter()
+    checked_rollout_logp = False
 
     for _ in range(ppo_epochs):
         minibatches = _stratified_population_minibatches(samples["population_idx"], minibatch_size, population_size, rnd)
@@ -2060,6 +2502,7 @@ def ppo_iteration(
             member_counts = _population_member_counts_torch(actions["population_idx"], population_size)
             timing.gather_s += perf_counter() - t0
 
+            check_rollout_logp = not checked_rollout_logp
             t0 = perf_counter()
             loss, mb_stats = _torch_ppo_loss_from_replay(
                 obs=obs,
@@ -2079,8 +2522,43 @@ def ppo_iteration(
                 member_counts=member_counts,
                 obs_feature_dim=obs_feature_dim,
                 policy_loss_mask=policy_loss_mask,
+                check_rollout_logp=check_rollout_logp,
             )
             timing.compiled_loss_s += perf_counter() - t0
+
+            if check_rollout_logp:
+                _verify_rollout_logp_from_loss(
+                    mb_stats=mb_stats,
+                    old_logp=old_logp,
+                    obs=obs,
+                    actions=actions,
+                    advantages=adv,
+                    returns=ret_t,
+                    old_value=old_v,
+                    policy_loss_mask=policy_loss_mask,
+                    players=torch.as_tensor(mb_player, device="cpu"),
+                    t_idx=torch.as_tensor(mb_t, device="cpu"),
+                    n_idx=torch.as_tensor(mb_n, device="cpu"),
+                    policy_id=(
+                        None
+                        if policy_id is None
+                        else torch.as_tensor(policy_id[mb_idx], device="cpu")
+                    ),
+                    env_mode=(
+                        None if env_mode is None else torch.as_tensor(env_mode[mb_idx], device="cpu")
+                    ),
+                    obs_feature_dim=obs_feature_dim,
+                    dump_dir=logp_check_dump_dir,
+                    policy_label=logp_check_label,
+                    train_iter=logp_check_iter,
+                    clip_eps=clip_eps,
+                    vf_coef=vf_coef,
+                    entropy_coef=entropy_coef,
+                    population_size=population_size,
+                    member_counts=member_counts,
+                    amp_dtype=amp_dtype,
+                )
+                checked_rollout_logp = True
 
             t0 = perf_counter()
             opt.zero_grad()
@@ -2127,6 +2605,9 @@ def ppo_iteration_host_staged(
     amp_dtype: Optional[torch.dtype] = None,
     obs_feature_dim: int,
     population_size: int,
+    logp_check_dump_dir: Optional[Path] = None,
+    logp_check_label: str = "policy",
+    logp_check_iter: int = 0,
 ) -> Tuple[float, PPOTiming, PPOStats]:
     """PPO over flattened host-side replay, staging only minibatches to device."""
 
@@ -2137,6 +2618,7 @@ def ppo_iteration_host_staged(
     t_total0 = perf_counter()
     total_samples = int(sum(store.advantages.shape[0] for store in member_stores))
     n_batches = max(1, int(np.ceil(float(total_samples) / float(max(1, minibatch_size)))))
+    checked_rollout_logp = False
 
     for _ in range(ppo_epochs):
         shuffled_stores: list[HostReplayMemberStore] = []
@@ -2156,6 +2638,11 @@ def ppo_iteration_host_staged(
                     old_logprob=store.old_logprob.index_select(0, perm),
                     old_value=store.old_value.index_select(0, perm),
                     policy_loss_mask=store.policy_loss_mask.index_select(0, perm),
+                    players=store.players.index_select(0, perm),
+                    t_idx=store.t_idx.index_select(0, perm),
+                    n_idx=store.n_idx.index_select(0, perm),
+                    policy_id=store.policy_id.index_select(0, perm),
+                    env_mode=store.env_mode.index_select(0, perm),
                 )
             else:
                 shuffled = store
@@ -2180,6 +2667,11 @@ def ppo_iteration_host_staged(
             old_lp_parts: list[torch.Tensor] = []
             old_v_parts: list[torch.Tensor] = []
             pmask_parts: list[torch.Tensor] = []
+            players_parts: list[torch.Tensor] = []
+            t_idx_parts: list[torch.Tensor] = []
+            n_idx_parts: list[torch.Tensor] = []
+            policy_id_parts: list[torch.Tensor] = []
+            env_mode_parts: list[torch.Tensor] = []
             for member in range(max(1, int(population_size))):
                 start, stop = batch_ranges[member][batch_i]
                 if stop <= start:
@@ -2193,6 +2685,11 @@ def ppo_iteration_host_staged(
                 old_lp_parts.append(store.old_logprob.index_select(0, sl))
                 old_v_parts.append(store.old_value.index_select(0, sl))
                 pmask_parts.append(store.policy_loss_mask.index_select(0, sl))
+                players_parts.append(store.players.index_select(0, sl))
+                t_idx_parts.append(store.t_idx.index_select(0, sl))
+                n_idx_parts.append(store.n_idx.index_select(0, sl))
+                policy_id_parts.append(store.policy_id.index_select(0, sl))
+                env_mode_parts.append(store.env_mode.index_select(0, sl))
             if not obs_parts:
                 continue
             obs = _concat_compressed_parts(obs_parts)
@@ -2203,9 +2700,15 @@ def ppo_iteration_host_staged(
             old_logp = torch.cat(old_lp_parts, dim=0).to(device=device, dtype=torch.float32)
             old_v = torch.cat(old_v_parts, dim=0).to(device=device, dtype=torch.float32)
             policy_loss_mask = torch.cat(pmask_parts, dim=0).to(device=device, dtype=torch.float32)
+            players_mb = torch.cat(players_parts, dim=0)
+            t_idx_mb = torch.cat(t_idx_parts, dim=0)
+            n_idx_mb = torch.cat(n_idx_parts, dim=0)
+            policy_id_mb = torch.cat(policy_id_parts, dim=0)
+            env_mode_mb = torch.cat(env_mode_parts, dim=0)
             member_counts = _population_member_counts_torch(actions["population_idx"], population_size)
             timing.gather_s += perf_counter() - t0
 
+            check_rollout_logp = not checked_rollout_logp
             t0 = perf_counter()
             loss, mb_stats = _torch_ppo_loss_from_replay(
                 obs=obs,
@@ -2225,8 +2728,37 @@ def ppo_iteration_host_staged(
                 member_counts=member_counts,
                 obs_feature_dim=obs_feature_dim,
                 policy_loss_mask=policy_loss_mask,
+                check_rollout_logp=check_rollout_logp,
             )
             timing.compiled_loss_s += perf_counter() - t0
+
+            if check_rollout_logp:
+                _verify_rollout_logp_from_loss(
+                    mb_stats=mb_stats,
+                    old_logp=old_logp,
+                    obs=obs,
+                    actions=actions,
+                    advantages=adv,
+                    returns=ret_t,
+                    old_value=old_v,
+                    policy_loss_mask=policy_loss_mask,
+                    players=players_mb,
+                    t_idx=t_idx_mb,
+                    n_idx=n_idx_mb,
+                    policy_id=policy_id_mb,
+                    env_mode=env_mode_mb,
+                    obs_feature_dim=obs_feature_dim,
+                    dump_dir=logp_check_dump_dir,
+                    policy_label=logp_check_label,
+                    train_iter=logp_check_iter,
+                    clip_eps=clip_eps,
+                    vf_coef=vf_coef,
+                    entropy_coef=entropy_coef,
+                    population_size=population_size,
+                    member_counts=member_counts,
+                    amp_dtype=amp_dtype,
+                )
+                checked_rollout_logp = True
 
             t0 = perf_counter()
             opt.zero_grad()
@@ -2882,6 +3414,7 @@ def train(args: argparse.Namespace) -> None:
             start_iter,
             writer,
             ckpt_dir,
+            exp_dir / "debug",
             reset_prefetch,
             consistency_proc,
         )
@@ -2915,6 +3448,7 @@ def _train_loop(
     start_iter: int,
     writer: SummaryWriter,
     ckpt_dir: Path,
+    logp_check_dump_dir: Path,
     reset_prefetch: Optional[RolloutResetPrefetch],
     consistency_proc: Optional[Any] = None,
 ) -> None:
@@ -3298,6 +3832,9 @@ def _train_loop(
                         amp_dtype=amp_dtype,
                         obs_feature_dim=obs_fd,
                         population_size=1,
+                        logp_check_dump_dir=logp_check_dump_dir,
+                        logp_check_label="main",
+                        logp_check_iter=it,
                     )
                     main_loss_parts.append(float(loss_mb_i))
                     main_ppo_summary = ppo_stats_i.summary()
@@ -3325,6 +3862,9 @@ def _train_loop(
                         amp_dtype=amp_dtype,
                         obs_feature_dim=obs_fd,
                         population_size=1,
+                        logp_check_dump_dir=logp_check_dump_dir,
+                        logp_check_label="main",
+                        logp_check_iter=it,
                     )
                     main_loss_parts.append(float(loss_mb_i))
                     main_ppo_summary = ppo_stats_i.summary()
@@ -3352,6 +3892,9 @@ def _train_loop(
                         amp_dtype=amp_dtype,
                         obs_feature_dim=obs_fd,
                         population_size=1,
+                        logp_check_dump_dir=logp_check_dump_dir,
+                        logp_check_label="exploiter",
+                        logp_check_iter=it,
                     )
                     exploiter_loss_parts.append(float(loss_mb_i))
                     exploiter_ppo_summary = ppo_stats_i.summary()
@@ -3379,6 +3922,9 @@ def _train_loop(
                         amp_dtype=amp_dtype,
                         obs_feature_dim=obs_fd,
                         population_size=1,
+                        logp_check_dump_dir=logp_check_dump_dir,
+                        logp_check_label="exploiter",
+                        logp_check_iter=it,
                     )
                     exploiter_loss_parts.append(float(loss_mb_i))
                     exploiter_ppo_summary = ppo_stats_i.summary()
@@ -3694,6 +4240,9 @@ def _train_loop(
                     amp_dtype=amp_dtype,
                     obs_feature_dim=obs_fd,
                     population_size=int(args.population_size),
+                    logp_check_dump_dir=logp_check_dump_dir,
+                    logp_check_label="policy",
+                    logp_check_iter=it,
                 )
             else:
                 loss_mb, ppo_t, ppo_stats = ppo_iteration(
@@ -3717,6 +4266,9 @@ def _train_loop(
                     amp_dtype=amp_dtype,
                     obs_feature_dim=obs_fd,
                     population_size=int(args.population_size),
+                    logp_check_dump_dir=logp_check_dump_dir,
+                    logp_check_label="policy",
+                    logp_check_iter=it,
                 )
             ppo_s = time.perf_counter() - t_ppo0
 
