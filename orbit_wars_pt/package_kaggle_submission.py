@@ -226,6 +226,8 @@ def package_submission(
     population_member: int | None = None,
     population_member_4p: int | None = None,
     population_member_2p: int | None = None,
+    policy_key_4p: str = "policy",
+    policy_key_2p: str = "policy",
 ) -> Path:
     """Write a submission bundle directory; return its path."""
 
@@ -248,18 +250,26 @@ def package_submission(
 
     keep_member_4p = population_member if population_member_4p is None else population_member_4p
     keep_member_2p = population_member if population_member_2p is None else population_member_2p
-    if slim or keep_member_4p is not None or keep_member_2p is not None:
+    if (
+        slim
+        or keep_member_4p is not None
+        or keep_member_2p is not None
+        or policy_key_4p != "policy"
+        or policy_key_2p != "policy"
+    ):
         _write_checkpoint(
             checkpoint_4p,
             bundle_dir / "checkpoint_4p.pt",
             slim=slim,
             keep_member=keep_member_4p,
+            policy_key=policy_key_4p,
         )
         _write_checkpoint(
             checkpoint_2p,
             bundle_dir / "checkpoint_2p.pt",
             slim=slim,
             keep_member=keep_member_2p,
+            policy_key=policy_key_2p,
         )
     else:
         shutil.copy2(checkpoint_4p, bundle_dir / "checkpoint_4p.pt")
@@ -346,21 +356,33 @@ def main() -> None:
         type=Path,
         default=None,
         help=(
-            "One exploiter-mode training checkpoint whose main policy should be used "
-            "for --main-as-4p and/or --main-as-2p."
+            "One exploiter-mode training checkpoint whose main or exploiter policy should be used "
+            "for --main-as-4p, --main-as-2p, --exploiter-as-4p, and/or --exploiter-as-2p."
         ),
     )
     parser.add_argument(
         "--main-as-4p",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Use --checkpoint-main as the packaged 4p policy.",
+        help="Use the main policy from --checkpoint-main as the packaged 4p policy.",
     )
     parser.add_argument(
         "--main-as-2p",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Use --checkpoint-main as the packaged 2p policy.",
+        help="Use the main policy from --checkpoint-main as the packaged 2p policy.",
+    )
+    parser.add_argument(
+        "--exploiter-as-4p",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the exploiter policy from --checkpoint-main as the packaged 4p policy.",
+    )
+    parser.add_argument(
+        "--exploiter-as-2p",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the exploiter policy from --checkpoint-main as the packaged 2p policy.",
     )
     parser.add_argument(
         "--out",
@@ -431,18 +453,38 @@ def main() -> None:
 
     checkpoint_4p = args.checkpoint_4p
     checkpoint_2p = args.checkpoint_2p
+    policy_key_4p = "policy"
+    policy_key_2p = "policy"
+    if args.main_as_4p and args.exploiter_as_4p:
+        raise SystemExit("use at most one of --main-as-4p and --exploiter-as-4p")
+    if args.main_as_2p and args.exploiter_as_2p:
+        raise SystemExit("use at most one of --main-as-2p and --exploiter-as-2p")
     if args.main_as_4p:
         if args.checkpoint_main is None:
             raise SystemExit("--main-as-4p requires --checkpoint-main")
         checkpoint_4p = args.checkpoint_main
+    elif args.exploiter_as_4p:
+        if args.checkpoint_main is None:
+            raise SystemExit("--exploiter-as-4p requires --checkpoint-main")
+        checkpoint_4p = args.checkpoint_main
+        policy_key_4p = "exploiter_policy"
     if args.main_as_2p:
         if args.checkpoint_main is None:
             raise SystemExit("--main-as-2p requires --checkpoint-main")
         checkpoint_2p = args.checkpoint_main
+    elif args.exploiter_as_2p:
+        if args.checkpoint_main is None:
+            raise SystemExit("--exploiter-as-2p requires --checkpoint-main")
+        checkpoint_2p = args.checkpoint_main
+        policy_key_2p = "exploiter_policy"
     if checkpoint_4p is None:
-        raise SystemExit("provide --checkpoint-4p, or --checkpoint-main with --main-as-4p")
+        raise SystemExit(
+            "provide --checkpoint-4p, or --checkpoint-main with --main-as-4p or --exploiter-as-4p"
+        )
     if checkpoint_2p is None:
-        raise SystemExit("provide --checkpoint-2p, or --checkpoint-main with --main-as-2p")
+        raise SystemExit(
+            "provide --checkpoint-2p, or --checkpoint-main with --main-as-2p or --exploiter-as-2p"
+        )
 
     result = package_submission(
         checkpoint_4p,
@@ -456,6 +498,8 @@ def main() -> None:
         population_member=args.member,
         population_member_4p=args.member if args.member_4p is None else args.member_4p,
         population_member_2p=args.member if args.member_2p is None else args.member_2p,
+        policy_key_4p=policy_key_4p,
+        policy_key_2p=policy_key_2p,
     )
 
     bundle_dir, archive_path = _submission_paths(args.out.expanduser().resolve())
