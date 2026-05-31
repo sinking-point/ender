@@ -631,6 +631,7 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "compile_mode",
         "matmul_precision",
         "amp",
+        "earlygame_env_turn_limit",
         "experiment",
         "experiment_root",
     )
@@ -795,6 +796,8 @@ def compute_gae(
     lam: float,
     *,
     bootstrap: Optional[float] = None,
+    trunc_bootstrap: Optional[np.ndarray] = None,
+    trunc_bootstrap_valid: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     T = len(rewards)
     if T == 0:
@@ -806,9 +809,18 @@ def compute_gae(
     else:
         next_val = 0.0
     for t in reversed(range(T)):
-        mask = 1.0 - float(dones[t])
-        delta = rewards[t] + gamma * next_val * mask - float(values[t])
-        last_gae = delta + gamma * lam * mask * last_gae
+        truncated = (
+            trunc_bootstrap is not None
+            and trunc_bootstrap_valid is not None
+            and bool(trunc_bootstrap_valid[t])
+        )
+        if truncated:
+            delta = rewards[t] + gamma * float(trunc_bootstrap[t]) - float(values[t])
+            last_gae = delta
+        else:
+            mask = 1.0 - float(dones[t])
+            delta = rewards[t] + gamma * next_val * mask - float(values[t])
+            last_gae = delta + gamma * lam * mask * last_gae
         adv[t] = last_gae
         next_val = float(values[t])
     ret = adv + values
@@ -839,6 +851,8 @@ def build_ppo_samples(
         dones = segment.done[player]
         bootstrap = segment.bootstrap[player]
         bootstrap_valid = segment.bootstrap_valid[player]
+        trunc_bootstrap = segment.trunc_bootstrap[player]
+        trunc_bootstrap_valid = segment.trunc_bootstrap_valid[player]
         write_idx = segment.write_idx[player]
         buf_population_idx = np.asarray(segment.bufs[player].population_idx.detach().cpu())
         buf_policy_idx = np.asarray(segment.bufs[player].policy_id.detach().cpu())
@@ -851,7 +865,16 @@ def build_ppo_samples(
             r = rewards[:T, n]
             d = dones[:T, n]
             bs = float(bootstrap[n]) if bool(bootstrap_valid[n]) else None
-            adv, ret = compute_gae(r, v, d, gamma, lam, bootstrap=bs)
+            adv, ret = compute_gae(
+                r,
+                v,
+                d,
+                gamma,
+                lam,
+                bootstrap=bs,
+                trunc_bootstrap=trunc_bootstrap[:T, n],
+                trunc_bootstrap_valid=trunc_bootstrap_valid[:T, n],
+            )
             advs.append(adv)
             rets.append(ret)
             players.append(np.full((T,), player, dtype=np.int32))
@@ -1103,6 +1126,8 @@ def _rollout_segment_to_host(segment: RolloutSegment) -> RolloutSegment:
         done=[np.asarray(x) for x in segment.done],
         bootstrap=[np.asarray(x) for x in segment.bootstrap],
         bootstrap_valid=[np.asarray(x) for x in segment.bootstrap_valid],
+        trunc_bootstrap=[np.asarray(x) for x in segment.trunc_bootstrap],
+        trunc_bootstrap_valid=[np.asarray(x) for x in segment.trunc_bootstrap_valid],
         env_steps_per_env=np.asarray(segment.env_steps_per_env),
         env_mode_by_env=(
             None if segment.env_mode_by_env is None else np.asarray(segment.env_mode_by_env, dtype=np.int32)
@@ -1449,6 +1474,8 @@ def _build_host_chunk_samples(
     for player in range(num_players):
         for n in range(num_envs):
             values_parts, rewards_parts, dones_parts, old_lp_parts = [], [], [], []
+            trunc_bootstrap_parts: list[np.ndarray] = []
+            trunc_bootstrap_valid_parts: list[np.ndarray] = []
             pop_parts: list[np.ndarray] = []
             policy_parts: list[np.ndarray] = []
             env_mode_parts: list[np.ndarray] = []
@@ -1461,6 +1488,8 @@ def _build_host_chunk_samples(
                 old_logprob = segment.old_logprob[player]
                 rewards = segment.reward[player]
                 dones = segment.done[player]
+                trunc_bootstrap = segment.trunc_bootstrap[player]
+                trunc_bootstrap_valid = segment.trunc_bootstrap_valid[player]
                 write_idx = segment.write_idx[player]
                 buf_population_idx = np.asarray(segment.bufs[player].population_idx.detach().cpu())
                 buf_policy_idx = np.asarray(segment.bufs[player].policy_id.detach().cpu())
@@ -1474,6 +1503,8 @@ def _build_host_chunk_samples(
                 values_parts.append(old_value[:T, n])
                 rewards_parts.append(rewards[:T, n])
                 dones_parts.append(dones[:T, n])
+                trunc_bootstrap_parts.append(trunc_bootstrap[:T, n])
+                trunc_bootstrap_valid_parts.append(trunc_bootstrap_valid[:T, n])
                 old_lp_parts.append(old_logprob[:T, n])
                 pop_parts.append(buf_population_idx[:T, n].astype(np.int32))
                 policy_parts.append(buf_policy_idx[:T, n].astype(np.int32))
@@ -1487,13 +1518,24 @@ def _build_host_chunk_samples(
             values = np.concatenate(values_parts).astype(np.float32)
             rewards = np.concatenate(rewards_parts).astype(np.float32)
             dones = np.concatenate(dones_parts).astype(np.bool_)
+            trunc_bootstrap = np.concatenate(trunc_bootstrap_parts).astype(np.float32)
+            trunc_bootstrap_valid = np.concatenate(trunc_bootstrap_valid_parts).astype(np.bool_)
             last_segment = segments[last_nonempty_i]
             bootstrap = (
                 float(last_segment.bootstrap[player][n])
                 if bool(last_segment.bootstrap_valid[player][n])
                 else None
             )
-            adv, ret = compute_gae(rewards, values, dones, gamma, lam, bootstrap=bootstrap)
+            adv, ret = compute_gae(
+                rewards,
+                values,
+                dones,
+                gamma,
+                lam,
+                bootstrap=bootstrap,
+                trunc_bootstrap=trunc_bootstrap,
+                trunc_bootstrap_valid=trunc_bootstrap_valid,
+            )
             offset = 0
             part_i = 0
             for ci, T in enumerate(lengths):
@@ -1658,6 +1700,10 @@ def _combine_segments_for_stats(segments: list[RolloutSegment]) -> RolloutSegmen
         done=[first.done[p] for p in range(P)],
         bootstrap=[first.bootstrap[p] for p in range(P)],
         bootstrap_valid=[first.bootstrap_valid[p] for p in range(P)],
+        trunc_bootstrap=[np.concatenate([s.trunc_bootstrap[p] for s in segments], axis=0) for p in range(P)],
+        trunc_bootstrap_valid=[
+            np.concatenate([s.trunc_bootstrap_valid[p] for s in segments], axis=0) for p in range(P)
+        ],
         env_steps_per_env=sum((s.env_steps_per_env for s in segments), np.zeros_like(first.env_steps_per_env)),
         env_mode_by_env=(
             None if first.env_mode_by_env is None else np.asarray(first.env_mode_by_env, dtype=np.int32)
@@ -3535,6 +3581,7 @@ def _train_loop(
                         additional_policies=[exploiter_policy],
                         termination_controller=0,
                         env_mode_by_env=active_env_modes,
+                        earlygame_env_turn_limit=int(args.earlygame_env_turn_limit),
                     )
                     sample_prep_t.chunk_collect_s += time.perf_counter() - t0
                     active_rollout_carry = next_rollout_carry_i
@@ -3630,6 +3677,7 @@ def _train_loop(
                     additional_policies=[exploiter_policy],
                     termination_controller=0,
                     env_mode_by_env=active_env_modes,
+                    earlygame_env_turn_limit=int(args.earlygame_env_turn_limit),
                 )
                 if active_env_range is not None and rollout_carry is not None:
                     rollout_carry = _merge_rollout_carry_envs(
@@ -4082,6 +4130,7 @@ def _train_loop(
                     first_hit_method=str(args.first_hit_method),
                     micro_step_penalty=float(args.micro_step_penalty),
                     sync_policy_timing=bool(args.sync_rollout_timing),
+                    earlygame_env_turn_limit=int(args.earlygame_env_turn_limit),
                 )
                 rollout_env_seed += seeds_used
                 cfg.max_fleets = rollout_carry.cfg.max_fleets
@@ -4162,6 +4211,7 @@ def _train_loop(
                 first_hit_method=str(args.first_hit_method),
                 micro_step_penalty=float(args.micro_step_penalty),
                 sync_policy_timing=bool(args.sync_rollout_timing),
+                earlygame_env_turn_limit=int(args.earlygame_env_turn_limit),
             )
             rollout_env_seed += seeds_used
             t_samples0 = time.perf_counter()
@@ -4428,6 +4478,16 @@ def parse_args() -> argparse.Namespace:
             "Number of device-sized rollout chunks to collect per PPO iteration when "
             "--rollout-storage=host. Effective rollout length is roughly "
             "rollout_micro_horizon * rollout_host_chunks."
+        ),
+    )
+    p.add_argument(
+        "--earlygame-env-turn-limit",
+        type=int,
+        default=0,
+        help=(
+            "If >0, even-numbered rollout envs are treated as earlygame-only: when they "
+            "reach this many env turns, they truncate, bootstrap from the pre-reset state, "
+            "and immediately reset into a fresh game."
         ),
     )
     p.add_argument(
