@@ -2322,6 +2322,8 @@ def collect_parallel_micro_rollouts(
                 reward_ship_mass_share_member_coefs=cfg_template.reward_ship_mass_share_member_coefs,
                 reward_production_share_coef=cfg_template.reward_production_share_coef,
                 reward_production_share_member_coefs=cfg_template.reward_production_share_member_coefs,
+                reward_terminal_win_loss_coef=cfg_template.reward_terminal_win_loss_coef,
+                reward_terminal_win_loss_member_coefs=cfg_template.reward_terminal_win_loss_member_coefs,
                 reward_time_bonus_coef=cfg_template.reward_time_bonus_coef,
                 reward_time_bonus_member_coefs=cfg_template.reward_time_bonus_member_coefs,
                 normalize_obs_to_p0=cfg_template.normalize_obs_to_p0,
@@ -2430,6 +2432,8 @@ def collect_parallel_micro_rollouts(
         cfg.reward_ship_mass_share_member_coefs = cfg_template.reward_ship_mass_share_member_coefs
         cfg.reward_production_share_coef = cfg_template.reward_production_share_coef
         cfg.reward_production_share_member_coefs = cfg_template.reward_production_share_member_coefs
+        cfg.reward_terminal_win_loss_coef = cfg_template.reward_terminal_win_loss_coef
+        cfg.reward_terminal_win_loss_member_coefs = cfg_template.reward_terminal_win_loss_member_coefs
         cfg.reward_time_bonus_coef = cfg_template.reward_time_bonus_coef
         cfg.reward_time_bonus_member_coefs = cfg_template.reward_time_bonus_member_coefs
         cfg.normalize_obs_to_p0 = cfg_template.normalize_obs_to_p0
@@ -2667,6 +2671,12 @@ def collect_parallel_micro_rollouts(
                     cfg.reward_production_share_member_coefs,
                     int(cfg.num_agents),
                 )
+                terminal_reward_coef_bucket = _reward_coef_matrix_for_population(
+                    population_assignments,
+                    cfg.reward_terminal_win_loss_coef,
+                    cfg.reward_terminal_win_loss_member_coefs,
+                    int(cfg.num_agents),
+                )
                 time_reward_coef_bucket = _reward_coef_matrix_for_population(
                     population_assignments,
                     cfg.reward_time_bonus_coef,
@@ -2697,6 +2707,7 @@ def collect_parallel_micro_rollouts(
                     ratios_pre_jax,
                     reward_ship_mass_share_coef=ship_reward_coef_bucket,
                     reward_production_share_coef=production_reward_coef_bucket,
+                    reward_terminal_win_loss_coef=terminal_reward_coef_bucket,
                     reward_time_bonus_coef=time_reward_coef_bucket,
                 )
                 if sync_policy_timing:
@@ -2764,6 +2775,7 @@ def collect_parallel_micro_rollouts(
                     )
                     reset_env_now = env_done_now or earlygame_truncate_now
                     main_policy_win: Optional[bool] = None
+                    time_bonus_scale = 0.0
                     if versus_controller_rollout and env_done_now:
                         main_slots = np.flatnonzero(main_player_mask[:, env_i]).astype(np.int32)
                         main_slot = int(main_slots[0]) if main_slots.size else 0
@@ -2772,11 +2784,10 @@ def collect_parallel_micro_rollouts(
                         else:
                             main_policy_win = bool(float(rewards_np[env_i, main_slot]) > 0.0)
                         timeout_step = int(step_count_np[env_i]) >= episode_timeout_step_count
-                        time_bonus = 0.0
                         if (not timeout_step) and (not bool(main_policy_win)):
                             timeout_turn = max(1.0, float(episode_lim - 2))
                             pre_turn = max(0.0, float(step_count_np[env_i]) - 1.0)
-                            time_bonus = float(cfg.reward_time_bonus_coef) * max(0.0, 1.0 - (pre_turn / timeout_turn))
+                            time_bonus_scale = max(0.0, 1.0 - (pre_turn / timeout_turn))
                     synthetic_dead_exploiters: list[int] = []
                     for p in range(n_ego):
                         if reward_idx[p, env_i] >= 0:
@@ -2786,7 +2797,11 @@ def collect_parallel_micro_rollouts(
                             if versus_controller_rollout and int(controller_assignments[p, env_i]) == 1:
                                 delta_r = 0.0
                                 if env_done_now and main_policy_win is not None:
-                                    delta_r = (1.0 + time_bonus) if not bool(main_policy_win) else -1.0
+                                    terminal_coef = float(terminal_reward_coef_bucket[env_i, p])
+                                    member_time_bonus = float(time_reward_coef_bucket[env_i, p]) * time_bonus_scale
+                                    delta_r = (
+                                        terminal_coef + member_time_bonus if not bool(main_policy_win) else -terminal_coef
+                                    )
                                 elif seat_dead:
                                     local_done = False
                                     pending_exploiter_terminal[p, env_i] = True
@@ -2811,25 +2826,33 @@ def collect_parallel_micro_rollouts(
                             next_bucket,
                             jnp.asarray([env_i] * row_count, dtype=jnp.int32),
                         )
+                        synthetic_dead_exploiters_np = np.asarray(synthetic_dead_exploiters, dtype=np.int32)
+                        synthetic_terminal_coef = terminal_reward_coef_bucket[
+                            env_i, synthetic_dead_exploiters_np
+                        ].astype(np.float32, copy=False)
+                        synthetic_time_bonus = (
+                            time_reward_coef_bucket[env_i, synthetic_dead_exploiters_np].astype(np.float32, copy=False)
+                            * np.float32(time_bonus_scale)
+                        )
                         synthetic_reward = (
-                            np.full(
-                                (row_count,),
-                                (1.0 + time_bonus) if not bool(main_policy_win) else -1.0,
-                                dtype=np.float32,
-                            )
+                            (
+                                synthetic_terminal_coef + synthetic_time_bonus
+                                if not bool(main_policy_win)
+                                else -synthetic_terminal_coef
+                            ).astype(np.float32, copy=False)
                             if main_policy_win is not None
                             else np.zeros((row_count,), dtype=np.float32)
                         )
                         _append_synthetic_terminal_rows(
                             state_rows=term_state,
-                            ego_idx=np.asarray(synthetic_dead_exploiters, dtype=np.int32),
+                            ego_idx=synthetic_dead_exploiters_np,
                             env_idx=np.full((row_count,), env_i, dtype=np.int32),
                             controller_idx=np.ones((row_count,), dtype=np.int32),
                             population_idx=population_assignments[
-                                np.asarray(synthetic_dead_exploiters, dtype=np.int32), env_i
+                                synthetic_dead_exploiters_np, env_i
                             ].astype(np.int32, copy=False),
                             value_head_idx=_relative_main_value_head_idx_for_rows(
-                                ego_idx=np.asarray(synthetic_dead_exploiters, dtype=np.int32),
+                                ego_idx=synthetic_dead_exploiters_np,
                                 env_idx=np.full((row_count,), env_i, dtype=np.int32),
                                 controller_assignments=controller_assignments,
                                 main_player_mask=main_player_mask,

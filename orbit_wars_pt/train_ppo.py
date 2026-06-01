@@ -197,13 +197,15 @@ def _parse_optional_float_list(text: Optional[str], *, name: str) -> Optional[li
         raise ValueError(f"{name} must be a comma-separated list of floats") from exc
 
 
-def resolve_reward_mix(args: argparse.Namespace) -> Tuple[float, float, float]:
+def resolve_reward_mix(args: argparse.Namespace) -> Tuple[float, float, float, float]:
     """Resolve reward coefficients, preserving legacy ``--reward-mode`` presets."""
 
     if args.reward_mode == "ship-mass-share":
-        ship_coef, prod_coef = 1.0, 0.0
+        ship_coef, prod_coef, terminal_coef = 1.0, 0.0, 0.0
     elif args.reward_mode == "production-share":
-        ship_coef, prod_coef = 0.0, 1.0
+        ship_coef, prod_coef, terminal_coef = 0.0, 1.0, 0.0
+    elif args.reward_mode == "terminal-win-loss":
+        ship_coef, prod_coef, terminal_coef = 0.0, 0.0, 1.0
     else:
         raise ValueError(f"unknown reward mode {args.reward_mode!r}")
     time_coef = 0.0
@@ -211,15 +213,17 @@ def resolve_reward_mix(args: argparse.Namespace) -> Tuple[float, float, float]:
         ship_coef = float(args.reward_ship_mass_share_coef)
     if args.reward_production_share_coef is not None:
         prod_coef = float(args.reward_production_share_coef)
+    if args.reward_terminal_win_loss_coef is not None:
+        terminal_coef = float(args.reward_terminal_win_loss_coef)
     if args.reward_time_bonus_coef is not None:
         time_coef = float(args.reward_time_bonus_coef)
-    return float(ship_coef), float(prod_coef), float(time_coef)
+    return float(ship_coef), float(prod_coef), float(terminal_coef), float(time_coef)
 
 
 def resolve_member_reward_mix(
     args: argparse.Namespace,
     population_size: int,
-) -> Tuple[Optional[list[float]], Optional[list[float]], Optional[list[float]]]:
+) -> Tuple[Optional[list[float]], Optional[list[float]], Optional[list[float]], Optional[list[float]]]:
     ship = _parse_optional_float_list(
         args.reward_ship_mass_share_member_coefs,
         name="--reward-ship-mass-share-member-coefs",
@@ -228,6 +232,10 @@ def resolve_member_reward_mix(
         args.reward_production_share_member_coefs,
         name="--reward-production-share-member-coefs",
     )
+    terminal = _parse_optional_float_list(
+        args.reward_terminal_win_loss_member_coefs,
+        name="--reward-terminal-win-loss-member-coefs",
+    )
     time = _parse_optional_float_list(
         args.reward_time_bonus_member_coefs,
         name="--reward-time-bonus-member-coefs",
@@ -235,6 +243,7 @@ def resolve_member_reward_mix(
     for name, vals in (
         ("--reward-ship-mass-share-member-coefs", ship),
         ("--reward-production-share-member-coefs", prod),
+        ("--reward-terminal-win-loss-member-coefs", terminal),
         ("--reward-time-bonus-member-coefs", time),
     ):
         if vals is not None and len(vals) != int(population_size):
@@ -242,8 +251,8 @@ def resolve_member_reward_mix(
                 f"{name} length {len(vals)} must equal population_size {int(population_size)}"
             )
     if int(population_size) <= 1:
-        return None, None, None
-    return ship, prod, time
+        return None, None, None, None
+    return ship, prod, terminal, time
 
 
 def _serialize_rollout_carry(carry: RolloutCarry) -> Dict[str, Any]:
@@ -609,6 +618,8 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "reward_ship_mass_share_member_coefs",
         "reward_production_share_coef",
         "reward_production_share_member_coefs",
+        "reward_terminal_win_loss_coef",
+        "reward_terminal_win_loss_member_coefs",
         "reward_time_bonus_coef",
         "reward_time_bonus_member_coefs",
         "normalize_obs_to_p0",
@@ -3116,16 +3127,23 @@ def train(args: argparse.Namespace) -> None:
         else:
             print("[orbit_wars_pt] no checkpoint in experiment dir — starting fresh", flush=True)
 
-    reward_ship_mass_share_coef, reward_production_share_coef, reward_time_bonus_coef = resolve_reward_mix(args)
+    (
+        reward_ship_mass_share_coef,
+        reward_production_share_coef,
+        reward_terminal_win_loss_coef,
+        reward_time_bonus_coef,
+    ) = resolve_reward_mix(args)
     (
         reward_ship_mass_share_member_coefs,
         reward_production_share_member_coefs,
+        reward_terminal_win_loss_member_coefs,
         reward_time_bonus_member_coefs,
     ) = resolve_member_reward_mix(args, int(args.population_size))
     print(
         "[orbit_wars_pt] reward mix "
         f"ship_mass_share={reward_ship_mass_share_coef:g} "
         f"production_share={reward_production_share_coef:g} "
+        f"terminal_win_loss={reward_terminal_win_loss_coef:g} "
         f"time_bonus={reward_time_bonus_coef:g}",
         flush=True,
     )
@@ -3139,6 +3157,12 @@ def train(args: argparse.Namespace) -> None:
         print(
             "[orbit_wars_pt] reward production-share member coefs "
             f"{reward_production_share_member_coefs}",
+            flush=True,
+        )
+    if reward_terminal_win_loss_member_coefs is not None:
+        print(
+            "[orbit_wars_pt] reward terminal-win-loss member coefs "
+            f"{reward_terminal_win_loss_member_coefs}",
             flush=True,
         )
     if reward_time_bonus_member_coefs is not None:
@@ -3157,6 +3181,8 @@ def train(args: argparse.Namespace) -> None:
         reward_ship_mass_share_member_coefs=reward_ship_mass_share_member_coefs,
         reward_production_share_coef=reward_production_share_coef,
         reward_production_share_member_coefs=reward_production_share_member_coefs,
+        reward_terminal_win_loss_coef=reward_terminal_win_loss_coef,
+        reward_terminal_win_loss_member_coefs=reward_terminal_win_loss_member_coefs,
         reward_time_bonus_coef=reward_time_bonus_coef,
         reward_time_bonus_member_coefs=reward_time_bonus_member_coefs,
         normalize_obs_to_p0=args.normalize_obs_to_p0,
@@ -3528,6 +3554,8 @@ def _train_loop(
                 reward_ship_mass_share_member_coefs=cfg.reward_ship_mass_share_member_coefs,
                 reward_production_share_coef=cfg.reward_production_share_coef,
                 reward_production_share_member_coefs=cfg.reward_production_share_member_coefs,
+                reward_terminal_win_loss_coef=cfg.reward_terminal_win_loss_coef,
+                reward_terminal_win_loss_member_coefs=cfg.reward_terminal_win_loss_member_coefs,
                 reward_time_bonus_coef=cfg.reward_time_bonus_coef,
                 reward_time_bonus_member_coefs=cfg.reward_time_bonus_member_coefs,
                 normalize_obs_to_p0=cfg.normalize_obs_to_p0,
@@ -4588,12 +4616,13 @@ def parse_args() -> argparse.Namespace:
         "--reward-mode",
         type=str,
         default="ship-mass-share",
-        choices=("ship-mass-share", "production-share"),
+        choices=("ship-mass-share", "production-share", "terminal-win-loss"),
         help=(
             "Legacy preset for the reward mix. 'ship-mass-share' initializes to "
             "(ship=1, production=0), 'production-share' initializes to "
-            "(ship=0, production=1). The explicit coefficient flags below override "
-            "individual terms."
+            "(ship=0, production=1), and 'terminal-win-loss' initializes to "
+            "(ship=0, production=0, terminal=1). The explicit coefficient flags "
+            "below override individual terms."
         ),
     )
     p.add_argument(
@@ -4630,6 +4659,24 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional comma-separated per-population-member coefficients for production share. "
             "Length must equal --population-size."
+        ),
+    )
+    p.add_argument(
+        "--reward-terminal-win-loss-coef",
+        type=float,
+        default=None,
+        help=(
+            "Coefficient for terminal outcome reward: winners receive +coef, losers receive "
+            "-coef, and draws receive 0. Defaults to the value implied by --reward-mode."
+        ),
+    )
+    p.add_argument(
+        "--reward-terminal-win-loss-member-coefs",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated per-population-member coefficients for terminal win/loss "
+            "reward. Length must equal --population-size."
         ),
     )
     p.add_argument(

@@ -22,6 +22,8 @@ class OrbitWarsEnvConfig:
     reward_ship_mass_share_member_coefs: list[float] | None = None
     reward_production_share_coef: float = 0.0
     reward_production_share_member_coefs: list[float] | None = None
+    reward_terminal_win_loss_coef: float = 0.0
+    reward_terminal_win_loss_member_coefs: list[float] | None = None
     reward_time_bonus_coef: float = 0.0
     reward_time_bonus_member_coefs: list[float] | None = None
     normalize_obs_to_p0: bool = False
