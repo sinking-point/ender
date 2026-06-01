@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import math
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 import torch
@@ -190,6 +191,8 @@ class OrbitWarsPopulationTail(nn.Module):
         dropout: float = 0.0,
         value_head_count: int = 1,
         target_abort_enabled: bool = False,
+        halt_init_prob: Optional[float] = None,
+        fraction_init_weights: Optional[Tuple[float, ...]] = None,
     ):
         super().__init__()
         self.block = TransformerBlock(d_model, n_heads, rope_dims=rope_dims, dropout=dropout)
@@ -205,6 +208,53 @@ class OrbitWarsPopulationTail(nn.Module):
         self.frac_heads = nn.ModuleList([nn.Linear(d_model * 2 + 32, 1) for _ in range(NUM_FRACTIONS)])
         self.halt_head = nn.Linear(d_model, 2)
         self.value_head = nn.Linear(d_model, int(value_head_count))
+        _apply_action_head_init_biases(
+            halt_head=self.halt_head,
+            origin_frac_head=self.origin_frac_head,
+            frac_heads=self.frac_heads,
+            halt_init_prob=halt_init_prob,
+            fraction_init_weights=fraction_init_weights,
+        )
+
+
+def _halt_logit_for_prob(prob: float) -> float:
+    p = float(prob)
+    if not math.isfinite(p) or not (0.0 < p < 1.0):
+        raise ValueError(f"halt_init_prob must be between 0 and 1, got {prob!r}")
+    return math.log(p / (1.0 - p))
+
+
+def _normalize_fraction_init_weights(weights: Tuple[float, ...]) -> Tuple[float, ...]:
+    if len(weights) != NUM_FRACTIONS:
+        raise ValueError(f"fraction_init_weights must have length {NUM_FRACTIONS}, got {len(weights)}")
+    out = []
+    for idx, val in enumerate(weights):
+        w = float(val)
+        if not math.isfinite(w) or w <= 0.0:
+            raise ValueError(f"fraction_init_weights[{idx}] must be finite and > 0, got {val!r}")
+        out.append(w)
+    return tuple(out)
+
+
+def _apply_action_head_init_biases(
+    *,
+    halt_head: nn.Linear,
+    origin_frac_head: nn.Linear,
+    frac_heads: nn.ModuleList,
+    halt_init_prob: Optional[float],
+    fraction_init_weights: Optional[Tuple[float, ...]],
+) -> None:
+    with torch.no_grad():
+        if halt_init_prob is not None:
+            halt_bias = _halt_logit_for_prob(float(halt_init_prob))
+            halt_head.bias.zero_()
+            halt_head.bias[1] = halt_bias
+        if fraction_init_weights is not None:
+            weights = _normalize_fraction_init_weights(fraction_init_weights)
+            frac_bias = torch.log(torch.tensor(weights, dtype=origin_frac_head.bias.dtype, device=origin_frac_head.bias.device))
+            origin_frac_head.bias.copy_(frac_bias)
+            for idx, head in enumerate(frac_heads):
+                head.bias.fill_(float(frac_bias[idx].item()))
 
 
 def infer_value_head_count_from_state_dict(state: Mapping[str, Any]) -> int:
@@ -263,6 +313,8 @@ class OrbitWarsPolicy(nn.Module):
         rope_dims: int = 2,
         value_head_count: int = 1,
         target_abort_enabled: bool = False,
+        halt_init_prob: Optional[float] = None,
+        fraction_init_weights: Optional[Tuple[float, ...]] = None,
     ):
         super().__init__()
         head_dim = d_model // n_heads
@@ -282,6 +334,10 @@ class OrbitWarsPolicy(nn.Module):
         self.population_size = int(population_size)
         self.value_head_count = int(value_head_count)
         self.target_abort_enabled = bool(target_abort_enabled)
+        self.halt_init_prob = None if halt_init_prob is None else float(halt_init_prob)
+        self.fraction_init_weights = (
+            None if fraction_init_weights is None else _normalize_fraction_init_weights(tuple(fraction_init_weights))
+        )
         if self.population_size < 1:
             raise ValueError(f"population_size must be >= 1, got {self.population_size}")
         if self.value_head_count < 1:
@@ -306,6 +362,13 @@ class OrbitWarsPolicy(nn.Module):
             self.frac_heads = nn.ModuleList([nn.Linear(d_model * 2 + 32, 1) for _ in range(NUM_FRACTIONS)])
             self.halt_head = nn.Linear(d_model, 2)
             self.value_head = nn.Linear(d_model, self.value_head_count)
+            _apply_action_head_init_biases(
+                halt_head=self.halt_head,
+                origin_frac_head=self.origin_frac_head,
+                frac_heads=self.frac_heads,
+                halt_init_prob=self.halt_init_prob,
+                fraction_init_weights=self.fraction_init_weights,
+            )
         else:
             shared_layers = max(0, int(n_layers) - 1)
             self.shared_blocks = nn.ModuleList(
@@ -320,6 +383,8 @@ class OrbitWarsPolicy(nn.Module):
                         dropout=dropout,
                         value_head_count=self.value_head_count,
                         target_abort_enabled=self.target_abort_enabled,
+                        halt_init_prob=self.halt_init_prob,
+                        fraction_init_weights=self.fraction_init_weights,
                     )
                     for _ in range(self.population_size)
                 ]

@@ -631,6 +631,8 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "d_model",
         "n_heads",
         "n_layers",
+        "halt_init_prob",
+        "fraction_init_ratio",
         "max_fleets",
         "num_agents",
         "population_size",
@@ -647,6 +649,25 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "experiment_root",
     )
     return {k: getattr(args, k) for k in keys}
+
+
+def _parse_fraction_init_weights(raw: Optional[str]) -> Optional[tuple[float, ...]]:
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    parts = [chunk.strip() for chunk in text.replace(",", ":").split(":")]
+    vals = [float(chunk) for chunk in parts if chunk]
+    if len(vals) != len(FRACTIONS):
+        raise ValueError(
+            f"--fraction-init-ratio expects {len(FRACTIONS)} positive weights "
+            f"(one per fraction in {FRACTIONS}), got {len(vals)} from {raw!r}"
+        )
+    for idx, val in enumerate(vals):
+        if not np.isfinite(val) or val <= 0.0:
+            raise ValueError(f"--fraction-init-ratio weight {idx} must be finite and > 0, got {val!r}")
+    return tuple(float(v) for v in vals)
 
 
 def _main_ppo_epochs(args: argparse.Namespace) -> int:
@@ -3070,6 +3091,12 @@ def train(args: argparse.Namespace) -> None:
         raise SystemExit("--exploiter-mode currently requires --population-size=1")
     if args.exploiter_mode and int(args.num_agents) != 4:
         raise SystemExit("--exploiter-mode currently requires --num-agents=4")
+    if args.halt_init_prob is not None and not (0.0 < float(args.halt_init_prob) < 1.0):
+        raise SystemExit("--halt-init-prob must be between 0 and 1")
+    try:
+        fraction_init_weights = _parse_fraction_init_weights(args.fraction_init_ratio)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     exp_dir, tb_dir, ckpt_dir = experiment_dirs(args)
     exp_dir.mkdir(parents=True, exist_ok=True)
@@ -3214,6 +3241,8 @@ def train(args: argparse.Namespace) -> None:
             population_size=args.population_size,
             rope_dims=policy_rope_dims,
             target_abort_enabled=bool(args.target_abort_enabled),
+            halt_init_prob=args.halt_init_prob,
+            fraction_init_weights=fraction_init_weights,
             value_head_count=(
                 int(policy_value_head_count) if value_head_count is None else int(value_head_count)
             ),
@@ -4711,6 +4740,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--d-model", type=int, default=192)
     p.add_argument("--n-heads", type=int, default=8)
     p.add_argument("--n-layers", type=int, default=4)
+    p.add_argument(
+        "--halt-init-prob",
+        type=float,
+        default=None,
+        help="Optional fresh-init prior for action=halt. For example 0.9 initializes halt logits to about 90%% halt.",
+    )
+    p.add_argument(
+        "--fraction-init-ratio",
+        type=str,
+        default=None,
+        help=(
+            "Optional fresh-init origin/fraction prior as colon- or comma-separated positive weights, "
+            "one per fraction in order. Example: '1:1:1:1:15'."
+        ),
+    )
     p.add_argument(
         "--target-abort-enabled",
         action=argparse.BooleanOptionalAction,

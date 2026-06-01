@@ -3190,7 +3190,12 @@ def _infer_policy_kwargs(payload: Any) -> dict[str, Any]:
         "rope_dims": int(training_args.get("rope_dims", 3)),
         "value_head_count": int(training_args.get("value_head_count", 1)),
         "target_abort_enabled": bool(training_args.get("target_abort_enabled", False)),
+        "halt_init_prob": training_args.get("halt_init_prob"),
     }
+    fraction_init_ratio = training_args.get("fraction_init_ratio")
+    if fraction_init_ratio:
+        parts = [chunk.strip() for chunk in str(fraction_init_ratio).replace(",", ":").split(":")]
+        kwargs["fraction_init_weights"] = tuple(float(chunk) for chunk in parts if chunk)
     if isinstance(policy_state, Mapping):
         w = policy_state.get("feat_proj.weight")
         if hasattr(w, "shape") and len(w.shape) >= 2:

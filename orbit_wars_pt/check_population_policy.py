@@ -16,6 +16,7 @@ This verifies three key behaviors:
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 
@@ -190,6 +191,31 @@ def _check_sampling_with_replacement(seed: int, num_agents: int, population_size
         raise AssertionError("population assignment helper produced out-of-range member ids")
 
 
+def _check_init_biases() -> None:
+    policy = OrbitWarsPolicy(
+        d_model=72,
+        n_heads=6,
+        n_layers=2,
+        feature_dim=FEATURE_DIM,
+        population_size=1,
+        halt_init_prob=0.9,
+        fraction_init_weights=(1.0, 1.0, 1.0, 1.0, 15.0),
+    )
+    halt_bias = policy.halt_head.bias.detach().cpu()
+    expected_halt = math.log(0.9 / 0.1)
+    if abs(float(halt_bias[0].item())) > 1e-6 or abs(float(halt_bias[1].item()) - expected_halt) > 1e-6:
+        raise AssertionError("halt init bias did not match requested prior")
+    expected_frac = torch.log(torch.tensor([1.0, 1.0, 1.0, 1.0, 15.0], dtype=policy.origin_frac_head.bias.dtype))
+    if not torch.allclose(policy.origin_frac_head.bias.detach().cpu(), expected_frac.cpu(), atol=1e-6, rtol=0.0):
+        raise AssertionError("origin_frac_head init bias did not match requested ratio")
+    frac_head_biases = torch.tensor(
+        [float(head.bias.detach().cpu().item()) for head in policy.frac_heads],
+        dtype=expected_frac.dtype,
+    )
+    if not torch.allclose(frac_head_biases, expected_frac.cpu(), atol=1e-6, rtol=0.0):
+        raise AssertionError("legacy frac_heads init bias did not match requested ratio")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--seed", type=int, default=0)
@@ -222,6 +248,9 @@ def main() -> int:
 
     print("checking rollout member assignment sampling")
     _check_sampling_with_replacement(args.seed, num_agents=4, population_size=args.population_size)
+
+    print("checking optional head init biases")
+    _check_init_biases()
 
     print("population policy checks: PASS")
     return 0
