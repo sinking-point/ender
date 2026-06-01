@@ -58,22 +58,6 @@ __all__ = ["agent"]
 """
 
 
-def _infer_policy_player_count(policy_state: Any, training_args: Mapping[str, Any] | None = None) -> int:
-    if training_args is not None:
-        for key in ("policy_player_count", "inference_policy_player_count"):
-            if key in training_args:
-                return int(training_args[key])
-    if isinstance(policy_state, Mapping):
-        w = policy_state.get("feat_proj.weight")
-        if hasattr(w, "shape") and len(w.shape) >= 2:
-            feat_dim = int(w.shape[1])
-            # FEATURE_DIM_MULTI (4p arch) is larger than the original 2p width.
-            return 4 if feat_dim > 32 else 2
-    if training_args is not None and "num_agents" in training_args:
-        return 4 if int(training_args["num_agents"]) > 2 else 2
-    return 2
-
-
 def _write_main_py(
     path: Path,
     *,
@@ -105,10 +89,6 @@ def _slim_checkpoint_payload(payload: Any, *, policy_key: str = "policy") -> dic
     training_args_in = payload.get("training_args", {})
     training_args = dict(training_args_in) if isinstance(training_args_in, Mapping) else {}
     policy_state = payload[policy_key]
-    training_args.setdefault(
-        "policy_player_count",
-        _infer_policy_player_count(policy_state, training_args),
-    )
     slim: dict[str, Any] = {
         "policy": policy_state,
         "training_args": training_args,

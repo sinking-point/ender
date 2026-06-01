@@ -3239,22 +3239,6 @@ def _checkpoint_training_args(payload: Any) -> Mapping[str, Any]:
     return {}
 
 
-def _infer_policy_player_count_from_payload(payload: Any) -> int:
-    training_args = _checkpoint_training_args(payload)
-    for key in ("policy_player_count", "inference_policy_player_count"):
-        if key in training_args:
-            return 4 if int(training_args[key]) > 2 else 2
-    policy_state = payload.get("policy", payload) if isinstance(payload, Mapping) else payload
-    if isinstance(policy_state, Mapping):
-        w = policy_state.get("feat_proj.weight")
-        if hasattr(w, "shape") and len(w.shape) >= 2:
-            feat_dim = int(w.shape[1])
-            return 4 if feat_dim > 32 else 2
-    if "num_agents" in training_args:
-        return 4 if int(training_args["num_agents"]) > 2 else 2
-    return 2
-
-
 def _checkpoint_search_roots() -> list[Path]:
     """Directories to try when resolving a relative checkpoint path."""
 
@@ -3331,10 +3315,6 @@ def load_policy(
     policy.load_state_dict(policy_state_adapted)
     policy.eval()
     training_args = dict(_checkpoint_training_args(payload))
-    training_args.setdefault(
-        "policy_player_count",
-        _infer_policy_player_count_from_payload(payload),
-    )
     return policy, torch_device, training_args
 
 
@@ -3371,7 +3351,7 @@ class KaggleOrbitWarsAgent:
             context="single",
         )
         self.normalize_obs_to_p0 = bool(training_args.get("normalize_obs_to_p0", False))
-        self.policy_player_count = 4 if int(training_args.get("policy_player_count", 2)) > 2 else 2
+        self.policy_player_count = 4 if int(training_args.get("num_agents", 2)) > 2 else 2
         self._greedy_by_player = _normalize_greedy(greedy)
         self.max_micro_steps = int(
             max_micro_steps
@@ -3615,8 +3595,8 @@ class KaggleOrbitWarsDualPolicyAgent:
         )
         self.normalize_obs_to_p0_4p = bool(training_args_4p.get("normalize_obs_to_p0", False))
         self.normalize_obs_to_p0_2p = bool(training_args_2p.get("normalize_obs_to_p0", False))
-        self.policy_player_count_4p = 4 if int(training_args_4p.get("policy_player_count", 4)) > 2 else 2
-        self.policy_player_count_2p = 4 if int(training_args_2p.get("policy_player_count", 2)) > 2 else 2
+        self.policy_player_count_4p = 4 if int(training_args_4p.get("num_agents", 4)) > 2 else 2
+        self.policy_player_count_2p = 4 if int(training_args_2p.get("num_agents", 2)) > 2 else 2
         self._greedy_by_player = _normalize_greedy(greedy)
         micro_4p = int(training_args_4p.get("max_micro_steps", DEFAULT_MAX_ACTIONS))
         micro_2p = int(training_args_2p.get("max_micro_steps", DEFAULT_MAX_ACTIONS))
