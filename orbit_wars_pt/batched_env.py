@@ -79,6 +79,21 @@ def _scatter_state_rows(
     return jax.tree.map(lambda dst, src: dst.at[env_idx].set(src), state_b, fresh_b)
 
 
+@jax.jit
+def _scatter_state_rows_from_bank_tail(
+    state_b: OrbitWarsState,
+    env_idx: jnp.ndarray,
+    bank_states: OrbitWarsState,
+    start: int,
+) -> OrbitWarsState:
+    take = env_idx.shape[0]
+    fresh_b = jax.tree.map(
+        lambda leaf: jax.lax.dynamic_slice_in_dim(leaf, start, take, axis=0),
+        bank_states,
+    )
+    return jax.tree.map(lambda dst, src: dst.at[env_idx].set(src), state_b, fresh_b)
+
+
 def reset_envs_at_indices(
     state_b: OrbitWarsState,
     env_idx: np.ndarray,
@@ -102,6 +117,35 @@ def reset_envs_at_indices(
         *fresh_states,
     )
     return _scatter_state_rows(state_b, env_j, fresh_b)
+
+
+def reset_envs_at_indices_batched(
+    state_b: OrbitWarsState,
+    env_idx: np.ndarray,
+    fresh_b: OrbitWarsState,
+) -> OrbitWarsState:
+    """Replace multiple batch slices from an already-batched fresh-state pytree."""
+
+    env_np = np.asarray(env_idx, dtype=np.int32).reshape(-1)
+    if env_np.size == 0:
+        return state_b
+    env_j = jnp.asarray(env_np, dtype=jnp.int32)
+    return _scatter_state_rows(state_b, env_j, fresh_b)
+
+
+def reset_envs_from_bank_tail(
+    state_b: OrbitWarsState,
+    env_idx: np.ndarray,
+    bank_states: OrbitWarsState,
+    start: int,
+) -> OrbitWarsState:
+    """Replace multiple batch slices from a contiguous tail segment of a bank pytree."""
+
+    env_np = np.asarray(env_idx, dtype=np.int32).reshape(-1)
+    if env_np.size == 0:
+        return state_b
+    env_j = jnp.asarray(env_np, dtype=jnp.int32)
+    return _scatter_state_rows_from_bank_tail(state_b, env_j, bank_states, int(start))
 
 
 def heal_terminal_env_slices(

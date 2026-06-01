@@ -58,6 +58,7 @@ from orbit_wars_pt.parallel_rollout import (
     RolloutSegment,
     RolloutTiming,
     collect_parallel_micro_rollouts,
+    make_device_reset_bank,
 )
 from orbit_wars_pt.reset_prefetch import RolloutResetPrefetch
 from orbit_wars_pt.ppo_replay import compute_ppo_loss_compressed_torch, compute_ppo_loss_torch
@@ -1617,6 +1618,15 @@ def _combine_rollout_timing(items: list[RolloutTiming]) -> RolloutTiming:
     out = RolloutTiming()
     for rt in items:
         out.init_s += rt.init_s
+        out.init_reset_bank_s += rt.init_reset_bank_s
+        out.init_reset_bank_drain_s += rt.init_reset_bank_drain_s
+        out.init_reset_bank_ready_pop_s += rt.init_reset_bank_ready_pop_s
+        out.init_reset_bank_wait_s += rt.init_reset_bank_wait_s
+        out.init_reset_bank_stack_s += rt.init_reset_bank_stack_s
+        out.init_reset_bank_append_s += rt.init_reset_bank_append_s
+        out.init_reset_bank_submit_s += rt.init_reset_bank_submit_s
+        out.init_buffer_alloc_s += rt.init_buffer_alloc_s
+        out.init_state_setup_s += rt.init_state_setup_s
         out.env_step_s += rt.env_step_s
         out.env_prep_s += rt.env_prep_s
         out.env_state_gather_s += rt.env_state_gather_s
@@ -1626,6 +1636,12 @@ def _combine_rollout_timing(items: list[RolloutTiming]) -> RolloutTiming:
         out.env_post_stats_s += rt.env_post_stats_s
         out.env_host_transfer_s += rt.env_host_transfer_s
         out.env_reset_s += rt.env_reset_s
+        out.env_reset_bank_slice_s += rt.env_reset_bank_slice_s
+        out.env_reset_host_resolve_s += rt.env_reset_host_resolve_s
+        out.env_reset_host_stack_s += rt.env_reset_host_stack_s
+        out.env_reset_concat_s += rt.env_reset_concat_s
+        out.env_reset_apply_s += rt.env_reset_apply_s
+        out.env_reset_fallback_host_s += rt.env_reset_fallback_host_s
         out.env_reset_count += rt.env_reset_count
         out.env_reset_mode_2p_count += rt.env_reset_mode_2p_count
         out.env_reset_mode_4p_count += rt.env_reset_mode_4p_count
@@ -1763,11 +1779,20 @@ def _rollout_timing_str(rt: RolloutTiming) -> str:
     reset_prefetch_wait_n = rt.reset_prefetch_wait_n
     return (
         f"rollout_wall {rt.wall_s:.3f}s loop {rt.loop_s:.3f}s "
+        f"init {rt.init_s:.3f}s"
+        f"(bank {rt.init_reset_bank_s:.3f} "
+        f"drain {rt.init_reset_bank_drain_s:.3f} ready {rt.init_reset_bank_ready_pop_s:.3f} "
+        f"wait {rt.init_reset_bank_wait_s:.3f} stack {rt.init_reset_bank_stack_s:.3f} "
+        f"append {rt.init_reset_bank_append_s:.3f} submit {rt.init_reset_bank_submit_s:.3f} "
+        f"alloc {rt.init_buffer_alloc_s:.3f} setup {rt.init_state_setup_s:.3f}) "
         f"env_step {rt.env_step_s:.3f}s env_prep {rt.env_prep_s:.3f}s "
         f"env_gather {rt.env_state_gather_s:.3f}s env_coef {rt.env_coef_s:.3f}s env_core {rt.env_step_core_s:.3f}s "
         f"env_reward {rt.env_reward_s:.3f}s env_post {rt.env_post_stats_s:.3f}s env_xfer {rt.env_host_transfer_s:.3f}s "
         f"env_reset {rt.env_reset_s:.3f}s"
-        f"(n {rt.env_reset_count} 2p {rt.env_reset_mode_2p_count} 4p {rt.env_reset_mode_4p_count}) "
+        f"(bank {rt.env_reset_bank_slice_s:.3f} host {rt.env_reset_host_resolve_s:.3f} "
+        f"hstack {rt.env_reset_host_stack_s:.3f} concat {rt.env_reset_concat_s:.3f} "
+        f"apply {rt.env_reset_apply_s:.3f} fb_host {rt.env_reset_fallback_host_s:.3f} "
+        f"n {rt.env_reset_count} 2p {rt.env_reset_mode_2p_count} 4p {rt.env_reset_mode_4p_count}) "
         f"env_book {rt.env_bookkeeping_s:.3f}s(scatter {rt.env_state_scatter_s:.3f}) env_py {rt.env_python_s:.3f}s "
         f"prefetch_pop {rt.reset_prefetch_pop_s:.3f}s"
         f"(init {rt.reset_prefetch_pop_init_s:.3f} ep {rt.reset_prefetch_pop_episode_s:.3f} "
@@ -3018,6 +3043,16 @@ def _log_iter_tensorboard(
     if rt is not None:
         writer.add_scalar("timing/rollout_wall_s", rt.wall_s, it)
         writer.add_scalar("timing/rollout_loop_s", rt.loop_s, it)
+        writer.add_scalar("timing/init_s", rt.init_s, it)
+        writer.add_scalar("timing/init_reset_bank_s", rt.init_reset_bank_s, it)
+        writer.add_scalar("timing/init_reset_bank_drain_s", rt.init_reset_bank_drain_s, it)
+        writer.add_scalar("timing/init_reset_bank_ready_pop_s", rt.init_reset_bank_ready_pop_s, it)
+        writer.add_scalar("timing/init_reset_bank_wait_s", rt.init_reset_bank_wait_s, it)
+        writer.add_scalar("timing/init_reset_bank_stack_s", rt.init_reset_bank_stack_s, it)
+        writer.add_scalar("timing/init_reset_bank_append_s", rt.init_reset_bank_append_s, it)
+        writer.add_scalar("timing/init_reset_bank_submit_s", rt.init_reset_bank_submit_s, it)
+        writer.add_scalar("timing/init_buffer_alloc_s", rt.init_buffer_alloc_s, it)
+        writer.add_scalar("timing/init_state_setup_s", rt.init_state_setup_s, it)
         writer.add_scalar("timing/env_step_s", rt.env_step_s, it)
         writer.add_scalar("timing/env_prep_s", rt.env_prep_s, it)
         writer.add_scalar("timing/env_state_gather_s", rt.env_state_gather_s, it)
@@ -3027,6 +3062,12 @@ def _log_iter_tensorboard(
         writer.add_scalar("timing/env_post_stats_s", rt.env_post_stats_s, it)
         writer.add_scalar("timing/env_host_transfer_s", rt.env_host_transfer_s, it)
         writer.add_scalar("timing/env_reset_s", rt.env_reset_s, it)
+        writer.add_scalar("timing/env_reset_bank_slice_s", rt.env_reset_bank_slice_s, it)
+        writer.add_scalar("timing/env_reset_host_resolve_s", rt.env_reset_host_resolve_s, it)
+        writer.add_scalar("timing/env_reset_host_stack_s", rt.env_reset_host_stack_s, it)
+        writer.add_scalar("timing/env_reset_concat_s", rt.env_reset_concat_s, it)
+        writer.add_scalar("timing/env_reset_apply_s", rt.env_reset_apply_s, it)
+        writer.add_scalar("timing/env_reset_fallback_host_s", rt.env_reset_fallback_host_s, it)
         writer.add_scalar("timing/env_reset_count", float(rt.env_reset_count), it)
         writer.add_scalar("timing/env_reset_mode_2p_count", float(rt.env_reset_mode_2p_count), it)
         writer.add_scalar("timing/env_reset_mode_4p_count", float(rt.env_reset_mode_4p_count), it)
@@ -3471,6 +3512,9 @@ def train(args: argparse.Namespace) -> None:
             f"lookahead={args.reset_prefetch_depth}",
             flush=True,
         )
+    rollout_device_reset_bank = (
+        None if reset_prefetch is None else make_device_reset_bank(int(args.reset_prefetch_depth))
+    )
 
     consistency_proc = None
     if bool(args.consistency_check) and str(args.rollout_storage) == "host":
@@ -3517,6 +3561,7 @@ def train(args: argparse.Namespace) -> None:
             ckpt_dir,
             exp_dir / "debug",
             reset_prefetch,
+            rollout_device_reset_bank,
             consistency_proc,
         )
     finally:
@@ -3551,6 +3596,7 @@ def _train_loop(
     ckpt_dir: Path,
     logp_check_dump_dir: Path,
     reset_prefetch: Optional[RolloutResetPrefetch],
+    rollout_device_reset_bank: Optional[Any],
     consistency_proc: Optional[Any] = None,
 ) -> None:
     for it in range(start_iter, args.iterations):
@@ -4181,6 +4227,7 @@ def _train_loop(
                     amp_dtype=amp_dtype,
                     min_max_fleets=args.max_fleets,
                     reset_prefetch=reset_prefetch,
+                    device_reset_bank=rollout_device_reset_bank,
                     first_hit_n_rays=max(8, int(args.first_hit_n_rays)),
                     first_hit_ray_chunk_size=max(0, int(args.first_hit_ray_chunk_size)),
                     first_hit_env_chunk_size=max(0, int(args.first_hit_env_chunk_size)),
@@ -4261,6 +4308,7 @@ def _train_loop(
                 amp_dtype=amp_dtype,
                 min_max_fleets=args.max_fleets,
                 reset_prefetch=reset_prefetch,
+                device_reset_bank=rollout_device_reset_bank,
                 first_hit_n_rays=max(8, int(args.first_hit_n_rays)),
                 first_hit_ray_chunk_size=max(0, int(args.first_hit_ray_chunk_size)),
                 first_hit_env_chunk_size=max(0, int(args.first_hit_env_chunk_size)),

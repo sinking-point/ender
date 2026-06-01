@@ -21,7 +21,7 @@ on device:
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Any, List, Optional, Tuple
 
@@ -38,7 +38,9 @@ from orbit_wars_pt.reset_prefetch import PrefetchPopMeta, RolloutResetPrefetch
 from orbit_wars_pt.batched_env import (
     post_step_stats_batched,
     reset_env_at_index,
+    reset_envs_from_bank_tail,
     reset_envs_at_indices,
+    reset_envs_at_indices_batched,
     reward_delta_from_state_pair_batched,
     reward_mix_ratios_batched,
     stack_initial_states,
@@ -539,6 +541,15 @@ class RolloutTiming:
     """Wall and per-phase times inside `collect_parallel_micro_rollouts` (perf_counter, host-side)."""
 
     init_s: float = 0.0
+    init_reset_bank_s: float = 0.0
+    init_reset_bank_drain_s: float = 0.0
+    init_reset_bank_ready_pop_s: float = 0.0
+    init_reset_bank_wait_s: float = 0.0
+    init_reset_bank_stack_s: float = 0.0
+    init_reset_bank_append_s: float = 0.0
+    init_reset_bank_submit_s: float = 0.0
+    init_buffer_alloc_s: float = 0.0
+    init_state_setup_s: float = 0.0
     env_step_s: float = 0.0
     env_prep_s: float = 0.0
     env_state_gather_s: float = 0.0
@@ -548,6 +559,12 @@ class RolloutTiming:
     env_post_stats_s: float = 0.0
     env_host_transfer_s: float = 0.0
     env_reset_s: float = 0.0
+    env_reset_bank_slice_s: float = 0.0
+    env_reset_host_resolve_s: float = 0.0
+    env_reset_host_stack_s: float = 0.0
+    env_reset_concat_s: float = 0.0
+    env_reset_apply_s: float = 0.0
+    env_reset_fallback_host_s: float = 0.0
     env_reset_count: int = 0
     env_reset_mode_2p_count: int = 0
     env_reset_mode_4p_count: int = 0
@@ -620,6 +637,312 @@ class RolloutTiming:
             + self.loop_post_micro_s
             + self.state_unstack_s
         )
+
+
+@dataclass
+class _DeviceResetBank:
+    """A fixed-capacity device-resident reset bank."""
+
+    capacity: int
+    num_agents: int = -1
+    max_fleets: int = -1
+    states: Optional[OrbitWarsState] = None
+    seeds: np.ndarray = field(default_factory=lambda: np.zeros((0,), dtype=np.int64))
+    size_used: int = 0
+    next_submit_seed: Optional[int] = None
+
+    def clear(self) -> None:
+        self.states = None
+        self.seeds = np.zeros((0,), dtype=np.int64)
+        self.size_used = 0
+        self.next_submit_seed = None
+
+    def prepare(self, *, num_agents: int, max_fleets: int, first_seed: Optional[int] = None) -> None:
+        if int(num_agents) != self.num_agents or int(max_fleets) != self.max_fleets:
+            self.num_agents = int(num_agents)
+            self.max_fleets = int(max_fleets)
+            self.clear()
+        if self.next_submit_seed is None and first_seed is not None:
+            self.next_submit_seed = int(first_seed)
+
+    def pop_any(self) -> Optional[tuple[int, OrbitWarsState]]:
+        if self.states is None or self.size_used <= 0:
+            return None
+        idx = int(self.size_used) - 1
+        seed = int(self.seeds[idx])
+        state = jax.tree.map(lambda leaf: leaf[idx], self.states)
+        self.size_used = idx
+        return seed, state
+
+    def size(self) -> int:
+        return int(self.size_used)
+
+    def pop_many(self, count: int) -> Optional[tuple[list[int], OrbitWarsState]]:
+        take = min(max(0, int(count)), int(self.size_used))
+        if self.states is None or take <= 0:
+            return None
+        start = int(self.size_used) - take
+        stop = int(self.size_used)
+        seeds = self.seeds[start:stop].astype(np.int64, copy=True).tolist()
+        states_b = jax.tree.map(
+            lambda leaf: jax.lax.dynamic_slice_in_dim(leaf, start, take, axis=0),
+            self.states,
+        )
+        self.size_used = start
+        return seeds, states_b
+
+    def reserve_tail(self, count: int) -> Optional[tuple[list[int], int, int]]:
+        take = min(max(0, int(count)), int(self.size_used))
+        if self.states is None or take <= 0:
+            return None
+        start = int(self.size_used) - take
+        stop = int(self.size_used)
+        seeds = self.seeds[start:stop].astype(np.int64, copy=True).tolist()
+        self.size_used = start
+        return seeds, start, take
+
+    def append_batch(self, seeds: list[int], states_b: OrbitWarsState) -> None:
+        n = len(seeds)
+        if n <= 0:
+            return
+        if self.states is None:
+            self.states = jax.tree.map(
+                lambda leaf: jnp.zeros((int(self.capacity),) + tuple(leaf.shape[1:]), dtype=leaf.dtype),
+                states_b,
+            )
+            self.seeds = np.full((int(self.capacity),), -1, dtype=np.int64)
+            self.size_used = 0
+        start = int(self.size_used)
+        stop = start + int(n)
+        if stop > int(self.capacity):
+            raise RuntimeError(
+                f"device reset bank overflow: stop={stop} capacity={int(self.capacity)}"
+            )
+        self.states = jax.tree.map(
+            lambda dst, src: jax.lax.dynamic_update_slice(
+                dst,
+                src,
+                (start,) + (0,) * (dst.ndim - 1),
+            ),
+            self.states,
+            states_b,
+        )
+        self.seeds[start:stop] = np.asarray(seeds, dtype=np.int64)
+        self.size_used = stop
+
+    def append_padded_tail(self, seeds: list[int], states_full: OrbitWarsState, tail_count: int) -> None:
+        n = int(tail_count)
+        if n <= 0:
+            return
+        if self.states is None:
+            self.states = jax.tree.map(
+                lambda leaf: jnp.zeros((int(self.capacity),) + tuple(leaf.shape[1:]), dtype=leaf.dtype),
+                states_full,
+            )
+            self.seeds = np.full((int(self.capacity),), -1, dtype=np.int64)
+            self.size_used = 0
+        start = int(self.size_used)
+        stop = start + n
+        if stop > int(self.capacity):
+            raise RuntimeError(
+                f"device reset bank overflow: stop={stop} capacity={int(self.capacity)}"
+            )
+        self.states = jax.tree.map(
+            lambda dst, src: _append_padded_tail_leaf(dst, src, start, n),
+            self.states,
+            states_full,
+        )
+        self.seeds[start:stop] = np.asarray(seeds, dtype=np.int64)
+        self.size_used = stop
+
+
+def make_device_reset_bank(capacity: int) -> _DeviceResetBank:
+    return _DeviceResetBank(capacity=int(capacity))
+
+
+@jax.jit
+def _append_padded_tail_leaf(
+    dst: jnp.ndarray,
+    src_full: jnp.ndarray,
+    start: int,
+    tail_count: int,
+) -> jnp.ndarray:
+    cap = int(dst.shape[0])
+    pos = jnp.arange(cap, dtype=jnp.int32)
+    stop = start + tail_count
+    mask = (pos >= start) & (pos < stop)
+    src_idx = pos - start + (cap - tail_count)
+    src_idx = jnp.clip(src_idx, 0, cap - 1)
+    src_rows = jnp.take(src_full, src_idx, axis=0)
+    mask_shape = (cap,) + (1,) * (dst.ndim - 1)
+    return jnp.where(mask.reshape(mask_shape), src_rows, dst)
+
+
+def _stack_padded_tail_numpy(xs: tuple[Any, ...], capacity: int) -> np.ndarray:
+    arr = np.stack([np.asarray(x) for x in xs], axis=0)
+    out = np.zeros((int(capacity),) + tuple(arr.shape[1:]), dtype=arr.dtype)
+    out[int(capacity) - int(arr.shape[0]) :] = arr
+    return out
+
+
+def _stage_plain_reset_bank(
+    device_reset_bank: Optional[_DeviceResetBank],
+    reset_prefetch: Optional[RolloutResetPrefetch],
+    *,
+    first_seed: int,
+    num_agents: int,
+    max_fleets: int,
+    target_size: Optional[int] = None,
+    block_until_full: bool = False,
+    timing: Optional[RolloutTiming] = None,
+    sync_policy_timing: bool = False,
+    device: Optional[torch.device] = None,
+) -> int:
+    """Upload ready plain reset states from the CPU prefetch bank into a bounded device pool."""
+
+    if device_reset_bank is None or reset_prefetch is None:
+        return 0
+    reset_prefetch.notify_max_fleets(int(max_fleets))
+    device_reset_bank.prepare(
+        num_agents=int(num_agents),
+        max_fleets=int(max_fleets),
+        first_seed=int(first_seed),
+    )
+    if device_reset_bank.next_submit_seed is not None and device_reset_bank.size() <= 0:
+        t_submit0 = perf_counter()
+        reset_prefetch.submit_plain_range(
+            int(device_reset_bank.next_submit_seed),
+            int(device_reset_bank.capacity),
+            int(num_agents),
+            int(max_fleets),
+        )
+        if timing is not None:
+            timing.init_reset_bank_submit_s += perf_counter() - t_submit0
+        device_reset_bank.next_submit_seed += int(device_reset_bank.capacity)
+    t_drain0 = perf_counter()
+    reset_prefetch.drain_ready()
+    if timing is not None:
+        timing.init_reset_bank_drain_s += perf_counter() - t_drain0
+    target = int(device_reset_bank.capacity) if target_size is None else max(0, int(target_size))
+    target = min(target, int(device_reset_bank.capacity))
+    staged = 0
+    while device_reset_bank.size() < target:
+        host_items: list[tuple[int, Any]] = []
+        target_n = target - int(device_reset_bank.size())
+        while len(host_items) < target_n:
+            t_pop0 = perf_counter()
+            item = reset_prefetch.pop_any_banked_state(
+                int(num_agents),
+                int(max_fleets),
+            )
+            if timing is not None:
+                timing.init_reset_bank_ready_pop_s += perf_counter() - t_pop0
+            if item is None:
+                if not block_until_full:
+                    break
+                t_wait0 = perf_counter()
+                item = reset_prefetch.wait_any_banked_state(
+                    int(num_agents),
+                    int(max_fleets),
+                )
+                if timing is not None:
+                    timing.init_reset_bank_wait_s += perf_counter() - t_wait0
+                if item is None:
+                    break
+            host_items.append(item)
+        if not host_items:
+            break
+        seeds = [int(seed) for seed, _ in host_items]
+        if sync_policy_timing and device is not None:
+            _sync_rollout_policy_timing(device)
+        t_stack0 = perf_counter()
+        fresh_b = jax.tree.map(
+            lambda *xs: jnp.asarray(_stack_padded_tail_numpy(xs, int(device_reset_bank.capacity))),
+            *[fresh_np for _, fresh_np in host_items],
+        )
+        if sync_policy_timing and device is not None:
+            _sync_rollout_policy_timing(device, fresh_b)
+        if timing is not None:
+            timing.init_reset_bank_stack_s += perf_counter() - t_stack0
+        if sync_policy_timing and device is not None:
+            _sync_rollout_policy_timing(device)
+        t_append0 = perf_counter()
+        device_reset_bank.append_padded_tail(seeds, fresh_b, len(host_items))
+        if sync_policy_timing and device is not None and device_reset_bank.states is not None:
+            _sync_rollout_policy_timing(device, device_reset_bank.states)
+        if timing is not None:
+            timing.init_reset_bank_append_s += perf_counter() - t_append0
+        if device_reset_bank.next_submit_seed is not None:
+            t_submit0 = perf_counter()
+            reset_prefetch.submit_plain_range(
+                int(device_reset_bank.next_submit_seed),
+                len(host_items),
+                int(num_agents),
+                int(max_fleets),
+            )
+            if timing is not None:
+                timing.init_reset_bank_submit_s += perf_counter() - t_submit0
+            device_reset_bank.next_submit_seed += len(host_items)
+        staged += len(host_items)
+    return staged
+
+
+def _resolve_plain_reset_host_batch(
+    *,
+    reset_count: int,
+    fallback_seeds: list[int],
+    reset_prefetch: Optional[RolloutResetPrefetch],
+    num_agents: int,
+    max_fleets: int,
+    timing: RolloutTiming,
+    sync_policy_timing: bool,
+    device: torch.device,
+) -> tuple[list[int], OrbitWarsState, list[PrefetchPopMeta]]:
+    """Return host/fallback plain reset states as one batched pytree, plus realized seeds/meta."""
+
+    if reset_count <= 0:
+        raise ValueError("reset_count must be positive")
+    seeds_out: list[int] = []
+    metas: list[PrefetchPopMeta] = []
+    host_items: list[tuple[int, Any]] = []
+    for i in range(int(reset_count)):
+        fallback_seed = int(fallback_seeds[i])
+        if sync_policy_timing:
+            _sync_rollout_policy_timing(device)
+        t0 = perf_counter()
+        if reset_prefetch is not None:
+            sid, fresh_np, meta = reset_prefetch.pop_any_state(
+                int(num_agents),
+                int(max_fleets),
+                fallback_seed=fallback_seed,
+                return_meta=True,
+            )
+        else:
+            sid = int(fallback_seed)
+            state_i = jow.reset_from_reference(sid, int(num_agents), max_fleets=int(max_fleets))
+            fresh_np = jax.device_get(state_i)
+            meta = PrefetchPopMeta()
+            meta.fallback_used = True
+        if sync_policy_timing:
+            _sync_rollout_policy_timing(device)
+        dt = perf_counter() - t0
+        timing.env_reset_host_resolve_s += dt
+        if meta.fallback_used:
+            timing.env_reset_fallback_host_s += dt
+        seeds_out.append(int(sid))
+        metas.append(meta)
+        host_items.append((int(sid), fresh_np))
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device)
+    t0 = perf_counter()
+    host_states = jax.tree.map(
+        lambda *xs: jnp.stack([jnp.asarray(x) for x in xs], axis=0),
+        *[fresh_np for _, fresh_np in host_items],
+    )
+    if sync_policy_timing:
+        _sync_rollout_policy_timing(device, host_states)
+    timing.env_reset_host_stack_s += perf_counter() - t0
+    return seeds_out, host_states, metas
 
 
 def _accum_prefetch_pop_meta(
@@ -2288,6 +2611,7 @@ def collect_parallel_micro_rollouts(
     amp_dtype: Optional[torch.dtype] = None,
     min_max_fleets: int = 1,
     reset_prefetch: Optional[RolloutResetPrefetch] = None,
+    device_reset_bank: Optional[_DeviceResetBank] = None,
     first_hit_n_rays: int = 2048,
     first_hit_ray_chunk_size: int = 0,
     first_hit_env_chunk_size: int = 0,
@@ -2341,6 +2665,7 @@ def collect_parallel_micro_rollouts(
     versus_controller_rollout = len(policies) > 1 and int(controller_counts[0]) > 0 and termination_controller is not None
     carry_mode_arr = None if carry_in is None or carry_in.env_mode_by_env is None else np.asarray(carry_in.env_mode_by_env)
     unified_exploiter_rollout = (env_mode_by_env is not None) or (carry_mode_arr is not None)
+    plain_device_bank_mode = (reset_prefetch is not None) and (not unified_exploiter_rollout)
     unified_seed_state = _normalize_unified_exploiter_seed_state(seed_base) if unified_exploiter_rollout else None
     if reset_prefetch is not None:
         mf0 = int(carry_in.cfg.max_fleets) if carry_in is not None else int(cfg_template.max_fleets)
@@ -2353,7 +2678,7 @@ def collect_parallel_micro_rollouts(
                 int(unified_seed_state["four_p"]),
                 mf0,
             )
-        else:
+        elif not plain_device_bank_mode:
             reset_prefetch.prefetch_ahead(int(seed_base) + seeds_consumed, na0, mf0)
     if carry_in is None:
         mode_arr = None
@@ -2579,14 +2904,32 @@ def collect_parallel_micro_rollouts(
 
     obs_feature_dim = int(policy.feat_proj.in_features)
     n_ego = int(cfg.num_agents)
-    _reset_prefetch_resync(
-        reset_prefetch,
-        seed_base,
-        seeds_consumed,
-        cfg,
-        unified_exploiter_rollout=unified_exploiter_rollout,
-        unified_seed_state=unified_seed_state,
-    )
+    if device_reset_bank is None and reset_prefetch is not None and not unified_exploiter_rollout:
+        device_reset_bank = _DeviceResetBank(capacity=int(reset_prefetch.lookahead))
+    if device_reset_bank is None:
+        _reset_prefetch_resync(
+            reset_prefetch,
+            seed_base,
+            seeds_consumed,
+            cfg,
+            unified_exploiter_rollout=unified_exploiter_rollout,
+            unified_seed_state=unified_seed_state,
+        )
+    if device_reset_bank is not None:
+        t_bank0 = perf_counter()
+        _stage_plain_reset_bank(
+            device_reset_bank,
+            reset_prefetch,
+            first_seed=int(seed_base) + int(seeds_consumed),
+            num_agents=int(cfg.num_agents),
+            max_fleets=int(cfg.max_fleets),
+            target_size=int(device_reset_bank.capacity),
+            block_until_full=True,
+            timing=timing,
+            sync_policy_timing=sync_policy_timing,
+            device=device,
+        )
+        timing.init_reset_bank_s += perf_counter() - t_bank0
 
     episode_lim = int(np.asarray(jax.device_get(jow.OrbitWarsConfig().episode_steps)))
     episode_timeout_step_count = episode_lim - 1
@@ -2600,6 +2943,7 @@ def collect_parallel_micro_rollouts(
     # boundary. In the worst phase mix, any player's buffer may still need
     # one full local turn of micro rows before that boundary.
     H_buf = rollout_micro_horizon + max_micro_steps_per_player + 2
+    t_buf0 = perf_counter()
     bufs = [
         init_torch_transition_buffer(num_envs, H_buf, max_micro_steps_per_player, device=device)
         for _ in range(n_ego)
@@ -2615,9 +2959,12 @@ def collect_parallel_micro_rollouts(
     write_idx_dev = [torch.zeros((num_envs,), dtype=torch.int32, device=device) for _ in range(n_ego)]
     trunc_bootstrap = [np.zeros((H_buf, num_envs), dtype=np.float32) for _ in range(n_ego)]
     trunc_bootstrap_valid = [np.zeros((H_buf, num_envs), dtype=np.bool_) for _ in range(n_ego)]
+    timing.init_buffer_alloc_s += perf_counter() - t_buf0
 
+    t_state_setup0 = perf_counter()
     env_steps_per_env = np.zeros((num_envs,), dtype=np.int32)
     horizon_fired = False
+    timing.init_state_setup_s += perf_counter() - t_state_setup0
     timing.init_s = perf_counter() - t_init0
 
     logged_first_policy_fwd = False
@@ -2801,6 +3148,7 @@ def collect_parallel_micro_rollouts(
                 done_env_seed: dict[int, int] = {}
                 reset_envs_apply: list[int] = []
                 reset_fresh_states: list[Any] = []
+                plain_reset_fallback_seeds: list[int] = []
                 trunc_reset_rows: list[tuple[int, int, int]] = []
                 bootstrap_controller_assignments = np.asarray(controller_assignments, dtype=np.int32).copy()
                 bootstrap_main_player_mask = np.asarray(main_player_mask, dtype=np.bool_).copy()
@@ -2989,20 +3337,8 @@ def collect_parallel_micro_rollouts(
                             main_player_mask[:, env_i] = main_i.astype(np.bool_, copy=False)
                         elif reset_prefetch is not None:
                             sid = int(seed_base + seeds_consumed)
-                            fresh_np, prefetch_meta = reset_prefetch.pop_state(
-                                sid,
-                                int(cfg.num_agents),
-                                int(cfg.max_fleets),
-                                return_meta=True,
-                            )
-                            _accum_prefetch_pop_meta(
-                                timing,
-                                prefetch_meta,
-                                init_phase=False,
-                                active_seat_count=int(cfg.num_agents),
-                            )
                             reset_envs_apply.append(env_i)
-                            reset_fresh_states.append(fresh_np)
+                            plain_reset_fallback_seeds.append(sid)
                         else:
                             sid = int(seed_base + seeds_consumed)
                             state_i = jow.reset_from_reference(sid, int(cfg.num_agents), max_fleets=int(cfg.max_fleets))
@@ -3017,8 +3353,9 @@ def collect_parallel_micro_rollouts(
                             elif active_seat_count == 4:
                                 timing.env_reset_mode_4p_count += 1
                         seeds_consumed += 1
-                        done_env_seed[env_i] = sid
-                        if first_reset_event is None:
+                        if mode_arr is not None or reset_prefetch is None:
+                            done_env_seed[env_i] = sid
+                        if (mode_arr is not None or reset_prefetch is None) and first_reset_event is None:
                             first_reset_event = (
                                 int(env_i),
                                 int(sid),
@@ -3060,20 +3397,8 @@ def collect_parallel_micro_rollouts(
                             main_player_mask[:, env_i] = main_i.astype(np.bool_, copy=False)
                         elif reset_prefetch is not None:
                             sid = int(seed_base + seeds_consumed)
-                            fresh_np, prefetch_meta = reset_prefetch.pop_state(
-                                sid,
-                                int(cfg.num_agents),
-                                int(cfg.max_fleets),
-                                return_meta=True,
-                            )
-                            _accum_prefetch_pop_meta(
-                                timing,
-                                prefetch_meta,
-                                init_phase=False,
-                                active_seat_count=int(cfg.num_agents),
-                            )
                             reset_envs_apply.append(env_i)
-                            reset_fresh_states.append(fresh_np)
+                            plain_reset_fallback_seeds.append(sid)
                         else:
                             sid = int(seed_base + seeds_consumed)
                             state_i = jow.reset_from_reference(sid, int(cfg.num_agents), max_fleets=int(cfg.max_fleets))
@@ -3088,8 +3413,9 @@ def collect_parallel_micro_rollouts(
                             elif active_seat_count == 4:
                                 timing.env_reset_mode_4p_count += 1
                         seeds_consumed += 1
-                        done_env_seed[env_i] = sid
-                        if first_reset_event is None:
+                        if mode_arr is not None or reset_prefetch is None:
+                            done_env_seed[env_i] = sid
+                        if (mode_arr is not None or reset_prefetch is None) and first_reset_event is None:
                             first_reset_event = (
                                 int(env_i),
                                 int(sid),
@@ -3134,6 +3460,82 @@ def collect_parallel_micro_rollouts(
                     for ego, env_i, row_t in trunc_reset_rows:
                         trunc_bootstrap[ego][row_t, env_i] = float(value_np_per_ego[ego, env_i])
                         trunc_bootstrap_valid[ego][row_t, env_i] = True
+                if mode_arr is None and plain_reset_fallback_seeds:
+                    batch_seeds: list[int] = []
+                    batch_metas: list[PrefetchPopMeta] = []
+                    bank_take = (
+                        0
+                        if device_reset_bank is None
+                        else min(len(plain_reset_fallback_seeds), int(device_reset_bank.size()))
+                    )
+                    if bank_take > 0:
+                        bank_reserved = device_reset_bank.reserve_tail(bank_take)
+                        if bank_reserved is None or device_reset_bank.states is None:
+                            raise RuntimeError("device reset bank reserve_tail unexpectedly returned None")
+                        bank_seeds, bank_start, bank_take = bank_reserved
+                        bank_env_idx = np.asarray(reset_envs_apply[:bank_take], dtype=np.int32)
+                        if sync_policy_timing:
+                            _sync_rollout_policy_timing(device)
+                        t_reset_bank0 = perf_counter()
+                        state_b = reset_envs_from_bank_tail(
+                            state_b,
+                            bank_env_idx,
+                            device_reset_bank.states,
+                            bank_start,
+                        )
+                        if sync_policy_timing:
+                            _sync_rollout_policy_timing(device, state_b)
+                        bank_dt = perf_counter() - t_reset_bank0
+                        timing.env_reset_bank_slice_s += bank_dt
+                        reset_total_s += bank_dt
+                        batch_seeds.extend(int(x) for x in bank_seeds)
+                        batch_metas.extend([PrefetchPopMeta(immediate_bank_hit=True) for _ in range(bank_take)])
+                    remaining = len(plain_reset_fallback_seeds) - len(batch_seeds)
+                    if remaining > 0:
+                        host_seeds, host_states, host_metas = _resolve_plain_reset_host_batch(
+                            reset_count=remaining,
+                            fallback_seeds=plain_reset_fallback_seeds[len(batch_seeds):],
+                            reset_prefetch=reset_prefetch,
+                            num_agents=int(cfg.num_agents),
+                            max_fleets=int(cfg.max_fleets),
+                            timing=timing,
+                            sync_policy_timing=sync_policy_timing,
+                            device=device,
+                        )
+                        host_env_idx = np.asarray(reset_envs_apply[len(batch_seeds):], dtype=np.int32)
+                        t_reset_apply0 = perf_counter()
+                        state_b = reset_envs_at_indices_batched(
+                            state_b,
+                            host_env_idx,
+                            host_states,
+                        )
+                        if sync_policy_timing:
+                            _sync_rollout_policy_timing(device, state_b)
+                        apply_dt = perf_counter() - t_reset_apply0
+                        timing.env_reset_apply_s += apply_dt
+                        reset_total_s += apply_dt
+                        batch_seeds.extend(host_seeds)
+                        batch_metas.extend(host_metas)
+                    for env_i, sid, meta in zip(reset_envs_apply, batch_seeds, batch_metas):
+                        _accum_prefetch_pop_meta(
+                            timing,
+                            meta,
+                            init_phase=False,
+                            active_seat_count=int(cfg.num_agents),
+                        )
+                        done_env_seed[int(env_i)] = int(sid)
+                        if first_reset_event is None:
+                            first_reset_event = (
+                                int(env_i),
+                                int(sid),
+                                np.asarray(
+                                    [int(write_idx[p][env_i]) for p in range(n_ego)],
+                                    dtype=np.int64,
+                                ),
+                            )
+                    reset_envs_apply = []
+                    reset_fresh_states = []
+                    plain_reset_fallback_seeds = []
                 if reset_envs_apply:
                     t_reset_apply0 = perf_counter()
                     state_b = reset_envs_at_indices(
@@ -3143,7 +3545,9 @@ def collect_parallel_micro_rollouts(
                     )
                     if sync_policy_timing:
                         _sync_rollout_policy_timing(device, state_b)
-                    reset_total_s += perf_counter() - t_reset_apply0
+                    apply_dt = perf_counter() - t_reset_apply0
+                    timing.env_reset_apply_s += apply_dt
+                    reset_total_s += apply_dt
                 timing.env_reset_s += reset_total_s
                 t_py0 += reset_total_s
                 if grouped_population_rollout and done_envs:
@@ -3187,14 +3591,15 @@ def collect_parallel_micro_rollouts(
                 step_env_t = torch.as_tensor(step_envs, dtype=torch.long, device=device)
                 micro_k_dev[:, step_env_t] = 0
                 ready_mask_j = jnp.asarray(ready_mask, dtype=jnp.bool_)
-                _reset_prefetch_resync(
-                    reset_prefetch,
-                    seed_base,
-                    seeds_consumed,
-                    cfg,
-                    unified_exploiter_rollout=unified_exploiter_rollout,
-                    unified_seed_state=unified_seed_state,
-                )
+                if device_reset_bank is None:
+                    _reset_prefetch_resync(
+                        reset_prefetch,
+                        seed_base,
+                        seeds_consumed,
+                        cfg,
+                        unified_exploiter_rollout=unified_exploiter_rollout,
+                        unified_seed_state=unified_seed_state,
+                    )
                 if grouped_population_rollout:
                     assert policy_row_for_seat is not None
                     row_env, row_ego = _invert_policy_row_mapping(policy_row_for_seat)
@@ -3358,6 +3763,7 @@ def collect_parallel_micro_rollouts(
 
         deferred_seed: dict[int, int] = {}
         deferred_fresh_states: list[Any] = []
+        deferred_plain_fallback_seeds: list[int] = []
         for env_i in reset_envs.tolist():
             episode_turns[env_i] = 0
             if mode_arr is not None:
@@ -3387,24 +3793,15 @@ def collect_parallel_micro_rollouts(
                 main_player_mask[:, env_i] = main_i.astype(np.bool_, copy=False)
             elif reset_prefetch is not None:
                 sid = int(seed_base + seeds_consumed)
-                fresh_np, prefetch_meta = reset_prefetch.pop_state(
-                    sid,
-                    int(cfg.num_agents),
-                    int(cfg.max_fleets),
-                    return_meta=True,
-                )
-                _accum_prefetch_pop_meta(
-                    timing,
-                    prefetch_meta,
-                    init_phase=False,
-                    active_seat_count=int(cfg.num_agents),
-                )
+                deferred_plain_fallback_seeds.append(sid)
             else:
                 sid = int(seed_base + seeds_consumed)
                 state_i = jow.reset_from_reference(sid, int(cfg.num_agents), max_fleets=int(cfg.max_fleets))
                 fresh_np = jax.device_get(state_i)
-            deferred_fresh_states.append(fresh_np)
-            deferred_seed[env_i] = sid
+            if mode_arr is not None or reset_prefetch is None:
+                deferred_fresh_states.append(fresh_np)
+            if mode_arr is not None or reset_prefetch is None:
+                deferred_seed[env_i] = sid
             timing.env_reset_count += 1
             if mode_arr is not None:
                 if active_seat_count == 2:
@@ -3412,16 +3809,81 @@ def collect_parallel_micro_rollouts(
                 elif active_seat_count == 4:
                     timing.env_reset_mode_4p_count += 1
             seeds_consumed += 1
-            if first_reset_event is None:
+            if (mode_arr is not None or reset_prefetch is None) and first_reset_event is None:
                 first_reset_event = (
                     int(env_i),
                     int(sid),
                     np.asarray([int(write_idx[p][env_i]) for p in range(n_ego)], dtype=np.int64),
                 )
         if reset_envs.size:
-            state_b = reset_envs_at_indices(state_b, reset_envs, deferred_fresh_states)
-            if sync_policy_timing:
-                _sync_rollout_policy_timing(device, state_b)
+            if mode_arr is None and deferred_plain_fallback_seeds:
+                batch_seeds: list[int] = []
+                batch_metas: list[PrefetchPopMeta] = []
+                bank_take = (
+                    0
+                    if device_reset_bank is None
+                    else min(len(deferred_plain_fallback_seeds), int(device_reset_bank.size()))
+                )
+                if bank_take > 0:
+                    bank_reserved = device_reset_bank.reserve_tail(bank_take)
+                    if bank_reserved is None or device_reset_bank.states is None:
+                        raise RuntimeError("device reset bank reserve_tail unexpectedly returned None")
+                    bank_seeds, bank_start, bank_take = bank_reserved
+                    bank_env_idx = reset_envs[:bank_take]
+                    if sync_policy_timing:
+                        _sync_rollout_policy_timing(device)
+                    t_reset_bank0 = perf_counter()
+                    state_b = reset_envs_from_bank_tail(
+                        state_b,
+                        bank_env_idx,
+                        device_reset_bank.states,
+                        bank_start,
+                    )
+                    if sync_policy_timing:
+                        _sync_rollout_policy_timing(device, state_b)
+                    timing.env_reset_bank_slice_s += perf_counter() - t_reset_bank0
+                    batch_seeds.extend(int(x) for x in bank_seeds)
+                    batch_metas.extend([PrefetchPopMeta(immediate_bank_hit=True) for _ in range(bank_take)])
+                remaining = len(deferred_plain_fallback_seeds) - len(batch_seeds)
+                if remaining > 0:
+                    host_seeds, host_states, host_metas = _resolve_plain_reset_host_batch(
+                        reset_count=remaining,
+                        fallback_seeds=deferred_plain_fallback_seeds[len(batch_seeds):],
+                        reset_prefetch=reset_prefetch,
+                        num_agents=int(cfg.num_agents),
+                        max_fleets=int(cfg.max_fleets),
+                        timing=timing,
+                        sync_policy_timing=sync_policy_timing,
+                        device=device,
+                    )
+                    host_env_idx = reset_envs[len(batch_seeds):]
+                    t_reset_apply0 = perf_counter()
+                    state_b = reset_envs_at_indices_batched(state_b, host_env_idx, host_states)
+                    if sync_policy_timing:
+                        _sync_rollout_policy_timing(device, state_b)
+                    timing.env_reset_apply_s += perf_counter() - t_reset_apply0
+                    batch_seeds.extend(host_seeds)
+                    batch_metas.extend(host_metas)
+                for env_i, sid, meta in zip(reset_envs.tolist(), batch_seeds, batch_metas):
+                    _accum_prefetch_pop_meta(
+                        timing,
+                        meta,
+                        init_phase=False,
+                        active_seat_count=int(cfg.num_agents),
+                    )
+                    deferred_seed[int(env_i)] = int(sid)
+                    if first_reset_event is None:
+                        first_reset_event = (
+                            int(env_i),
+                            int(sid),
+                            np.asarray([int(write_idx[p][env_i]) for p in range(n_ego)], dtype=np.int64),
+                        )
+            else:
+                t_reset_apply0 = perf_counter()
+                state_b = reset_envs_at_indices(state_b, reset_envs, deferred_fresh_states)
+                if sync_policy_timing:
+                    _sync_rollout_policy_timing(device, state_b)
+                timing.env_reset_apply_s += perf_counter() - t_reset_apply0
             for env_i in reset_envs.tolist():
                 pending_exploiter_terminal[:, env_i] = False
                 population_assignments[:, env_i] = _sample_population_assignments_for_env(

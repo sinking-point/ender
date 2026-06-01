@@ -134,6 +134,129 @@ class RolloutResetPrefetch:
         self._submitted.add(key)
         self._task_q.put(key)
 
+    def drain_ready(self, max_items: Optional[int] = None) -> int:
+        """Move completed worker results into the local bank without blocking."""
+
+        drained = 0
+        limit = None if max_items is None else max(0, int(max_items))
+        while limit is None or drained < limit:
+            try:
+                gen_r, seed_r, na_r, mf_r, mode_r, np_st = self._result_q.get_nowait()
+            except queue.Empty:
+                break
+            rkey = (gen_r, seed_r, na_r, mf_r, mode_r)
+            self._bank[rkey] = np_st
+            drained += 1
+        return drained
+
+    def pop_any_banked_state(
+        self,
+        num_agents: int,
+        max_fleets: int,
+        *,
+        mode_code: Optional[int] = None,
+    ) -> Optional[tuple[int, Any]]:
+        """Return any ready state matching this shape/mode, along with its seed."""
+
+        if not self._started:
+            raise RuntimeError("RolloutResetPrefetch.start() first")
+        g = self._gen
+        mf = int(max_fleets)
+        na = int(num_agents)
+        mode = None if mode_code is None else int(mode_code)
+        for key, val in list(self._bank.items()):
+            if key[0] == g and key[2] == na and key[3] == mf and key[4] == mode:
+                self._bank.pop(key, None)
+                return int(key[1]), val
+        return None
+
+    def wait_any_banked_state(
+        self,
+        num_agents: int,
+        max_fleets: int,
+        *,
+        mode_code: Optional[int] = None,
+        sync_timeout_s: float = 120.0,
+    ) -> Optional[tuple[int, Any]]:
+        """Block until any matching ready state arrives, then return ``(seed, state)``."""
+
+        if not self._started:
+            raise RuntimeError("RolloutResetPrefetch.start() first")
+        ready = self.pop_any_banked_state(
+            int(num_agents),
+            int(max_fleets),
+            mode_code=mode_code,
+        )
+        if ready is not None:
+            return ready
+        g = self._gen
+        mf = int(max_fleets)
+        na = int(num_agents)
+        mode = None if mode_code is None else int(mode_code)
+        deadline = time.perf_counter() + float(sync_timeout_s)
+        while time.perf_counter() < deadline:
+            try:
+                gen_r, seed_r, na_r, mf_r, mode_r, np_st = self._result_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            rkey = (gen_r, seed_r, na_r, mf_r, mode_r)
+            if gen_r == g and na_r == na and mf_r == mf and mode_r == mode:
+                return int(seed_r), np_st
+            self._bank[rkey] = np_st
+            ready = self.pop_any_banked_state(
+                int(num_agents),
+                int(max_fleets),
+                mode_code=mode_code,
+            )
+            if ready is not None:
+                return ready
+        return None
+
+    def pop_any_state(
+        self,
+        num_agents: int,
+        max_fleets: int,
+        *,
+        fallback_seed: int,
+        sync_timeout_s: float = 120.0,
+        return_meta: bool = False,
+    ) -> Any:
+        """Return any matching state, waiting on the worker queue first, then falling back in-process."""
+
+        import jax
+        import jax_orbit_wars as jow
+
+        if not self._started:
+            raise RuntimeError("RolloutResetPrefetch.start() first")
+        meta = PrefetchPopMeta()
+        ready = self.pop_any_banked_state(
+            int(num_agents),
+            int(max_fleets),
+        )
+        if ready is not None:
+            meta.immediate_bank_hit = True
+            seed_r, out = ready
+            payload = (int(seed_r), out, meta)
+            return payload if return_meta else payload[:2]
+
+        t_wait0 = time.perf_counter()
+        ready = self.wait_any_banked_state(
+            int(num_agents),
+            int(max_fleets),
+            sync_timeout_s=float(sync_timeout_s),
+        )
+        meta.wait_s = time.perf_counter() - t_wait0
+        if ready is not None:
+            seed_r, out = ready
+            payload = (int(seed_r), out, meta)
+            return payload if return_meta else payload[:2]
+
+        st = jow.reset_from_reference(int(fallback_seed), int(num_agents), max_fleets=int(max_fleets))
+        meta.fallback_used = True
+        out = jax.device_get(st)
+        payload = (int(fallback_seed), out, meta)
+        return payload if return_meta else payload[:2]
+
     def prefetch_ahead(self, first_seed: int, num_agents: int, max_fleets: int) -> None:
         """Ensure seeds ``first_seed .. first_seed + lookahead - 1`` are queued for current gen."""
 
@@ -144,6 +267,18 @@ class RolloutResetPrefetch:
             self._mf = mf
         g = self._gen
         for k in range(self._lookahead):
+            self._submit(g, int(first_seed) + k, int(num_agents), mf)
+
+    def submit_plain_range(self, first_seed: int, count: int, num_agents: int, max_fleets: int) -> None:
+        """Queue a specific number of future plain reset seeds for the current generation."""
+
+        if not self._started:
+            raise RuntimeError("RolloutResetPrefetch.start() first")
+        mf = int(max_fleets)
+        if self._mf < 0:
+            self._mf = mf
+        g = self._gen
+        for k in range(max(0, int(count))):
             self._submit(g, int(first_seed) + k, int(num_agents), mf)
 
     def prefetch_unified_exploiter_ahead(
