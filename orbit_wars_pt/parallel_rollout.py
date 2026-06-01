@@ -1353,10 +1353,22 @@ def _run_async_micro_step_multi(
     sync_policy_timing: bool = False,
     controller_assignments: Optional[np.ndarray] = None,
     main_player_mask: Optional[np.ndarray] = None,
-) -> tuple[OrbitWarsState, List[TorchTransitionBuffer], List[CompressedObservationBuffer]]:
+    value_only: Optional[np.ndarray] = None,
+) -> tuple[
+    OrbitWarsState,
+    List[TorchTransitionBuffer],
+    List[CompressedObservationBuffer],
+    Optional[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
+]:
     """Run one micro decision for every pending egocentric row in a ``n_ego * num_envs`` JAX batch."""
 
     t_prep0 = perf_counter()
+    if value_only is None:
+        value_only = np.zeros_like(pending, dtype=np.bool_)
+    else:
+        value_only = np.asarray(value_only, dtype=np.bool_)
+        if value_only.shape != pending.shape:
+            raise ValueError(f"value_only shape {value_only.shape} != pending shape {pending.shape}")
     players_active = [np.flatnonzero(pending[p]).astype(np.int32) for p in range(n_ego)]
     n_list = [int(x.size) for x in players_active]
     offsets: list[int] = []
@@ -1367,7 +1379,7 @@ def _run_async_micro_step_multi(
     n_active = int(off)
     total_env_rows = int(virt_b.planets.shape[0])
     if n_active == 0:
-        return virt_b, bufs, obs_bufs
+        return virt_b, bufs, obs_bufs, None
 
     active_rows = np.concatenate([players_active[p] + p * num_envs for p in range(n_ego)]).astype(np.int32)
     active_population_idx = np.concatenate(
@@ -1383,6 +1395,9 @@ def _run_async_micro_step_multi(
     active_ego_idx = np.concatenate(
         [np.full((int(players_active[p].size),), p, dtype=np.int32) for p in range(n_ego)]
     ).astype(np.int32)
+    active_value_only = np.concatenate(
+        [value_only[p, players_active[p]] for p in range(n_ego)]
+    ).astype(np.bool_, copy=False)
     active_value_head_idx = _relative_main_value_head_idx_for_rows(
         ego_idx=active_ego_idx,
         env_idx=active_env_idx,
@@ -1588,6 +1603,10 @@ def _run_async_micro_step_multi(
     apply_halt_now = apply_halt_now.detach()
     stop_now = stop_now.detach()
     policy_fleet_eta = policy_fleet_eta.detach()
+    if np.any(active_value_only):
+        value_only_t = torch.as_tensor(active_value_only, device=device, dtype=torch.bool)
+        apply_halt_now = torch.where(value_only_t, torch.ones_like(apply_halt_now), apply_halt_now)
+        stop_now = torch.where(value_only_t, torch.ones_like(stop_now), stop_now)
     del out
     if sync_policy_timing:
         _sync_rollout_policy_timing(device)
@@ -1651,8 +1670,11 @@ def _run_async_micro_step_multi(
         offset = offsets[p]
         if n_p == 0:
             continue
-        pos_p_t = torch.arange(offset, offset + n_p, device=device, dtype=torch.long)
-        active_p_idx_t = torch.as_tensor(ap, device=device, dtype=torch.long)
+        action_local = np.flatnonzero(~active_value_only[offset : offset + n_p]).astype(np.int32)
+        if action_local.size == 0:
+            continue
+        pos_p_t = torch.as_tensor(offset + action_local, device=device, dtype=torch.long)
+        active_p_idx_t = torch.as_tensor(ap[action_local], device=device, dtype=torch.long)
         active_p_rows_t = active_p_idx_t + p * num_envs
         micro_kp_t = micro_k_dev[p].index_select(0, active_p_idx_t)
         write_row_t = write_idx_dev[p].index_select(0, active_p_idx_t)
@@ -1713,12 +1735,16 @@ def _run_async_micro_step_multi(
         offset = offsets[p]
         if n_p == 0:
             continue
-        rows_np = write_idx[p][ap]
-        valid[p][rows_np, ap] = True
-        old_logprob[p][rows_np, ap] = total_logp_np[offset : offset + n_p]
-        old_value[p][rows_np, ap] = values_np[offset : offset + n_p]
+        action_local = np.flatnonzero(~active_value_only[offset : offset + n_p]).astype(np.int32)
+        if action_local.size == 0:
+            continue
+        env_sel = ap[action_local]
+        rows_np = write_idx[p][env_sel]
+        valid[p][rows_np, env_sel] = True
+        old_logprob[p][rows_np, env_sel] = total_logp_np[offset + action_local]
+        old_value[p][rows_np, env_sel] = values_np[offset + action_local]
         if micro_step_penalty != 0.0:
-            reward[p][rows_np, ap] -= float(micro_step_penalty) * dispatched_np[offset : offset + n_p].astype(
+            reward[p][rows_np, env_sel] -= float(micro_step_penalty) * dispatched_np[offset + action_local].astype(
                 np.float32
             )
     t_post2 = perf_counter()
@@ -1732,6 +1758,8 @@ def _run_async_micro_step_multi(
         widx = write_idx[p]
         micro_arr = micro_k[p]
         for local_j, env_i in enumerate(ap):
+            if bool(active_value_only[offset + local_j]):
+                continue
             j_arr = offset + local_j
             env_i = int(env_i)
             if bool(dispatched_np[j_arr]):
@@ -1754,14 +1782,21 @@ def _run_async_micro_step_multi(
         offset = offsets[p]
         widx = write_idx[p]
         micro_arr = micro_k[p]
+        value_only_local = np.flatnonzero(active_value_only[offset : offset + n_p]).astype(np.int32)
+        if value_only_local.size > 0:
+            halted[p, ap[value_only_local]] = True
         if n_p == 0:
             continue
-        stop_mask = stop_now_np[offset : offset + n_p].astype(np.bool_, copy=False)
-        reward_idx[p, ap] = widx[ap]
-        halted[p, ap] |= stop_mask
-        widx[ap] += 1
-        micro_arr[ap] += 1
-        halted[p, ap] |= micro_arr[ap] >= max_micro_steps
+        action_local = np.flatnonzero(~active_value_only[offset : offset + n_p]).astype(np.int32)
+        if action_local.size == 0:
+            continue
+        env_sel = ap[action_local]
+        stop_mask = stop_now_np[offset + action_local].astype(np.bool_, copy=False)
+        reward_idx[p, env_sel] = widx[env_sel]
+        halted[p, env_sel] |= stop_mask
+        widx[env_sel] += 1
+        micro_arr[env_sel] += 1
+        halted[p, env_sel] |= micro_arr[env_sel] >= max_micro_steps
     t_post6 = perf_counter()
     timing.micro_post_apply_halt_block_indices_s += t_post6 - t_post5
     timing.micro_post_apply_host_bookkeeping_s += t_post6 - t_post1
@@ -1770,14 +1805,24 @@ def _run_async_micro_step_multi(
     for p in range(n_ego):
         ap = players_active[p]
         n_p = n_list[p]
+        offset = offsets[p]
         if n_p == 0:
             continue
-        active_p_idx_t = torch.as_tensor(ap, device=device, dtype=torch.long)
+        action_local = np.flatnonzero(~active_value_only[offset : offset + n_p]).astype(np.int32)
+        if action_local.size == 0:
+            continue
+        active_p_idx_t = torch.as_tensor(ap[action_local], device=device, dtype=torch.long)
         micro_k_dev[p, active_p_idx_t] = micro_k_dev[p, active_p_idx_t] + 1
         write_idx_dev[p][active_p_idx_t] = write_idx_dev[p][active_p_idx_t] + 1
     timing.micro_post_apply_device_index_s += perf_counter() - t_post7
 
-    return virt_b, bufs, obs_bufs
+    value_capture = (
+        values_np,
+        active_env_idx.astype(np.int32, copy=False),
+        active_ego_idx.astype(np.int32, copy=False),
+        active_value_only.astype(np.bool_, copy=False),
+    )
+    return virt_b, bufs, obs_bufs, value_capture
 
 
 def _run_async_micro_step_multi_grouped_population(
@@ -2609,6 +2654,7 @@ def collect_parallel_micro_rollouts(
     pending_actions[..., 5] = 500.0
     pending_action_count = np.zeros((n_ego, num_envs), dtype=np.int32)
     reward_idx = np.full((n_ego, num_envs), -1, dtype=np.int32)
+    earlygame_bootstrap_row = np.full((n_ego, num_envs), -1, dtype=np.int32)
     segment_done = np.zeros((num_envs,), dtype=np.bool_)
     # First env to reset during this segment, recorded for the optional
     # background consistency check. Stored as ``(env_i, new_seed,
@@ -2630,6 +2676,7 @@ def collect_parallel_micro_rollouts(
 
             ready_mask = (~segment_done) & np.all(halted | player_done, axis=0)
             pending = (~segment_done)[None, :] & (~halted) & (~player_done)
+            earlygame_value_only = pending & (earlygame_bootstrap_row >= 0)
             if grouped_population_rollout:
                 assert row_env is not None and row_ego is not None
                 pending_rows = (~segment_done[row_env]) & (~halted[row_ego, row_env]) & (~player_done[row_ego, row_env])
@@ -2767,13 +2814,28 @@ def collect_parallel_micro_rollouts(
                         and np.any(main_player_mask[:, env_i] & (~alive_post_np[env_i, : int(cfg.num_agents)]))
                     )
                     env_done_now = bool(done_np[env_i]) or main_dead
-                    earlygame_truncate_now = (
-                        int(earlygame_env_turn_limit) > 0
+                    grouped_earlygame_truncate_now = (
+                        grouped_population_rollout
+                        and int(earlygame_env_turn_limit) > 0
                         and (env_i % 2) == 0
                         and int(episode_turns[env_i]) >= int(earlygame_env_turn_limit)
                         and not env_done_now
                     )
-                    reset_env_now = env_done_now or earlygame_truncate_now
+                    earlygame_bootstrap_now = (
+                        (not grouped_population_rollout)
+                        and int(earlygame_env_turn_limit) > 0
+                        and (env_i % 2) == 0
+                        and int(episode_turns[env_i]) == int(earlygame_env_turn_limit)
+                        and not env_done_now
+                    )
+                    earlygame_reset_now = (
+                        (not grouped_population_rollout)
+                        and int(earlygame_env_turn_limit) > 0
+                        and (env_i % 2) == 0
+                        and int(episode_turns[env_i]) > int(earlygame_env_turn_limit)
+                        and not env_done_now
+                    )
+                    reset_env_now = env_done_now or grouped_earlygame_truncate_now or earlygame_reset_now
                     main_policy_win: Optional[bool] = None
                     time_bonus_scale = 0.0
                     if versus_controller_rollout and env_done_now:
@@ -2792,7 +2854,7 @@ def collect_parallel_micro_rollouts(
                     for p in range(n_ego):
                         if reward_idx[p, env_i] >= 0:
                             seat_dead = not bool(alive_post_np[env_i, p])
-                            local_done = reset_env_now or seat_dead
+                            local_done = reset_env_now or earlygame_bootstrap_now or seat_dead
                             delta_r = float(dr_np[env_i, p])
                             if versus_controller_rollout and int(controller_assignments[p, env_i]) == 1:
                                 delta_r = 0.0
@@ -2809,8 +2871,11 @@ def collect_parallel_micro_rollouts(
                             done[p][reward_idx[p, env_i], env_i] = local_done or bool(
                                 done[p][reward_idx[p, env_i], env_i]
                             )
-                            if earlygame_truncate_now and not seat_dead:
-                                trunc_reset_rows.append((p, env_i, int(reward_idx[p, env_i])))
+                            if (grouped_earlygame_truncate_now or earlygame_bootstrap_now) and not seat_dead:
+                                if grouped_population_rollout:
+                                    trunc_reset_rows.append((p, env_i, int(reward_idx[p, env_i])))
+                                else:
+                                    earlygame_bootstrap_row[p, env_i] = int(reward_idx[p, env_i])
                         if not bool(alive_post_np[env_i, p]):
                             player_done[p, env_i] = True
                         if (
@@ -2962,7 +3027,7 @@ def collect_parallel_micro_rollouts(
                                     dtype=np.int64,
                                 ),
                             )
-                    elif earlygame_truncate_now:
+                    elif reset_env_now:
                         done_envs.append(env_i)
                         episode_turns[env_i] = 0
                         t_reset0 = perf_counter()
@@ -3043,6 +3108,8 @@ def collect_parallel_micro_rollouts(
                     pending_actions[env_i, :, :, 5] = 500.0
                     pending_action_count[:, env_i] = 0
                     reward_idx[:, env_i] = -1
+                    if reset_env_now:
+                        earlygame_bootstrap_row[:, env_i] = -1
                     if horizon_fired:
                         segment_done[env_i] = True
                 if trunc_reset_rows:
@@ -3195,46 +3262,59 @@ def collect_parallel_micro_rollouts(
                     obs_feature_dim=obs_feature_dim,
                     normalize_obs_to_p0=cfg.normalize_obs_to_p0,
                     sync_policy_timing=sync_policy_timing,
-                )
+                    )
             else:
-                virt_b, bufs, obs_bufs = _run_async_micro_step_multi(
-                    n_ego=n_ego,
-                    num_envs=num_envs,
-                    pending=pending,
-                    virt_b=virt_b,
-                    bufs=bufs,
-                    obs_bufs=obs_bufs,
-                    write_idx=write_idx,
-                    write_idx_dev=write_idx_dev,
-                    micro_k=micro_k,
-                    micro_k_dev=micro_k_dev,
-                    valid=valid,
-                    old_logprob=old_logprob,
-                    old_value=old_value,
-                    reward=reward,
-                    pending_actions=pending_actions,
-                    pending_action_count=pending_action_count,
-                    reward_idx=reward_idx,
-                    halted=halted,
-                    policies=policies,
-                    device=device,
-                    rng=rng,
-                    greedy=greedy,
-                    ship_speed=ship_speed,
-                    max_micro_steps=max_micro_steps_per_player,
-                    timing=timing,
-                    first_hit_n_rays=first_hit_n_rays,
-                    micro_step_penalty=micro_step_penalty,
-                    first_hit_ray_chunk_size=first_hit_ray_chunk_size,
-                    first_hit_env_chunk_size=first_hit_env_chunk_size,
-                    first_hit_method=first_hit_method,
-                    obs_feature_dim=obs_feature_dim,
-                    normalize_obs_to_p0=cfg.normalize_obs_to_p0,
-                    sync_policy_timing=sync_policy_timing,
-                    controller_assignments=controller_assignments,
-                    main_player_mask=main_player_mask,
-                    population_assignments=population_assignments,
-                )
+                virt_b, bufs, obs_bufs, value_capture = _run_async_micro_step_multi(
+                        n_ego=n_ego,
+                        num_envs=num_envs,
+                        pending=pending,
+                        virt_b=virt_b,
+                        bufs=bufs,
+                        obs_bufs=obs_bufs,
+                        write_idx=write_idx,
+                        write_idx_dev=write_idx_dev,
+                        micro_k=micro_k,
+                        micro_k_dev=micro_k_dev,
+                        valid=valid,
+                        old_logprob=old_logprob,
+                        old_value=old_value,
+                        reward=reward,
+                        population_assignments=population_assignments,
+                        pending_actions=pending_actions,
+                        pending_action_count=pending_action_count,
+                        reward_idx=reward_idx,
+                        halted=halted,
+                        policies=policies,
+                        device=device,
+                        rng=rng,
+                        greedy=greedy,
+                        ship_speed=ship_speed,
+                        max_micro_steps=max_micro_steps_per_player,
+                        timing=timing,
+                        first_hit_n_rays=first_hit_n_rays,
+                        micro_step_penalty=micro_step_penalty,
+                        first_hit_ray_chunk_size=first_hit_ray_chunk_size,
+                        first_hit_env_chunk_size=first_hit_env_chunk_size,
+                        first_hit_method=first_hit_method,
+                        obs_feature_dim=obs_feature_dim,
+                        normalize_obs_to_p0=cfg.normalize_obs_to_p0,
+                        sync_policy_timing=sync_policy_timing,
+                        controller_assignments=controller_assignments,
+                        main_player_mask=main_player_mask,
+                        value_only=earlygame_value_only,
+                    )
+                if value_capture is not None and np.any(earlygame_bootstrap_row >= 0):
+                    t_eg0 = perf_counter()
+                    values_np, active_env_np, active_ego_np, active_value_only_np = value_capture
+                    value_only_rows = np.flatnonzero(active_value_only_np).astype(np.int32)
+                    for row in value_only_rows.tolist():
+                        ego = int(active_ego_np[row])
+                        env_i = int(active_env_np[row])
+                        row_t = int(earlygame_bootstrap_row[ego, env_i])
+                        if row_t >= 0:
+                            trunc_bootstrap[ego][row_t, env_i] = float(values_np[row])
+                            trunc_bootstrap_valid[ego][row_t, env_i] = True
+                    timing.env_python_s += perf_counter() - t_eg0
             t_post0 = perf_counter()
             if profile_rollout and device.type == "cuda" and not logged_first_policy_fwd:
                 log_cuda_mem("rollout after first batched policy forward", device)
@@ -3245,6 +3325,120 @@ def collect_parallel_micro_rollouts(
             if sync_policy_timing:
                 _sync_rollout_policy_timing(device)
             timing.loop_post_micro_s += perf_counter() - t_post0
+
+    if (not grouped_population_rollout) and np.any(earlygame_bootstrap_row >= 0):
+        t_fallback0 = perf_counter()
+        with amp_ctx:
+            value_np_per_ego = _compute_state_values_per_ego(
+                state_b=state_b,
+                grouped_population_rollout=grouped_population_rollout,
+                row_env=row_env,
+                row_ego=row_ego,
+                row_env_j=row_env_j,
+                num_envs=num_envs,
+                n_ego=n_ego,
+                ship_speed=ship_speed,
+                obs_feature_dim=obs_feature_dim,
+                normalize_obs_to_p0=cfg.normalize_obs_to_p0,
+                population_assignments=population_assignments,
+                controller_assignments=controller_assignments,
+                main_player_mask=main_player_mask,
+                policies=policies,
+                policy=policy,
+                device=device,
+                timing=timing,
+            )
+        reset_envs = np.flatnonzero(np.any(earlygame_bootstrap_row >= 0, axis=0)).astype(np.int32)
+        for env_i in reset_envs.tolist():
+            for ego in range(n_ego):
+                row_t = int(earlygame_bootstrap_row[ego, env_i])
+                if row_t >= 0:
+                    trunc_bootstrap[ego][row_t, env_i] = float(value_np_per_ego[ego, env_i])
+                    trunc_bootstrap_valid[ego][row_t, env_i] = True
+
+        deferred_seed: dict[int, int] = {}
+        deferred_fresh_states: list[Any] = []
+        for env_i in reset_envs.tolist():
+            episode_turns[env_i] = 0
+            if mode_arr is not None:
+                active_seat_count = unified_exploiter_active_seat_count(int(mode_arr[env_i]))
+                assert unified_seed_state is not None
+                sid = _take_unified_exploiter_seed(unified_seed_state, active_seat_count)
+                ctrl_i, main_i = sample_unified_exploiter_mode_layout(sid, int(mode_arr[env_i]))
+                if reset_prefetch is not None:
+                    fresh_np, prefetch_meta = reset_prefetch.pop_unified_exploiter_state(
+                        sid,
+                        active_seat_count,
+                        int(cfg.max_fleets),
+                        return_meta=True,
+                    )
+                    _accum_prefetch_pop_meta(
+                        timing,
+                        prefetch_meta,
+                        init_phase=False,
+                        active_seat_count=active_seat_count,
+                    )
+                else:
+                    state_i, _, _ = build_unified_exploiter_reset(
+                        sid, int(mode_arr[env_i]), int(cfg.max_fleets)
+                    )
+                    fresh_np = jax.device_get(state_i)
+                controller_assignments[:, env_i] = ctrl_i.astype(np.int32, copy=False)
+                main_player_mask[:, env_i] = main_i.astype(np.bool_, copy=False)
+            elif reset_prefetch is not None:
+                sid = int(seed_base + seeds_consumed)
+                fresh_np, prefetch_meta = reset_prefetch.pop_state(
+                    sid,
+                    int(cfg.num_agents),
+                    int(cfg.max_fleets),
+                    return_meta=True,
+                )
+                _accum_prefetch_pop_meta(
+                    timing,
+                    prefetch_meta,
+                    init_phase=False,
+                    active_seat_count=int(cfg.num_agents),
+                )
+            else:
+                sid = int(seed_base + seeds_consumed)
+                state_i = jow.reset_from_reference(sid, int(cfg.num_agents), max_fleets=int(cfg.max_fleets))
+                fresh_np = jax.device_get(state_i)
+            deferred_fresh_states.append(fresh_np)
+            deferred_seed[env_i] = sid
+            timing.env_reset_count += 1
+            if mode_arr is not None:
+                if active_seat_count == 2:
+                    timing.env_reset_mode_2p_count += 1
+                elif active_seat_count == 4:
+                    timing.env_reset_mode_4p_count += 1
+            seeds_consumed += 1
+            if first_reset_event is None:
+                first_reset_event = (
+                    int(env_i),
+                    int(sid),
+                    np.asarray([int(write_idx[p][env_i]) for p in range(n_ego)], dtype=np.int64),
+                )
+        if reset_envs.size:
+            state_b = reset_envs_at_indices(state_b, reset_envs, deferred_fresh_states)
+            if sync_policy_timing:
+                _sync_rollout_policy_timing(device, state_b)
+            for env_i in reset_envs.tolist():
+                pending_exploiter_terminal[:, env_i] = False
+                population_assignments[:, env_i] = _sample_population_assignments_for_env(
+                    deferred_seed[env_i], int(cfg.num_agents), population_size
+                )
+                if mode_arr is None:
+                    controller_assignments[:, env_i] = _sample_controller_assignments_for_env(
+                        deferred_seed[env_i], int(cfg.num_agents), controller_counts
+                    )
+                    main_player_mask[:, env_i] = _sample_main_player_mask_for_env(
+                        controller_assignments[:, env_i], termination_controller
+                    )
+                player_done[:, env_i] = controller_assignments[:, env_i] < 0 if mode_arr is not None else False
+                earlygame_bootstrap_row[:, env_i] = -1
+        fallback_dt = perf_counter() - t_fallback0
+        timing.env_reset_s += fallback_dt
+        timing.env_python_s += fallback_dt
 
     timing.loop_s = perf_counter() - t_loop0
     timing.outer_iters = outer

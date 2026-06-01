@@ -4196,7 +4196,6 @@ def _train_loop(
                 host_segment_i = _rollout_segment_to_host(segment_i)
                 host_transfer_s = time.perf_counter() - t_host0
                 del segment_i
-                _release_rollout_device_refs(device)
                 chunk_segments.append(host_segment_i)
                 chunk_timings.append(rt_i)
                 chunk_stats.append(game_stats_i)
@@ -4378,6 +4377,8 @@ def _train_loop(
                     logp_check_iter=it,
                 )
             ppo_s = time.perf_counter() - t_ppo0
+            if host_chunks is not None:
+                _release_rollout_device_refs(device)
 
             if mem_dbg and device.type == "cuda":
                 log_cuda_mem(f"iter {it} after PPO epochs", device)
