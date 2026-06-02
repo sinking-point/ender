@@ -43,6 +43,30 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--checkpoint-p0",
+        type=str,
+        default=None,
+        help="Checkpoint override for player 0. Default: same as --checkpoint.",
+    )
+    parser.add_argument(
+        "--checkpoint-p1",
+        type=str,
+        default=None,
+        help="Checkpoint override for player 1. Default: same as --checkpoint.",
+    )
+    parser.add_argument(
+        "--checkpoint-p2",
+        type=str,
+        default=None,
+        help="Checkpoint override for player 2 in 4-player mode. Default: same as --checkpoint.",
+    )
+    parser.add_argument(
+        "--checkpoint-p3",
+        type=str,
+        default=None,
+        help="Checkpoint override for player 3 in 4-player mode. Default: same as --checkpoint.",
+    )
+    parser.add_argument(
         "--num-agents",
         type=int,
         default=2,
@@ -384,6 +408,13 @@ def main() -> None:
         greedy_p2,
         greedy_p3,
     ]
+    base_checkpoint = Path(args.checkpoint).expanduser()
+    checkpoint_by_seat = [
+        base_checkpoint if args.checkpoint_p0 is None else Path(args.checkpoint_p0).expanduser(),
+        base_checkpoint if args.checkpoint_p1 is None else Path(args.checkpoint_p1).expanduser(),
+        base_checkpoint if args.checkpoint_p2 is None else Path(args.checkpoint_p2).expanduser(),
+        base_checkpoint if args.checkpoint_p3 is None else Path(args.checkpoint_p3).expanduser(),
+    ]
     member_by_seat = [
         member_p0,
         member_p1,
@@ -400,11 +431,18 @@ def main() -> None:
                 raise SystemExit(f"--main-seat must be in [0, {int(args.num_agents) - 1}]")
         print(
             f"[orbit_wars_pt] selfplay main-vs-exploiter mode: main_seat={main_seat} "
-            f"checkpoint={Path(args.checkpoint).expanduser()}",
+            f"base_checkpoint={base_checkpoint}",
             flush=True,
         )
     else:
         main_seat = -1
+
+    unique_checkpoints = {str(checkpoint_by_seat[seat]) for seat in range(int(args.num_agents))}
+    if len(unique_checkpoints) > 1:
+        checkpoint_summary = ", ".join(
+            f"p{seat}={checkpoint_by_seat[seat]}" for seat in range(int(args.num_agents))
+        )
+        print(f"[orbit_wars_pt] per-seat checkpoints: {checkpoint_summary}", flush=True)
 
     run_agents: list[Callable[[dict[str, Any], Any], list[list[float]]]] = []
     for seat in range(int(args.num_agents)):
@@ -412,7 +450,7 @@ def main() -> None:
         if args.main_vs_exploiter and seat != main_seat:
             policy_key = "exploiter_policy"
         seat_agent = KaggleOrbitWarsAgent(
-            Path(args.checkpoint).expanduser(),
+            checkpoint_by_seat[seat],
             device=str(args.device),
             policy_key=policy_key,
             greedy=bool(greedy_by_seat[seat]),
