@@ -2514,7 +2514,7 @@ def _first_hit_targets_np(
             selected_target_slot=selected_target_slot,
             return_jobs=return_jobs,
         )
-    return _raycast_targets_np(
+    result = _raycast_targets_np(
         state,
         origin_idx,
         frac_idx,
@@ -2524,6 +2524,10 @@ def _first_hit_targets_np(
         target_timing=target_timing,
         launch_geometry=launch_geometry,
     )
+    if return_jobs:
+        # Interval refinement jobs are unused for discrete raycast targets.
+        return (*result, [None] * MAX_PLANETS)
+    return result
 
 
 def _refine_interval_launches_in_place(
