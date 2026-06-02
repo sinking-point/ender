@@ -1644,6 +1644,8 @@ def _combine_rollout_timing(items: list[RolloutTiming]) -> RolloutTiming:
     for rt in items:
         out.init_s += rt.init_s
         out.init_reset_bank_s += rt.init_reset_bank_s
+        out.init_reset_host_ready_n = rt.init_reset_host_ready_n
+        out.init_reset_host_pending_n = rt.init_reset_host_pending_n
         out.init_reset_bank_drain_s += rt.init_reset_bank_drain_s
         out.init_reset_bank_ready_pop_s += rt.init_reset_bank_ready_pop_s
         out.init_reset_bank_wait_s += rt.init_reset_bank_wait_s
@@ -1806,6 +1808,7 @@ def _rollout_timing_str(rt: RolloutTiming) -> str:
         f"rollout_wall {rt.wall_s:.3f}s loop {rt.loop_s:.3f}s "
         f"init {rt.init_s:.3f}s"
         f"(bank {rt.init_reset_bank_s:.3f} "
+        f"host_ready {rt.init_reset_host_ready_n} host_pending {rt.init_reset_host_pending_n} "
         f"drain {rt.init_reset_bank_drain_s:.3f} ready {rt.init_reset_bank_ready_pop_s:.3f} "
         f"wait {rt.init_reset_bank_wait_s:.3f} stack {rt.init_reset_bank_stack_s:.3f} "
         f"append {rt.init_reset_bank_append_s:.3f} submit {rt.init_reset_bank_submit_s:.3f} "
@@ -3070,6 +3073,8 @@ def _log_iter_tensorboard(
         writer.add_scalar("timing/rollout_loop_s", rt.loop_s, it)
         writer.add_scalar("timing/init_s", rt.init_s, it)
         writer.add_scalar("timing/init_reset_bank_s", rt.init_reset_bank_s, it)
+        writer.add_scalar("timing/init_reset_host_ready_n", float(rt.init_reset_host_ready_n), it)
+        writer.add_scalar("timing/init_reset_host_pending_n", float(rt.init_reset_host_pending_n), it)
         writer.add_scalar("timing/init_reset_bank_drain_s", rt.init_reset_bank_drain_s, it)
         writer.add_scalar("timing/init_reset_bank_ready_pop_s", rt.init_reset_bank_ready_pop_s, it)
         writer.add_scalar("timing/init_reset_bank_wait_s", rt.init_reset_bank_wait_s, it)

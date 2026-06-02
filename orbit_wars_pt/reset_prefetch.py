@@ -73,6 +73,7 @@ class RolloutResetPrefetch:
         self._gen = 0
         self._mf = -1
         self._submitted: Set[Tuple[int, int, int, int, Optional[int]]] = set()
+        self._outstanding: Set[Tuple[int, int, int, int, Optional[int]]] = set()
         self._bank: Dict[Tuple[int, int, int, int, Optional[int]], Any] = {}
         self._started = False
 
@@ -101,6 +102,7 @@ class RolloutResetPrefetch:
         self._procs.clear()
         self._started = False
         self._submitted.clear()
+        self._outstanding.clear()
         self._bank.clear()
 
     def notify_max_fleets(self, max_fleets: int) -> None:
@@ -113,6 +115,7 @@ class RolloutResetPrefetch:
         self._mf = mf
         self._gen += 1
         self._submitted.clear()
+        self._outstanding.clear()
         self._bank.clear()
         while True:
             try:
@@ -132,6 +135,7 @@ class RolloutResetPrefetch:
         if key in self._submitted or key in self._bank:
             return
         self._submitted.add(key)
+        self._outstanding.add(key)
         self._task_q.put(key)
 
     def drain_ready(self, max_items: Optional[int] = None) -> int:
@@ -145,9 +149,48 @@ class RolloutResetPrefetch:
             except queue.Empty:
                 break
             rkey = (gen_r, seed_r, na_r, mf_r, mode_r)
+            self._outstanding.discard(rkey)
             self._bank[rkey] = np_st
             drained += 1
         return drained
+
+    def ready_banked_count(
+        self,
+        num_agents: int,
+        max_fleets: int,
+        *,
+        mode_code: Optional[int] = None,
+    ) -> int:
+        if not self._started:
+            raise RuntimeError("RolloutResetPrefetch.start() first")
+        g = self._gen
+        mf = int(max_fleets)
+        na = int(num_agents)
+        mode = None if mode_code is None else int(mode_code)
+        return sum(
+            1
+            for key in self._bank
+            if key[0] == g and key[2] == na and key[3] == mf and key[4] == mode
+        )
+
+    def outstanding_count(
+        self,
+        num_agents: int,
+        max_fleets: int,
+        *,
+        mode_code: Optional[int] = None,
+    ) -> int:
+        if not self._started:
+            raise RuntimeError("RolloutResetPrefetch.start() first")
+        g = self._gen
+        mf = int(max_fleets)
+        na = int(num_agents)
+        mode = None if mode_code is None else int(mode_code)
+        return sum(
+            1
+            for key in self._outstanding
+            if key[0] == g and key[2] == na and key[3] == mf and key[4] == mode
+        )
 
     def pop_any_banked_state(
         self,
@@ -200,6 +243,7 @@ class RolloutResetPrefetch:
             except queue.Empty:
                 continue
             rkey = (gen_r, seed_r, na_r, mf_r, mode_r)
+            self._outstanding.discard(rkey)
             if gen_r == g and na_r == na and mf_r == mf and mode_r == mode:
                 return int(seed_r), np_st
             self._bank[rkey] = np_st
@@ -336,6 +380,7 @@ class RolloutResetPrefetch:
                 continue
             meta.drained_results += 1
             rkey = (gen_r, seed_r, na_r, mf_r, mode_r)
+            self._outstanding.discard(rkey)
             if rkey == key:
                 meta.wait_s = time.perf_counter() - t_wait0
                 return (np_st, meta) if return_meta else np_st
@@ -393,6 +438,7 @@ class RolloutResetPrefetch:
                 continue
             meta.drained_results += 1
             rkey = (gen_r, seed_r, na_r, mf_r, mode_r)
+            self._outstanding.discard(rkey)
             if rkey == key:
                 meta.wait_s = time.perf_counter() - t_wait0
                 return (np_st, meta) if return_meta else np_st

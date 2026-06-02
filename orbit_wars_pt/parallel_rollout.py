@@ -542,6 +542,8 @@ class RolloutTiming:
 
     init_s: float = 0.0
     init_reset_bank_s: float = 0.0
+    init_reset_host_ready_n: int = 0
+    init_reset_host_pending_n: int = 0
     init_reset_bank_drain_s: float = 0.0
     init_reset_bank_ready_pop_s: float = 0.0
     init_reset_bank_wait_s: float = 0.0
@@ -823,6 +825,14 @@ def _stage_plain_reset_bank(
     reset_prefetch.drain_ready()
     if timing is not None:
         timing.init_reset_bank_drain_s += perf_counter() - t_drain0
+        timing.init_reset_host_ready_n = reset_prefetch.ready_banked_count(
+            int(num_agents),
+            int(max_fleets),
+        )
+        timing.init_reset_host_pending_n = reset_prefetch.outstanding_count(
+            int(num_agents),
+            int(max_fleets),
+        )
     target = int(device_reset_bank.capacity) if target_size is None else max(0, int(target_size))
     target = min(target, int(device_reset_bank.capacity))
     staged = 0
