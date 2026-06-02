@@ -691,7 +691,7 @@ _RESUME_ARG_MISMATCH_IGNORE = frozenset(
 )
 
 
-def _validate_checkpoint_args(saved: Dict[str, Any], args: argparse.Namespace) -> None:
+def _validate_checkpoint_args(saved: Dict[str, Any], args: argparse.Namespace) -> list[str]:
     cur = _checkpoint_training_args(args)
     mismatches = [
         k
@@ -699,10 +699,18 @@ def _validate_checkpoint_args(saved: Dict[str, Any], args: argparse.Namespace) -
         if k not in _RESUME_ARG_MISMATCH_IGNORE and k in saved and saved[k] != cur[k]
     ]
     if mismatches:
-        raise RuntimeError(
-            "Checkpoint training args mismatch current CLI — refusing to resume. "
-            f"Differing keys: {mismatches}. Use matching flags or a fresh experiment name."
-        )
+        if getattr(args, "force", False):
+            print(
+                "[orbit_wars_pt] --force set; resuming despite checkpoint/training CLI mismatches: "
+                f"{mismatches}",
+                flush=True,
+            )
+        else:
+            raise RuntimeError(
+                "Checkpoint training args mismatch current CLI — refusing to resume. "
+                f"Differing keys: {mismatches}. Use matching flags, pass --force, or use a fresh experiment name."
+            )
+    return mismatches
 
 
 def save_checkpoint(
@@ -4567,6 +4575,15 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="If true, load latest iter_*.pt under the experiment checkpoints dir when present.",
+    )
+    p.add_argument(
+        "--force",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Allow resume even when checkpointed training args differ from the current CLI. "
+            "Useful for explicitly forking an experiment from an existing checkpoint."
+        ),
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--iterations", type=int, default=100000)
