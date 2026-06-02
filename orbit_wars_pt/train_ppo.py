@@ -2547,7 +2547,17 @@ def _torch_ppo_loss_from_replay(
             actions["value_head_idx"].to(device=adv.device, dtype=torch.long),
             policy_loss_mask,
             check_rollout_logp,
-        )
+    )
+
+
+def _opportunistic_drain_reset_prefetch(
+    reset_prefetch: Optional[RolloutResetPrefetch],
+    *,
+    max_items: int = 128,
+) -> int:
+    if reset_prefetch is None:
+        return 0
+    return int(reset_prefetch.drain_ready(max_items=max_items))
 
 
 def ppo_iteration(
@@ -2575,6 +2585,7 @@ def ppo_iteration(
     logp_check_dump_dir: Optional[Path] = None,
     logp_check_label: str = "policy",
     logp_check_iter: int = 0,
+    reset_prefetch: Optional[RolloutResetPrefetch] = None,
 ) -> Tuple[float, PPOTiming, PPOStats]:
     """Multiple epochs of clipped PPO surrogate with minibatches.
 
@@ -2605,6 +2616,7 @@ def ppo_iteration(
     for _ in range(ppo_epochs):
         minibatches = _stratified_population_minibatches(samples["population_idx"], minibatch_size, population_size, rnd)
         for mb_idx in minibatches:
+            _opportunistic_drain_reset_prefetch(reset_prefetch)
 
             t0 = perf_counter()
             mb_player = players[mb_idx]
@@ -2710,6 +2722,7 @@ def ppo_iteration(
             stats.update(mb_stats, grad_norm)
             timing.sync_s += perf_counter() - t0
             n_mb += 1
+            _opportunistic_drain_reset_prefetch(reset_prefetch)
     timing.n_minibatches = n_mb
     timing.total_s = perf_counter() - t_total0
     return total_loss_sum / max(1, n_mb), timing, stats
@@ -2739,6 +2752,7 @@ def ppo_iteration_host_staged(
     logp_check_dump_dir: Optional[Path] = None,
     logp_check_label: str = "policy",
     logp_check_iter: int = 0,
+    reset_prefetch: Optional[RolloutResetPrefetch] = None,
 ) -> Tuple[float, PPOTiming, PPOStats]:
     """PPO over flattened host-side replay, staging only minibatches to device."""
 
@@ -2790,6 +2804,7 @@ def ppo_iteration_host_staged(
             batch_ranges.append(ranges)
 
         for batch_i in range(n_batches):
+            _opportunistic_drain_reset_prefetch(reset_prefetch)
             t0 = perf_counter()
             obs_parts: list[CompressedObservationBuffer] = []
             action_parts: list[dict[str, torch.Tensor]] = []
@@ -2906,6 +2921,7 @@ def ppo_iteration_host_staged(
             stats.update(mb_stats, grad_norm)
             timing.sync_s += perf_counter() - t0
             n_mb += 1
+            _opportunistic_drain_reset_prefetch(reset_prefetch)
     timing.n_minibatches = n_mb
     timing.total_s = perf_counter() - t_total0
     return total_loss_sum / max(1, n_mb), timing, stats
@@ -4016,6 +4032,7 @@ def _train_loop(
                         logp_check_dump_dir=logp_check_dump_dir,
                         logp_check_label="main",
                         logp_check_iter=it,
+                        reset_prefetch=reset_prefetch,
                     )
                     main_loss_parts.append(float(loss_mb_i))
                     main_ppo_summary = ppo_stats_i.summary()
@@ -4046,6 +4063,7 @@ def _train_loop(
                         logp_check_dump_dir=logp_check_dump_dir,
                         logp_check_label="main",
                         logp_check_iter=it,
+                        reset_prefetch=reset_prefetch,
                     )
                     main_loss_parts.append(float(loss_mb_i))
                     main_ppo_summary = ppo_stats_i.summary()
@@ -4076,6 +4094,7 @@ def _train_loop(
                         logp_check_dump_dir=logp_check_dump_dir,
                         logp_check_label="exploiter",
                         logp_check_iter=it,
+                        reset_prefetch=reset_prefetch,
                     )
                     exploiter_loss_parts.append(float(loss_mb_i))
                     exploiter_ppo_summary = ppo_stats_i.summary()
@@ -4106,6 +4125,7 @@ def _train_loop(
                         logp_check_dump_dir=logp_check_dump_dir,
                         logp_check_label="exploiter",
                         logp_check_iter=it,
+                        reset_prefetch=reset_prefetch,
                     )
                     exploiter_loss_parts.append(float(loss_mb_i))
                     exploiter_ppo_summary = ppo_stats_i.summary()
@@ -4427,6 +4447,7 @@ def _train_loop(
                     logp_check_dump_dir=logp_check_dump_dir,
                     logp_check_label="policy",
                     logp_check_iter=it,
+                    reset_prefetch=reset_prefetch,
                 )
             else:
                 loss_mb, ppo_t, ppo_stats = ppo_iteration(
@@ -4453,6 +4474,7 @@ def _train_loop(
                     logp_check_dump_dir=logp_check_dump_dir,
                     logp_check_label="policy",
                     logp_check_iter=it,
+                    reset_prefetch=reset_prefetch,
                 )
             ppo_s = time.perf_counter() - t_ppo0
             if host_chunks is not None:

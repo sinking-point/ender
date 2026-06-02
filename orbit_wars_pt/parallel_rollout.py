@@ -3026,6 +3026,9 @@ def collect_parallel_micro_rollouts(
         while outer < max_outer_iters:
             outer += 1
 
+            if reset_prefetch is not None:
+                timing.reset_prefetch_drained_results += int(reset_prefetch.drain_ready(max_items=32))
+
             t_ctrl0 = perf_counter()
             if horizon_fired and np.all(segment_done):
                 timing.loop_control_s += perf_counter() - t_ctrl0
