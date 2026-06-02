@@ -59,6 +59,8 @@ def _compute_logp_value_entropy_torch(
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor,
     torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor, torch.Tensor,
     torch.Tensor, torch.Tensor,
 ]:
     """Forward + masking + log-prob/entropy/value (pure torch).
@@ -76,11 +78,13 @@ def _compute_logp_value_entropy_torch(
 
     Returns
     -------
-    ``(new_logp, new_value, new_entropy, halt_entropy, origin_frac_entropy,
-    target_entropy, origin_frac_used, target_used)``. The first three are the
-    quantities the diagnostic / loss path consumes; the latter five are kept
-    so the loss path can report a per-head entropy breakdown (halt / origin+
-    fraction / target) conditioned on the rows where each head is sampled.
+    ``(new_logp, new_value, new_entropy, halt_logp, origin_frac_logp,
+    target_logp, halt_entropy, origin_frac_entropy, target_entropy,
+    origin_frac_used, target_used, halt_lp, origin_frac_logits,
+    origin_frac_mask)``. The first three are the quantities the diagnostic /
+    loss path consumes; the rest are kept so the loss path can report
+    per-head diagnostics and prior-aware regularizers without re-running the
+    model.
     """
 
     P = MAX_PLANETS
@@ -194,6 +198,9 @@ def _compute_logp_value_entropy_torch(
         new_target_entropy,
         origin_frac_used,
         target_used,
+        halt_lp,
+        out["origin_frac_logits"],
+        origin_frac_mask,
     )
 
 
@@ -245,7 +252,13 @@ def compute_ppo_loss_torch(
       ``must_halt_no_ships``).
     * ``loss_vf`` — clipped value MSE (mean, x0.5 not applied — matches
       what the optimizer sees).
-    * ``entropy`` — mean policy entropy over the same non-forced subset.
+    * ``entropy`` — mean effective policy regularizer over the same
+      non-forced subset. When no priors are configured this is the usual
+      entropy bonus. When ``halt_init_prob`` and/or
+      ``fraction_init_weights`` are configured on the policy, the halt
+      and/or fraction components become KL-to-prior penalties folded
+      into the same scalar with sign chosen so the loss still uses
+      ``-entropy_coef * entropy``.
     * ``entropy_halt`` / ``entropy_origin_frac`` / ``entropy_target`` —
       conditional mean entropy of each head over the (non-forced) rows
       where that head was actually sampled. The halt head is always
@@ -254,6 +267,9 @@ def compute_ppo_loss_torch(
       sampled when origin+fraction sampled and at least one pair is valid.
       Each is set to ``nan`` when its conditioning set is empty for the
       minibatch (rare but possible early in training).
+    * ``prior_kl_halt`` / ``prior_kl_frac`` — conditional mean KL to the
+      configured halt / fraction priors on the same subsets. ``nan`` when
+      the corresponding prior is unset or the conditioning set is empty.
     * ``approx_kl`` — ``((old_logp - new_logp) * w_pi).sum() / w_sum`` over
       non-forced rows.
     * ``approx_kl_k3`` — masked mean of ``ratio - 1 - log_ratio``.
@@ -281,6 +297,9 @@ def compute_ppo_loss_torch(
         new_target_entropy,
         origin_frac_used,
         target_used,
+        halt_lp,
+        origin_frac_logits_3d,
+        origin_frac_mask_3d,
     ) = _compute_logp_value_entropy_torch(
         policy,
         entity_type,
@@ -304,6 +323,59 @@ def compute_ppo_loss_torch(
         value_head_idx,
     )
 
+    has_halt_prior = getattr(policy, "halt_init_prob", None) is not None
+    has_frac_prior = getattr(policy, "fraction_init_weights", None) is not None
+
+    halt_prior_kl = torch.zeros_like(new_halt_entropy)
+    if has_halt_prior:
+        halt_prob = float(policy.halt_init_prob)
+        halt_prior = torch.tensor(
+            [1.0 - halt_prob, halt_prob],
+            device=halt_action.device,
+            dtype=new_halt_entropy.dtype,
+        )
+        halt_probs = halt_lp.exp()
+        halt_prior_kl = (halt_probs * (halt_lp - halt_prior.log().unsqueeze(0))).sum(dim=-1)
+
+    origin_frac_reg = new_origin_frac_entropy
+    frac_prior_kl = torch.zeros_like(new_origin_frac_entropy)
+    if has_frac_prior:
+        frac_weights = torch.tensor(
+            tuple(float(x) for x in policy.fraction_init_weights),
+            device=pair_flat.device,
+            dtype=new_origin_frac_entropy.dtype,
+        )
+        masked_origin_frac_3d = origin_frac_logits_3d.masked_fill(~origin_frac_mask_3d, -1e4)
+        joint_lp = torch.log_softmax(masked_origin_frac_3d.flatten(start_dim=1), dim=-1).view_as(masked_origin_frac_3d)
+        mask_f = origin_frac_mask_3d.to(dtype=joint_lp.dtype)
+        joint_prob = joint_lp.exp() * mask_f
+        joint_prob = joint_prob / joint_prob.sum(dim=(1, 2), keepdim=True).clamp(min=1e-12)
+        origin_prob = joint_prob.sum(dim=-1)
+        origin_entropy = -(origin_prob * origin_prob.clamp(min=1e-12).log()).sum(dim=-1)
+
+        cond_prob = joint_prob / origin_prob.unsqueeze(-1).clamp(min=1e-12)
+        prior_mass = mask_f * frac_weights.view(1, 1, -1)
+        prior_mass = prior_mass / prior_mass.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        frac_kl_per_origin = (
+            cond_prob
+            * (
+                cond_prob.clamp(min=1e-12).log()
+                - prior_mass.clamp(min=1e-12).log()
+            )
+        ).sum(dim=-1)
+        frac_prior_kl = (origin_prob * frac_kl_per_origin).sum(dim=-1)
+        origin_frac_reg = origin_entropy - frac_prior_kl
+
+    halt_reg = new_halt_entropy
+    if has_halt_prior:
+        halt_reg = -halt_prior_kl
+
+    total_regularizer = (
+        halt_reg
+        + origin_frac_used.float() * origin_frac_reg
+        + target_used.float() * new_target_entropy
+    )
+
     log_ratio = new_logp - old_logp
     ratio = torch.exp(log_ratio)
     surr1 = ratio * adv
@@ -325,7 +397,7 @@ def compute_ppo_loss_torch(
         w_sum = w_pi.sum().clamp(min=1.0)
         loss_pi = -(torch.min(surr1, surr2) * w_pi).sum() / w_sum
         loss_vf = value_err.mean()
-        entropy = (new_entropy * w_pi).sum() / w_sum
+        entropy = (total_regularizer * w_pi).sum() / w_sum
     else:
         loss_pi_parts = []
         loss_vf_parts = []
@@ -340,7 +412,7 @@ def compute_ppo_loss_torch(
             w_sum_m = w_pi_m.sum().clamp(min=1.0)
             loss_pi_parts.append(-(torch.min(surr1[start:stop], surr2[start:stop]) * w_pi_m).sum() / w_sum_m)
             loss_vf_parts.append(value_err[start:stop].mean())
-            entropy_parts.append((new_entropy[start:stop] * w_pi_m).sum() / w_sum_m)
+            entropy_parts.append((total_regularizer[start:stop] * w_pi_m).sum() / w_sum_m)
             start = stop
         loss_pi = torch.stack(loss_pi_parts).mean()
         loss_vf = torch.stack(loss_vf_parts).mean()
@@ -411,6 +483,22 @@ def compute_ppo_loss_torch(
             (new_target_entropy * w_target).sum() / w_target_sum.clamp(min=1.0),
             nan,
         )
+        if has_halt_prior:
+            prior_kl_halt = torch.where(
+                w_halt_sum > 0,
+                (halt_prior_kl * w_halt).sum() / w_halt_sum.clamp(min=1.0),
+                nan,
+            )
+        else:
+            prior_kl_halt = nan
+        if has_frac_prior:
+            prior_kl_frac = torch.where(
+                w_origin_frac_sum > 0,
+                (frac_prior_kl * w_origin_frac).sum() / w_origin_frac_sum.clamp(min=1.0),
+                nan,
+            )
+        else:
+            prior_kl_frac = nan
         logp_diff = (new_logp - old_logp).abs()
         rollout_logp_max_abs_diff = logp_diff.max()
         rollout_logp_mean_abs_diff = logp_diff.mean()
@@ -422,6 +510,8 @@ def compute_ppo_loss_torch(
         "entropy_halt": entropy_halt,
         "entropy_origin_frac": entropy_origin_frac,
         "entropy_target": entropy_target,
+        "prior_kl_halt": prior_kl_halt,
+        "prior_kl_frac": prior_kl_frac,
         "approx_kl": approx_kl,
         "approx_kl_k3": approx_kl_k3,
         "clip_frac": clip_frac,

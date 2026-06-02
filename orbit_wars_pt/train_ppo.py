@@ -999,6 +999,10 @@ class PPOStats:
     entropy_origin_frac_n: int = 0
     entropy_target_sum: float = 0.0
     entropy_target_n: int = 0
+    prior_kl_halt_sum: float = 0.0
+    prior_kl_halt_n: int = 0
+    prior_kl_frac_sum: float = 0.0
+    prior_kl_frac_n: int = 0
     approx_kl_sum: float = 0.0
     approx_kl_k3_sum: float = 0.0
     clip_frac_sum: float = 0.0
@@ -1031,6 +1035,14 @@ class PPOStats:
         if ent_t == ent_t:
             self.entropy_target_sum += ent_t
             self.entropy_target_n += 1
+        kl_h = float(stats["prior_kl_halt"].item())
+        if kl_h == kl_h:
+            self.prior_kl_halt_sum += kl_h
+            self.prior_kl_halt_n += 1
+        kl_f = float(stats["prior_kl_frac"].item())
+        if kl_f == kl_f:
+            self.prior_kl_frac_sum += kl_f
+            self.prior_kl_frac_n += 1
         self.approx_kl_sum += float(stats["approx_kl"].item())
         self.approx_kl_k3_sum += float(stats["approx_kl_k3"].item())
         self.clip_frac_sum += float(stats["clip_frac"].item())
@@ -1070,6 +1082,16 @@ class PPOStats:
             if self.entropy_target_n > 0
             else float("nan")
         )
+        kl_h = (
+            self.prior_kl_halt_sum / self.prior_kl_halt_n
+            if self.prior_kl_halt_n > 0
+            else float("nan")
+        )
+        kl_f = (
+            self.prior_kl_frac_sum / self.prior_kl_frac_n
+            if self.prior_kl_frac_n > 0
+            else float("nan")
+        )
         return {
             "loss_pi": self.loss_pi_sum / n,
             "loss_vf": self.loss_vf_sum / n,
@@ -1077,6 +1099,8 @@ class PPOStats:
             "entropy_halt": ent_h,
             "entropy_origin_frac": ent_of,
             "entropy_target": ent_t,
+            "prior_kl_halt": kl_h,
+            "prior_kl_frac": kl_f,
             "approx_kl": self.approx_kl_sum / n,
             "approx_kl_k3": self.approx_kl_k3_sum / n,
             "clip_frac": self.clip_frac_sum / n,
@@ -1092,6 +1116,7 @@ def _ppo_stats_str(s: dict) -> str:
         f"ent {s['entropy']:.3f} "
         f"ent_h {s['entropy_halt']:.3f} ent_of {s['entropy_origin_frac']:.3f} "
         f"ent_t {s['entropy_target']:.3f} "
+        f"klp_h {s['prior_kl_halt']:.3f} klp_f {s['prior_kl_frac']:.3f} "
         f"kl {s['approx_kl']:+.4f} kl_k3 {s['approx_kl_k3']:.4f} "
         f"clip {s['clip_frac']:.3f} ev {s['explained_var']:+.3f} "
         f"v_mean {s['value_mean']:+.4f} g_norm {s['grad_norm']:.3f}"
