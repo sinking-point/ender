@@ -760,18 +760,6 @@ def _raw_rows(obs: Mapping[str, Any], name: str, width: int) -> np.ndarray:
         return np.zeros((0, width), dtype=np.float64)
 
 
-def _warn_greedy_bool_4p(greedy: bool | Mapping[int, bool], seen: set[str], context: str) -> None:
-    if isinstance(greedy, Mapping) or not bool(greedy):
-        return
-    _adapter_warn_once(
-        seen,
-        f"{context}:greedy-bool-p23",
-        "greedy=True currently normalizes only players 0 and 1; "
-        f"context={context} players 2 and 3 will use the adapter fallback unless set explicitly "
-        "with a per-player mapping or ORBIT_WARS_GREEDY_P2/P3",
-    )
-
-
 @dataclass
 class MicroTargetTiming:
     """Breakdown of ``micro_raycast`` (first-hit target selection: rays vs interval)."""
@@ -3392,7 +3380,6 @@ class KaggleOrbitWarsAgent:
         self._last_env_step: Optional[int] = None
         self._last_call_timing: Optional[KaggleAgentCallTiming] = None
         self._sanity_warnings: set[str] = set()
-        self._greedy_bool_true = (not isinstance(greedy, Mapping)) and bool(greedy)
         warn_oob = os.environ.get("ORBIT_WARS_WARN_OOB_LAUNCHES", "1").lower() not in {"0", "false", "no", "off"}
         self.launch_tracker = FleetLaunchDebugTracker(
             warn_oob=warn_oob,
@@ -3517,8 +3504,6 @@ class KaggleOrbitWarsAgent:
             seen=self._sanity_warnings,
             context="single",
         )
-        if self._greedy_bool_true and int(np.asarray(state.num_agents)) > 2:
-            _warn_greedy_bool_4p(True, self._sanity_warnings, "single")
         actions = _build_turn_actions_torch_only(
             self.policy,
             state,
@@ -3634,7 +3619,6 @@ class KaggleOrbitWarsDualPolicyAgent:
         self._last_env_step: Optional[int] = None
         self._last_call_timing: Optional[KaggleAgentCallTiming] = None
         self._sanity_warnings: set[str] = set()
-        self._greedy_bool_true = (not isinstance(greedy, Mapping)) and bool(greedy)
         warn_oob = os.environ.get("ORBIT_WARS_WARN_OOB_LAUNCHES", "1").lower() not in {"0", "false", "no", "off"}
         self.launch_tracker = FleetLaunchDebugTracker(
             warn_oob=warn_oob,
@@ -3755,8 +3739,6 @@ class KaggleOrbitWarsDualPolicyAgent:
             use_4p_policy=use_4p_policy,
             live_opponents=live_opponents,
         )
-        if self._greedy_bool_true and int(np.asarray(state.num_agents)) > 2:
-            _warn_greedy_bool_4p(True, self._sanity_warnings, "dual")
         actions = _build_turn_actions_torch_only(
             policy,
             state,
@@ -3816,12 +3798,12 @@ def _env_int(name: str) -> Optional[int]:
 
 def _normalize_greedy(greedy: bool | Mapping[int, bool]) -> dict[int, bool]:
     if isinstance(greedy, Mapping):
-        out = {0: False, 1: False}
+        out = {i: False for i in range(4)}
         for k, v in greedy.items():
             out[int(k)] = bool(v)
         return out
     g = bool(greedy)
-    return {0: g, 1: g}
+    return {i: g for i in range(4)}
 
 
 def _greedy_from_env() -> bool | dict[int, bool]:
