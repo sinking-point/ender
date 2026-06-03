@@ -4,7 +4,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from orbit_wars_pt.kaggle_adapter import _greedy_from_env, _normalize_greedy
+from orbit_wars_pt.kaggle_adapter import _dual_greedy_from_env, _greedy_from_env, _normalize_greedy
 
 
 class TestGreedyNormalization(unittest.TestCase):
@@ -25,6 +25,19 @@ class TestGreedyNormalization(unittest.TestCase):
             clear=False,
         ):
             self.assertEqual(_greedy_from_env(), {0: True, 1: True, 2: False, 3: True})
+
+    def test_dual_env_can_split_4p_and_2p_modes(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "ORBIT_WARS_GREEDY": "0",
+                "ORBIT_WARS_GREEDY_2P": "1",
+            },
+            clear=False,
+        ):
+            greedy_4p, greedy_2p = _dual_greedy_from_env()
+            self.assertEqual(greedy_4p, False)
+            self.assertEqual(greedy_2p, True)
 
 
 if __name__ == "__main__":

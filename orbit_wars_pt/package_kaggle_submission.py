@@ -197,6 +197,8 @@ def package_submission(
     out: Path,
     *,
     greedy: bool = False,
+    greedy_4p: bool | None = None,
+    greedy_2p: bool | None = None,
     device: str = "cpu",
     extra_env: dict[str, str] | None = None,
     source_pkg: Path | None = None,
@@ -256,6 +258,10 @@ def package_submission(
         shutil.copy2(checkpoint_2p, bundle_dir / "checkpoint_2p.pt")
     _copy_inference_package(bundle_dir / "orbit_wars_pt", source_pkg=source_pkg)
     submission_env = dict(extra_env or {})
+    if greedy_4p is not None:
+        submission_env["ORBIT_WARS_GREEDY_4P"] = "1" if bool(greedy_4p) else "0"
+    if greedy_2p is not None:
+        submission_env["ORBIT_WARS_GREEDY_2P"] = "1" if bool(greedy_2p) else "0"
     if population_member is not None:
         submission_env["ORBIT_WARS_MEMBER"] = str(int(population_member))
     if population_member_4p is not None:
@@ -281,7 +287,9 @@ def package_submission(
 
         4-player checkpoint: {checkpoint_4p.name} (copied to checkpoint_4p.pt)
         2-player checkpoint: {checkpoint_2p.name} (copied to checkpoint_2p.pt)
-        Greedy: {greedy}
+        Greedy (default): {greedy}
+        Greedy 4p override: {greedy_4p if greedy_4p is not None else 'default'}
+        Greedy 2p override: {greedy_2p if greedy_2p is not None else 'default'}
         Device: {device}
         Population member (fallback): {population_member if population_member is not None else 'member 0 / checkpoint default'}
         Population member 4p: {population_member_4p if population_member_4p is not None else (population_member if population_member is not None else 'member 0 / checkpoint default')}
@@ -374,7 +382,19 @@ def main() -> None:
         "--greedy",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Use argmax actions in main.py (default: stochastic sampling from the policy).",
+        help="Use argmax actions in main.py by default for both policies.",
+    )
+    parser.add_argument(
+        "--greedy-4p",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override the packaged 4-player policy mode. Defaults to --greedy when omitted.",
+    )
+    parser.add_argument(
+        "--greedy-2p",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override the packaged 2-player policy mode. Defaults to --greedy when omitted.",
     )
     parser.add_argument(
         "--device",
@@ -471,6 +491,8 @@ def main() -> None:
         checkpoint_2p,
         args.out,
         greedy=bool(args.greedy),
+        greedy_4p=(None if args.greedy_4p is None else bool(args.greedy_4p)),
+        greedy_2p=(None if args.greedy_2p is None else bool(args.greedy_2p)),
         device=str(args.device),
         slim=not args.no_slim,
         target_method=args.target_method,

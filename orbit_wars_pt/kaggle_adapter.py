@@ -3556,6 +3556,8 @@ class KaggleOrbitWarsDualPolicyAgent:
         *,
         device: Optional[str | torch.device] = None,
         greedy: bool | Mapping[int, bool] = False,
+        greedy_4p: bool | Mapping[int, bool] | None = None,
+        greedy_2p: bool | Mapping[int, bool] | None = None,
         population_member_4p: Optional[int] = None,
         population_member_2p: Optional[int] = None,
         max_micro_steps: Optional[int] = None,
@@ -3586,7 +3588,8 @@ class KaggleOrbitWarsDualPolicyAgent:
         self.normalize_obs_to_p0_2p = bool(training_args_2p.get("normalize_obs_to_p0", False))
         self.policy_player_count_4p = 4 if int(training_args_4p.get("num_agents", 4)) > 2 else 2
         self.policy_player_count_2p = 4 if int(training_args_2p.get("num_agents", 2)) > 2 else 2
-        self._greedy_by_player = _normalize_greedy(greedy)
+        self._greedy_by_player_4p = _normalize_greedy(greedy if greedy_4p is None else greedy_4p)
+        self._greedy_by_player_2p = _normalize_greedy(greedy if greedy_2p is None else greedy_2p)
         micro_4p = int(training_args_4p.get("max_micro_steps", DEFAULT_MAX_ACTIONS))
         micro_2p = int(training_args_2p.get("max_micro_steps", DEFAULT_MAX_ACTIONS))
         self.max_micro_steps = int(
@@ -3746,7 +3749,11 @@ class KaggleOrbitWarsDualPolicyAgent:
             self.device,
             ship_speed=ship_speed,
             max_micro_steps=self.max_micro_steps,
-            greedy=self._greedy_by_player.get(ego_player, False),
+            greedy=(
+                self._greedy_by_player_4p.get(ego_player, False)
+                if use_4p_policy
+                else self._greedy_by_player_2p.get(ego_player, False)
+            ),
             rng=self.rng,
             n_rays=self.raycast_rays,
             samples_per_span=self.interval_samples_per_span,
@@ -3815,6 +3822,27 @@ def _greedy_from_env() -> bool | dict[int, bool]:
             for i in range(4)
         }
     return _env_bool("ORBIT_WARS_GREEDY", False)
+
+
+def _greedy_from_env_with_fallback(fallback: bool) -> bool | dict[int, bool]:
+    per_player_set = [f"ORBIT_WARS_GREEDY_P{i}" in os.environ for i in range(4)]
+    if any(per_player_set):
+        return {
+            i: _env_bool(f"ORBIT_WARS_GREEDY_P{i}", fallback) if per_player_set[i] else fallback
+            for i in range(4)
+        }
+    return fallback
+
+
+def _dual_greedy_from_env() -> tuple[bool | dict[int, bool], bool | dict[int, bool]]:
+    greedy_default = _greedy_from_env()
+    greedy_4p = greedy_default
+    greedy_2p = greedy_default
+    if "ORBIT_WARS_GREEDY_4P" in os.environ:
+        greedy_4p = _greedy_from_env_with_fallback(_env_bool("ORBIT_WARS_GREEDY_4P", False))
+    if "ORBIT_WARS_GREEDY_2P" in os.environ:
+        greedy_2p = _greedy_from_env_with_fallback(_env_bool("ORBIT_WARS_GREEDY_2P", False))
+    return greedy_4p, greedy_2p
 
 
 def _normalize_population_member(
@@ -3923,6 +3951,7 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
     if _AGENT is None:
         device = os.environ.get("ORBIT_WARS_DEVICE")
         greedy = _greedy_from_env()
+        greedy_4p, greedy_2p = _dual_greedy_from_env()
         population_members = _population_members_single_from_env()
         population_member_4p, population_member_2p = _population_members_dual_from_env()
         seed_raw = os.environ.get("ORBIT_WARS_AGENT_SEED")
@@ -3943,6 +3972,8 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
                     resolve_checkpoint_path(ckpt_2p),
                     device=device,
                     greedy=greedy,
+                    greedy_4p=greedy_4p,
+                    greedy_2p=greedy_2p,
                     population_member_4p=population_member_4p,
                     population_member_2p=population_member_2p,
                     max_micro_steps=max_micro_steps,
