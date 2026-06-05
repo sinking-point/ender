@@ -845,6 +845,78 @@ class KaggleAgentCallTiming:
 
 
 @dataclass
+class BatchObsPlanetTiming:
+    """Breakdown of the 60-planet observation encoding loop."""
+
+    meta_s: float = 0.0
+    velocity_s: float = 0.0
+    comet_s: float = 0.0
+    feat_base_s: float = 0.0
+    feat_survivor_s: float = 0.0
+    feat_abort_s: float = 0.0
+    rope_s: float = 0.0
+    mask_s: float = 0.0
+
+    def total_s(self) -> float:
+        return (
+            self.meta_s
+            + self.velocity_s
+            + self.comet_s
+            + self.feat_base_s
+            + self.feat_survivor_s
+            + self.feat_abort_s
+            + self.rope_s
+            + self.mask_s
+        )
+
+    def format_suffix(self) -> str:
+        if self.total_s() <= 0.0:
+            return ""
+        return (
+            f"[meta={self.meta_s:.4f}"
+            f" vel={self.velocity_s:.4f}"
+            f" comet={self.comet_s:.4f}"
+            f" base={self.feat_base_s:.4f}"
+            f" surv={self.feat_survivor_s:.4f}"
+            f" abort={self.feat_abort_s:.4f}"
+            f" rope={self.rope_s:.4f}"
+            f" mask={self.mask_s:.4f}]"
+        )
+
+
+@dataclass
+class BatchObsTiming:
+    """Breakdown of ``batch_plan`` observation tensor construction."""
+
+    encode_calls: int = 0
+    virt_states_s: float = 0.0
+    setup_s: float = 0.0
+    incoming_s: float = 0.0
+    planet_loop_s: float = 0.0
+    planets: BatchObsPlanetTiming = field(default_factory=BatchObsPlanetTiming)
+    to_device_s: float = 0.0
+    cat_s: float = 0.0
+
+    def encode_total_s(self) -> float:
+        return self.setup_s + self.incoming_s + self.planet_loop_s + self.to_device_s
+
+    def total_s(self) -> float:
+        return self.virt_states_s + self.encode_total_s() + self.cat_s
+
+    def format_suffix(self) -> str:
+        if self.encode_calls <= 0 and self.virt_states_s <= 0.0:
+            return ""
+        return (
+            f"(virt={self.virt_states_s:.4f}"
+            f" setup={self.setup_s:.4f}"
+            f" incoming={self.incoming_s:.4f}"
+            f" planets={self.planet_loop_s:.4f}{self.planets.format_suffix()}"
+            f" h2d={self.to_device_s:.4f}"
+            f" cat={self.cat_s:.4f})"
+        )
+
+
+@dataclass
 class ModelSearchTiming:
     """Detailed timing for the optional halt-vs-launch rollout search."""
 
@@ -881,6 +953,7 @@ class ModelSearchTiming:
     batch_plan_s: float = 0.0
     batch_plan_rounds: int = 0
     batch_obs_tensors_s: float = 0.0
+    batch_obs: BatchObsTiming = field(default_factory=BatchObsTiming)
     batch_policy_forward_s: float = 0.0
     batch_post_forward_s: float = 0.0
     batch_raycast_s: float = 0.0
@@ -903,7 +976,7 @@ class ModelSearchTiming:
             f" build={self.opponent_greedy_action_build_s:.4f}) "
             f"batch_plan×{self.batch_plan_calls}={self.batch_plan_s:.4f}s"
             f"(rounds={self.batch_plan_rounds}"
-            f" obs={self.batch_obs_tensors_s:.4f}"
+            f" obs={self.batch_obs_tensors_s:.4f}{self.batch_obs.format_suffix()}"
             f" fwd={self.batch_policy_forward_s:.4f}"
             f" post={self.batch_post_forward_s:.4f}"
             f" ray={self.batch_raycast_s:.4f}"
@@ -1421,12 +1494,32 @@ def _rotate_xy_about_center_np(x: float, y: float, qturns: int) -> tuple[float, 
 
 def _opponent_slot_4p_np(owner: np.ndarray | int, ego: int, normalize_to_p0: bool) -> np.ndarray | int:
     o = np.asarray(owner, dtype=np.int32)
+    if normalize_to_p0:
+        row = _NORMALIZED_OWNER_SLOT_4P[min(max(int(ego), 0), 3)]
+        out = row[np.clip(o, 0, 3)]
+        return out if isinstance(owner, np.ndarray) else int(np.asarray(out))
     canonical = np.where(o < ego, 2 + o, 2 + (o - 1))
-    if not normalize_to_p0:
-        return canonical if isinstance(owner, np.ndarray) else int(np.asarray(canonical))
-    row = _NORMALIZED_OWNER_SLOT_4P[min(max(int(ego), 0), 3)]
-    normalized = row[np.clip(o, 0, 3)]
-    return normalized if isinstance(owner, np.ndarray) else int(np.asarray(normalized))
+    return canonical if isinstance(owner, np.ndarray) else int(np.asarray(canonical))
+
+
+def _remap_owner_np(
+    owner: np.ndarray,
+    ego: int,
+    num_agents: int,
+    normalize_to_p0: bool = False,
+) -> np.ndarray:
+    """Egocentric owner bucket per planet: 0 neutral, 1 self, 2–4 opponents (4p) or 2 (2p)."""
+
+    o = np.asarray(owner, dtype=np.int32)
+    ego_j = int(ego)
+    is_neutral = o < 0
+    is_self = o == ego_j
+    if num_agents <= 2:
+        opponent_slot = np.full_like(o, 2)
+    else:
+        opponent_slot = _opponent_slot_4p_np(o, ego_j, normalize_to_p0)
+    out = np.where(is_neutral, 0, np.where(is_self, 1, opponent_slot))
+    return np.minimum(out, NUM_OWNER_SLOTS - 1).astype(np.int64)
 
 
 def _remap_owner(owner: float, ego: int, num_agents: int, normalize_to_p0: bool = False) -> int:
@@ -3085,7 +3178,9 @@ def _obs_tensors_for_state(
     policy_player_count: Optional[int] = None,
     target_abort_enabled: bool = False,
     normalize_obs_to_p0: bool = False,
+    obs_timing: BatchObsTiming | None = None,
 ) -> dict[str, torch.Tensor]:
+    t0 = perf_counter() if obs_timing is not None else 0.0
     planets = np.asarray(state.planets)
     planet_active = np.asarray(state.planet_active)
     initial_planets = np.asarray(state.initial_planets)
@@ -3100,7 +3195,6 @@ def _obs_tensors_for_state(
     player_count = int(policy_player_count if policy_player_count is not None else num_agents)
     obs_qturns = _obs_qturns_to_p0_np(int(ego_player), player_count, normalize_obs_to_p0)
     comet_ids = np.asarray(state.comet_planet_ids)
-    comet_set = set(float(x) for x in comet_ids.flatten() if int(x) >= 0)
 
     entity_type = np.zeros((1 + MAX_PLANETS,), dtype=np.int64)
     owner_idx = np.zeros((1 + MAX_PLANETS,), dtype=np.int64)
@@ -3116,21 +3210,43 @@ def _obs_tensors_for_state(
     rope_pos[0] = np.asarray([CENTER / BOARD_SIZE, CENTER / BOARD_SIZE, 0.0], dtype=np.float32)
     entity_mask[0] = True
 
+    if obs_timing is not None:
+        obs_timing.setup_s += perf_counter() - t0
+        obs_timing.encode_calls += 1
+        t0 = perf_counter()
+
     incoming_net, survivor_slot = _incoming_interfleet_np(
         incoming_fleets.astype(np.float32), int(ego_player), player_count, normalize_obs_to_p0
     )
     incoming_net, survivor_slot = _hide_enemy_far_right_after_resolution(incoming_net, survivor_slot)
 
+    if obs_timing is not None:
+        obs_timing.incoming_s += perf_counter() - t0
+        t0 = perf_counter()
+
+    multi_survivor = fdim in (FEATURE_DIM_MULTI, FEATURE_DIM_MULTI_ABORT) and player_count > 2
+    tp = perf_counter() if obs_timing is not None else 0.0
+    valid_comet_ids = comet_ids[comet_ids >= 0]
+    if valid_comet_ids.size > 0:
+        is_comet_arr = np.isin(planets[:, 0], valid_comet_ids)
+    else:
+        is_comet_arr = np.zeros((MAX_PLANETS,), dtype=np.bool_)
+    owner_idx[1 : 1 + MAX_PLANETS] = _remap_owner_np(
+        planets[:, 1],
+        int(ego_player),
+        player_count,
+        normalize_obs_to_p0,
+    )
+    entity_type[1 : 1 + MAX_PLANETS] = np.where(is_comet_arr, ENTITY_COMET, ENTITY_PLANET)
+    if obs_timing is not None:
+        obs_timing.planets.meta_s += perf_counter() - tp
+        tp = perf_counter()
+
     for i in range(MAX_PLANETS):
         j = 1 + i
         active = bool(planet_active[i])
-        pid = float(planets[i, 0])
-        is_comet = pid in comet_set
-        entity_type[j] = ENTITY_COMET if is_comet else ENTITY_PLANET
-        owner_idx[j] = min(
-            _remap_owner(float(planets[i, 1]), ego_player, player_count, normalize_obs_to_p0),
-            NUM_OWNER_SLOTS - 1,
-        )
+        is_comet = bool(is_comet_arr[i])
+
         vx, vy = planet_pred_velocity(
             initial_planets[i, 2:4].astype(np.float64),
             planets[i, 2:4].astype(np.float64),
@@ -3140,8 +3256,13 @@ def _obs_tensors_for_state(
             bool(initial_active[i]),
             active,
         )
+        if obs_timing is not None:
+            obs_timing.planets.velocity_s += perf_counter() - tp
+            tp = perf_counter()
+
         if is_comet and active:
-            group_row = np.where(comet_ids == int(pid))
+            pid = int(planets[i, 0])
+            group_row = np.where(comet_ids == pid)
             if group_row[0].size > 0:
                 g, k = int(group_row[0][0]), int(group_row[1][0])
                 paths = np.asarray(state.comet_paths[g, k])
@@ -3150,6 +3271,10 @@ def _obs_tensors_for_state(
                 if lens > 1 and 0 <= idx < lens - 1:
                     vx = float(paths[idx + 1, 0] - paths[idx, 0])
                     vy = float(paths[idx + 1, 1] - paths[idx, 1])
+        if obs_timing is not None:
+            obs_timing.planets.comet_s += perf_counter() - tp
+            tp = perf_counter()
+
         vx, vy = _rotate_vec_np(vx, vy, obs_qturns)
 
         features[j, 0] = np.log1p(max(float(planets[i, 6]), 0.0))
@@ -3159,24 +3284,47 @@ def _obs_tensors_for_state(
         features[j, 4] = float(active)
         features[j, 5] = float(planets[i, 4]) / 10.0
         features[j, 8 : 8 + INCOMING_TA_BINS] = incoming_net[i].astype(np.float32)
-        if fdim in (FEATURE_DIM_MULTI, FEATURE_DIM_MULTI_ABORT) and player_count > 2:
+        if obs_timing is not None:
+            obs_timing.planets.feat_base_s += perf_counter() - tp
+            tp = perf_counter()
+
+        if multi_survivor:
             oh = np.eye(NUM_OWNER_SLOTS, dtype=np.float32)[survivor_slot[i]]
             features[
                 j, 8 + INCOMING_TA_BINS : 8 + INCOMING_TA_BINS + INCOMING_SURVIVOR_FLAT
             ] = oh.reshape(INCOMING_SURVIVOR_FLAT)
+        if obs_timing is not None:
+            obs_timing.planets.feat_survivor_s += perf_counter() - tp
+            tp = perf_counter()
+
         if bool(target_abort_enabled):
             features[j, -BLOCKED_FRAC_FEATURES:] = origin_frac_blocked[i].astype(np.float32)
+        if obs_timing is not None:
+            obs_timing.planets.feat_abort_s += perf_counter() - tp
+            tp = perf_counter()
+
         if active:
             px, py = _rotate_xy_about_center_np(float(planets[i, 2]), float(planets[i, 3]), obs_qturns)
             rope_pos[j, 0] = px / BOARD_SIZE
             rope_pos[j, 1] = py / BOARD_SIZE
+        if obs_timing is not None:
+            obs_timing.planets.rope_s += perf_counter() - tp
+            tp = perf_counter()
+
         entity_mask[j] = active
         planet_mask[j] = True
+        if obs_timing is not None:
+            obs_timing.planets.mask_s += perf_counter() - tp
+            tp = perf_counter()
+
+    if obs_timing is not None:
+        obs_timing.planet_loop_s += perf_counter() - t0
+        t0 = perf_counter()
 
     def tensor(x: np.ndarray, dtype: torch.dtype) -> torch.Tensor:
         return torch.from_numpy(np.ascontiguousarray(x)).to(device=device, dtype=dtype).unsqueeze(0)
 
-    return {
+    out = {
         "entity_type": tensor(entity_type, torch.long),
         "owner_idx": tensor(owner_idx, torch.long),
         "features": tensor(features, torch.float32),
@@ -3184,6 +3332,9 @@ def _obs_tensors_for_state(
         "entity_mask": tensor(entity_mask, torch.bool),
         "planet_mask": tensor(planet_mask, torch.bool),
     }
+    if obs_timing is not None:
+        obs_timing.to_device_s += perf_counter() - t0
+    return out
 
 
 def _obs_tensors_for_states(
@@ -3194,6 +3345,7 @@ def _obs_tensors_for_states(
     policy_player_count: Optional[int] = None,
     target_abort_enabled: bool = False,
     normalize_obs_to_p0: bool = False,
+    obs_timing: BatchObsTiming | None = None,
 ) -> dict[str, torch.Tensor]:
     if not states:
         raise ValueError("states must be non-empty")
@@ -3205,11 +3357,17 @@ def _obs_tensors_for_states(
             policy_player_count=policy_player_count,
             target_abort_enabled=target_abort_enabled,
             normalize_obs_to_p0=normalize_obs_to_p0,
+            obs_timing=obs_timing,
         )
         for state, player in zip(states, ego_players)
     ]
+    if obs_timing is not None:
+        t0 = perf_counter()
     keys = tuple(parts[0].keys())
-    return {key: torch.cat([part[key] for part in parts], dim=0) for key in keys}
+    batch = {key: torch.cat([part[key] for part in parts], dim=0) for key in keys}
+    if obs_timing is not None:
+        obs_timing.cat_s += perf_counter() - t0
+    return batch
 
 
 def _build_turn_actions_torch_only(
@@ -4297,7 +4455,7 @@ class KaggleOrbitWarsAgent:
         while active:
             if timing is not None:
                 timing.batch_plan_rounds += 1
-                t0 = perf_counter()
+                t_obs = perf_counter()
             virt_states = [
                 plan.state_template._replace(
                     planets=plan.planets,
@@ -4306,6 +4464,8 @@ class KaggleOrbitWarsAgent:
                 )
                 for plan in active
             ]
+            if timing is not None:
+                timing.batch_obs.virt_states_s += perf_counter() - t_obs
             batch = _obs_tensors_for_states(
                 virt_states,
                 [int(plan.player) for plan in active],
@@ -4313,9 +4473,10 @@ class KaggleOrbitWarsAgent:
                 policy_player_count=self.policy_player_count,
                 target_abort_enabled=bool(getattr(self.policy, "target_abort_enabled", False)),
                 normalize_obs_to_p0=self.normalize_obs_to_p0,
+                obs_timing=timing.batch_obs if timing is not None else None,
             )
             if timing is not None:
-                timing.batch_obs_tensors_s += perf_counter() - t0
+                timing.batch_obs_tensors_s += perf_counter() - t_obs
                 t0 = perf_counter()
             population_members = [self._population_member_for_player(int(plan.player)) for plan in active]
             population_idx = None
