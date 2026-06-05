@@ -2704,6 +2704,9 @@ def collect_parallel_micro_rollouts(
                 reward_production_share_member_coefs=cfg_template.reward_production_share_member_coefs,
                 reward_terminal_win_loss_coef=cfg_template.reward_terminal_win_loss_coef,
                 reward_terminal_win_loss_member_coefs=cfg_template.reward_terminal_win_loss_member_coefs,
+                reward_terminal_loss=cfg_template.reward_terminal_loss,
+                reward_terminal_draw=cfg_template.reward_terminal_draw,
+                reward_terminal_win=cfg_template.reward_terminal_win,
                 reward_time_bonus_coef=cfg_template.reward_time_bonus_coef,
                 reward_time_bonus_member_coefs=cfg_template.reward_time_bonus_member_coefs,
                 normalize_obs_to_p0=cfg_template.normalize_obs_to_p0,
@@ -2814,6 +2817,9 @@ def collect_parallel_micro_rollouts(
         cfg.reward_production_share_member_coefs = cfg_template.reward_production_share_member_coefs
         cfg.reward_terminal_win_loss_coef = cfg_template.reward_terminal_win_loss_coef
         cfg.reward_terminal_win_loss_member_coefs = cfg_template.reward_terminal_win_loss_member_coefs
+        cfg.reward_terminal_loss = cfg_template.reward_terminal_loss
+        cfg.reward_terminal_draw = cfg_template.reward_terminal_draw
+        cfg.reward_terminal_win = cfg_template.reward_terminal_win
         cfg.reward_time_bonus_coef = cfg_template.reward_time_bonus_coef
         cfg.reward_time_bonus_member_coefs = cfg_template.reward_time_bonus_member_coefs
         cfg.normalize_obs_to_p0 = cfg_template.normalize_obs_to_p0
@@ -3102,7 +3108,14 @@ def collect_parallel_micro_rollouts(
                 timing.env_reward_s += perf_counter() - t_reward0
 
                 t_core0 = perf_counter()
-                next_bucket = step_env_masked_batched(state_b, actions_bucket, ready_mask_j)
+                next_bucket = step_env_masked_batched(
+                    state_b,
+                    actions_bucket,
+                    ready_mask_j,
+                    cfg.reward_terminal_loss,
+                    cfg.reward_terminal_draw,
+                    cfg.reward_terminal_win,
+                )
                 if sync_policy_timing:
                     _sync_rollout_policy_timing(device, next_bucket)
                 timing.env_step_core_s += perf_counter() - t_core0
@@ -3115,6 +3128,7 @@ def collect_parallel_micro_rollouts(
                     reward_ship_mass_share_coef=ship_reward_coef_bucket,
                     reward_production_share_coef=production_reward_coef_bucket,
                     reward_terminal_win_loss_coef=terminal_reward_coef_bucket,
+                    reward_terminal_win=cfg.reward_terminal_win,
                     reward_time_bonus_coef=time_reward_coef_bucket,
                 )
                 if sync_policy_timing:

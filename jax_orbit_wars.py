@@ -59,6 +59,9 @@ class OrbitWarsConfig(NamedTuple):
     ship_speed: jnp.ndarray = jnp.asarray(6.0, dtype=jnp.float32)
     sun_radius: jnp.ndarray = jnp.asarray(SUN_RADIUS, dtype=jnp.float32)
     board_size: jnp.ndarray = jnp.asarray(BOARD_SIZE, dtype=jnp.float32)
+    reward_terminal_loss: jnp.ndarray = jnp.asarray(-1.0, dtype=jnp.float32)
+    reward_terminal_draw: jnp.ndarray = jnp.asarray(0.0, dtype=jnp.float32)
+    reward_terminal_win: jnp.ndarray = jnp.asarray(1.0, dtype=jnp.float32)
 
 
 class OrbitWarsState(NamedTuple):
@@ -644,7 +647,12 @@ def _score_and_done(state: OrbitWarsState, config: OrbitWarsConfig) -> OrbitWars
     alive_count = jnp.sum(alive & player_mask)
     terminated = (state.step_count >= config.episode_steps - 2) | (alive_count <= 1)
     max_score = jnp.max(jnp.where(player_mask, scores, -jnp.inf))
-    rewards = jnp.where((scores == max_score) & (max_score > 0.0), 1.0, -1.0)
+    winner_mask = (scores == max_score) & (max_score > 0.0) & player_mask
+    winner_count = jnp.sum(winner_mask.astype(jnp.int32))
+    draw_mask = winner_mask & (winner_count > 1)
+    rewards = jnp.full((4,), config.reward_terminal_loss, dtype=jnp.float32)
+    rewards = jnp.where(draw_mask, config.reward_terminal_draw, rewards)
+    rewards = jnp.where(winner_mask & ~draw_mask, config.reward_terminal_win, rewards)
     rewards = jnp.where(terminated, rewards, state.rewards)
     return state._replace(done=terminated, rewards=rewards)
 

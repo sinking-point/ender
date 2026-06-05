@@ -621,6 +621,9 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "reward_production_share_member_coefs",
         "reward_terminal_win_loss_coef",
         "reward_terminal_win_loss_member_coefs",
+        "reward_terminal_loss",
+        "reward_terminal_draw",
+        "reward_terminal_win",
         "reward_time_bonus_coef",
         "reward_time_bonus_member_coefs",
         "normalize_obs_to_p0",
@@ -3266,6 +3269,7 @@ def train(args: argparse.Namespace) -> None:
         f"ship_mass_share={reward_ship_mass_share_coef:g} "
         f"production_share={reward_production_share_coef:g} "
         f"terminal_win_loss={reward_terminal_win_loss_coef:g} "
+        f"terminal_values=({float(args.reward_terminal_loss):g},{float(args.reward_terminal_draw):g},{float(args.reward_terminal_win):g}) "
         f"time_bonus={reward_time_bonus_coef:g}",
         flush=True,
     )
@@ -3305,6 +3309,9 @@ def train(args: argparse.Namespace) -> None:
         reward_production_share_member_coefs=reward_production_share_member_coefs,
         reward_terminal_win_loss_coef=reward_terminal_win_loss_coef,
         reward_terminal_win_loss_member_coefs=reward_terminal_win_loss_member_coefs,
+        reward_terminal_loss=float(args.reward_terminal_loss),
+        reward_terminal_draw=float(args.reward_terminal_draw),
+        reward_terminal_win=float(args.reward_terminal_win),
         reward_time_bonus_coef=reward_time_bonus_coef,
         reward_time_bonus_member_coefs=reward_time_bonus_member_coefs,
         normalize_obs_to_p0=args.normalize_obs_to_p0,
@@ -3685,6 +3692,9 @@ def _train_loop(
                 reward_production_share_member_coefs=cfg.reward_production_share_member_coefs,
                 reward_terminal_win_loss_coef=cfg.reward_terminal_win_loss_coef,
                 reward_terminal_win_loss_member_coefs=cfg.reward_terminal_win_loss_member_coefs,
+                reward_terminal_loss=cfg.reward_terminal_loss,
+                reward_terminal_draw=cfg.reward_terminal_draw,
+                reward_terminal_win=cfg.reward_terminal_win,
                 reward_time_bonus_coef=cfg.reward_time_bonus_coef,
                 reward_time_bonus_member_coefs=cfg.reward_time_bonus_member_coefs,
                 normalize_obs_to_p0=cfg.normalize_obs_to_p0,
@@ -4813,8 +4823,9 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "Coefficient for terminal outcome reward: winners receive +coef, losers receive "
-            "-coef, and draws receive 0. Defaults to the value implied by --reward-mode."
+            "Coefficient applied to the raw terminal outcome reward values configured by "
+            "--reward-terminal-loss/--reward-terminal-draw/--reward-terminal-win. "
+            "Defaults to the value implied by --reward-mode."
         ),
     )
     p.add_argument(
@@ -4825,6 +4836,24 @@ def parse_args() -> argparse.Namespace:
             "Optional comma-separated per-population-member coefficients for terminal win/loss "
             "reward. Length must equal --population-size."
         ),
+    )
+    p.add_argument(
+        "--reward-terminal-loss",
+        type=float,
+        default=-1.0,
+        help="Raw terminal reward assigned to losing players. Default: -1.",
+    )
+    p.add_argument(
+        "--reward-terminal-draw",
+        type=float,
+        default=0.0,
+        help="Raw terminal reward assigned to tied winners in a draw. Default: 0.",
+    )
+    p.add_argument(
+        "--reward-terminal-win",
+        type=float,
+        default=1.0,
+        help="Raw terminal reward assigned to sole winners. Default: 1.",
     )
     p.add_argument(
         "--reward-time-bonus-coef",

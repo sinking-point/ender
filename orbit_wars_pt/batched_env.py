@@ -36,6 +36,18 @@ from orbit_wars_pt.scores_jax import (
 _DEFAULT_STEP_CFG = OrbitWarsConfig()
 
 
+def _step_cfg_with_terminal_rewards(
+    reward_terminal_loss: jnp.ndarray,
+    reward_terminal_draw: jnp.ndarray,
+    reward_terminal_win: jnp.ndarray,
+) -> OrbitWarsConfig:
+    return OrbitWarsConfig(
+        reward_terminal_loss=jnp.asarray(reward_terminal_loss, dtype=jnp.float32),
+        reward_terminal_draw=jnp.asarray(reward_terminal_draw, dtype=jnp.float32),
+        reward_terminal_win=jnp.asarray(reward_terminal_win, dtype=jnp.float32),
+    )
+
+
 # vmap leading num_envs axis on (state, actions); broadcast the static config.
 _vmapped_step = jax.jit(jax.vmap(jow.step, in_axes=(0, 0, None), out_axes=0))
 
@@ -198,6 +210,9 @@ def stack_initial_states(
         reward_production_share_member_coefs=cfg_template.reward_production_share_member_coefs,
         reward_terminal_win_loss_coef=cfg_template.reward_terminal_win_loss_coef,
         reward_terminal_win_loss_member_coefs=cfg_template.reward_terminal_win_loss_member_coefs,
+        reward_terminal_loss=cfg_template.reward_terminal_loss,
+        reward_terminal_draw=cfg_template.reward_terminal_draw,
+        reward_terminal_win=cfg_template.reward_terminal_win,
         reward_time_bonus_coef=cfg_template.reward_time_bonus_coef,
         reward_time_bonus_member_coefs=cfg_template.reward_time_bonus_member_coefs,
         normalize_obs_to_p0=cfg_template.normalize_obs_to_p0,
@@ -320,17 +335,27 @@ def step_env_with_scores_batched(
     actions: jnp.ndarray,
     reward_ship_mass_share_coef: jnp.ndarray,
     reward_production_share_coef: jnp.ndarray,
+    reward_terminal_loss: jnp.ndarray,
+    reward_terminal_draw: jnp.ndarray,
+    reward_terminal_win: jnp.ndarray,
     reward_time_bonus_coef: jnp.ndarray,
 ) -> Tuple[OrbitWarsState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Step a bucket; return next state, reward deltas, post-step alive mask, ships p0/p1."""
 
     ship_coef = jnp.asarray(reward_ship_mass_share_coef, dtype=jnp.float32)
     prod_coef = jnp.asarray(reward_production_share_coef, dtype=jnp.float32)
+    terminal_loss = jnp.asarray(reward_terminal_loss, dtype=jnp.float32)
+    terminal_draw = jnp.asarray(reward_terminal_draw, dtype=jnp.float32)
+    terminal_win = jnp.asarray(reward_terminal_win, dtype=jnp.float32)
     time_coef = jnp.asarray(reward_time_bonus_coef, dtype=jnp.float32)
     ratios_pre = ship_coef * jax.vmap(_ship_mass_ratios_four_core)(
         state.planets, state.planet_active, state.incoming_fleets
     ) + prod_coef * jax.vmap(_production_ratios_four_core)(state.planets, state.planet_active)
-    next_state = _vmapped_step(state, actions, _DEFAULT_STEP_CFG)
+    next_state = _vmapped_step(
+        state,
+        actions,
+        _step_cfg_with_terminal_rewards(terminal_loss, terminal_draw, terminal_win),
+    )
     ratios_post = ship_coef * jax.vmap(_ship_mass_ratios_four_core)(
         next_state.planets, next_state.planet_active, next_state.incoming_fleets
     ) + prod_coef * jax.vmap(_production_ratios_four_core)(
@@ -341,7 +366,7 @@ def step_env_with_scores_batched(
     pre_turn = state.step_count.astype(jnp.float32)
     time_bonus_scale = jnp.clip(1.0 - pre_turn / timeout_turn, 0.0, 1.0)
     timeout_done = state.step_count >= (_DEFAULT_STEP_CFG.episode_steps - 2)
-    win_mask = next_state.done[:, None] & (~timeout_done[:, None]) & (next_state.rewards > 0.0)
+    win_mask = next_state.done[:, None] & (~timeout_done[:, None]) & (next_state.rewards == terminal_win)
     dr = dr + time_coef * win_mask.astype(jnp.float32) * time_bonus_scale[:, None]
     s0_post, s1_post = jax.vmap(_ship_totals_p01_core)(
         next_state.planets, next_state.planet_active, next_state.incoming_fleets
@@ -356,10 +381,21 @@ def step_env_with_scores_batched(
 def step_env_batched(
     state: OrbitWarsState,
     actions: jnp.ndarray,
+    reward_terminal_loss: jnp.ndarray,
+    reward_terminal_draw: jnp.ndarray,
+    reward_terminal_win: jnp.ndarray,
 ) -> OrbitWarsState:
     """Step a bucket and return only the next state."""
 
-    return _vmapped_step(state, actions, _DEFAULT_STEP_CFG)
+    return _vmapped_step(
+        state,
+        actions,
+        _step_cfg_with_terminal_rewards(
+            reward_terminal_loss,
+            reward_terminal_draw,
+            reward_terminal_win,
+        ),
+    )
 
 
 @jax.jit
@@ -367,10 +403,21 @@ def step_env_masked_batched(
     state: OrbitWarsState,
     actions: jnp.ndarray,
     apply_mask: jnp.ndarray,
+    reward_terminal_loss: jnp.ndarray,
+    reward_terminal_draw: jnp.ndarray,
+    reward_terminal_win: jnp.ndarray,
 ) -> OrbitWarsState:
     """Step a full batch and keep non-applied envs unchanged."""
 
-    stepped = _vmapped_step(state, actions, _DEFAULT_STEP_CFG)
+    stepped = _vmapped_step(
+        state,
+        actions,
+        _step_cfg_with_terminal_rewards(
+            reward_terminal_loss,
+            reward_terminal_draw,
+            reward_terminal_win,
+        ),
+    )
 
     def _blend(old_leaf: jnp.ndarray, new_leaf: jnp.ndarray) -> jnp.ndarray:
         mask = apply_mask.astype(jnp.bool_)
@@ -404,6 +451,7 @@ def reward_delta_from_state_pair_batched(
     reward_ship_mass_share_coef: jnp.ndarray,
     reward_production_share_coef: jnp.ndarray,
     reward_terminal_win_loss_coef: jnp.ndarray,
+    reward_terminal_win: jnp.ndarray,
     reward_time_bonus_coef: jnp.ndarray,
 ) -> jnp.ndarray:
     """Reward deltas for one env-step bucket given pre-step reward ratios."""
@@ -415,14 +463,14 @@ def reward_delta_from_state_pair_batched(
     )
     dr = ratios_post - ratios_pre
     terminal_coef = jnp.asarray(reward_terminal_win_loss_coef, dtype=jnp.float32)
-    terminal_outcome = jnp.sign(next_state.rewards).astype(jnp.float32)
-    terminal_reward = terminal_coef * next_state.done[:, None].astype(jnp.float32) * terminal_outcome
+    terminal_reward = terminal_coef * next_state.done[:, None].astype(jnp.float32) * next_state.rewards.astype(jnp.float32)
+    terminal_win = jnp.asarray(reward_terminal_win, dtype=jnp.float32)
     time_coef = jnp.asarray(reward_time_bonus_coef, dtype=jnp.float32)
     timeout_turn = jnp.maximum(_DEFAULT_STEP_CFG.episode_steps - 2, 1).astype(jnp.float32)
     pre_turn = state.step_count.astype(jnp.float32)
     time_bonus_scale = jnp.clip(1.0 - pre_turn / timeout_turn, 0.0, 1.0)
     timeout_done = state.step_count >= (_DEFAULT_STEP_CFG.episode_steps - 2)
-    win_mask = next_state.done[:, None] & (~timeout_done[:, None]) & (next_state.rewards > 0.0)
+    win_mask = next_state.done[:, None] & (~timeout_done[:, None]) & (next_state.rewards == terminal_win)
     return dr + terminal_reward + time_coef * win_mask.astype(jnp.float32) * time_bonus_scale[:, None]
 
 

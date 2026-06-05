@@ -24,6 +24,9 @@ class OrbitWarsEnvConfig:
     reward_production_share_member_coefs: list[float] | None = None
     reward_terminal_win_loss_coef: float = 0.0
     reward_terminal_win_loss_member_coefs: list[float] | None = None
+    reward_terminal_loss: float = -1.0
+    reward_terminal_draw: float = 0.0
+    reward_terminal_win: float = 1.0
     reward_time_bonus_coef: float = 0.0
     reward_time_bonus_member_coefs: list[float] | None = None
     normalize_obs_to_p0: bool = False
@@ -36,8 +39,15 @@ def reset_env(cfg: OrbitWarsEnvConfig) -> OrbitWarsState:
 def step_env(state: OrbitWarsState, actions_np: np.ndarray, cfg: OrbitWarsEnvConfig) -> Tuple[OrbitWarsState, bool]:
     """Returns `(next_state, overflow)` where `overflow` is True if launch slots were exhausted."""
 
-    del cfg
     actions_jax = jnp.asarray(actions_np, dtype=jnp.float32)
-    next_state = jit_step(state, actions_jax, OrbitWarsConfig())
+    next_state = jit_step(
+        state,
+        actions_jax,
+        OrbitWarsConfig(
+            reward_terminal_loss=jnp.asarray(cfg.reward_terminal_loss, dtype=jnp.float32),
+            reward_terminal_draw=jnp.asarray(cfg.reward_terminal_draw, dtype=jnp.float32),
+            reward_terminal_win=jnp.asarray(cfg.reward_terminal_win, dtype=jnp.float32),
+        ),
+    )
     overflow = bool(np.asarray(jax.device_get(next_state.overflow)))
     return next_state, overflow
