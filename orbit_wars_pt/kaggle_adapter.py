@@ -7,6 +7,7 @@ The Kaggle agent API calls ``agent(obs, config)`` and expects a Python list of
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import math
 import os
@@ -830,6 +831,7 @@ class KaggleAgentCallTiming:
     micro_target: MicroTargetTiming = field(default_factory=MicroTargetTiming)
     micro_target_s: float = 0.0
     micro_book_s: float = 0.0
+    model_search: "ModelSearchTiming" = field(default_factory=lambda: ModelSearchTiming())
 
     def micro_sum_s(self) -> float:
         return (
@@ -839,6 +841,81 @@ class KaggleAgentCallTiming:
             + self.micro_raycast_s
             + self.micro_target_s
             + self.micro_book_s
+        )
+
+
+@dataclass
+class ModelSearchTiming:
+    """Detailed timing for the optional halt-vs-launch rollout search."""
+
+    choose_calls: int = 0
+    choose_s: float = 0.0
+    branch_rollouts: int = 0
+    branch_rollout_s: float = 0.0
+    rollout_steps: int = 0
+    simulate_joint_calls: int = 0
+    simulate_joint_s: float = 0.0
+    opponent_greedy_calls: int = 0
+    opponent_greedy_s: float = 0.0
+    opponent_greedy_obs_to_state_calls: int = 0
+    opponent_greedy_obs_to_state_s: float = 0.0
+    opponent_greedy_policy_select_calls: int = 0
+    opponent_greedy_policy_select_s: float = 0.0
+    opponent_greedy_action_build_calls: int = 0
+    opponent_greedy_action_build_s: float = 0.0
+    ego_tail_build_calls: int = 0
+    ego_tail_build_s: float = 0.0
+    state_rebuild_calls: int = 0
+    state_rebuild_s: float = 0.0
+    kaggle_step_calls: int = 0
+    kaggle_step_s: float = 0.0
+    value_calls: int = 0
+    value_s: float = 0.0
+    value_obs_to_state_calls: int = 0
+    value_obs_to_state_s: float = 0.0
+    value_policy_select_calls: int = 0
+    value_policy_select_s: float = 0.0
+    value_eval_calls: int = 0
+    value_eval_s: float = 0.0
+    batch_plan_calls: int = 0
+    batch_plan_s: float = 0.0
+    batch_plan_rounds: int = 0
+    batch_obs_tensors_s: float = 0.0
+    batch_policy_forward_s: float = 0.0
+    batch_post_forward_s: float = 0.0
+    batch_raycast_s: float = 0.0
+    batch_target_head_s: float = 0.0
+    batch_apply_s: float = 0.0
+
+    def format_suffix(self) -> str:
+        if self.choose_calls <= 0:
+            return ""
+        return (
+            " model_search{"
+            f"choose×{self.choose_calls}={self.choose_s:.4f}s "
+            f"rollouts×{self.branch_rollouts}={self.branch_rollout_s:.4f}s "
+            f"steps={self.rollout_steps} "
+            f"tail×{self.ego_tail_build_calls}={self.ego_tail_build_s:.4f}s "
+            f"joint×{self.simulate_joint_calls}={self.simulate_joint_s:.4f}s "
+            f"opp_greedy×{self.opponent_greedy_calls}={self.opponent_greedy_s:.4f}s "
+            f"(obs2state={self.opponent_greedy_obs_to_state_s:.4f}"
+            f" select={self.opponent_greedy_policy_select_s:.4f}"
+            f" build={self.opponent_greedy_action_build_s:.4f}) "
+            f"batch_plan×{self.batch_plan_calls}={self.batch_plan_s:.4f}s"
+            f"(rounds={self.batch_plan_rounds}"
+            f" obs={self.batch_obs_tensors_s:.4f}"
+            f" fwd={self.batch_policy_forward_s:.4f}"
+            f" post={self.batch_post_forward_s:.4f}"
+            f" ray={self.batch_raycast_s:.4f}"
+            f" target={self.batch_target_head_s:.4f}"
+            f" apply={self.batch_apply_s:.4f}) "
+            f"obs2state×{self.state_rebuild_calls}={self.state_rebuild_s:.4f}s "
+            f"kaggle_step×{self.kaggle_step_calls}={self.kaggle_step_s:.4f}s "
+            f"value×{self.value_calls}={self.value_s:.4f}s"
+            f"(obs2state={self.value_obs_to_state_s:.4f}"
+            f" select={self.value_policy_select_s:.4f}"
+            f" eval={self.value_eval_s:.4f})"
+            "}"
         )
 
 
@@ -866,6 +943,135 @@ class OrbitWarsState(NamedTuple):
     rewards: np.ndarray
     done: np.ndarray
     overflow: np.ndarray
+
+
+@dataclass(frozen=True)
+class RewardSettings:
+    ship_mass_share_coef: float = 1.0
+    production_share_coef: float = 0.0
+    terminal_win_loss_coef: float = 0.0
+    terminal_loss: float = -1.0
+    terminal_draw: float = 0.0
+    terminal_win: float = 1.0
+    time_bonus_coef: float = 0.0
+    gamma: float = 1.0
+    episode_steps: int = 500
+
+
+@dataclass(frozen=True)
+class ModelSearchSettings:
+    horizon_steps: int
+    reward: RewardSettings
+
+
+def _reward_settings_from_training_args(training_args: Mapping[str, Any]) -> RewardSettings:
+    def _get_float(name: str, default: float) -> float:
+        value = training_args.get(name, default)
+        return float(default if value is None else value)
+
+    def _get_int(name: str, default: int) -> int:
+        value = training_args.get(name, default)
+        return int(default if value is None else value)
+
+    return RewardSettings(
+        ship_mass_share_coef=_get_float("reward_ship_mass_share_coef", 1.0),
+        production_share_coef=_get_float("reward_production_share_coef", 0.0),
+        terminal_win_loss_coef=_get_float("reward_terminal_win_loss_coef", 0.0),
+        terminal_loss=_get_float("reward_terminal_loss", -1.0),
+        terminal_draw=_get_float("reward_terminal_draw", 0.0),
+        terminal_win=_get_float("reward_terminal_win", 1.0),
+        time_bonus_coef=_get_float("reward_time_bonus_coef", 0.0),
+        gamma=_get_float("gamma", 1.0),
+        episode_steps=_get_int("episode_steps", 500),
+    )
+
+
+def _reward_mix_ratios_np(state: OrbitWarsState, reward: RewardSettings) -> np.ndarray:
+    owners = np.asarray(state.planets[:, 1], dtype=np.int32)
+    active = np.asarray(state.planet_active, dtype=bool)
+    safe_owners = np.clip(owners, 0, 3)
+
+    planet_mask = active & (owners >= 0)
+    planet_scores = np.zeros((4,), dtype=np.float32)
+    if bool(np.any(planet_mask)):
+        np.add.at(
+            planet_scores,
+            safe_owners[planet_mask],
+            np.asarray(state.planets[planet_mask, 5], dtype=np.float32),
+        )
+
+    incoming = np.asarray(state.incoming_fleets, dtype=np.float32)
+    incoming_active = incoming * active.astype(np.float32)[None, :, None]
+    fleet_scores_a = np.sum(incoming_active, axis=(1, 2), dtype=np.float32)
+    fleet_scores = np.pad(fleet_scores_a, (0, max(0, 4 - fleet_scores_a.shape[0]))).astype(np.float32, copy=False)
+    ship_scores = planet_scores + fleet_scores[:4]
+    ship_total = float(np.sum(ship_scores, dtype=np.float32)) + 1e-6
+    ship_ratios = ship_scores / ship_total
+
+    prod_scores = np.zeros((4,), dtype=np.float32)
+    if bool(np.any(planet_mask)):
+        np.add.at(
+            prod_scores,
+            safe_owners[planet_mask],
+            np.asarray(state.planets[planet_mask, 6], dtype=np.float32),
+        )
+    prod_total = float(np.sum(prod_scores, dtype=np.float32)) + 1e-6
+    prod_ratios = prod_scores / prod_total
+
+    return (
+        np.float32(reward.ship_mass_share_coef) * ship_ratios
+        + np.float32(reward.production_share_coef) * prod_ratios
+    ).astype(np.float32, copy=False)
+
+
+def _terminal_rewards_np(state: OrbitWarsState, reward: RewardSettings) -> np.ndarray:
+    owners = np.asarray(state.planets[:, 1], dtype=np.int32)
+    active = np.asarray(state.planet_active, dtype=bool)
+    safe_owners = np.clip(owners, 0, 3)
+    scores = np.zeros((4,), dtype=np.float32)
+    planet_mask = active & (owners >= 0)
+    if bool(np.any(planet_mask)):
+        np.add.at(
+            scores,
+            safe_owners[planet_mask],
+            np.asarray(state.planets[planet_mask, 5], dtype=np.float32),
+        )
+    incoming = np.asarray(state.incoming_fleets, dtype=np.float32)
+    incoming_active = incoming * active.astype(np.float32)[None, :, None]
+    fleet_scores_a = np.sum(incoming_active, axis=(1, 2), dtype=np.float32)
+    scores[: min(4, fleet_scores_a.shape[0])] += fleet_scores_a[:4]
+
+    num_agents = int(np.asarray(state.num_agents))
+    player_mask = np.arange(4, dtype=np.int32) < num_agents
+    masked_scores = np.where(player_mask, scores, -np.inf)
+    max_score = float(np.max(masked_scores))
+    winner_mask = player_mask & (scores == max_score) & (max_score > 0.0)
+    winner_count = int(np.sum(winner_mask.astype(np.int32)))
+    draw_mask = winner_mask & (winner_count > 1)
+    rewards = np.full((4,), np.float32(reward.terminal_loss), dtype=np.float32)
+    rewards = np.where(draw_mask, np.float32(reward.terminal_draw), rewards)
+    rewards = np.where(winner_mask & ~draw_mask, np.float32(reward.terminal_win), rewards)
+    return rewards
+
+
+def _reward_delta_np(
+    state: OrbitWarsState,
+    next_state: OrbitWarsState,
+    ratios_pre: np.ndarray,
+    reward: RewardSettings,
+) -> np.ndarray:
+    ratios_post = _reward_mix_ratios_np(next_state, reward)
+    out = ratios_post - np.asarray(ratios_pre, dtype=np.float32)
+    if bool(np.asarray(next_state.done)):
+        out = out + np.float32(reward.terminal_win_loss_coef) * _terminal_rewards_np(next_state, reward)
+        timeout_turn = float(max(int(reward.episode_steps) - 2, 1))
+        pre_turn = float(np.asarray(state.step_count, dtype=np.float32))
+        time_bonus_scale = np.float32(np.clip(1.0 - pre_turn / timeout_turn, 0.0, 1.0))
+        timeout_done = pre_turn >= timeout_turn
+        term = _terminal_rewards_np(next_state, reward)
+        win_mask = (~timeout_done) & np.isclose(term, np.float32(reward.terminal_win))
+        out = out + np.float32(reward.time_bonus_coef) * win_mask.astype(np.float32) * time_bonus_scale
+    return out.astype(np.float32, copy=False)
 
 
 def _cfg_get(config: Any, name: str, default: Any) -> Any:
@@ -1911,6 +2117,21 @@ class PlannedLaunchAction:
     refine_job: Any | None = None
 
 
+@dataclass
+class SearchFirstContactTargets:
+    angles: np.ndarray
+    valid: np.ndarray
+    eta: np.ndarray
+    origin_xy: np.ndarray
+    origin_radius: float
+    speed: float
+    p0_by_tick: np.ndarray
+    p1_by_tick: np.ndarray
+    active_by_tick: np.ndarray
+    radii: np.ndarray
+    collision_rank: np.ndarray
+
+
 def _first_hit_signature(kind: str, code: int, tick: int) -> tuple[str, int]:
     """Compare what is hit, not when (tick ignored)."""
 
@@ -2518,6 +2739,85 @@ def _first_hit_targets_np(
     return result
 
 
+def _search_first_contact_targets_np(
+    state: OrbitWarsState,
+    origin_idx: int,
+    frac_idx: int,
+    *,
+    ship_speed: float = 6.0,
+    horizon: int = INCOMING_TA_BINS,
+    launch_geometry: LaunchGeometryInputs | None = None,
+) -> SearchFirstContactTargets:
+    from orbit_wars_pt.tangent_geometry_np import tangent_hit_time_polyline
+
+    if launch_geometry is None:
+        planets = np.asarray(state.planets, dtype=np.float64)
+        current_active = np.asarray(state.planet_active, dtype=bool)
+    else:
+        planets = np.asarray(launch_geometry.planets, dtype=np.float64)
+        current_active = np.asarray(launch_geometry.planet_active, dtype=bool)
+
+    p0_by_tick, p1_by_tick, active_by_tick = _forecast_planet_paths_with_geometry_np(
+        state,
+        launch_geometry,
+        horizon=horizon,
+    )
+    origin_xy = planets[origin_idx, PLANET_X : PLANET_Y + 1].astype(np.float64)
+    origin_radius = float(planets[origin_idx, PLANET_RADIUS])
+    ships_avail = float(np.asarray(state.planets)[origin_idx, 5])
+    send = _planned_send(ships_avail, frac_idx)
+    speed = _fleet_speed(float(max(send, 1)), ship_speed)
+    radii = planets[:, PLANET_RADIUS].astype(np.float64)
+    collision_rank = np.asarray(state.planet_collision_rank, dtype=np.int32)
+
+    out_angle = np.zeros((MAX_PLANETS,), dtype=np.float64)
+    valid = np.zeros((MAX_PLANETS,), dtype=np.bool_)
+    hit_eta = np.full((MAX_PLANETS,), 500.0, dtype=np.float32)
+    if p0_by_tick.shape[0] > 0:
+        for target in range(MAX_PLANETS):
+            if target == int(origin_idx) or not bool(current_active[target]):
+                continue
+            if not bool(np.any(active_by_tick[:, target])):
+                continue
+            pts = np.concatenate(
+                [
+                    np.asarray(p0_by_tick[:, target, :], dtype=np.float64),
+                    np.asarray(p1_by_tick[-1:, target, :], dtype=np.float64),
+                ],
+                axis=0,
+            )
+            hit = tangent_hit_time_polyline(
+                pts,
+                float(radii[target]),
+                origin_xy,
+                float(speed),
+                float(origin_radius) + 0.1,
+                float(max(0, pts.shape[0] - 1)),
+                mode="external",
+                return_all=False,
+            )
+            if hit is None:
+                continue
+            hit_t, _kind, angle = hit
+            out_angle[target] = float(angle % (2.0 * math.pi))
+            hit_eta[target] = float(hit_t)
+            valid[target] = True
+
+    return SearchFirstContactTargets(
+        angles=out_angle,
+        valid=valid,
+        eta=hit_eta,
+        origin_xy=origin_xy,
+        origin_radius=float(origin_radius),
+        speed=float(speed),
+        p0_by_tick=np.asarray(p0_by_tick, dtype=np.float64),
+        p1_by_tick=np.asarray(p1_by_tick, dtype=np.float64),
+        active_by_tick=np.asarray(active_by_tick, dtype=np.bool_),
+        radii=np.asarray(radii, dtype=np.float64),
+        collision_rank=collision_rank,
+    )
+
+
 def _refine_interval_launches_in_place(
     actions: list[list[float]],
     planned_launches: list[PlannedLaunchAction],
@@ -2607,6 +2907,174 @@ def _refine_interval_launches_in_place(
                     ),
                 )
             )
+
+
+@dataclass(frozen=True)
+class SearchRuntime:
+    settings: ModelSearchSettings
+    public_obs: Mapping[str, Any]
+    kaggle_config: Any
+    step_count: int
+    num_agents: int
+    greedy_actions_for_player: Any
+    value_for_player: Any
+    public_state: Optional[OrbitWarsState] = None
+    choose_launch: Any = None
+
+
+@dataclass
+class _BatchedSearchSeatPlan:
+    branch_idx: int
+    player: int
+    state_template: OrbitWarsState
+    planets: np.ndarray
+    incoming_fleets: np.ndarray
+    origin_frac_blocked: np.ndarray
+    actions: list[list[float]]
+    micro_idx: int
+    max_micro_steps: int
+
+
+def _simulate_current_step_joint_actions(
+    runtime: SearchRuntime,
+    *,
+    ego_player: int,
+    ego_actions: list[list[float]],
+    timing: ModelSearchTiming | None = None,
+) -> list[list[list[float]]]:
+    t_total = perf_counter() if timing is not None else 0.0
+    joint_actions: list[list[list[float]]] = [[] for _ in range(int(runtime.num_agents))]
+    joint_actions[int(ego_player)] = copy.deepcopy(ego_actions)
+    for player in range(int(runtime.num_agents)):
+        if player == int(ego_player):
+            continue
+        player_obs = _public_obs_for_player(
+            runtime.public_obs,
+            player=player,
+            step_count=int(runtime.step_count),
+        )
+        t0 = perf_counter() if timing is not None else 0.0
+        joint_actions[player] = runtime.greedy_actions_for_player(
+            player_obs,
+            player,
+            int(runtime.step_count),
+        )
+    if timing is not None:
+        timing.simulate_joint_calls += 1
+        timing.simulate_joint_s += perf_counter() - t_total
+    return joint_actions
+
+
+def _rollout_branch_score(
+    runtime: SearchRuntime,
+    *,
+    ego_player: int,
+    ego_actions: list[list[float]],
+    timing: ModelSearchTiming | None = None,
+) -> float:
+    t_rollout = perf_counter() if timing is not None else 0.0
+    reward = runtime.settings.reward
+    sim_state = _make_sim_state(
+        runtime.public_obs,
+        num_agents=int(runtime.num_agents),
+        step_count=int(runtime.step_count),
+    )
+    public_obs = _public_obs_for_player(runtime.public_obs, player=0, step_count=int(runtime.step_count))
+    sim_step = int(runtime.step_count)
+    total = 0.0
+    discount = 1.0
+
+    for depth in range(int(runtime.settings.horizon_steps)):
+        if timing is not None:
+            timing.rollout_steps += 1
+            t0 = perf_counter()
+        state_pre = observation_to_state(
+            public_obs,
+            runtime.kaggle_config,
+            max_fleets=DEFAULT_MAX_ACTIONS + len(public_obs.get("fleets", []) or []),
+            step_count_override=sim_step,
+        )
+        if timing is not None:
+            timing.state_rebuild_calls += 1
+            timing.state_rebuild_s += perf_counter() - t0
+        ratios_pre = _reward_mix_ratios_np(state_pre, reward)
+        if depth == 0:
+            joint_actions = _simulate_current_step_joint_actions(
+                runtime,
+                ego_player=int(ego_player),
+                ego_actions=ego_actions,
+                timing=timing,
+            )
+        else:
+            joint_actions = [[] for _ in range(int(runtime.num_agents))]
+            for player in range(int(runtime.num_agents)):
+                player_obs = _public_obs_for_player(public_obs, player=player, step_count=sim_step)
+                joint_actions[player] = runtime.greedy_actions_for_player(player_obs, player, sim_step)
+        t0 = perf_counter() if timing is not None else 0.0
+        _simulate_joint_step_with_kaggle_model(
+            sim_state,
+            joint_actions=joint_actions,
+            config=runtime.kaggle_config,
+        )
+        if timing is not None:
+            timing.kaggle_step_calls += 1
+            timing.kaggle_step_s += perf_counter() - t0
+        sim_step += 1
+        public_obs = _public_obs_from_sim_state(sim_state, step_count=sim_step)
+        if timing is not None:
+            t0 = perf_counter()
+        state_post = observation_to_state(
+            public_obs,
+            runtime.kaggle_config,
+            max_fleets=DEFAULT_MAX_ACTIONS + len(public_obs.get("fleets", []) or []),
+            step_count_override=sim_step,
+        )
+        if timing is not None:
+            timing.state_rebuild_calls += 1
+            timing.state_rebuild_s += perf_counter() - t0
+        step_reward = _reward_delta_np(state_pre, state_post, ratios_pre, reward)
+        total += discount * float(step_reward[int(ego_player)])
+        if bool(np.asarray(state_post.done)):
+            if timing is not None:
+                timing.branch_rollouts += 1
+                timing.branch_rollout_s += perf_counter() - t_rollout
+            return total
+        discount *= float(reward.gamma)
+
+    final_obs = _public_obs_for_player(public_obs, player=int(ego_player), step_count=sim_step)
+    total += discount * float(runtime.value_for_player(final_obs, int(ego_player), sim_step))
+    if timing is not None:
+        timing.branch_rollouts += 1
+        timing.branch_rollout_s += perf_counter() - t_rollout
+    return total
+
+
+def _choose_launch_via_model_search(
+    runtime: SearchRuntime,
+    *,
+    ego_player: int,
+    action_prefix: list[list[float]],
+    launch_action: list[float],
+    launch_tail_actions: list[list[float]],
+    timing: ModelSearchTiming | None = None,
+) -> bool:
+    t_choose = perf_counter() if timing is not None else 0.0
+    halt_score = _rollout_branch_score(
+        runtime,
+        ego_player=int(ego_player),
+        ego_actions=copy.deepcopy(action_prefix),
+        timing=timing,
+    )
+    launch_score = _rollout_branch_score(
+        runtime,
+        ego_player=int(ego_player),
+        ego_actions=copy.deepcopy(action_prefix) + [copy.deepcopy(launch_action)] + copy.deepcopy(launch_tail_actions),
+        timing=timing,
+    )
+    if timing is not None:
+        timing.choose_calls += 1
+        timing.choose_s += perf_counter() - t_choose
+    return bool(launch_score > halt_score)
 
 
 def _obs_tensors_for_state(
@@ -2718,6 +3186,32 @@ def _obs_tensors_for_state(
     }
 
 
+def _obs_tensors_for_states(
+    states: list[OrbitWarsState],
+    ego_players: list[int],
+    device: torch.device,
+    *,
+    policy_player_count: Optional[int] = None,
+    target_abort_enabled: bool = False,
+    normalize_obs_to_p0: bool = False,
+) -> dict[str, torch.Tensor]:
+    if not states:
+        raise ValueError("states must be non-empty")
+    parts = [
+        _obs_tensors_for_state(
+            state,
+            int(player),
+            device,
+            policy_player_count=policy_player_count,
+            target_abort_enabled=target_abort_enabled,
+            normalize_obs_to_p0=normalize_obs_to_p0,
+        )
+        for state, player in zip(states, ego_players)
+    ]
+    keys = tuple(parts[0].keys())
+    return {key: torch.cat([part[key] for part in parts], dim=0) for key in keys}
+
+
 def _build_turn_actions_torch_only(
     policy: OrbitWarsPolicy,
     state: OrbitWarsState,
@@ -2739,6 +3233,7 @@ def _build_turn_actions_torch_only(
     launch_geometry: LaunchGeometryInputs | None = None,
     deadline_s: float | None = None,
     population_member: Optional[int] = None,
+    search_runtime: SearchRuntime | None = None,
 ) -> list[list[float]]:
     planets = np.array(np.asarray(state.planets), copy=True)
     incoming_fleets = np.array(np.asarray(state.incoming_fleets), copy=True)
@@ -2777,13 +3272,24 @@ def _build_turn_actions_torch_only(
             population_idx = None
             if population_member is not None:
                 population_idx = torch.tensor([int(population_member)], device=device, dtype=torch.long)
-            out = policy(**batch, population_idx=population_idx)
+            out = _policy_forward_inference(
+                policy,
+                batch,
+                population_idx=population_idx,
+            )
             if timing is not None:
                 timing.micro_policy_forward_s += perf_counter() - t0
 
             t0 = perf_counter()
+            use_search = (
+                search_runtime is not None
+                and int(search_runtime.settings.horizon_steps) > 0
+                and int(micro_idx) == 0
+            )
             halt_logits = out["halt_logits"][0]
-            if greedy:
+            if use_search:
+                halt_action = 0
+            elif greedy:
                 halt_action = int(torch.argmax(halt_logits, dim=-1).item())
             else:
                 halt_probs = torch.softmax(halt_logits, dim=-1)
@@ -2800,7 +3306,7 @@ def _build_turn_actions_torch_only(
                 break
             flat_logits = out["origin_frac_logits"].flatten(start_dim=1)[0]
             masked_origin_frac = flat_logits.masked_fill(~flat_mask, -1e4)
-            if greedy:
+            if greedy or use_search:
                 origin_frac_flat = int(torch.argmax(masked_origin_frac).item())
             else:
                 origin_frac_probs = torch.softmax(masked_origin_frac, dim=-1)
@@ -2860,7 +3366,7 @@ def _build_turn_actions_torch_only(
             target_mask &= ray_valid_t
             if abort_logit is not None:
                 combined_target = torch.cat([target_logits.masked_fill(~target_mask, -1e4), abort_logit.reshape(1)], dim=0)
-                if greedy:
+                if greedy or use_search:
                     target_choice = int(torch.argmax(combined_target).item())
                 else:
                     target_probs = torch.softmax(combined_target, dim=-1)
@@ -2878,7 +3384,7 @@ def _build_turn_actions_torch_only(
                         timing.micro_target_s += perf_counter() - t0
                     break
                 masked_target = target_logits.masked_fill(~target_mask, -1e4)
-                if greedy:
+                if greedy or use_search:
                     d_idx = int(torch.argmax(masked_target).item())
                 else:
                     target_probs = torch.softmax(masked_target, dim=-1)
@@ -2894,6 +3400,82 @@ def _build_turn_actions_torch_only(
                     timing.micro_book_s += perf_counter() - t0
                 break
             angle = float(ray_angle[d_idx])
+            if use_search:
+                launch_action = [float(planets[o_idx, 0]), float(angle), int(send)]
+                if search_runtime.choose_launch is not None:
+                    if not bool(
+                        search_runtime.choose_launch(
+                            search_runtime,
+                            ego_player=int(ego_player),
+                            current_state=virt,
+                            current_micro_idx=int(micro_idx),
+                            action_prefix=copy.deepcopy(actions),
+                            launch_action=launch_action,
+                            launch_origin_slot=int(o_idx),
+                            launch_send=int(send),
+                            launch_true_target_slot=int(true_planet[d_idx]),
+                            launch_true_hit_tick=float(true_hit_tick[d_idx]),
+                            timing=(timing.model_search if timing is not None else None),
+                        )
+                    ):
+                        if timing is not None:
+                            timing.micro_book_s += perf_counter() - t0
+                        break
+                else:
+                    branch_planets = np.array(planets, copy=True)
+                    branch_incoming = np.array(incoming_fleets, copy=True)
+                    branch_blocked = np.array(origin_frac_blocked, copy=True)
+                    apply_micro_launch_in_place(
+                        branch_planets,
+                        branch_incoming,
+                        ego_player=int(ego_player),
+                        origin_slot=int(o_idx),
+                        send=int(send),
+                        true_target_slot=int(true_planet[d_idx]),
+                        true_hit_tick=float(true_hit_tick[d_idx]),
+                    )
+                    branch_state = state._replace(
+                        planets=branch_planets,
+                        incoming_fleets=branch_incoming,
+                        origin_frac_blocked=branch_blocked,
+                    )
+                    t_search = perf_counter() if timing is not None else 0.0
+                    launch_tail_actions = _build_turn_actions_torch_only(
+                        policy,
+                        branch_state,
+                        ego_player,
+                        device,
+                        ship_speed=ship_speed,
+                        max_micro_steps=max(0, int(max_micro_steps) - int(micro_idx) - 1),
+                        greedy=True,
+                        rng=rng,
+                        n_rays=n_rays,
+                        samples_per_span=samples_per_span,
+                        target_method=target_method,
+                        timing=None,
+                        launch_tracker=None,
+                        game_step=game_step,
+                        policy_player_count=policy_player_count,
+                        normalize_obs_to_p0=normalize_obs_to_p0,
+                        launch_geometry=launch_geometry,
+                        deadline_s=deadline_s,
+                        population_member=population_member,
+                        search_runtime=None,
+                    )
+                    if timing is not None:
+                        timing.model_search.ego_tail_build_calls += 1
+                        timing.model_search.ego_tail_build_s += perf_counter() - t_search
+                    if not _choose_launch_via_model_search(
+                        search_runtime,
+                        ego_player=int(ego_player),
+                        action_prefix=copy.deepcopy(actions),
+                        launch_action=launch_action,
+                        launch_tail_actions=launch_tail_actions,
+                        timing=(timing.model_search if timing is not None else None),
+                    ):
+                        if timing is not None:
+                            timing.micro_book_s += perf_counter() - t0
+                        break
             actions.append([float(planets[o_idx, 0]), float(angle), int(send)])
             planned_launches.append(
                 PlannedLaunchAction(
@@ -3170,6 +3752,118 @@ def observation_to_state(
     )
 
 
+def _public_obs_for_player(
+    public_obs: Mapping[str, Any],
+    *,
+    player: int,
+    step_count: int,
+) -> dict[str, Any]:
+    out = {
+        "player": int(player),
+        "angular_velocity": float(public_obs.get("angular_velocity", 0.0)),
+        "planets": copy.deepcopy(list(public_obs.get("planets", []) or [])),
+        "initial_planets": copy.deepcopy(list(public_obs.get("initial_planets", []) or [])),
+        "fleets": copy.deepcopy(list(public_obs.get("fleets", []) or [])),
+        "next_fleet_id": int(public_obs.get("next_fleet_id", len(public_obs.get("fleets", []) or []))),
+        "comets": copy.deepcopy(list(public_obs.get("comets", []) or [])),
+        "comet_planet_ids": copy.deepcopy(list(public_obs.get("comet_planet_ids", []) or [])),
+        "remainingOverageTime": float(public_obs.get("remainingOverageTime", 60.0)),
+        "step": int(step_count),
+    }
+    return out
+
+
+def _public_obs_from_sim_state(state: list[Any], *, step_count: int) -> dict[str, Any]:
+    obs0 = state[0].observation
+    return _public_obs_for_player(obs0, player=0, step_count=step_count)
+
+
+def _kaggle_env_modules() -> tuple[Any, Any]:
+    from kaggle_environments.envs.orbit_wars import orbit_wars as ow
+    from kaggle_environments.utils import structify
+
+    return ow, structify
+
+
+def _make_sim_state(
+    public_obs: Mapping[str, Any],
+    *,
+    num_agents: int,
+    step_count: int,
+) -> list[Any]:
+    _ow, structify = _kaggle_env_modules()
+    state: list[dict[str, Any]] = []
+    for player in range(int(num_agents)):
+        state.append(
+            {
+                "action": [],
+                "reward": 0.0,
+                "status": "ACTIVE",
+                "info": {},
+                "observation": _public_obs_for_player(public_obs, player=player, step_count=step_count),
+            }
+        )
+    return list(structify(state))
+
+
+def _simulate_joint_step_with_kaggle_model(
+    sim_state: list[Any],
+    *,
+    joint_actions: list[list[list[float]]],
+    config: Any,
+) -> None:
+    ow, structify = _kaggle_env_modules()
+    for player, action in enumerate(joint_actions):
+        sim_state[player].action = copy.deepcopy(action)
+    env_stub = structify(
+        {
+            "configuration": {
+                "agentCount": len(sim_state),
+                "shipSpeed": float(_cfg_get(config, "shipSpeed", 6.0)),
+                "episodeSteps": int(_cfg_get(config, "episodeSteps", 500)),
+                "cometSpeed": float(_cfg_get(config, "cometSpeed", 8.0)),
+            },
+            "done": False,
+            "info": {},
+        }
+    )
+    ow.interpreter(sim_state, env_stub)
+    # Kaggle's outer environment loop advances ``observation.step`` around the
+    # interpreter call. Our search stub calls the interpreter directly, so we
+    # must mirror that bookkeeping here or future-step forecasts will see
+    # stale planet positions paired with newer step counts.
+    step0 = int(getattr(sim_state[0].observation, "step", 0))
+    next_step = step0 + 1
+    for seat in sim_state:
+        seat.observation.step = next_step
+
+
+def _env_float(name: str) -> Optional[float]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    return float(raw)
+
+
+def _model_search_steps_from_env() -> int:
+    raw = _env_int("ORBIT_WARS_MODEL_SEARCH_STEPS")
+    if raw is None:
+        raw = _env_int("ORBIT_WARS_MODEL_SEARCH_HORIZON")
+    if raw is None:
+        return 0
+    return max(0, int(raw))
+
+
+def _model_search_gamma_from_env(fallback: float) -> float:
+    raw = _env_float("ORBIT_WARS_MODEL_SEARCH_GAMMA")
+    if raw is None:
+        return float(fallback)
+    return float(raw)
+
+
 def _infer_policy_kwargs(payload: Any) -> dict[str, Any]:
     training_args = payload.get("training_args", {}) if isinstance(payload, Mapping) else {}
     policy_state = payload.get("policy", payload) if isinstance(payload, Mapping) else payload
@@ -3310,6 +4004,142 @@ def load_policy(
     return policy, torch_device, training_args
 
 
+def _maybe_compile_policy_batched_forward_for_inference(policy: OrbitWarsPolicy) -> OrbitWarsPolicy:
+    raw = os.environ.get("ORBIT_WARS_COMPILE_BATCHED_FORWARD", "0").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return policy
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+        return policy
+    mode = os.environ.get("ORBIT_WARS_COMPILE_BATCHED_FORWARD_MODE", "default").strip() or "default"
+    try:
+        import torch._dynamo as torch_dynamo
+
+        torch_dynamo.config.capture_scalar_outputs = True
+        policy.forward_dense_rollout = compile_fn(policy.forward_dense_rollout, mode=mode, dynamic=True)  # type: ignore[assignment]
+    except Exception as exc:
+        print(
+            f"[orbit_wars_pt] torch.compile skipped for policy.forward_dense_rollout: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return policy
+
+
+def _compile_batched_forward_enabled() -> bool:
+    raw = os.environ.get("ORBIT_WARS_COMPILE_BATCHED_FORWARD", "0").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _compile_batched_forward_warmup_batches() -> list[int]:
+    raw = os.environ.get("ORBIT_WARS_COMPILE_BATCHED_FORWARD_WARMUP_BATCHES", "7").strip()
+    if not raw:
+        return [7]
+    out: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            val = int(part)
+        except ValueError:
+            continue
+        if val > 0 and val not in out:
+            out.append(val)
+    return out or [7]
+
+
+def _policy_forward_inference(
+    policy: OrbitWarsPolicy,
+    batch: Mapping[str, torch.Tensor],
+    *,
+    population_idx: Optional[torch.Tensor],
+) -> dict[str, Any]:
+    batch_size = int(batch["features"].shape[0])
+    if batch_size > 1:
+        return policy.forward_dense_rollout(
+            entity_type=batch["entity_type"],
+            owner_idx=batch["owner_idx"],
+            features=batch["features"],
+            rope_pos=batch["rope_pos"],
+            entity_mask=batch["entity_mask"],
+            planet_mask=batch["planet_mask"],
+            origin_frac_blocked=batch.get("origin_frac_blocked"),
+            population_idx=population_idx,
+        )
+    return policy(**batch, population_idx=population_idx)
+
+
+def _warmup_compiled_policy_batched_forward(
+    policy: OrbitWarsPolicy,
+    state: OrbitWarsState,
+    ego_player: int,
+    device: torch.device,
+    *,
+    policy_player_count: Optional[int],
+    normalize_obs_to_p0: bool,
+    population_member: Optional[int],
+) -> None:
+    if not _compile_batched_forward_enabled():
+        return
+    batches = _compile_batched_forward_warmup_batches()
+    with torch.inference_mode():
+        for batch_size in batches:
+            states = [state] * int(batch_size)
+            players = [int(ego_player)] * int(batch_size)
+            batch = _obs_tensors_for_states(
+                states,
+                players,
+                device,
+                policy_player_count=policy_player_count,
+                target_abort_enabled=bool(getattr(policy, "target_abort_enabled", False)),
+                normalize_obs_to_p0=normalize_obs_to_p0,
+            )
+            population_idx = None
+            if population_member is not None:
+                population_idx = torch.full(
+                    (int(batch_size),),
+                    int(population_member),
+                    device=device,
+                    dtype=torch.long,
+                )
+            _policy_forward_inference(
+                policy,
+                batch,
+                population_idx=population_idx,
+            )
+
+
+def _policy_value_for_state(
+    policy: OrbitWarsPolicy,
+    state: OrbitWarsState,
+    ego_player: int,
+    device: torch.device,
+    *,
+    policy_player_count: Optional[int],
+    normalize_obs_to_p0: bool,
+    population_member: Optional[int],
+) -> float:
+    batch = _obs_tensors_for_state(
+        state,
+        ego_player,
+        device,
+        policy_player_count=policy_player_count,
+        target_abort_enabled=bool(getattr(policy, "target_abort_enabled", False)),
+        normalize_obs_to_p0=normalize_obs_to_p0,
+    )
+    population_idx = None
+    if population_member is not None:
+        population_idx = torch.tensor([int(population_member)], device=device, dtype=torch.long)
+    with torch.inference_mode():
+        out = _policy_forward_inference(
+            policy,
+            batch,
+            population_idx=population_idx,
+        )
+    return float(out["value"][0].item())
+
+
 class KaggleOrbitWarsAgent:
     """Callable adapter object suitable for Kaggle's ``agent(obs, config)`` API."""
 
@@ -3327,6 +4157,8 @@ class KaggleOrbitWarsAgent:
         raycast_rays: Optional[int] = None,
         target_method: Optional[str] = None,
         interval_samples_per_span: Optional[int] = None,
+        model_search_steps: Optional[int] = None,
+        model_search_gamma: Optional[float] = None,
     ):
         _configure_cpu_threads()
         self.checkpoint_path = resolve_checkpoint_path(checkpoint_path)
@@ -3335,6 +4167,31 @@ class KaggleOrbitWarsAgent:
             self.checkpoint_path,
             device=device,
             policy_key=self.policy_key,
+        )
+        self.policy = _maybe_compile_policy_batched_forward_for_inference(self.policy)
+        self.reward_settings = _reward_settings_from_training_args(training_args)
+        self.reward_settings = RewardSettings(
+            ship_mass_share_coef=self.reward_settings.ship_mass_share_coef,
+            production_share_coef=self.reward_settings.production_share_coef,
+            terminal_win_loss_coef=self.reward_settings.terminal_win_loss_coef,
+            terminal_loss=self.reward_settings.terminal_loss,
+            terminal_draw=self.reward_settings.terminal_draw,
+            terminal_win=self.reward_settings.terminal_win,
+            time_bonus_coef=self.reward_settings.time_bonus_coef,
+            gamma=(
+                float(model_search_gamma)
+                if model_search_gamma is not None
+                else _model_search_gamma_from_env(self.reward_settings.gamma)
+            ),
+            episode_steps=self.reward_settings.episode_steps,
+        )
+        self.model_search = ModelSearchSettings(
+            horizon_steps=(
+                max(0, int(model_search_steps))
+                if model_search_steps is not None
+                else _model_search_steps_from_env()
+            ),
+            reward=self.reward_settings,
         )
         self.population_size = int(training_args.get("population_size", 1))
         self._population_member_by_player = _normalize_population_members(
@@ -3380,6 +4237,7 @@ class KaggleOrbitWarsAgent:
         self._last_env_step: Optional[int] = None
         self._last_call_timing: Optional[KaggleAgentCallTiming] = None
         self._sanity_warnings: set[str] = set()
+        self._compiled_forward_warmup_done = False
         warn_oob = os.environ.get("ORBIT_WARS_WARN_OOB_LAUNCHES", "1").lower() not in {"0", "false", "no", "off"}
         self.launch_tracker = FleetLaunchDebugTracker(
             warn_oob=warn_oob,
@@ -3391,6 +4249,582 @@ class KaggleOrbitWarsAgent:
         if self.population_size <= 1:
             return None
         return int(self._population_member_by_player.get(int(player), self._population_member_by_player[-1]))
+
+    def _policy_values_for_states_batched(
+        self,
+        states: list[OrbitWarsState],
+        players: list[int],
+    ) -> list[float]:
+        if not states:
+            return []
+        batch = _obs_tensors_for_states(
+            states,
+            players,
+            self.device,
+            policy_player_count=self.policy_player_count,
+            target_abort_enabled=bool(getattr(self.policy, "target_abort_enabled", False)),
+            normalize_obs_to_p0=self.normalize_obs_to_p0,
+        )
+        population_members = [self._population_member_for_player(player) for player in players]
+        population_idx = None
+        if any(member is not None for member in population_members):
+            population_idx = torch.tensor(
+                [0 if member is None else int(member) for member in population_members],
+                device=self.device,
+                dtype=torch.long,
+            )
+        with torch.inference_mode():
+            out = _policy_forward_inference(
+                self.policy,
+                batch,
+                population_idx=population_idx,
+            )
+        values = out["value"].reshape(len(states), -1)[:, 0]
+        return [float(v.item()) for v in values]
+
+    def _plan_joint_actions_batched_single_policy(
+        self,
+        *,
+        seat_plans: list[_BatchedSearchSeatPlan],
+        branch_joint_actions: list[list[list[float]]],
+        branch_launch_geometry: list[LaunchGeometryInputs],
+        sim_step: int,
+        ship_speed: float,
+        timing: ModelSearchTiming | None = None,
+    ) -> list[list[list[float]]]:
+        t_plan = perf_counter() if timing is not None else 0.0
+        active = [plan for plan in seat_plans if int(plan.micro_idx) < int(plan.max_micro_steps)]
+        while active:
+            if timing is not None:
+                timing.batch_plan_rounds += 1
+                t0 = perf_counter()
+            virt_states = [
+                plan.state_template._replace(
+                    planets=plan.planets,
+                    incoming_fleets=plan.incoming_fleets,
+                    origin_frac_blocked=plan.origin_frac_blocked,
+                )
+                for plan in active
+            ]
+            batch = _obs_tensors_for_states(
+                virt_states,
+                [int(plan.player) for plan in active],
+                self.device,
+                policy_player_count=self.policy_player_count,
+                target_abort_enabled=bool(getattr(self.policy, "target_abort_enabled", False)),
+                normalize_obs_to_p0=self.normalize_obs_to_p0,
+            )
+            if timing is not None:
+                timing.batch_obs_tensors_s += perf_counter() - t0
+                t0 = perf_counter()
+            population_members = [self._population_member_for_player(int(plan.player)) for plan in active]
+            population_idx = None
+            if any(member is not None for member in population_members):
+                population_idx = torch.tensor(
+                    [0 if member is None else int(member) for member in population_members],
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            with torch.inference_mode():
+                out = _policy_forward_inference(
+                    self.policy,
+                    batch,
+                    population_idx=population_idx,
+                )
+            if timing is not None:
+                timing.batch_policy_forward_s += perf_counter() - t0
+                t0 = perf_counter()
+
+            continue_rows: list[int] = []
+            continue_plans: list[_BatchedSearchSeatPlan] = []
+            continue_states: list[OrbitWarsState] = []
+            origin_slots: list[int] = []
+            frac_slots: list[int] = []
+            sends: list[int] = []
+            search_targets: list[SearchFirstContactTargets] = []
+            ray_angles: list[np.ndarray] = []
+            ray_valids: list[np.ndarray] = []
+            ray_hit_ticks: list[np.ndarray] = []
+            true_planets: list[np.ndarray | None] = []
+            true_hit_ticks: list[np.ndarray | None] = []
+            t_raycast = 0.0
+
+            for row, plan in enumerate(active):
+                halt_logits = out["halt_logits"][row]
+                halt_action = int(torch.argmax(halt_logits, dim=-1).item())
+                if halt_action == 1:
+                    continue
+
+                flat_mask = out["origin_frac_mask"].flatten(start_dim=1)[row]
+                if not bool(flat_mask.any().item()):
+                    continue
+                flat_logits = out["origin_frac_logits"].flatten(start_dim=1)[row]
+                masked_origin_frac = flat_logits.masked_fill(~flat_mask, -1e4)
+                origin_frac_flat = int(torch.argmax(masked_origin_frac).item())
+                o_idx = origin_frac_flat // len(FRACTIONS)
+                frac_idx = origin_frac_flat % len(FRACTIONS)
+                ships_avail = float(plan.planets[o_idx, 5])
+                send = _planned_send(ships_avail, int(frac_idx))
+                if send <= 0:
+                    continue
+
+                virt = virt_states[row]
+                t_ray0 = perf_counter() if timing is not None else 0.0
+                if self.target_method == "interval":
+                    coarse = _search_first_contact_targets_np(
+                        virt,
+                        int(o_idx),
+                        int(frac_idx),
+                        ship_speed=float(ship_speed),
+                        horizon=INCOMING_TA_BINS,
+                        launch_geometry=branch_launch_geometry[int(plan.branch_idx)],
+                    )
+                    ray_angle = coarse.angles
+                    ray_valid = coarse.valid
+                    ray_hit_tick = coarse.eta
+                    true_planet = None
+                    true_hit_tick = None
+                else:
+                    coarse = None
+                    ray_angle, ray_valid, ray_hit_tick, true_planet, true_hit_tick, _ = _first_hit_targets_np(
+                        virt,
+                        int(o_idx),
+                        int(frac_idx),
+                        ship_speed=float(ship_speed),
+                        horizon=INCOMING_TA_BINS,
+                        n_rays=self.raycast_rays,
+                        samples_per_span=self.interval_samples_per_span,
+                        target_method=self.target_method,
+                        target_timing=None,
+                        game_step=int(sim_step),
+                        micro_idx=int(plan.micro_idx),
+                        ego_player=int(plan.player),
+                        launch_geometry=branch_launch_geometry[int(plan.branch_idx)],
+                        refine_boundaries=False,
+                        phase="search",
+                        return_jobs=True,
+                    )
+                if timing is not None:
+                    t_raycast += perf_counter() - t_ray0
+                continue_rows.append(int(row))
+                continue_plans.append(plan)
+                continue_states.append(virt)
+                origin_slots.append(int(o_idx))
+                frac_slots.append(int(frac_idx))
+                sends.append(int(send))
+                search_targets.append(coarse)
+                ray_angles.append(np.asarray(ray_angle, dtype=np.float32))
+                ray_valids.append(np.asarray(ray_valid, dtype=np.bool_))
+                ray_hit_ticks.append(np.asarray(ray_hit_tick, dtype=np.float32))
+                true_planets.append(None if true_planet is None else np.asarray(true_planet, dtype=np.int32))
+                true_hit_ticks.append(None if true_hit_tick is None else np.asarray(true_hit_tick, dtype=np.float32))
+            if timing is not None:
+                loop_dt = perf_counter() - t0
+                timing.batch_raycast_s += t_raycast
+                timing.batch_post_forward_s += max(0.0, loop_dt - t_raycast)
+
+            if not continue_plans:
+                break
+
+            if timing is not None:
+                t0 = perf_counter()
+            row_idx_t = torch.tensor(continue_rows, device=self.device, dtype=torch.long)
+            origin_idx_t = torch.tensor(origin_slots, device=self.device, dtype=torch.long)
+            frac_idx_t = torch.tensor(frac_slots, device=self.device, dtype=torch.long)
+            fleet_size_t = torch.tensor(sends, device=self.device, dtype=torch.float32)
+            target_eta_t = torch.from_numpy(np.stack(ray_hit_ticks, axis=0)).to(device=self.device, dtype=torch.float32)
+            target_ships_t = torch.from_numpy(
+                np.stack([np.asarray(plan.planets[:, 5], dtype=np.float32) for plan in continue_plans], axis=0)
+            ).to(device=self.device, dtype=torch.float32)
+            target_pop_idx = None
+            if population_idx is not None:
+                target_pop_idx = population_idx.index_select(0, row_idx_t)
+            target_logits_b = self.policy.target_logits_for_origin_fraction(
+                out["planet_hidden"].index_select(0, row_idx_t),
+                origin_idx_t,
+                frac_idx_t,
+                fleet_size=fleet_size_t,
+                target_eta=target_eta_t,
+                target_ships=target_ships_t,
+                population_idx=target_pop_idx,
+            )
+            abort_logits_all = out.get("abort_logits")
+            if timing is not None:
+                timing.batch_target_head_s += perf_counter() - t0
+
+            if timing is not None:
+                t0 = perf_counter()
+            next_active: list[_BatchedSearchSeatPlan] = []
+            for idx, plan in enumerate(continue_plans):
+                o_idx = int(origin_slots[idx])
+                frac_idx = int(frac_slots[idx])
+                target_mask = out["pair_mask"][continue_rows[idx], o_idx].clone()
+                ray_valid_t = torch.from_numpy(ray_valids[idx]).to(device=self.device, dtype=torch.bool)
+                target_mask &= ray_valid_t
+                abort_logit = None
+                if abort_logits_all is not None:
+                    abort_logit = abort_logits_all[continue_rows[idx], o_idx, frac_idx].reshape(1)
+                if abort_logit is not None:
+                    combined_target = torch.cat(
+                        [target_logits_b[idx].masked_fill(~target_mask, -1e4), abort_logit.reshape(1)],
+                        dim=0,
+                    )
+                    target_choice = int(torch.argmax(combined_target).item())
+                    if target_choice == MAX_PLANETS:
+                        plan.origin_frac_blocked[o_idx, frac_idx] = True
+                        plan.micro_idx += 1
+                        if int(plan.micro_idx) < int(plan.max_micro_steps):
+                            next_active.append(plan)
+                        continue
+                    sorted_choices = [int(target_choice)]
+                    remaining = torch.argsort(
+                        target_logits_b[idx].masked_fill(~target_mask, -1e4),
+                        descending=True,
+                    ).tolist()
+                    sorted_choices.extend(
+                        int(choice) for choice in remaining if int(choice) != int(target_choice)
+                    )
+                else:
+                    if not bool(target_mask.any().item()):
+                        continue
+                    sorted_choices = torch.argsort(
+                        target_logits_b[idx].masked_fill(~target_mask, -1e4),
+                        descending=True,
+                    ).tolist()
+
+                d_idx = -1
+                true_target_slot = -1
+                true_hit_tick = -1.0
+                if search_targets[idx] is not None:
+                    coarse = search_targets[idx]
+                    t_confirm0 = perf_counter() if timing is not None else 0.0
+                    for choice in sorted_choices:
+                        choice = int(choice)
+                        if choice < 0 or choice >= MAX_PLANETS:
+                            continue
+                        if not bool(target_mask[choice].item()):
+                            continue
+                        kind, code, tick = _discrete_first_hit_at_angle_np(
+                            float(ray_angles[idx][choice]),
+                            coarse.origin_xy,
+                            float(coarse.origin_radius),
+                            float(coarse.speed),
+                            coarse.p0_by_tick,
+                            coarse.p1_by_tick,
+                            coarse.radii,
+                            coarse.active_by_tick,
+                            coarse.collision_rank,
+                            horizon=INCOMING_TA_BINS,
+                        )
+                        if kind == "planet" and int(code) == choice:
+                            d_idx = int(choice)
+                            true_target_slot = int(code)
+                            true_hit_tick = float(tick)
+                            break
+                    if timing is not None:
+                        timing.batch_raycast_s += perf_counter() - t_confirm0
+                else:
+                    d_idx = int(sorted_choices[0]) if sorted_choices else -1
+                    true_target_slot = (
+                        int(true_planets[idx][d_idx])
+                        if d_idx >= 0 and true_planets[idx] is not None
+                        else int(d_idx)
+                    )
+                    true_hit_tick = (
+                        float(true_hit_ticks[idx][d_idx])
+                        if d_idx >= 0 and true_hit_ticks[idx] is not None
+                        else (float(ray_hit_ticks[idx][d_idx]) if d_idx >= 0 else -1.0)
+                    )
+
+                if d_idx < 0:
+                    continue
+
+                action = [float(plan.planets[o_idx, 0]), float(ray_angles[idx][d_idx]), int(sends[idx])]
+                plan.actions.append(action)
+                branch_joint_actions[int(plan.branch_idx)][int(plan.player)] = copy.deepcopy(plan.actions)
+                apply_micro_launch_in_place(
+                    plan.planets,
+                    plan.incoming_fleets,
+                    ego_player=int(plan.player),
+                    origin_slot=int(o_idx),
+                    send=int(sends[idx]),
+                    true_target_slot=int(true_target_slot),
+                    true_hit_tick=float(true_hit_tick),
+                )
+                plan.micro_idx += 1
+                if int(plan.micro_idx) < int(plan.max_micro_steps):
+                    next_active.append(plan)
+            if timing is not None:
+                timing.batch_apply_s += perf_counter() - t0
+
+            active = next_active
+        if timing is not None:
+            timing.batch_plan_calls += 1
+            timing.batch_plan_s += perf_counter() - t_plan
+
+        return branch_joint_actions
+
+    def _choose_launch_via_model_search_batched_single_policy(
+        self,
+        runtime: SearchRuntime,
+        *,
+        ego_player: int,
+        current_state: OrbitWarsState,
+        current_micro_idx: int,
+        action_prefix: list[list[float]],
+        launch_action: list[float],
+        launch_origin_slot: int,
+        launch_send: int,
+        launch_true_target_slot: int,
+        launch_true_hit_tick: float,
+        timing: ModelSearchTiming | None = None,
+    ) -> bool:
+        t_choose = perf_counter() if timing is not None else 0.0
+        reward = runtime.settings.reward
+        sim_max_micro_steps = int(self.max_micro_steps)
+        base_public_state = runtime.public_state
+        if base_public_state is None:
+            base_public_state = observation_to_state(
+                runtime.public_obs,
+                runtime.kaggle_config,
+                max_fleets=self.max_fleets,
+                step_count_override=int(runtime.step_count),
+            )
+
+        launched_planets = np.array(np.asarray(current_state.planets), copy=True)
+        launched_incoming = np.array(np.asarray(current_state.incoming_fleets), copy=True)
+        launched_blocked = np.array(np.asarray(current_state.origin_frac_blocked), copy=True)
+        apply_micro_launch_in_place(
+            launched_planets,
+            launched_incoming,
+            ego_player=int(ego_player),
+            origin_slot=int(launch_origin_slot),
+            send=int(launch_send),
+            true_target_slot=int(launch_true_target_slot),
+            true_hit_tick=float(launch_true_hit_tick),
+        )
+        launched_state = current_state._replace(
+            planets=launched_planets,
+            incoming_fleets=launched_incoming,
+            origin_frac_blocked=launched_blocked,
+        )
+
+        branch_scores = [0.0, 0.0]
+        discount = 1.0
+        branch_public_obs = [copy.deepcopy(runtime.public_obs), copy.deepcopy(runtime.public_obs)]
+        branch_states_pre = [base_public_state, base_public_state]
+        branch_sim_states = [
+            _make_sim_state(runtime.public_obs, num_agents=int(runtime.num_agents), step_count=int(runtime.step_count)),
+            _make_sim_state(runtime.public_obs, num_agents=int(runtime.num_agents), step_count=int(runtime.step_count)),
+        ]
+        branch_steps = [int(runtime.step_count), int(runtime.step_count)]
+        branch_done = [False, False]
+
+        for depth in range(int(runtime.settings.horizon_steps)):
+            if timing is not None:
+                timing.rollout_steps += int(sum(0 if done else 1 for done in branch_done))
+
+            joint_actions_by_branch: list[list[list[float]]] = [
+                [[] for _ in range(int(runtime.num_agents))],
+                [[] for _ in range(int(runtime.num_agents))],
+            ]
+            seat_plans: list[_BatchedSearchSeatPlan] = []
+            branch_launch_geometry = [
+                _launch_geometry_from_obs(branch_public_obs[0], runtime.kaggle_config),
+                _launch_geometry_from_obs(branch_public_obs[1], runtime.kaggle_config),
+            ]
+
+            if depth == 0:
+                joint_actions_by_branch[0][int(ego_player)] = copy.deepcopy(action_prefix)
+                joint_actions_by_branch[1][int(ego_player)] = copy.deepcopy(action_prefix) + [copy.deepcopy(launch_action)]
+                for branch_idx in range(2):
+                    if branch_done[branch_idx]:
+                        continue
+                    for player in range(int(runtime.num_agents)):
+                        if player == int(ego_player):
+                            if branch_idx == 1:
+                                seat_plans.append(
+                                    _BatchedSearchSeatPlan(
+                                        branch_idx=1,
+                                        player=int(ego_player),
+                                        state_template=current_state,
+                                        planets=np.array(np.asarray(launched_state.planets), copy=True),
+                                        incoming_fleets=np.array(np.asarray(launched_state.incoming_fleets), copy=True),
+                                        origin_frac_blocked=np.array(np.asarray(launched_state.origin_frac_blocked), copy=True),
+                                        actions=copy.deepcopy(joint_actions_by_branch[1][int(ego_player)]),
+                                        micro_idx=int(current_micro_idx) + 1,
+                                        max_micro_steps=int(sim_max_micro_steps),
+                                    )
+                                )
+                            continue
+                        seat_plans.append(
+                            _BatchedSearchSeatPlan(
+                                branch_idx=int(branch_idx),
+                                player=int(player),
+                                state_template=base_public_state,
+                                planets=np.array(np.asarray(base_public_state.planets), copy=True),
+                                incoming_fleets=np.array(np.asarray(base_public_state.incoming_fleets), copy=True),
+                                origin_frac_blocked=np.zeros((MAX_PLANETS, len(FRACTIONS)), dtype=np.bool_),
+                                actions=[],
+                                micro_idx=0,
+                                max_micro_steps=int(sim_max_micro_steps),
+                            )
+                        )
+            else:
+                for branch_idx in range(2):
+                    if branch_done[branch_idx]:
+                        continue
+                    branch_state = branch_states_pre[branch_idx]
+                    for player in range(int(runtime.num_agents)):
+                        seat_plans.append(
+                            _BatchedSearchSeatPlan(
+                                branch_idx=int(branch_idx),
+                                player=int(player),
+                                state_template=branch_state,
+                                planets=np.array(np.asarray(branch_state.planets), copy=True),
+                                incoming_fleets=np.array(np.asarray(branch_state.incoming_fleets), copy=True),
+                                origin_frac_blocked=np.zeros((MAX_PLANETS, len(FRACTIONS)), dtype=np.bool_),
+                                actions=[],
+                                micro_idx=0,
+                                max_micro_steps=int(sim_max_micro_steps),
+                            )
+                        )
+
+            if seat_plans:
+                joint_actions_by_branch = self._plan_joint_actions_batched_single_policy(
+                    seat_plans=seat_plans,
+                    branch_joint_actions=joint_actions_by_branch,
+                    branch_launch_geometry=branch_launch_geometry,
+                    sim_step=int(branch_steps[0]),
+                    ship_speed=float(_cfg_get(runtime.kaggle_config, "shipSpeed", 6.0)),
+                    timing=timing,
+                )
+
+            for branch_idx in range(2):
+                if branch_done[branch_idx]:
+                    continue
+                ratios_pre = _reward_mix_ratios_np(branch_states_pre[branch_idx], reward)
+                if timing is not None:
+                    t0 = perf_counter()
+                _simulate_joint_step_with_kaggle_model(
+                    branch_sim_states[branch_idx],
+                    joint_actions=joint_actions_by_branch[branch_idx],
+                    config=runtime.kaggle_config,
+                )
+                if timing is not None:
+                    timing.kaggle_step_calls += 1
+                    timing.kaggle_step_s += perf_counter() - t0
+                branch_steps[branch_idx] += 1
+                branch_public_obs[branch_idx] = _public_obs_from_sim_state(
+                    branch_sim_states[branch_idx],
+                    step_count=int(branch_steps[branch_idx]),
+                )
+                if timing is not None:
+                    t0 = perf_counter()
+                state_post = observation_to_state(
+                    branch_public_obs[branch_idx],
+                    runtime.kaggle_config,
+                    max_fleets=self.max_fleets,
+                    step_count_override=int(branch_steps[branch_idx]),
+                )
+                if timing is not None:
+                    timing.state_rebuild_calls += 1
+                    timing.state_rebuild_s += perf_counter() - t0
+                step_reward = _reward_delta_np(branch_states_pre[branch_idx], state_post, ratios_pre, reward)
+                branch_scores[branch_idx] += discount * float(step_reward[int(ego_player)])
+                branch_states_pre[branch_idx] = state_post
+                if bool(np.asarray(state_post.done)):
+                    branch_done[branch_idx] = True
+
+            if all(branch_done):
+                if timing is not None:
+                    timing.branch_rollouts += 2
+                    timing.branch_rollout_s += perf_counter() - t_choose
+                    timing.choose_calls += 1
+                    timing.choose_s += perf_counter() - t_choose
+                return bool(branch_scores[1] > branch_scores[0])
+
+            discount *= float(reward.gamma)
+
+        remaining_states = [branch_states_pre[idx] for idx in range(2) if not branch_done[idx]]
+        remaining_players = [int(ego_player) for idx in range(2) if not branch_done[idx]]
+        if remaining_states:
+            if timing is not None:
+                t0 = perf_counter()
+            remaining_values = self._policy_values_for_states_batched(remaining_states, remaining_players)
+            if timing is not None:
+                timing.value_calls += len(remaining_values)
+                timing.value_eval_calls += len(remaining_values)
+                timing.value_s += perf_counter() - t0
+                timing.value_eval_s += perf_counter() - t0
+            value_i = 0
+            for branch_idx in range(2):
+                if branch_done[branch_idx]:
+                    continue
+                branch_scores[branch_idx] += discount * float(remaining_values[value_i])
+                value_i += 1
+        if timing is not None:
+            timing.branch_rollouts += 2
+            timing.branch_rollout_s += perf_counter() - t_choose
+            timing.choose_calls += 1
+            timing.choose_s += perf_counter() - t_choose
+        return bool(branch_scores[1] > branch_scores[0])
+
+    def _search_greedy_actions_for_player(
+        self,
+        obs: Mapping[str, Any],
+        player: int,
+        step_count: int,
+    ) -> list[list[float]]:
+        state = observation_to_state(
+            obs,
+            None,
+            max_fleets=self.max_fleets,
+            step_count_override=step_count,
+        )
+        return _build_turn_actions_torch_only(
+            self.policy,
+            state,
+            player,
+            self.device,
+            ship_speed=6.0,
+            max_micro_steps=self.max_micro_steps,
+            greedy=True,
+            rng=self.rng,
+            n_rays=self.raycast_rays,
+            samples_per_span=self.interval_samples_per_span,
+            target_method=self.target_method,
+            timing=None,
+            launch_tracker=None,
+            game_step=step_count,
+            policy_player_count=self.policy_player_count,
+            normalize_obs_to_p0=self.normalize_obs_to_p0,
+            launch_geometry=_launch_geometry_from_obs(obs, None),
+            population_member=self._population_member_for_player(player),
+            search_runtime=None,
+        )
+
+    def _search_value_for_player(
+        self,
+        obs: Mapping[str, Any],
+        player: int,
+        step_count: int,
+    ) -> float:
+        state = observation_to_state(
+            obs,
+            None,
+            max_fleets=self.max_fleets,
+            step_count_override=step_count,
+        )
+        return _policy_value_for_state(
+            self.policy,
+            state,
+            player,
+            self.device,
+            policy_player_count=self.policy_player_count,
+            normalize_obs_to_p0=self.normalize_obs_to_p0,
+            population_member=self._population_member_for_player(player),
+        )
 
     def _obs_game_key(self, obs: Mapping[str, Any]) -> str:
         """Stable per-episode id.
@@ -3483,6 +4917,17 @@ class KaggleOrbitWarsAgent:
             step_count_override=step_count,
             fleet_forecast_arrival=fleet_arrivals,
         )
+        if not self._compiled_forward_warmup_done:
+            _warmup_compiled_policy_batched_forward(
+                self.policy,
+                state,
+                ego_player,
+                self.device,
+                policy_player_count=self.policy_player_count,
+                normalize_obs_to_p0=self.normalize_obs_to_p0,
+                population_member=self._population_member_for_player(ego_player),
+            )
+            self._compiled_forward_warmup_done = True
         launch_geometry = _launch_geometry_from_obs(obs, config)
         timing.obs_to_state_s = perf_counter() - t0
         self.launch_tracker.check_forecast_vs_raycast(
@@ -3504,6 +4949,87 @@ class KaggleOrbitWarsAgent:
             seen=self._sanity_warnings,
             context="single",
         )
+        search_runtime = None
+        if int(self.model_search.horizon_steps) > 0:
+            search_timing = timing.model_search
+
+            def _search_greedy_actions(sim_obs: Mapping[str, Any], player: int, sim_step: int) -> list[list[float]]:
+                t_total = perf_counter()
+                t0 = perf_counter()
+                sim_state = observation_to_state(
+                    sim_obs,
+                    config,
+                    max_fleets=self.max_fleets,
+                    step_count_override=sim_step,
+                )
+                search_timing.opponent_greedy_obs_to_state_calls += 1
+                search_timing.opponent_greedy_obs_to_state_s += perf_counter() - t0
+                t0 = perf_counter()
+                actions = _build_turn_actions_torch_only(
+                    self.policy,
+                    sim_state,
+                    player,
+                    self.device,
+                    ship_speed=ship_speed,
+                    max_micro_steps=self.max_micro_steps,
+                    greedy=True,
+                    rng=self.rng,
+                    n_rays=self.raycast_rays,
+                    samples_per_span=self.interval_samples_per_span,
+                    target_method=self.target_method,
+                    timing=None,
+                    launch_tracker=None,
+                    game_step=sim_step,
+                    policy_player_count=self.policy_player_count,
+                    normalize_obs_to_p0=self.normalize_obs_to_p0,
+                    launch_geometry=_launch_geometry_from_obs(sim_obs, config),
+                    population_member=self._population_member_for_player(player),
+                    search_runtime=None,
+                )
+                search_timing.opponent_greedy_action_build_calls += 1
+                search_timing.opponent_greedy_action_build_s += perf_counter() - t0
+                search_timing.opponent_greedy_calls += 1
+                search_timing.opponent_greedy_s += perf_counter() - t_total
+                return actions
+
+            def _search_value(sim_obs: Mapping[str, Any], player: int, sim_step: int) -> float:
+                t_total = perf_counter()
+                t0 = perf_counter()
+                sim_state = observation_to_state(
+                    sim_obs,
+                    config,
+                    max_fleets=self.max_fleets,
+                    step_count_override=sim_step,
+                )
+                search_timing.value_obs_to_state_calls += 1
+                search_timing.value_obs_to_state_s += perf_counter() - t0
+                t0 = perf_counter()
+                value = _policy_value_for_state(
+                    self.policy,
+                    sim_state,
+                    player,
+                    self.device,
+                    policy_player_count=self.policy_player_count,
+                    normalize_obs_to_p0=self.normalize_obs_to_p0,
+                    population_member=self._population_member_for_player(player),
+                )
+                search_timing.value_eval_calls += 1
+                search_timing.value_eval_s += perf_counter() - t0
+                search_timing.value_calls += 1
+                search_timing.value_s += perf_counter() - t_total
+                return value
+
+            search_runtime = SearchRuntime(
+                settings=self.model_search,
+                public_obs=_public_obs_for_player(obs, player=0, step_count=step_count),
+                kaggle_config=config,
+                step_count=step_count,
+                num_agents=int(np.asarray(state.num_agents)),
+                public_state=state,
+                greedy_actions_for_player=_search_greedy_actions,
+                value_for_player=_search_value,
+                choose_launch=self._choose_launch_via_model_search_batched_single_policy,
+            )
         actions = _build_turn_actions_torch_only(
             self.policy,
             state,
@@ -3523,6 +5049,7 @@ class KaggleOrbitWarsAgent:
             normalize_obs_to_p0=self.normalize_obs_to_p0,
             launch_geometry=launch_geometry,
             population_member=self._population_member_for_player(ego_player),
+            search_runtime=search_runtime,
             deadline_s=(
                 call_t0 + max(0.0, float(_cfg_get(config, "actTimeout", 1.0)) - 0.1)
                 if _cfg_get(config, "actTimeout", None) is not None
@@ -3566,12 +5093,50 @@ class KaggleOrbitWarsDualPolicyAgent:
         raycast_rays: Optional[int] = None,
         target_method: Optional[str] = None,
         interval_samples_per_span: Optional[int] = None,
+        model_search_steps: Optional[int] = None,
+        model_search_gamma: Optional[float] = None,
     ):
         _configure_cpu_threads()
         self.checkpoint_4p = resolve_checkpoint_path(checkpoint_4p)
         self.checkpoint_2p = resolve_checkpoint_path(checkpoint_2p)
         self.policy_4p, self.device, training_args_4p = load_policy(self.checkpoint_4p, device=device)
         self.policy_2p, _, training_args_2p = load_policy(self.checkpoint_2p, device=self.device)
+        self.policy_4p = _maybe_compile_policy_batched_forward_for_inference(self.policy_4p)
+        self.policy_2p = _maybe_compile_policy_batched_forward_for_inference(self.policy_2p)
+        reward_4p = _reward_settings_from_training_args(training_args_4p)
+        reward_2p = _reward_settings_from_training_args(training_args_2p)
+        gamma_search = (
+            float(model_search_gamma)
+            if model_search_gamma is not None
+            else _model_search_gamma_from_env(max(float(reward_4p.gamma), float(reward_2p.gamma)))
+        )
+        self.reward_settings_4p = RewardSettings(
+            ship_mass_share_coef=reward_4p.ship_mass_share_coef,
+            production_share_coef=reward_4p.production_share_coef,
+            terminal_win_loss_coef=reward_4p.terminal_win_loss_coef,
+            terminal_loss=reward_4p.terminal_loss,
+            terminal_draw=reward_4p.terminal_draw,
+            terminal_win=reward_4p.terminal_win,
+            time_bonus_coef=reward_4p.time_bonus_coef,
+            gamma=gamma_search,
+            episode_steps=reward_4p.episode_steps,
+        )
+        self.reward_settings_2p = RewardSettings(
+            ship_mass_share_coef=reward_2p.ship_mass_share_coef,
+            production_share_coef=reward_2p.production_share_coef,
+            terminal_win_loss_coef=reward_2p.terminal_win_loss_coef,
+            terminal_loss=reward_2p.terminal_loss,
+            terminal_draw=reward_2p.terminal_draw,
+            terminal_win=reward_2p.terminal_win,
+            time_bonus_coef=reward_2p.time_bonus_coef,
+            gamma=gamma_search,
+            episode_steps=reward_2p.episode_steps,
+        )
+        self.model_search_steps = (
+            max(0, int(model_search_steps))
+            if model_search_steps is not None
+            else _model_search_steps_from_env()
+        )
         self.population_size_4p = int(training_args_4p.get("population_size", 1))
         self.population_size_2p = int(training_args_2p.get("population_size", 1))
         self.population_member_4p = _normalize_population_member(
@@ -3620,6 +5185,8 @@ class KaggleOrbitWarsDualPolicyAgent:
         self._frozen_game_key: Optional[str] = None
         self._next_step_count = 0
         self._last_env_step: Optional[int] = None
+        self._compiled_forward_warmup_done_4p = False
+        self._compiled_forward_warmup_done_2p = False
         self._last_call_timing: Optional[KaggleAgentCallTiming] = None
         self._sanity_warnings: set[str] = set()
         warn_oob = os.environ.get("ORBIT_WARS_WARN_OOB_LAUNCHES", "1").lower() not in {"0", "false", "no", "off"}
@@ -3687,6 +5254,110 @@ class KaggleOrbitWarsDualPolicyAgent:
         self._next_step_count += 1
         return step_count
 
+    def _search_dual_greedy_actions_for_player(
+        self,
+        obs: Mapping[str, Any],
+        config: Any,
+        player: int,
+        step_count: int,
+        timing: ModelSearchTiming | None = None,
+    ) -> list[list[float]]:
+        t_total = perf_counter() if timing is not None else 0.0
+        t0 = perf_counter() if timing is not None else 0.0
+        state = observation_to_state(
+            obs,
+            config,
+            max_fleets=self.max_fleets,
+            step_count_override=step_count,
+        )
+        if timing is not None:
+            timing.opponent_greedy_obs_to_state_calls += 1
+            timing.opponent_greedy_obs_to_state_s += perf_counter() - t0
+            t0 = perf_counter()
+        live_opponents = _count_live_opponents(state, int(player))
+        use_4p_policy = live_opponents >= 2
+        policy = self.policy_4p if use_4p_policy else self.policy_2p
+        policy_player_count = self.policy_player_count_4p if use_4p_policy else self.policy_player_count_2p
+        normalize_obs_to_p0 = self.normalize_obs_to_p0_4p if use_4p_policy else self.normalize_obs_to_p0_2p
+        population_member = self.population_member_4p if use_4p_policy else self.population_member_2p
+        if timing is not None:
+            timing.opponent_greedy_policy_select_calls += 1
+            timing.opponent_greedy_policy_select_s += perf_counter() - t0
+            t0 = perf_counter()
+        actions = _build_turn_actions_torch_only(
+            policy,
+            state,
+            player,
+            self.device,
+            ship_speed=float(_cfg_get(config, "shipSpeed", 6.0)),
+            max_micro_steps=self.max_micro_steps,
+            greedy=True,
+            rng=self.rng,
+            n_rays=self.raycast_rays,
+            samples_per_span=self.interval_samples_per_span,
+            target_method=self.target_method,
+            timing=None,
+            launch_tracker=None,
+            game_step=step_count,
+            policy_player_count=policy_player_count,
+            normalize_obs_to_p0=normalize_obs_to_p0,
+            launch_geometry=_launch_geometry_from_obs(obs, config),
+            population_member=population_member,
+            search_runtime=None,
+        )
+        if timing is not None:
+            timing.opponent_greedy_action_build_calls += 1
+            timing.opponent_greedy_action_build_s += perf_counter() - t0
+            timing.opponent_greedy_calls += 1
+            timing.opponent_greedy_s += perf_counter() - t_total
+        return actions
+
+    def _search_dual_value_for_player(
+        self,
+        obs: Mapping[str, Any],
+        config: Any,
+        player: int,
+        step_count: int,
+        timing: ModelSearchTiming | None = None,
+    ) -> float:
+        t_total = perf_counter() if timing is not None else 0.0
+        t0 = perf_counter() if timing is not None else 0.0
+        state = observation_to_state(
+            obs,
+            config,
+            max_fleets=self.max_fleets,
+            step_count_override=step_count,
+        )
+        if timing is not None:
+            timing.value_obs_to_state_calls += 1
+            timing.value_obs_to_state_s += perf_counter() - t0
+            t0 = perf_counter()
+        live_opponents = _count_live_opponents(state, int(player))
+        use_4p_policy = live_opponents >= 2
+        policy = self.policy_4p if use_4p_policy else self.policy_2p
+        policy_player_count = self.policy_player_count_4p if use_4p_policy else self.policy_player_count_2p
+        normalize_obs_to_p0 = self.normalize_obs_to_p0_4p if use_4p_policy else self.normalize_obs_to_p0_2p
+        population_member = self.population_member_4p if use_4p_policy else self.population_member_2p
+        if timing is not None:
+            timing.value_policy_select_calls += 1
+            timing.value_policy_select_s += perf_counter() - t0
+            t0 = perf_counter()
+        value = _policy_value_for_state(
+            policy,
+            state,
+            player,
+            self.device,
+            policy_player_count=policy_player_count,
+            normalize_obs_to_p0=normalize_obs_to_p0,
+            population_member=population_member,
+        )
+        if timing is not None:
+            timing.value_eval_calls += 1
+            timing.value_eval_s += perf_counter() - t0
+            timing.value_calls += 1
+            timing.value_s += perf_counter() - t_total
+        return value
+
     @torch.inference_mode()
     def __call__(self, obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
         call_t0 = perf_counter()
@@ -3729,6 +5400,31 @@ class KaggleOrbitWarsDualPolicyAgent:
         policy = self.policy_4p if use_4p_policy else self.policy_2p
         policy_player_count = self.policy_player_count_4p if use_4p_policy else self.policy_player_count_2p
         normalize_obs_to_p0 = self.normalize_obs_to_p0_4p if use_4p_policy else self.normalize_obs_to_p0_2p
+        population_member = self.population_member_4p if use_4p_policy else self.population_member_2p
+        if use_4p_policy:
+            if not self._compiled_forward_warmup_done_4p:
+                _warmup_compiled_policy_batched_forward(
+                    policy,
+                    state,
+                    ego_player,
+                    self.device,
+                    policy_player_count=policy_player_count,
+                    normalize_obs_to_p0=normalize_obs_to_p0,
+                    population_member=population_member,
+                )
+                self._compiled_forward_warmup_done_4p = True
+        else:
+            if not self._compiled_forward_warmup_done_2p:
+                _warmup_compiled_policy_batched_forward(
+                    policy,
+                    state,
+                    ego_player,
+                    self.device,
+                    policy_player_count=policy_player_count,
+                    normalize_obs_to_p0=normalize_obs_to_p0,
+                    population_member=population_member,
+                )
+                self._compiled_forward_warmup_done_2p = True
         _check_4p_adapter_sanity(
             obs=obs,
             config=config,
@@ -3742,6 +5438,33 @@ class KaggleOrbitWarsDualPolicyAgent:
             use_4p_policy=use_4p_policy,
             live_opponents=live_opponents,
         )
+        search_runtime = None
+        if int(self.model_search_steps) > 0:
+            reward_settings = self.reward_settings_4p if use_4p_policy else self.reward_settings_2p
+            search_runtime = SearchRuntime(
+                settings=ModelSearchSettings(
+                    horizon_steps=int(self.model_search_steps),
+                    reward=reward_settings,
+                ),
+                public_obs=_public_obs_for_player(obs, player=0, step_count=step_count),
+                kaggle_config=config,
+                step_count=step_count,
+                num_agents=int(np.asarray(state.num_agents)),
+                greedy_actions_for_player=lambda sim_obs, player, sim_step: self._search_dual_greedy_actions_for_player(
+                    sim_obs,
+                    config,
+                    player,
+                    sim_step,
+                    timing=timing.model_search,
+                ),
+                value_for_player=lambda sim_obs, player, sim_step: self._search_dual_value_for_player(
+                    sim_obs,
+                    config,
+                    player,
+                    sim_step,
+                    timing=timing.model_search,
+                ),
+            )
         actions = _build_turn_actions_torch_only(
             policy,
             state,
@@ -3765,6 +5488,7 @@ class KaggleOrbitWarsDualPolicyAgent:
             normalize_obs_to_p0=normalize_obs_to_p0,
             launch_geometry=launch_geometry,
             population_member=self.population_member_4p if use_4p_policy else self.population_member_2p,
+            search_runtime=search_runtime,
             deadline_s=(
                 call_t0 + max(0.0, float(_cfg_get(config, "actTimeout", 1.0)) - 0.1)
                 if _cfg_get(config, "actTimeout", None) is not None

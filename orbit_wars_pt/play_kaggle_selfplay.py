@@ -105,6 +105,15 @@ def main() -> None:
         help="Inference device for the adapter. Default is cpu for local Kaggle-env runs.",
     )
     parser.add_argument(
+        "--act-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Optional Kaggle actTimeout in seconds for the local selfplay env. "
+            "This is passed into env.configuration so adapter deadline logic and timing output use it."
+        ),
+    )
+    parser.add_argument(
         "--member",
         type=int,
         default=None,
@@ -184,6 +193,45 @@ def main() -> None:
         type=int,
         default=None,
         help="Override maximum policy micro-actions per turn. Default: checkpoint max_micro_steps.",
+    )
+    parser.add_argument(
+        "--model-search-steps",
+        type=int,
+        default=0,
+        help=(
+            "Enable the adapter's env-backed halt-vs-launch search with this many future env steps. "
+            "Use 0 to disable unless overridden by --model-search-steps-p0 / --p1 / --p2 / --p3."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-steps-p0",
+        type=int,
+        default=None,
+        help="Search horizon in env steps for player 0. Default: same as --model-search-steps.",
+    )
+    parser.add_argument(
+        "--model-search-steps-p1",
+        type=int,
+        default=None,
+        help="Search horizon in env steps for player 1. Default: same as --model-search-steps.",
+    )
+    parser.add_argument(
+        "--model-search-steps-p2",
+        type=int,
+        default=None,
+        help="Search horizon in env steps for player 2 in 4-player mode. Default: same as --model-search-steps.",
+    )
+    parser.add_argument(
+        "--model-search-steps-p3",
+        type=int,
+        default=None,
+        help="Search horizon in env steps for player 3 in 4-player mode. Default: same as --model-search-steps.",
+    )
+    parser.add_argument(
+        "--model-search-gamma",
+        type=float,
+        default=None,
+        help="Optional search rollout discount override. Default: checkpoint gamma.",
     )
     parser.add_argument(
         "--swap-player-view",
@@ -315,6 +363,7 @@ def main() -> None:
         micro_sum = t.micro_sum_s()
         slack = dt_wall - t.obs_to_state_s - micro_sum
         target_detail = t.micro_target.format_suffix()
+        search_detail = t.model_search.format_suffix()
         return (
             " internal["
             f"obs_to_state={t.obs_to_state_s:.4f}s "
@@ -326,6 +375,7 @@ def main() -> None:
             f"{target_detail} "
             f"micro_target={t.micro_target_s:.4f}s "
             f"micro_book={t.micro_book_s:.4f}s "
+            f"{search_detail} "
             f"micro_sum={micro_sum:.4f}s "
             f"slack={slack:+.4f}s]"
         )
@@ -400,6 +450,8 @@ def main() -> None:
     configuration["agentCount"] = int(args.num_agents)
     if args.seed is not None:
         configuration["seed"] = int(args.seed)
+    if args.act_timeout is not None:
+        configuration["actTimeout"] = float(args.act_timeout)
 
     env = make("orbit_wars", configuration=configuration, debug=bool(args.debug))
     greedy_by_seat = [
@@ -420,6 +472,16 @@ def main() -> None:
         member_p1,
         member_p2,
         member_p3,
+    ]
+    model_search_steps_p0 = args.model_search_steps if args.model_search_steps_p0 is None else args.model_search_steps_p0
+    model_search_steps_p1 = args.model_search_steps if args.model_search_steps_p1 is None else args.model_search_steps_p1
+    model_search_steps_p2 = args.model_search_steps if args.model_search_steps_p2 is None else args.model_search_steps_p2
+    model_search_steps_p3 = args.model_search_steps if args.model_search_steps_p3 is None else args.model_search_steps_p3
+    model_search_steps_by_seat = [
+        model_search_steps_p0,
+        model_search_steps_p1,
+        model_search_steps_p2,
+        model_search_steps_p3,
     ]
     if args.main_vs_exploiter:
         if args.main_seat is None:
@@ -443,6 +505,12 @@ def main() -> None:
             f"p{seat}={checkpoint_by_seat[seat]}" for seat in range(int(args.num_agents))
         )
         print(f"[orbit_wars_pt] per-seat checkpoints: {checkpoint_summary}", flush=True)
+    if any(int(model_search_steps_by_seat[seat]) > 0 for seat in range(int(args.num_agents))):
+        search_summary = ", ".join(
+            f"p{seat}={int(model_search_steps_by_seat[seat])}" for seat in range(int(args.num_agents))
+        )
+        gamma_suffix = "" if args.model_search_gamma is None else f" gamma={float(args.model_search_gamma):g}"
+        print(f"[orbit_wars_pt] per-seat model search steps: {search_summary}{gamma_suffix}", flush=True)
 
     run_agents: list[Callable[[dict[str, Any], Any], list[list[float]]]] = []
     for seat in range(int(args.num_agents)):
@@ -458,6 +526,8 @@ def main() -> None:
             max_micro_steps=(None if args.max_micro_steps is None else int(args.max_micro_steps)),
             seed=int(args.agent_seed) + seat + (1000 if policy_key != "policy" else 0),
             raycast_rays=(None if args.raycast_rays is None else int(args.raycast_rays)),
+            model_search_steps=int(model_search_steps_by_seat[seat]),
+            model_search_gamma=args.model_search_gamma,
         )
         run_agent = seat_agent
         if args.swap_player_view:
