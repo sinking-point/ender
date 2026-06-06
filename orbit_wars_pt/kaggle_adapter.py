@@ -3176,6 +3176,7 @@ def _rollout_branch_score(
             runtime.kaggle_config,
             max_fleets=DEFAULT_MAX_ACTIONS + len(public_obs.get("fleets", []) or []),
             step_count_override=sim_step,
+            num_agents_override=int(runtime.num_agents),
         )
         if timing is not None:
             timing.state_rebuild_calls += 1
@@ -3211,6 +3212,7 @@ def _rollout_branch_score(
             runtime.kaggle_config,
             max_fleets=DEFAULT_MAX_ACTIONS + len(public_obs.get("fleets", []) or []),
             step_count_override=sim_step,
+            num_agents_override=int(runtime.num_agents),
         )
         if timing is not None:
             timing.state_rebuild_calls += 1
@@ -3872,6 +3874,7 @@ def observation_to_state(
     max_fleets: int = 512,
     step_count_override: Optional[int] = None,
     fleet_forecast_arrival: Optional[np.ndarray] = None,
+    num_agents_override: Optional[int] = None,
 ) -> OrbitWarsState:
     """Convert an official Kaggle observation dict into a padded ``OrbitWarsState``.
 
@@ -3939,8 +3942,10 @@ def observation_to_state(
         fleets[i, FLEET_SHIPS] = row[6]
         fleet_active[i] = True
 
-    num_agents = int(_cfg_get(config, "agentCount", 2))
-    num_agents = max(num_agents, int(obs.get("player", 0)) + 1, 2)
+    if num_agents_override is not None:
+        num_agents = max(2, int(num_agents_override))
+    else:
+        num_agents = max(2, int(_cfg_get(config, "agentCount", 2)))
 
     comet_paths = np.zeros((MAX_COMET_GROUPS, 4, MAX_COMET_PATH, 2), dtype=np.float32)
     comet_paths_forecast = np.zeros((MAX_COMET_GROUPS, 4, MAX_COMET_PATH, 2), dtype=np.float64)
@@ -4116,6 +4121,26 @@ def _env_float(name: str) -> Optional[float]:
     if not raw:
         return None
     return float(raw)
+
+
+def _infer_num_agents_from_planet_owners(
+    obs: Mapping[str, Any],
+    *,
+    fallback: int = 2,
+) -> int:
+    """Infer player count from distinct non-neutral planet owners."""
+
+    owners: set[int] = set()
+    for row in obs.get("planets", []) or []:
+        try:
+            owner = int(row[1])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if owner >= 0:
+            owners.add(owner)
+    if owners:
+        return max(2, len(owners))
+    return max(2, int(fallback))
 
 
 def _model_search_steps_from_env() -> int:
@@ -4538,6 +4563,7 @@ class KaggleOrbitWarsAgent:
         self._game_key: Optional[str] = None
         # ``initial_planets`` in Kaggle obs grows/shrinks as comets appear; hash only at step 0.
         self._frozen_game_key: Optional[str] = None
+        self._frozen_num_agents: Optional[int] = None
         self._next_step_count = 0
         # Kaggle omits ``step`` on player 1's observation; after player 0 runs, mirror that value here
         # so a single shared ``KaggleOrbitWarsAgent`` (``agent()``) still builds the correct state.
@@ -4556,6 +4582,14 @@ class KaggleOrbitWarsAgent:
         if self.population_size <= 1:
             return None
         return int(self._population_member_by_player.get(int(player), self._population_member_by_player[-1]))
+
+    def _num_agents_for_obs(self, obs: Mapping[str, Any], config: Any = None) -> int:
+        if self._frozen_num_agents is None:
+            self._frozen_num_agents = _infer_num_agents_from_planet_owners(
+                obs,
+                fallback=int(_cfg_get(config, "agentCount", self.policy_player_count)),
+            )
+        return int(self._frozen_num_agents)
 
     def _policy_values_for_states_batched(
         self,
@@ -4899,6 +4933,7 @@ class KaggleOrbitWarsAgent:
                 runtime.kaggle_config,
                 max_fleets=self.max_fleets,
                 step_count_override=int(runtime.step_count),
+                num_agents_override=int(runtime.num_agents),
             )
 
         launched_planets = np.array(np.asarray(current_state.planets), copy=True)
@@ -5051,6 +5086,7 @@ class KaggleOrbitWarsAgent:
                     runtime.kaggle_config,
                     max_fleets=self.max_fleets,
                     step_count_override=int(branch_steps[branch_idx]),
+                    num_agents_override=int(runtime.num_agents),
                 )
                 if timing is not None:
                     timing.state_rebuild_calls += 1
@@ -5120,6 +5156,7 @@ class KaggleOrbitWarsAgent:
             None,
             max_fleets=self.max_fleets,
             step_count_override=step_count,
+            num_agents_override=self._num_agents_for_obs(obs, None),
         )
         return _build_turn_actions_torch_only(
             self.policy,
@@ -5154,6 +5191,7 @@ class KaggleOrbitWarsAgent:
             None,
             max_fleets=self.max_fleets,
             step_count_override=step_count,
+            num_agents_override=self._num_agents_for_obs(obs, None),
         )
         return _policy_value_for_state(
             self.policy,
@@ -5197,7 +5235,10 @@ class KaggleOrbitWarsAgent:
             s = int(step_raw)
             self._last_env_step = s
             self._next_step_count = s + 1
-            self._game_key = self._obs_game_key(obs)
+            key = self._obs_game_key(obs)
+            if key != self._game_key:
+                self._frozen_num_agents = None
+            self._game_key = key
             return s
 
         key = self._obs_game_key(obs)
@@ -5205,6 +5246,7 @@ class KaggleOrbitWarsAgent:
             self._game_key = key
             self._next_step_count = 0
             self._last_env_step = None
+            self._frozen_num_agents = None
 
         if self._last_env_step is not None:
             ego = int(obs.get("player", 0))
@@ -5255,6 +5297,7 @@ class KaggleOrbitWarsAgent:
             max_fleets=self.max_fleets,
             step_count_override=step_count,
             fleet_forecast_arrival=fleet_arrivals,
+            num_agents_override=self._num_agents_for_obs(obs, config),
         )
         if not self._compiled_forward_warmup_done:
             _warmup_compiled_policy_batched_forward(
@@ -5300,6 +5343,7 @@ class KaggleOrbitWarsAgent:
                     config,
                     max_fleets=self.max_fleets,
                     step_count_override=sim_step,
+                    num_agents_override=int(np.asarray(state.num_agents)),
                 )
                 search_timing.opponent_greedy_obs_to_state_calls += 1
                 search_timing.opponent_greedy_obs_to_state_s += perf_counter() - t0
@@ -5339,6 +5383,7 @@ class KaggleOrbitWarsAgent:
                     config,
                     max_fleets=self.max_fleets,
                     step_count_override=sim_step,
+                    num_agents_override=int(np.asarray(state.num_agents)),
                 )
                 search_timing.value_obs_to_state_calls += 1
                 search_timing.value_obs_to_state_s += perf_counter() - t0
@@ -5548,6 +5593,7 @@ class KaggleOrbitWarsDualPolicyAgent:
         self.rng.manual_seed(int(seed if seed is not None else os.environ.get("ORBIT_WARS_AGENT_SEED", "0")))
         self._game_key: Optional[str] = None
         self._frozen_game_key: Optional[str] = None
+        self._frozen_num_agents: Optional[int] = None
         self._next_step_count = 0
         self._last_env_step: Optional[int] = None
         self._compiled_forward_warmup_done_4p = False
@@ -5560,6 +5606,12 @@ class KaggleOrbitWarsDualPolicyAgent:
             warn_forecast_mismatch=_warn_forecast_mismatch_enabled(),
             warn_unmatched_fleet=_warn_unmatched_fleet_enabled(),
         )
+
+    def _num_agents_for_obs(self, obs: Mapping[str, Any], config: Any = None) -> int:
+        if self._frozen_num_agents is None:
+            fallback = int(_cfg_get(config, "agentCount", self.policy_player_count_4p))
+            self._frozen_num_agents = _infer_num_agents_from_planet_owners(obs, fallback=fallback)
+        return int(self._frozen_num_agents)
 
     def _obs_game_key(self, obs: Mapping[str, Any]) -> str:
         step_raw = obs.get("step", obs.get("step_count", None))
@@ -5587,7 +5639,10 @@ class KaggleOrbitWarsDualPolicyAgent:
             s = int(step_raw)
             self._last_env_step = s
             self._next_step_count = s + 1
-            self._game_key = self._obs_game_key(obs)
+            key = self._obs_game_key(obs)
+            if key != self._game_key:
+                self._frozen_num_agents = None
+            self._game_key = key
             return s
 
         key = self._obs_game_key(obs)
@@ -5595,6 +5650,7 @@ class KaggleOrbitWarsDualPolicyAgent:
             self._game_key = key
             self._next_step_count = 0
             self._last_env_step = None
+            self._frozen_num_agents = None
 
         if self._last_env_step is not None:
             ego = int(obs.get("player", 0))
@@ -5634,6 +5690,7 @@ class KaggleOrbitWarsDualPolicyAgent:
             config,
             max_fleets=self.max_fleets,
             step_count_override=step_count,
+            num_agents_override=self._num_agents_for_obs(obs, config),
         )
         if timing is not None:
             timing.opponent_greedy_obs_to_state_calls += 1
@@ -5692,6 +5749,7 @@ class KaggleOrbitWarsDualPolicyAgent:
             config,
             max_fleets=self.max_fleets,
             step_count_override=step_count,
+            num_agents_override=self._num_agents_for_obs(obs, config),
         )
         if timing is not None:
             timing.value_obs_to_state_calls += 1
@@ -5749,6 +5807,7 @@ class KaggleOrbitWarsDualPolicyAgent:
             max_fleets=self.max_fleets,
             step_count_override=step_count,
             fleet_forecast_arrival=fleet_arrivals,
+            num_agents_override=self._num_agents_for_obs(obs, config),
         )
         launch_geometry = _launch_geometry_from_obs(obs, config)
         timing.obs_to_state_s = perf_counter() - t0
