@@ -205,6 +205,11 @@ def package_submission(
     slim: bool = True,
     target_method: str | None = None,
     interval_geometry: str | None = None,
+    model_search_steps: int | None = None,
+    model_search_adaptive_horizon: bool | None = None,
+    model_search_adaptive_horizon_offset: int | None = None,
+    model_search_min_overage_s: float | None = None,
+    model_search_gamma: float | None = None,
     population_member: int | None = None,
     population_member_4p: int | None = None,
     population_member_2p: int | None = None,
@@ -272,6 +277,22 @@ def package_submission(
         submission_env["ORBIT_WARS_TARGET_METHOD"] = str(target_method)
     if interval_geometry is not None:
         submission_env["ORBIT_WARS_INTERVAL_GEOMETRY"] = str(interval_geometry)
+    if model_search_steps is not None:
+        submission_env["ORBIT_WARS_MODEL_SEARCH_STEPS"] = str(max(0, int(model_search_steps)))
+    if model_search_adaptive_horizon is not None:
+        submission_env["ORBIT_WARS_MODEL_SEARCH_ADAPTIVE_HORIZON"] = (
+            "1" if bool(model_search_adaptive_horizon) else "0"
+        )
+    if model_search_adaptive_horizon_offset is not None:
+        submission_env["ORBIT_WARS_MODEL_SEARCH_ADAPTIVE_HORIZON_OFFSET"] = str(
+            max(0, int(model_search_adaptive_horizon_offset))
+        )
+    if model_search_min_overage_s is not None:
+        submission_env["ORBIT_WARS_MODEL_SEARCH_MIN_OVERAGE_S"] = str(
+            max(0.0, float(model_search_min_overage_s))
+        )
+    if model_search_gamma is not None:
+        submission_env["ORBIT_WARS_MODEL_SEARCH_GAMMA"] = str(float(model_search_gamma))
 
     _write_main_py(
         bundle_dir / "main.py",
@@ -296,6 +317,11 @@ def package_submission(
         Population member 2p: {population_member_2p if population_member_2p is not None else (population_member if population_member is not None else 'member 0 / checkpoint default')}
         Target method: {target_method or 'checkpoint/default'}
         Interval geometry: {interval_geometry or 'checkpoint/default'}
+        Model search steps: {model_search_steps if model_search_steps is not None else 'disabled / env default'}
+        Model search adaptive horizon: {model_search_adaptive_horizon if model_search_adaptive_horizon is not None else 'env default'}
+        Model search adaptive horizon offset: {model_search_adaptive_horizon_offset if model_search_adaptive_horizon_offset is not None else 'env default'}
+        Model search min overage seconds: {model_search_min_overage_s if model_search_min_overage_s is not None else 'env default'}
+        Model search gamma: {model_search_gamma if model_search_gamma is not None else 'checkpoint/default'}
 
         Policy selection: 4-player policy while two or more opponents are alive;
         switches to the 2-player policy as soon as only one opponent remains.
@@ -439,6 +465,51 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--model-search-steps",
+        type=int,
+        default=None,
+        help=(
+            "Bake ORBIT_WARS_MODEL_SEARCH_STEPS into main.py. "
+            "Set >0 to enable fixed-horizon halt-vs-launch search."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-adaptive-horizon",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Bake ORBIT_WARS_MODEL_SEARCH_ADAPTIVE_HORIZON into main.py. "
+            "When enabled, rollout depth follows launch hit time plus the configured offset."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-adaptive-horizon-offset",
+        type=int,
+        default=None,
+        help=(
+            "Bake ORBIT_WARS_MODEL_SEARCH_ADAPTIVE_HORIZON_OFFSET into main.py. "
+            "Only used when adaptive horizon is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-min-overage-s",
+        type=float,
+        default=None,
+        help=(
+            "Bake ORBIT_WARS_MODEL_SEARCH_MIN_OVERAGE_S into main.py. "
+            "Search only runs when remaining Kaggle overage is at least this many seconds."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-gamma",
+        type=float,
+        default=None,
+        help=(
+            "Bake ORBIT_WARS_MODEL_SEARCH_GAMMA into main.py. "
+            "Overrides the reward discount used by the rollout search."
+        ),
+    )
+    parser.add_argument(
         "--keep-dir",
         action="store_true",
         help="When --out ends with .tar.gz, keep the extracted bundle directory beside the archive.",
@@ -497,6 +568,15 @@ def main() -> None:
         slim=not args.no_slim,
         target_method=args.target_method,
         interval_geometry=args.interval_geometry,
+        model_search_steps=args.model_search_steps,
+        model_search_adaptive_horizon=(
+            None
+            if args.model_search_adaptive_horizon is None
+            else bool(args.model_search_adaptive_horizon)
+        ),
+        model_search_adaptive_horizon_offset=args.model_search_adaptive_horizon_offset,
+        model_search_min_overage_s=args.model_search_min_overage_s,
+        model_search_gamma=args.model_search_gamma,
         population_member=args.member,
         population_member_4p=args.member if args.member_4p is None else args.member_4p,
         population_member_2p=args.member if args.member_2p is None else args.member_2p,
