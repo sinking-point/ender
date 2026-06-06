@@ -115,6 +115,15 @@ def _launch_debug(msg: str) -> None:
         print(f"[orbit_wars:launch] {msg}", file=sys.stderr, flush=True)
 
 
+def _model_search_debug_enabled() -> bool:
+    return os.environ.get("ORBIT_WARS_DEBUG_MODEL_SEARCH", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _model_search_debug(msg: str) -> None:
+    if _model_search_debug_enabled():
+        print(f"[orbit_wars:search] {msg}", file=sys.stderr, flush=True)
+
+
 def _trace_fleet_ids() -> set[int]:
     raw = os.environ.get("ORBIT_WARS_TRACE_FLEETS", "").strip()
     if not raw:
@@ -1035,6 +1044,71 @@ class RewardSettings:
 class ModelSearchSettings:
     horizon_steps: int
     reward: RewardSettings
+    adaptive_horizon: bool = False
+    adaptive_horizon_offset: int = 2
+
+
+def _model_search_enabled(settings: ModelSearchSettings) -> bool:
+    return bool(settings.adaptive_horizon) or int(settings.horizon_steps) > 0
+
+
+def _model_search_rollout_horizon(
+    settings: ModelSearchSettings,
+    *,
+    launch_true_hit_tick: float,
+) -> int:
+    """Rollout depth (env steps) for halt-vs-launch search.
+
+    With ``adaptive_horizon``, rollout depth is
+    ``floor(launch_true_hit_tick) + adaptive_horizon_offset`` env steps.
+    ``launch_true_hit_tick`` uses the same tick convention as
+    ``apply_micro_launch_in_place``: tick ``k`` collides on env step ``k``
+    after launch (tick 0 is the launch step itself).
+    """
+
+    if settings.adaptive_horizon:
+        if float(launch_true_hit_tick) >= 500.0:
+            cap = int(settings.horizon_steps)
+            return max(1, cap) if cap > 0 else INCOMING_TA_BINS
+        steps = int(math.floor(float(launch_true_hit_tick))) + int(settings.adaptive_horizon_offset)
+        cap = int(settings.horizon_steps)
+        if cap > 0:
+            steps = min(steps, cap)
+        return max(1, steps)
+    return int(settings.horizon_steps)
+
+
+def _log_model_search_horizon(
+    settings: ModelSearchSettings,
+    *,
+    rollout_horizon: int,
+    launch_true_hit_tick: float,
+    step_count: int,
+    ego_player: int,
+    origin_slot: int = -1,
+    target_slot: int = -1,
+    micro_idx: int = -1,
+    send: int = -1,
+) -> None:
+    if not _model_search_debug_enabled():
+        return
+    hit_tick = float(launch_true_hit_tick)
+    if settings.adaptive_horizon:
+        cap = int(settings.horizon_steps)
+        cap_s = "none" if cap <= 0 else str(cap)
+        mode = (
+            f"adaptive floor({hit_tick:.3f})+{int(settings.adaptive_horizon_offset)} cap={cap_s}"
+        )
+    else:
+        mode = f"fixed steps={int(settings.horizon_steps)}"
+    origin_s = "" if int(origin_slot) < 0 else f" origin={int(origin_slot)}"
+    target_s = "" if int(target_slot) < 0 else f" target={int(target_slot)}"
+    micro_s = "" if int(micro_idx) < 0 else f" micro={int(micro_idx)}"
+    send_s = "" if int(send) < 0 else f" send={int(send)}"
+    _model_search_debug(
+        f"horizon={int(rollout_horizon)} step={int(step_count)} ego={int(ego_player)}"
+        f" true_hit_tick={hit_tick:.3f}{origin_s}{target_s}{micro_s}{send_s} ({mode})"
+    )
 
 
 def _reward_settings_from_training_args(training_args: Mapping[str, Any]) -> RewardSettings:
@@ -3063,6 +3137,7 @@ def _rollout_branch_score(
     *,
     ego_player: int,
     ego_actions: list[list[float]],
+    rollout_horizon: int | None = None,
     timing: ModelSearchTiming | None = None,
 ) -> float:
     t_rollout = perf_counter() if timing is not None else 0.0
@@ -3077,10 +3152,11 @@ def _rollout_branch_score(
     total = 0.0
     discount = 1.0
 
-    for depth in range(int(runtime.settings.horizon_steps)):
+    horizon = int(rollout_horizon if rollout_horizon is not None else runtime.settings.horizon_steps)
+    for depth in range(horizon):
         if timing is not None:
             timing.rollout_steps += 1
-            t0 = perf_counter()
+        t0 = perf_counter()
         state_pre = observation_to_state(
             public_obs,
             runtime.kaggle_config,
@@ -3149,25 +3225,46 @@ def _choose_launch_via_model_search(
     action_prefix: list[list[float]],
     launch_action: list[float],
     launch_tail_actions: list[list[float]],
+    launch_true_hit_tick: float,
     timing: ModelSearchTiming | None = None,
 ) -> bool:
     t_choose = perf_counter() if timing is not None else 0.0
+    rollout_horizon = _model_search_rollout_horizon(
+        runtime.settings,
+        launch_true_hit_tick=float(launch_true_hit_tick),
+    )
+    _log_model_search_horizon(
+        runtime.settings,
+        rollout_horizon=int(rollout_horizon),
+        launch_true_hit_tick=float(launch_true_hit_tick),
+        step_count=int(runtime.step_count),
+        ego_player=int(ego_player),
+        send=int(launch_action[2]) if len(launch_action) >= 3 else -1,
+    )
     halt_score = _rollout_branch_score(
         runtime,
         ego_player=int(ego_player),
         ego_actions=copy.deepcopy(action_prefix),
+        rollout_horizon=rollout_horizon,
         timing=timing,
     )
     launch_score = _rollout_branch_score(
         runtime,
         ego_player=int(ego_player),
         ego_actions=copy.deepcopy(action_prefix) + [copy.deepcopy(launch_action)] + copy.deepcopy(launch_tail_actions),
+        rollout_horizon=rollout_horizon,
         timing=timing,
     )
     if timing is not None:
         timing.choose_calls += 1
         timing.choose_s += perf_counter() - t_choose
-    return bool(launch_score > halt_score)
+    chose_launch = bool(launch_score > halt_score)
+    if _model_search_debug_enabled():
+        _model_search_debug(
+            f"choose step={int(runtime.step_count)} ego={int(ego_player)} "
+            f"halt={halt_score:.6f} launch={launch_score:.6f} -> {'launch' if chose_launch else 'halt'}"
+        )
+    return chose_launch
 
 
 def _obs_tensors_for_state(
@@ -3441,7 +3538,7 @@ def _build_turn_actions_torch_only(
             t0 = perf_counter()
             use_search = (
                 search_runtime is not None
-                and int(search_runtime.settings.horizon_steps) > 0
+                and _model_search_enabled(search_runtime.settings)
                 and int(micro_idx) == 0
             )
             halt_logits = out["halt_logits"][0]
@@ -3629,6 +3726,7 @@ def _build_turn_actions_torch_only(
                         action_prefix=copy.deepcopy(actions),
                         launch_action=launch_action,
                         launch_tail_actions=launch_tail_actions,
+                        launch_true_hit_tick=float(true_hit_tick[d_idx]),
                         timing=(timing.model_search if timing is not None else None),
                     ):
                         if timing is not None:
@@ -4015,6 +4113,18 @@ def _model_search_steps_from_env() -> int:
     return max(0, int(raw))
 
 
+def _model_search_adaptive_horizon_from_env() -> bool:
+    raw = os.environ.get("ORBIT_WARS_MODEL_SEARCH_ADAPTIVE_HORIZON", "").lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _model_search_adaptive_horizon_offset_from_env() -> int:
+    raw = _env_int("ORBIT_WARS_MODEL_SEARCH_ADAPTIVE_HORIZON_OFFSET")
+    if raw is None:
+        return 2
+    return max(0, int(raw))
+
+
 def _model_search_gamma_from_env(fallback: float) -> float:
     raw = _env_float("ORBIT_WARS_MODEL_SEARCH_GAMMA")
     if raw is None:
@@ -4317,6 +4427,8 @@ class KaggleOrbitWarsAgent:
         interval_samples_per_span: Optional[int] = None,
         model_search_steps: Optional[int] = None,
         model_search_gamma: Optional[float] = None,
+        model_search_adaptive_horizon: Optional[bool] = None,
+        model_search_adaptive_horizon_offset: Optional[int] = None,
     ):
         _configure_cpu_threads()
         self.checkpoint_path = resolve_checkpoint_path(checkpoint_path)
@@ -4350,6 +4462,16 @@ class KaggleOrbitWarsAgent:
                 else _model_search_steps_from_env()
             ),
             reward=self.reward_settings,
+            adaptive_horizon=(
+                bool(model_search_adaptive_horizon)
+                if model_search_adaptive_horizon is not None
+                else _model_search_adaptive_horizon_from_env()
+            ),
+            adaptive_horizon_offset=(
+                max(0, int(model_search_adaptive_horizon_offset))
+                if model_search_adaptive_horizon_offset is not None
+                else _model_search_adaptive_horizon_offset_from_env()
+            ),
         )
         self.population_size = int(training_args.get("population_size", 1))
         self._population_member_by_player = _normalize_population_members(
@@ -4780,8 +4902,23 @@ class KaggleOrbitWarsAgent:
         ]
         branch_steps = [int(runtime.step_count), int(runtime.step_count)]
         branch_done = [False, False]
+        rollout_horizon = _model_search_rollout_horizon(
+            runtime.settings,
+            launch_true_hit_tick=float(launch_true_hit_tick),
+        )
+        _log_model_search_horizon(
+            runtime.settings,
+            rollout_horizon=int(rollout_horizon),
+            launch_true_hit_tick=float(launch_true_hit_tick),
+            step_count=int(runtime.step_count),
+            ego_player=int(ego_player),
+            origin_slot=int(launch_origin_slot),
+            target_slot=int(launch_true_target_slot),
+            micro_idx=int(current_micro_idx),
+            send=int(launch_send),
+        )
 
-        for depth in range(int(runtime.settings.horizon_steps)):
+        for depth in range(rollout_horizon):
             if timing is not None:
                 timing.rollout_steps += int(sum(0 if done else 1 for done in branch_done))
 
@@ -4903,7 +5040,14 @@ class KaggleOrbitWarsAgent:
                     timing.branch_rollout_s += perf_counter() - t_choose
                     timing.choose_calls += 1
                     timing.choose_s += perf_counter() - t_choose
-                return bool(branch_scores[1] > branch_scores[0])
+                chose_launch = bool(branch_scores[1] > branch_scores[0])
+                if _model_search_debug_enabled():
+                    _model_search_debug(
+                        f"choose step={int(runtime.step_count)} ego={int(ego_player)} "
+                        f"halt={branch_scores[0]:.6f} launch={branch_scores[1]:.6f} -> "
+                        f"{'launch' if chose_launch else 'halt'}"
+                    )
+                return chose_launch
 
             discount *= float(reward.gamma)
 
@@ -4929,7 +5073,14 @@ class KaggleOrbitWarsAgent:
             timing.branch_rollout_s += perf_counter() - t_choose
             timing.choose_calls += 1
             timing.choose_s += perf_counter() - t_choose
-        return bool(branch_scores[1] > branch_scores[0])
+        chose_launch = bool(branch_scores[1] > branch_scores[0])
+        if _model_search_debug_enabled():
+            _model_search_debug(
+                f"choose step={int(runtime.step_count)} ego={int(ego_player)} "
+                f"halt={branch_scores[0]:.6f} launch={branch_scores[1]:.6f} -> "
+                f"{'launch' if chose_launch else 'halt'}"
+            )
+        return chose_launch
 
     def _search_greedy_actions_for_player(
         self,
@@ -5111,7 +5262,7 @@ class KaggleOrbitWarsAgent:
             context="single",
         )
         search_runtime = None
-        if int(self.model_search.horizon_steps) > 0:
+        if _model_search_enabled(self.model_search):
             search_timing = timing.model_search
 
             def _search_greedy_actions(sim_obs: Mapping[str, Any], player: int, sim_step: int) -> list[list[float]]:
@@ -5256,6 +5407,8 @@ class KaggleOrbitWarsDualPolicyAgent:
         interval_samples_per_span: Optional[int] = None,
         model_search_steps: Optional[int] = None,
         model_search_gamma: Optional[float] = None,
+        model_search_adaptive_horizon: Optional[bool] = None,
+        model_search_adaptive_horizon_offset: Optional[int] = None,
     ):
         _configure_cpu_threads()
         self.checkpoint_4p = resolve_checkpoint_path(checkpoint_4p)
@@ -5297,6 +5450,16 @@ class KaggleOrbitWarsDualPolicyAgent:
             max(0, int(model_search_steps))
             if model_search_steps is not None
             else _model_search_steps_from_env()
+        )
+        self.model_search_adaptive_horizon = (
+            bool(model_search_adaptive_horizon)
+            if model_search_adaptive_horizon is not None
+            else _model_search_adaptive_horizon_from_env()
+        )
+        self.model_search_adaptive_horizon_offset = (
+            max(0, int(model_search_adaptive_horizon_offset))
+            if model_search_adaptive_horizon_offset is not None
+            else _model_search_adaptive_horizon_offset_from_env()
         )
         self.population_size_4p = int(training_args_4p.get("population_size", 1))
         self.population_size_2p = int(training_args_2p.get("population_size", 1))
@@ -5600,12 +5763,14 @@ class KaggleOrbitWarsDualPolicyAgent:
             live_opponents=live_opponents,
         )
         search_runtime = None
-        if int(self.model_search_steps) > 0:
+        if bool(self.model_search_adaptive_horizon) or int(self.model_search_steps) > 0:
             reward_settings = self.reward_settings_4p if use_4p_policy else self.reward_settings_2p
             search_runtime = SearchRuntime(
                 settings=ModelSearchSettings(
                     horizon_steps=int(self.model_search_steps),
                     reward=reward_settings,
+                    adaptive_horizon=bool(self.model_search_adaptive_horizon),
+                    adaptive_horizon_offset=int(self.model_search_adaptive_horizon_offset),
                 ),
                 public_obs=_public_obs_for_player(obs, player=0, step_count=step_count),
                 kaggle_config=config,

@@ -234,6 +234,73 @@ def main() -> None:
         help="Optional search rollout discount override. Default: checkpoint gamma.",
     )
     parser.add_argument(
+        "--model-search-adaptive-horizon",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Roll search out until (inclusive) the launch branch's fleet is projected to hit its target, "
+            "using floor(hit_tick)+offset env steps. When --model-search-steps is also set, it caps the adaptive depth. "
+            "Override per seat with --model-search-adaptive-horizon-p0 / --p1 / --p2 / --p3."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-adaptive-horizon-offset",
+        type=int,
+        default=2,
+        help=(
+            "Added to floor(hit_tick) for adaptive search depth. Default: 2. "
+            "Override per seat with --model-search-adaptive-horizon-offset-p0 / --p1 / --p2 / --p3."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-adaptive-horizon-p0",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Adaptive search horizon for player 0. Default: same as --model-search-adaptive-horizon.",
+    )
+    parser.add_argument(
+        "--model-search-adaptive-horizon-p1",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Adaptive search horizon for player 1. Default: same as --model-search-adaptive-horizon.",
+    )
+    parser.add_argument(
+        "--model-search-adaptive-horizon-p2",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Adaptive search horizon for player 2 in 4-player mode. Default: same as --model-search-adaptive-horizon.",
+    )
+    parser.add_argument(
+        "--model-search-adaptive-horizon-p3",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Adaptive search horizon for player 3 in 4-player mode. Default: same as --model-search-adaptive-horizon.",
+    )
+    parser.add_argument(
+        "--model-search-adaptive-horizon-offset-p0",
+        type=int,
+        default=None,
+        help="Adaptive search offset for player 0. Default: same as --model-search-adaptive-horizon-offset.",
+    )
+    parser.add_argument(
+        "--model-search-adaptive-horizon-offset-p1",
+        type=int,
+        default=None,
+        help="Adaptive search offset for player 1. Default: same as --model-search-adaptive-horizon-offset.",
+    )
+    parser.add_argument(
+        "--model-search-adaptive-horizon-offset-p2",
+        type=int,
+        default=None,
+        help="Adaptive search offset for player 2 in 4-player mode. Default: same as --model-search-adaptive-horizon-offset.",
+    )
+    parser.add_argument(
+        "--model-search-adaptive-horizon-offset-p3",
+        type=int,
+        default=None,
+        help="Adaptive search offset for player 3 in 4-player mode. Default: same as --model-search-adaptive-horizon-offset.",
+    )
+    parser.add_argument(
         "--swap-player-view",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -483,6 +550,58 @@ def main() -> None:
         model_search_steps_p2,
         model_search_steps_p3,
     ]
+    model_search_adaptive_horizon_p0 = (
+        args.model_search_adaptive_horizon
+        if args.model_search_adaptive_horizon_p0 is None
+        else args.model_search_adaptive_horizon_p0
+    )
+    model_search_adaptive_horizon_p1 = (
+        args.model_search_adaptive_horizon
+        if args.model_search_adaptive_horizon_p1 is None
+        else args.model_search_adaptive_horizon_p1
+    )
+    model_search_adaptive_horizon_p2 = (
+        args.model_search_adaptive_horizon
+        if args.model_search_adaptive_horizon_p2 is None
+        else args.model_search_adaptive_horizon_p2
+    )
+    model_search_adaptive_horizon_p3 = (
+        args.model_search_adaptive_horizon
+        if args.model_search_adaptive_horizon_p3 is None
+        else args.model_search_adaptive_horizon_p3
+    )
+    model_search_adaptive_horizon_by_seat = [
+        model_search_adaptive_horizon_p0,
+        model_search_adaptive_horizon_p1,
+        model_search_adaptive_horizon_p2,
+        model_search_adaptive_horizon_p3,
+    ]
+    model_search_adaptive_horizon_offset_p0 = (
+        args.model_search_adaptive_horizon_offset
+        if args.model_search_adaptive_horizon_offset_p0 is None
+        else args.model_search_adaptive_horizon_offset_p0
+    )
+    model_search_adaptive_horizon_offset_p1 = (
+        args.model_search_adaptive_horizon_offset
+        if args.model_search_adaptive_horizon_offset_p1 is None
+        else args.model_search_adaptive_horizon_offset_p1
+    )
+    model_search_adaptive_horizon_offset_p2 = (
+        args.model_search_adaptive_horizon_offset
+        if args.model_search_adaptive_horizon_offset_p2 is None
+        else args.model_search_adaptive_horizon_offset_p2
+    )
+    model_search_adaptive_horizon_offset_p3 = (
+        args.model_search_adaptive_horizon_offset
+        if args.model_search_adaptive_horizon_offset_p3 is None
+        else args.model_search_adaptive_horizon_offset_p3
+    )
+    model_search_adaptive_horizon_offset_by_seat = [
+        max(0, int(model_search_adaptive_horizon_offset_p0)),
+        max(0, int(model_search_adaptive_horizon_offset_p1)),
+        max(0, int(model_search_adaptive_horizon_offset_p2)),
+        max(0, int(model_search_adaptive_horizon_offset_p3)),
+    ]
     if args.main_vs_exploiter:
         if args.main_seat is None:
             seat_rng_seed = int(args.seed if args.seed is not None else args.agent_seed)
@@ -505,12 +624,26 @@ def main() -> None:
             f"p{seat}={checkpoint_by_seat[seat]}" for seat in range(int(args.num_agents))
         )
         print(f"[orbit_wars_pt] per-seat checkpoints: {checkpoint_summary}", flush=True)
-    if any(int(model_search_steps_by_seat[seat]) > 0 for seat in range(int(args.num_agents))):
+    search_enabled_by_seat = [
+        bool(model_search_adaptive_horizon_by_seat[seat]) or int(model_search_steps_by_seat[seat]) > 0
+        for seat in range(int(args.num_agents))
+    ]
+    if any(search_enabled_by_seat):
         search_summary = ", ".join(
-            f"p{seat}={int(model_search_steps_by_seat[seat])}" for seat in range(int(args.num_agents))
+            (
+                (
+                    f"p{seat}=adaptive+{int(model_search_adaptive_horizon_offset_by_seat[seat])}"
+                    if int(model_search_steps_by_seat[seat]) <= 0
+                    else f"p{seat}=adaptive+{int(model_search_adaptive_horizon_offset_by_seat[seat])}≤{int(model_search_steps_by_seat[seat])}"
+                )
+                if bool(model_search_adaptive_horizon_by_seat[seat])
+                else f"p{seat}={int(model_search_steps_by_seat[seat])}"
+            )
+            for seat in range(int(args.num_agents))
+            if search_enabled_by_seat[seat]
         )
         gamma_suffix = "" if args.model_search_gamma is None else f" gamma={float(args.model_search_gamma):g}"
-        print(f"[orbit_wars_pt] per-seat model search steps: {search_summary}{gamma_suffix}", flush=True)
+        print(f"[orbit_wars_pt] per-seat model search: {search_summary}{gamma_suffix}", flush=True)
 
     run_agents: list[Callable[[dict[str, Any], Any], list[list[float]]]] = []
     for seat in range(int(args.num_agents)):
@@ -528,6 +661,8 @@ def main() -> None:
             raycast_rays=(None if args.raycast_rays is None else int(args.raycast_rays)),
             model_search_steps=int(model_search_steps_by_seat[seat]),
             model_search_gamma=args.model_search_gamma,
+            model_search_adaptive_horizon=bool(model_search_adaptive_horizon_by_seat[seat]),
+            model_search_adaptive_horizon_offset=int(model_search_adaptive_horizon_offset_by_seat[seat]),
         )
         run_agent = seat_agent
         if args.swap_player_view:
