@@ -1046,10 +1046,24 @@ class ModelSearchSettings:
     reward: RewardSettings
     adaptive_horizon: bool = False
     adaptive_horizon_offset: int = 2
+    min_overage_s: float = 15.0
 
 
 def _model_search_enabled(settings: ModelSearchSettings) -> bool:
     return bool(settings.adaptive_horizon) or int(settings.horizon_steps) > 0
+
+
+def _remaining_overage_s(obs: Mapping[str, Any]) -> float | None:
+    if "remainingOverageTime" not in obs:
+        return None
+    return float(obs.get("remainingOverageTime", 0.0))
+
+
+def _model_search_allowed_for_obs(obs: Mapping[str, Any], settings: ModelSearchSettings) -> bool:
+    overage = _remaining_overage_s(obs)
+    if overage is None:
+        return True
+    return float(overage) >= float(settings.min_overage_s)
 
 
 def _model_search_rollout_horizon(
@@ -4125,6 +4139,13 @@ def _model_search_adaptive_horizon_offset_from_env() -> int:
     return max(0, int(raw))
 
 
+def _model_search_min_overage_from_env() -> float:
+    raw = _env_float("ORBIT_WARS_MODEL_SEARCH_MIN_OVERAGE_S")
+    if raw is None:
+        return 15.0
+    return max(0.0, float(raw))
+
+
 def _model_search_gamma_from_env(fallback: float) -> float:
     raw = _env_float("ORBIT_WARS_MODEL_SEARCH_GAMMA")
     if raw is None:
@@ -4429,6 +4450,7 @@ class KaggleOrbitWarsAgent:
         model_search_gamma: Optional[float] = None,
         model_search_adaptive_horizon: Optional[bool] = None,
         model_search_adaptive_horizon_offset: Optional[int] = None,
+        model_search_min_overage_s: Optional[float] = None,
     ):
         _configure_cpu_threads()
         self.checkpoint_path = resolve_checkpoint_path(checkpoint_path)
@@ -4471,6 +4493,11 @@ class KaggleOrbitWarsAgent:
                 max(0, int(model_search_adaptive_horizon_offset))
                 if model_search_adaptive_horizon_offset is not None
                 else _model_search_adaptive_horizon_offset_from_env()
+            ),
+            min_overage_s=(
+                max(0.0, float(model_search_min_overage_s))
+                if model_search_min_overage_s is not None
+                else _model_search_min_overage_from_env()
             ),
         )
         self.population_size = int(training_args.get("population_size", 1))
@@ -5262,7 +5289,7 @@ class KaggleOrbitWarsAgent:
             context="single",
         )
         search_runtime = None
-        if _model_search_enabled(self.model_search):
+        if _model_search_enabled(self.model_search) and _model_search_allowed_for_obs(obs, self.model_search):
             search_timing = timing.model_search
 
             def _search_greedy_actions(sim_obs: Mapping[str, Any], player: int, sim_step: int) -> list[list[float]]:
@@ -5342,6 +5369,14 @@ class KaggleOrbitWarsAgent:
                 value_for_player=_search_value,
                 choose_launch=self._choose_launch_via_model_search_batched_single_policy,
             )
+        elif _model_search_enabled(self.model_search):
+            overage = _remaining_overage_s(obs)
+            if overage is not None and _model_search_debug_enabled():
+                _model_search_debug(
+                    f"disabled step={int(step_count)} ego={int(ego_player)} "
+                    f"remainingOverageTime={float(overage):.3f}s "
+                    f"< min={float(self.model_search.min_overage_s):.3f}s"
+                )
         actions = _build_turn_actions_torch_only(
             self.policy,
             state,
@@ -5409,6 +5444,7 @@ class KaggleOrbitWarsDualPolicyAgent:
         model_search_gamma: Optional[float] = None,
         model_search_adaptive_horizon: Optional[bool] = None,
         model_search_adaptive_horizon_offset: Optional[int] = None,
+        model_search_min_overage_s: Optional[float] = None,
     ):
         _configure_cpu_threads()
         self.checkpoint_4p = resolve_checkpoint_path(checkpoint_4p)
@@ -5460,6 +5496,11 @@ class KaggleOrbitWarsDualPolicyAgent:
             max(0, int(model_search_adaptive_horizon_offset))
             if model_search_adaptive_horizon_offset is not None
             else _model_search_adaptive_horizon_offset_from_env()
+        )
+        self.model_search_min_overage_s = (
+            max(0.0, float(model_search_min_overage_s))
+            if model_search_min_overage_s is not None
+            else _model_search_min_overage_from_env()
         )
         self.population_size_4p = int(training_args_4p.get("population_size", 1))
         self.population_size_2p = int(training_args_2p.get("population_size", 1))
@@ -5763,15 +5804,16 @@ class KaggleOrbitWarsDualPolicyAgent:
             live_opponents=live_opponents,
         )
         search_runtime = None
-        if bool(self.model_search_adaptive_horizon) or int(self.model_search_steps) > 0:
-            reward_settings = self.reward_settings_4p if use_4p_policy else self.reward_settings_2p
+        search_settings = ModelSearchSettings(
+            horizon_steps=int(self.model_search_steps),
+            reward=self.reward_settings_4p if use_4p_policy else self.reward_settings_2p,
+            adaptive_horizon=bool(self.model_search_adaptive_horizon),
+            adaptive_horizon_offset=int(self.model_search_adaptive_horizon_offset),
+            min_overage_s=float(self.model_search_min_overage_s),
+        )
+        if _model_search_enabled(search_settings) and _model_search_allowed_for_obs(obs, search_settings):
             search_runtime = SearchRuntime(
-                settings=ModelSearchSettings(
-                    horizon_steps=int(self.model_search_steps),
-                    reward=reward_settings,
-                    adaptive_horizon=bool(self.model_search_adaptive_horizon),
-                    adaptive_horizon_offset=int(self.model_search_adaptive_horizon_offset),
-                ),
+                settings=search_settings,
                 public_obs=_public_obs_for_player(obs, player=0, step_count=step_count),
                 kaggle_config=config,
                 step_count=step_count,
@@ -5791,6 +5833,14 @@ class KaggleOrbitWarsDualPolicyAgent:
                     timing=timing.model_search,
                 ),
             )
+        elif _model_search_enabled(search_settings):
+            overage = _remaining_overage_s(obs)
+            if overage is not None and _model_search_debug_enabled():
+                _model_search_debug(
+                    f"disabled step={int(step_count)} ego={int(ego_player)} "
+                    f"remainingOverageTime={float(overage):.3f}s "
+                    f"< min={float(search_settings.min_overage_s):.3f}s"
+                )
         actions = _build_turn_actions_torch_only(
             policy,
             state,
