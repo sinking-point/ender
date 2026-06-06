@@ -49,7 +49,9 @@ import os
 os.environ.setdefault("ORBIT_WARS_CHECKPOINT_4P", "checkpoint_4p.pt")
 os.environ.setdefault("ORBIT_WARS_CHECKPOINT_2P", "checkpoint_2p.pt")
 os.environ.setdefault("ORBIT_WARS_DEVICE", {device!r})
+os.environ.setdefault("ORBIT_WARS_CPU_THREADS", "2")
 os.environ.setdefault("ORBIT_WARS_GREEDY", {greedy!r})
+os.environ.setdefault("ORBIT_WARS_LOG_TIMING", "1")
 {extra_env}
 
 from orbit_wars_pt.kaggle_adapter import agent
@@ -312,6 +314,7 @@ def package_submission(
         Greedy 4p override: {greedy_4p if greedy_4p is not None else 'default'}
         Greedy 2p override: {greedy_2p if greedy_2p is not None else 'default'}
         Device: {device}
+        CPU threads: 2
         Population member (fallback): {population_member if population_member is not None else 'member 0 / checkpoint default'}
         Population member 4p: {population_member_4p if population_member_4p is not None else (population_member if population_member is not None else 'member 0 / checkpoint default')}
         Population member 2p: {population_member_2p if population_member_2p is not None else (population_member if population_member is not None else 'member 0 / checkpoint default')}

@@ -5585,6 +5585,35 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.lower() in {"1", "true", "yes", "on"}
 
 
+def _timing_logging_enabled() -> bool:
+    return _env_bool("ORBIT_WARS_LOG_TIMING", False)
+
+
+def _agent_internal_timing_suffix(duration_s: float, timing: Any) -> str:
+    if timing is None:
+        return ""
+    target_detail = timing.micro_target.format_suffix()
+    search_detail = timing.model_search.format_suffix()
+    micro_sum = timing.micro_sum_s()
+    slack = float(duration_s) - float(timing.obs_to_state_s + micro_sum)
+    return (
+        " internal["
+        f"obs_to_state={timing.obs_to_state_s:.4f}s"
+        f" micro_iters={int(timing.micro_iters)}"
+        f" micro_obs_tensors={timing.micro_obs_tensors_s:.4f}s"
+        f" micro_policy_fwd={timing.micro_policy_forward_s:.4f}s"
+        f" micro_post_fwd={timing.micro_post_forward_s:.4f}s"
+        f" micro_raycast={timing.micro_raycast_s:.4f}s"
+        f" micro_target{target_detail}"
+        f" micro_target={timing.micro_target_s:.4f}s"
+        f" micro_book={timing.micro_book_s:.4f}s"
+        f"{search_detail}"
+        f" micro_sum={micro_sum:.4f}s"
+        f" slack={slack:+.4f}s"
+        "]"
+    )
+
+
 def _env_int(name: str) -> Optional[int]:
     raw = os.environ.get(name)
     if raw is None:
@@ -5793,8 +5822,32 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
         except Exception as exc:
             _report_once(exc)
             return []
+    before_overage = obs.get("remainingOverageTime", None)
+    act_timeout = _cfg_get(config, "actTimeout", None)
+    t0 = perf_counter()
     try:
-        return _AGENT(obs, config)
+        actions = _AGENT(obs, config)
     except Exception as exc:
         _report_once(exc)
         return []
+    dt = perf_counter() - t0
+    if _timing_logging_enabled():
+        overage_spent = 0.0
+        if act_timeout is not None:
+            overage_spent = max(0.0, dt - float(act_timeout))
+        after_overage = None if before_overage is None else float(before_overage) - overage_spent
+        timeout_suffix = ""
+        if act_timeout is not None:
+            timeout_suffix = f" actTimeout={float(act_timeout):.3f}s overage_spent={overage_spent:.3f}s"
+        overage_suffix = ""
+        if before_overage is not None:
+            overage_suffix = f" remainingOverage {float(before_overage):.3f}->{after_overage:.3f}s"
+        internal_suffix = _agent_internal_timing_suffix(dt, get_last_agent_call_timing())
+        print(
+            f"[timing] step={obs.get('step', obs.get('step_count', '?'))} "
+            f"player={obs.get('player', '?')} duration={dt:.6f}s"
+            f"{internal_suffix}{timeout_suffix}{overage_suffix}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return actions
