@@ -5462,10 +5462,12 @@ class KaggleOrbitWarsAgent:
 
 
 class KaggleOrbitWarsDualPolicyAgent:
-    """4p policy while two or more opponents are alive; 2p policy once only one remains.
+    """Submission wrapper that picks 4p or 2p policy once per episode.
 
-    Both checkpoints are loaded eagerly at construction so a mid-game switch does not
-    pay load/JIT cost under the 1s turn timer.
+    When both checkpoints are provided, the first observation decides the mode
+    from ``configuration.agentCount`` when available, otherwise from distinct
+    non-neutral planet owners in the public observation. There is no mid-game
+    policy switching.
     """
 
     def __init__(
@@ -5491,457 +5493,88 @@ class KaggleOrbitWarsDualPolicyAgent:
         model_search_adaptive_horizon_offset: Optional[int] = None,
         model_search_min_overage_s: Optional[float] = None,
     ):
-        _configure_cpu_threads()
         self.checkpoint_4p = resolve_checkpoint_path(checkpoint_4p)
         self.checkpoint_2p = resolve_checkpoint_path(checkpoint_2p)
-        self.policy_4p, self.device, training_args_4p = load_policy(self.checkpoint_4p, device=device)
-        self.policy_2p, _, training_args_2p = load_policy(self.checkpoint_2p, device=self.device)
-        self.policy_4p = _maybe_compile_policy_batched_forward_for_inference(self.policy_4p)
-        self.policy_2p = _maybe_compile_policy_batched_forward_for_inference(self.policy_2p)
-        reward_4p = _reward_settings_from_training_args(training_args_4p)
-        reward_2p = _reward_settings_from_training_args(training_args_2p)
-        gamma_search = (
-            float(model_search_gamma)
-            if model_search_gamma is not None
-            else _model_search_gamma_from_env(max(float(reward_4p.gamma), float(reward_2p.gamma)))
-        )
-        self.reward_settings_4p = RewardSettings(
-            ship_mass_share_coef=reward_4p.ship_mass_share_coef,
-            production_share_coef=reward_4p.production_share_coef,
-            terminal_win_loss_coef=reward_4p.terminal_win_loss_coef,
-            terminal_loss=reward_4p.terminal_loss,
-            terminal_draw=reward_4p.terminal_draw,
-            terminal_win=reward_4p.terminal_win,
-            time_bonus_coef=reward_4p.time_bonus_coef,
-            gamma=gamma_search,
-            episode_steps=reward_4p.episode_steps,
-        )
-        self.reward_settings_2p = RewardSettings(
-            ship_mass_share_coef=reward_2p.ship_mass_share_coef,
-            production_share_coef=reward_2p.production_share_coef,
-            terminal_win_loss_coef=reward_2p.terminal_win_loss_coef,
-            terminal_loss=reward_2p.terminal_loss,
-            terminal_draw=reward_2p.terminal_draw,
-            terminal_win=reward_2p.terminal_win,
-            time_bonus_coef=reward_2p.time_bonus_coef,
-            gamma=gamma_search,
-            episode_steps=reward_2p.episode_steps,
-        )
-        self.model_search_steps = (
-            max(0, int(model_search_steps))
-            if model_search_steps is not None
-            else _model_search_steps_from_env()
-        )
-        self.model_search_adaptive_horizon = (
-            bool(model_search_adaptive_horizon)
-            if model_search_adaptive_horizon is not None
-            else _model_search_adaptive_horizon_from_env()
-        )
-        self.model_search_adaptive_horizon_offset = (
-            max(0, int(model_search_adaptive_horizon_offset))
-            if model_search_adaptive_horizon_offset is not None
-            else _model_search_adaptive_horizon_offset_from_env()
-        )
-        self.model_search_min_overage_s = (
-            max(0.0, float(model_search_min_overage_s))
-            if model_search_min_overage_s is not None
-            else _model_search_min_overage_from_env()
-        )
-        self.population_size_4p = int(training_args_4p.get("population_size", 1))
-        self.population_size_2p = int(training_args_2p.get("population_size", 1))
-        self.population_member_4p = _normalize_population_member(
-            population_member_4p,
-            population_size=self.population_size_4p,
-            context="dual:4p",
-        )
-        self.population_member_2p = _normalize_population_member(
-            population_member_2p,
-            population_size=self.population_size_2p,
-            context="dual:2p",
-        )
-        self.normalize_obs_to_p0_4p = bool(training_args_4p.get("normalize_obs_to_p0", False))
-        self.normalize_obs_to_p0_2p = bool(training_args_2p.get("normalize_obs_to_p0", False))
-        self.policy_player_count_4p = 4 if int(training_args_4p.get("num_agents", 4)) > 2 else 2
-        self.policy_player_count_2p = 4 if int(training_args_2p.get("num_agents", 2)) > 2 else 2
-        self._greedy_by_player_4p = _normalize_greedy(greedy if greedy_4p is None else greedy_4p)
-        self._greedy_by_player_2p = _normalize_greedy(greedy if greedy_2p is None else greedy_2p)
-        micro_4p = int(training_args_4p.get("max_micro_steps", DEFAULT_MAX_ACTIONS))
-        micro_2p = int(training_args_2p.get("max_micro_steps", DEFAULT_MAX_ACTIONS))
-        self.max_micro_steps = int(
-            max_micro_steps if max_micro_steps is not None else max(micro_4p, micro_2p)
-        )
+        self.device = device
+        self.greedy_default = greedy
+        self.greedy_4p = greedy if greedy_4p is None else greedy_4p
+        self.greedy_2p = greedy if greedy_2p is None else greedy_2p
+        self.population_member_4p = population_member_4p
+        self.population_member_2p = population_member_2p
+        self.max_micro_steps = max_micro_steps
         self.max_fleets = int(max_fleets)
-        rays_4p = int(training_args_4p.get("first_hit_n_rays", DEFAULT_RAYCAST_RAYS))
-        rays_2p = int(training_args_2p.get("first_hit_n_rays", DEFAULT_RAYCAST_RAYS))
-        self.raycast_rays = int(
-            raycast_rays if raycast_rays is not None else max(rays_4p, rays_2p)
-        )
-        self.target_method = str(
-            target_method
-            if target_method is not None
-            else os.environ.get("ORBIT_WARS_TARGET_METHOD", DEFAULT_TARGET_METHOD)
-        ).lower()
-        self.interval_samples_per_span = int(
-            interval_samples_per_span
-            if interval_samples_per_span is not None
-            else os.environ.get(
-                "ORBIT_WARS_INTERVAL_SAMPLES",
-                str(DEFAULT_INTERVAL_SAMPLES_PER_SPAN),
-            )
-        )
-        self.rng = torch.Generator(device=self.device)
-        self.rng.manual_seed(int(seed if seed is not None else os.environ.get("ORBIT_WARS_AGENT_SEED", "0")))
+        self.seed = seed
+        self.raycast_rays = raycast_rays
+        self.target_method = target_method
+        self.interval_samples_per_span = interval_samples_per_span
+        self.model_search_steps = model_search_steps
+        self.model_search_gamma = model_search_gamma
+        self.model_search_adaptive_horizon = model_search_adaptive_horizon
+        self.model_search_adaptive_horizon_offset = model_search_adaptive_horizon_offset
+        self.model_search_min_overage_s = model_search_min_overage_s
+        self._delegate: Optional[KaggleOrbitWarsAgent] = None
+        self._delegate_mode: Optional[str] = None
         self._game_key: Optional[str] = None
         self._frozen_game_key: Optional[str] = None
-        self._frozen_num_agents: Optional[int] = None
-        self._next_step_count = 0
-        self._last_env_step: Optional[int] = None
-        self._compiled_forward_warmup_done_4p = False
-        self._compiled_forward_warmup_done_2p = False
         self._last_call_timing: Optional[KaggleAgentCallTiming] = None
-        self._sanity_warnings: set[str] = set()
-        warn_oob = os.environ.get("ORBIT_WARS_WARN_OOB_LAUNCHES", "1").lower() not in {"0", "false", "no", "off"}
-        self.launch_tracker = FleetLaunchDebugTracker(
-            warn_oob=warn_oob,
-            warn_forecast_mismatch=_warn_forecast_mismatch_enabled(),
-            warn_unmatched_fleet=_warn_unmatched_fleet_enabled(),
-        )
-
-    def _num_agents_for_obs(self, obs: Mapping[str, Any], config: Any = None) -> int:
-        if self._frozen_num_agents is None:
-            fallback = int(_cfg_get(config, "agentCount", self.policy_player_count_4p))
-            self._frozen_num_agents = _infer_num_agents_from_planet_owners(obs, fallback=fallback)
-        return int(self._frozen_num_agents)
 
     def _obs_game_key(self, obs: Mapping[str, Any]) -> str:
         step_raw = obs.get("step", obs.get("step_count", None))
         step = int(step_raw) if step_raw is not None else None
-
         initial = obs.get("initial_planets")
         if not initial:
             if self._frozen_game_key is not None:
                 return self._frozen_game_key
             initial = obs.get("planets", [])
-
         arr = np.asarray(initial, dtype=np.float32)
         h = hashlib.blake2b(digest_size=16)
         h.update(arr.tobytes())
         h.update(str(obs.get("angular_velocity", 0.0)).encode("ascii", errors="ignore"))
         key = h.hexdigest()
-
         if step == 0 or self._frozen_game_key is None:
             self._frozen_game_key = key
         return self._frozen_game_key
 
-    def _step_count_for_obs(self, obs: Mapping[str, Any]) -> int:
-        step_raw = obs.get("step", obs.get("step_count", None))
-        if step_raw is not None:
-            s = int(step_raw)
-            self._last_env_step = s
-            self._next_step_count = s + 1
-            key = self._obs_game_key(obs)
-            if key != self._game_key:
-                self._frozen_num_agents = None
-            self._game_key = key
-            return s
+    def _mode_for_obs(self, obs: Mapping[str, Any], config: Any = None) -> str:
+        cfg_agents = _cfg_get(config, "agentCount", None)
+        if cfg_agents is not None:
+            agents = max(2, int(cfg_agents))
+        else:
+            agents = _infer_num_agents_from_planet_owners(obs, fallback=2)
+        return "4p" if agents > 2 else "2p"
 
-        key = self._obs_game_key(obs)
-        if key != self._game_key:
-            self._game_key = key
-            self._next_step_count = 0
-            self._last_env_step = None
-            self._frozen_num_agents = None
-
-        if self._last_env_step is not None:
-            ego = int(obs.get("player", 0))
-            if ego >= 2:
-                _adapter_warn_once(
-                    self._sanity_warnings,
-                    f"dual:missing-step-mirrored:ego{ego}",
-                    "Kaggle observation omitted step for player >=2; reusing last observed env step "
-                    f"context=dual ego={ego} reused_step={int(self._last_env_step)}",
-                )
-            return int(self._last_env_step)
-
-        step_count = self._next_step_count
-        ego = int(obs.get("player", 0))
-        if ego >= 2:
-            _adapter_warn_once(
-                self._sanity_warnings,
-                f"dual:missing-step-inferred:ego{ego}",
-                "Kaggle observation omitted step for player >=2 and no prior step was available; "
-                f"context=dual ego={ego} inferred_step={step_count}",
-            )
-        self._next_step_count += 1
-        return step_count
-
-    def _search_dual_greedy_actions_for_player(
-        self,
-        obs: Mapping[str, Any],
-        config: Any,
-        player: int,
-        step_count: int,
-        timing: ModelSearchTiming | None = None,
-    ) -> list[list[float]]:
-        t_total = perf_counter() if timing is not None else 0.0
-        t0 = perf_counter() if timing is not None else 0.0
-        state = observation_to_state(
-            obs,
-            config,
-            max_fleets=self.max_fleets,
-            step_count_override=step_count,
-            num_agents_override=self._num_agents_for_obs(obs, config),
-        )
-        if timing is not None:
-            timing.opponent_greedy_obs_to_state_calls += 1
-            timing.opponent_greedy_obs_to_state_s += perf_counter() - t0
-            t0 = perf_counter()
-        live_opponents = _count_live_opponents(state, int(player))
-        use_4p_policy = live_opponents >= 2
-        policy = self.policy_4p if use_4p_policy else self.policy_2p
-        policy_player_count = self.policy_player_count_4p if use_4p_policy else self.policy_player_count_2p
-        normalize_obs_to_p0 = self.normalize_obs_to_p0_4p if use_4p_policy else self.normalize_obs_to_p0_2p
-        population_member = self.population_member_4p if use_4p_policy else self.population_member_2p
-        if timing is not None:
-            timing.opponent_greedy_policy_select_calls += 1
-            timing.opponent_greedy_policy_select_s += perf_counter() - t0
-            t0 = perf_counter()
-        actions = _build_turn_actions_torch_only(
-            policy,
-            state,
-            player,
-            self.device,
-            ship_speed=float(_cfg_get(config, "shipSpeed", 6.0)),
+    def _build_delegate(self, mode: str) -> KaggleOrbitWarsAgent:
+        use_4p = mode == "4p"
+        return KaggleOrbitWarsAgent(
+            self.checkpoint_4p if use_4p else self.checkpoint_2p,
+            device=self.device,
+            greedy=self.greedy_4p if use_4p else self.greedy_2p,
+            population_member=self.population_member_4p if use_4p else self.population_member_2p,
             max_micro_steps=self.max_micro_steps,
-            greedy=True,
-            rng=self.rng,
-            n_rays=self.raycast_rays,
-            samples_per_span=self.interval_samples_per_span,
-            target_method=self.target_method,
-            timing=None,
-            launch_tracker=None,
-            game_step=step_count,
-            policy_player_count=policy_player_count,
-            normalize_obs_to_p0=normalize_obs_to_p0,
-            launch_geometry=_launch_geometry_from_obs(obs, config),
-            population_member=population_member,
-            search_runtime=None,
-        )
-        if timing is not None:
-            timing.opponent_greedy_action_build_calls += 1
-            timing.opponent_greedy_action_build_s += perf_counter() - t0
-            timing.opponent_greedy_calls += 1
-            timing.opponent_greedy_s += perf_counter() - t_total
-        return actions
-
-    def _search_dual_value_for_player(
-        self,
-        obs: Mapping[str, Any],
-        config: Any,
-        player: int,
-        step_count: int,
-        timing: ModelSearchTiming | None = None,
-    ) -> float:
-        t_total = perf_counter() if timing is not None else 0.0
-        t0 = perf_counter() if timing is not None else 0.0
-        state = observation_to_state(
-            obs,
-            config,
             max_fleets=self.max_fleets,
-            step_count_override=step_count,
-            num_agents_override=self._num_agents_for_obs(obs, config),
+            seed=self.seed,
+            raycast_rays=self.raycast_rays,
+            target_method=self.target_method,
+            interval_samples_per_span=self.interval_samples_per_span,
+            model_search_steps=self.model_search_steps,
+            model_search_gamma=self.model_search_gamma,
+            model_search_adaptive_horizon=self.model_search_adaptive_horizon,
+            model_search_adaptive_horizon_offset=self.model_search_adaptive_horizon_offset,
+            model_search_min_overage_s=self.model_search_min_overage_s,
         )
-        if timing is not None:
-            timing.value_obs_to_state_calls += 1
-            timing.value_obs_to_state_s += perf_counter() - t0
-            t0 = perf_counter()
-        live_opponents = _count_live_opponents(state, int(player))
-        use_4p_policy = live_opponents >= 2
-        policy = self.policy_4p if use_4p_policy else self.policy_2p
-        policy_player_count = self.policy_player_count_4p if use_4p_policy else self.policy_player_count_2p
-        normalize_obs_to_p0 = self.normalize_obs_to_p0_4p if use_4p_policy else self.normalize_obs_to_p0_2p
-        population_member = self.population_member_4p if use_4p_policy else self.population_member_2p
-        if timing is not None:
-            timing.value_policy_select_calls += 1
-            timing.value_policy_select_s += perf_counter() - t0
-            t0 = perf_counter()
-        value = _policy_value_for_state(
-            policy,
-            state,
-            player,
-            self.device,
-            policy_player_count=policy_player_count,
-            normalize_obs_to_p0=normalize_obs_to_p0,
-            population_member=population_member,
-        )
-        if timing is not None:
-            timing.value_eval_calls += 1
-            timing.value_eval_s += perf_counter() - t0
-            timing.value_calls += 1
-            timing.value_s += perf_counter() - t_total
-        return value
 
     @torch.inference_mode()
     def __call__(self, obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
-        call_t0 = perf_counter()
-        self._last_call_timing = None
-        timing = KaggleAgentCallTiming()
-        ego_player = int(obs.get("player", 0))
-        step_count = self._step_count_for_obs(obs)
-        game_key = self._obs_game_key(obs)
-        self.launch_tracker.sync_game(game_key, game_step=step_count)
-        ship_speed = float(_cfg_get(config, "shipSpeed", 6.0))
-        self.launch_tracker.observe_fleets(
-            obs,
-            ego_player,
-            game_step=step_count,
-            ship_speed=ship_speed,
-            n_rays=self.raycast_rays,
-        )
-        fleets_in = obs.get("fleets") or []
-        fleet_arrivals = np.full((len(fleets_in), 2), -1, dtype=np.int32)
-        t0 = perf_counter()
-        state = observation_to_state(
-            obs,
-            config,
-            max_fleets=self.max_fleets,
-            step_count_override=step_count,
-            fleet_forecast_arrival=fleet_arrivals,
-            num_agents_override=self._num_agents_for_obs(obs, config),
-        )
-        launch_geometry = _launch_geometry_from_obs(obs, config)
-        timing.obs_to_state_s = perf_counter() - t0
-        self.launch_tracker.check_forecast_vs_raycast(
-            obs,
-            fleet_arrivals,
-            np.asarray(state.planets),
-            np.asarray(state.comet_planet_ids),
-            game_step=step_count,
-            ego_player=ego_player,
-        )
-        live_opponents = _count_live_opponents(state, ego_player)
-        use_4p_policy = live_opponents >= 2
-        policy = self.policy_4p if use_4p_policy else self.policy_2p
-        policy_player_count = self.policy_player_count_4p if use_4p_policy else self.policy_player_count_2p
-        normalize_obs_to_p0 = self.normalize_obs_to_p0_4p if use_4p_policy else self.normalize_obs_to_p0_2p
-        population_member = self.population_member_4p if use_4p_policy else self.population_member_2p
-        if use_4p_policy:
-            if not self._compiled_forward_warmup_done_4p:
-                _warmup_compiled_policy_batched_forward(
-                    policy,
-                    state,
-                    ego_player,
-                    self.device,
-                    policy_player_count=policy_player_count,
-                    normalize_obs_to_p0=normalize_obs_to_p0,
-                    population_member=population_member,
-                )
-                self._compiled_forward_warmup_done_4p = True
-        else:
-            if not self._compiled_forward_warmup_done_2p:
-                _warmup_compiled_policy_batched_forward(
-                    policy,
-                    state,
-                    ego_player,
-                    self.device,
-                    policy_player_count=policy_player_count,
-                    normalize_obs_to_p0=normalize_obs_to_p0,
-                    population_member=population_member,
-                )
-                self._compiled_forward_warmup_done_2p = True
-        _check_4p_adapter_sanity(
-            obs=obs,
-            config=config,
-            state=state,
-            ego_player=ego_player,
-            step_count=step_count,
-            policy=policy,
-            policy_player_count=policy_player_count,
-            seen=self._sanity_warnings,
-            context="dual",
-            use_4p_policy=use_4p_policy,
-            live_opponents=live_opponents,
-        )
-        search_runtime = None
-        search_settings = ModelSearchSettings(
-            horizon_steps=int(self.model_search_steps),
-            reward=self.reward_settings_4p if use_4p_policy else self.reward_settings_2p,
-            adaptive_horizon=bool(self.model_search_adaptive_horizon),
-            adaptive_horizon_offset=int(self.model_search_adaptive_horizon_offset),
-            min_overage_s=float(self.model_search_min_overage_s),
-        )
-        if _model_search_enabled(search_settings) and _model_search_allowed_for_obs(obs, search_settings):
-            search_runtime = SearchRuntime(
-                settings=search_settings,
-                public_obs=_public_obs_for_player(obs, player=0, step_count=step_count),
-                kaggle_config=config,
-                step_count=step_count,
-                num_agents=int(np.asarray(state.num_agents)),
-                greedy_actions_for_player=lambda sim_obs, player, sim_step: self._search_dual_greedy_actions_for_player(
-                    sim_obs,
-                    config,
-                    player,
-                    sim_step,
-                    timing=timing.model_search,
-                ),
-                value_for_player=lambda sim_obs, player, sim_step: self._search_dual_value_for_player(
-                    sim_obs,
-                    config,
-                    player,
-                    sim_step,
-                    timing=timing.model_search,
-                ),
-            )
-        elif _model_search_enabled(search_settings):
-            overage = _remaining_overage_s(obs)
-            if overage is not None and _model_search_debug_enabled():
-                _model_search_debug(
-                    f"disabled step={int(step_count)} ego={int(ego_player)} "
-                    f"remainingOverageTime={float(overage):.3f}s "
-                    f"< min={float(search_settings.min_overage_s):.3f}s"
-                )
-        actions = _build_turn_actions_torch_only(
-            policy,
-            state,
-            ego_player,
-            self.device,
-            ship_speed=ship_speed,
-            max_micro_steps=self.max_micro_steps,
-            greedy=(
-                self._greedy_by_player_4p.get(ego_player, False)
-                if use_4p_policy
-                else self._greedy_by_player_2p.get(ego_player, False)
-            ),
-            rng=self.rng,
-            n_rays=self.raycast_rays,
-            samples_per_span=self.interval_samples_per_span,
-            target_method=self.target_method,
-            timing=timing,
-            launch_tracker=self.launch_tracker,
-            game_step=step_count,
-            policy_player_count=policy_player_count,
-            normalize_obs_to_p0=normalize_obs_to_p0,
-            launch_geometry=launch_geometry,
-            population_member=self.population_member_4p if use_4p_policy else self.population_member_2p,
-            search_runtime=search_runtime,
-            deadline_s=(
-                call_t0 + max(0.0, float(_cfg_get(config, "actTimeout", 1.0)) - 0.1)
-                if _cfg_get(config, "actTimeout", None) is not None
-                else None
-            ),
-        )
-        self._last_call_timing = timing
-        if _launch_debug_enabled():
-            action_summaries = [
-                f"[{float(a[0]):.0f},{float(a[1]):.6f},{int(a[2])}]" for a in actions[:8]
-            ]
-            mode = "4p" if use_4p_policy else "2p"
-            _launch_debug(
-                f"call OUT ego={ego_player} policy={mode} live_opponents={live_opponents} "
-                f"game_step={step_count} obs.step={obs.get('step')!r} "
-                f"actions={len(actions)} {action_summaries}"
-                + (f" (+{len(actions) - 8} more)" if len(actions) > 8 else "")
-            )
+        key = self._obs_game_key(obs)
+        if key != self._game_key:
+            self._game_key = key
+            self._delegate = None
+            self._delegate_mode = None
+        if self._delegate is None:
+            self._delegate_mode = self._mode_for_obs(obs, config)
+            self._delegate = self._build_delegate(self._delegate_mode)
+        actions = self._delegate(obs, config)
+        self._last_call_timing = getattr(self._delegate, "_last_call_timing", None)
         return actions
 
 
@@ -6102,8 +5735,9 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
 
     Single-policy: set ``ORBIT_WARS_CHECKPOINT`` (default ``checkpoint.pt``).
 
-    Dual-policy (4p FFA + 2p endgame): set ``ORBIT_WARS_CHECKPOINT_4P`` and
-    ``ORBIT_WARS_CHECKPOINT_2P``.  Both are loaded at startup.
+    Two-checkpoint submission mode: set ``ORBIT_WARS_CHECKPOINT_4P`` and
+    ``ORBIT_WARS_CHECKPOINT_2P``. The first observation picks the 4p or 2p
+    policy for the whole episode; there is no mid-game switching.
     """
 
     global _AGENT

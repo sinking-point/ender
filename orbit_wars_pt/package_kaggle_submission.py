@@ -323,9 +323,9 @@ def package_submission(
         Model search min overage seconds: {model_search_min_overage_s if model_search_min_overage_s is not None else 'env default'}
         Model search gamma: {model_search_gamma if model_search_gamma is not None else 'checkpoint/default'}
 
-        Policy selection: 4-player policy while two or more opponents are alive;
-        switches to the 2-player policy as soon as only one opponent remains.
-        Both policies are loaded at process start.
+        Policy selection: 4-player matches use checkpoint_4p.pt; 2-player matches
+        use checkpoint_2p.pt. The first observation selects the mode for the full
+        episode; there is no mid-game policy switching.
 
         Test locally (from this directory):
 
