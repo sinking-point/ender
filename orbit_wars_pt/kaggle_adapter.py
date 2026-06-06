@@ -931,6 +931,8 @@ class ModelSearchTiming:
 
     choose_calls: int = 0
     choose_s: float = 0.0
+    cache_hits: int = 0
+    cache_misses: int = 0
     branch_rollouts: int = 0
     branch_rollout_s: float = 0.0
     rollout_steps: int = 0
@@ -975,6 +977,7 @@ class ModelSearchTiming:
         return (
             " model_search{"
             f"choose×{self.choose_calls}={self.choose_s:.4f}s "
+            f"cache(h={self.cache_hits} m={self.cache_misses}) "
             f"rollouts×{self.branch_rollouts}={self.branch_rollout_s:.4f}s "
             f"steps={self.rollout_steps} "
             f"tail×{self.ego_tail_build_calls}={self.ego_tail_build_s:.4f}s "
@@ -3095,12 +3098,32 @@ class SearchRuntime:
     settings: ModelSearchSettings
     public_obs: Mapping[str, Any]
     kaggle_config: Any
+    game_key: str
     step_count: int
     num_agents: int
     greedy_actions_for_player: Any
     value_for_player: Any
     public_state: Optional[OrbitWarsState] = None
     choose_launch: Any = None
+
+
+@dataclass
+class CachedSearchTransition:
+    public_obs: dict[str, Any]
+    state: OrbitWarsState
+    step_count: int
+    step_reward: float
+    done: bool
+
+
+@dataclass
+class CachedSearchRollout:
+    game_key: str
+    ego_player: int
+    root_public_obs: dict[str, Any]
+    root_state: OrbitWarsState
+    root_step_count: int
+    transitions: list[CachedSearchTransition]
 
 
 @dataclass
@@ -3150,9 +3173,10 @@ def _rollout_branch_score(
     runtime: SearchRuntime,
     *,
     ego_player: int,
-    ego_actions: list[list[float]],
+    ego_actions: list[list[float]] | None,
     rollout_horizon: int | None = None,
     timing: ModelSearchTiming | None = None,
+    trace_out: list[CachedSearchTransition] | None = None,
 ) -> float:
     t_rollout = perf_counter() if timing is not None else 0.0
     reward = runtime.settings.reward
@@ -3182,7 +3206,7 @@ def _rollout_branch_score(
             timing.state_rebuild_calls += 1
             timing.state_rebuild_s += perf_counter() - t0
         ratios_pre = _reward_mix_ratios_np(state_pre, reward)
-        if depth == 0:
+        if depth == 0 and ego_actions is not None:
             joint_actions = _simulate_current_step_joint_actions(
                 runtime,
                 ego_player=int(ego_player),
@@ -3218,6 +3242,16 @@ def _rollout_branch_score(
             timing.state_rebuild_calls += 1
             timing.state_rebuild_s += perf_counter() - t0
         step_reward = _reward_delta_np(state_pre, state_post, ratios_pre, reward)
+        if trace_out is not None:
+            trace_out.append(
+                CachedSearchTransition(
+                    public_obs=copy.deepcopy(public_obs),
+                    state=state_post,
+                    step_count=int(sim_step),
+                    step_reward=float(step_reward[int(ego_player)]),
+                    done=bool(np.asarray(state_post.done)),
+                )
+            )
         total += discount * float(step_reward[int(ego_player)])
         if bool(np.asarray(state_post.done)):
             if timing is not None:
@@ -4053,6 +4087,84 @@ def _public_obs_from_sim_state(state: list[Any], *, step_count: int) -> dict[str
     return _public_obs_for_player(obs0, player=0, step_count=step_count)
 
 
+_CACHE_FLOAT_ATOL = 1e-5
+
+
+def _state_float_array_match(
+    lhs: Any,
+    rhs: Any,
+    *,
+    float_atol: float = _CACHE_FLOAT_ATOL,
+) -> bool:
+    lhs = np.asarray(lhs)
+    rhs = np.asarray(rhs)
+    if lhs.shape != rhs.shape:
+        return False
+    if lhs.size == 0:
+        return True
+    return bool(np.allclose(lhs, rhs, atol=float_atol, rtol=0.0))
+
+
+def _state_int_array_match(lhs: Any, rhs: Any) -> bool:
+    lhs = np.asarray(lhs)
+    rhs = np.asarray(rhs)
+    if lhs.shape != rhs.shape:
+        return False
+    return bool(np.array_equal(lhs, rhs))
+
+
+def _cache_state_match(
+    lhs: OrbitWarsState,
+    rhs: OrbitWarsState,
+    *,
+    float_atol: float = _CACHE_FLOAT_ATOL,
+) -> bool:
+    if int(np.asarray(lhs.step_count)) != int(np.asarray(rhs.step_count)):
+        return False
+    if int(np.asarray(lhs.next_fleet_id)) != int(np.asarray(rhs.next_fleet_id)):
+        return False
+    if int(np.asarray(lhs.num_agents)) != int(np.asarray(rhs.num_agents)):
+        return False
+    if bool(np.asarray(lhs.done)) != bool(np.asarray(rhs.done)):
+        return False
+    if bool(np.asarray(lhs.overflow)) != bool(np.asarray(rhs.overflow)):
+        return False
+    if not math.isclose(
+        float(np.asarray(lhs.angular_velocity)),
+        float(np.asarray(rhs.angular_velocity)),
+        abs_tol=float_atol,
+        rel_tol=0.0,
+    ):
+        return False
+    if not _state_float_array_match(lhs.planets, rhs.planets, float_atol=float_atol):
+        return False
+    if not _state_int_array_match(lhs.planet_active, rhs.planet_active):
+        return False
+    if not _state_float_array_match(lhs.initial_planets, rhs.initial_planets, float_atol=float_atol):
+        return False
+    if not _state_int_array_match(lhs.initial_active, rhs.initial_active):
+        return False
+    if not _state_float_array_match(lhs.incoming_fleets, rhs.incoming_fleets, float_atol=float_atol):
+        return False
+    if not _state_float_array_match(lhs.comet_paths, rhs.comet_paths, float_atol=float_atol):
+        return False
+    if not _state_int_array_match(lhs.comet_path_lengths, rhs.comet_path_lengths):
+        return False
+    if not _state_float_array_match(lhs.comet_ships, rhs.comet_ships, float_atol=float_atol):
+        return False
+    if not _state_int_array_match(lhs.comet_group_active, rhs.comet_group_active):
+        return False
+    if not _state_int_array_match(lhs.comet_path_index, rhs.comet_path_index):
+        return False
+    if not _state_int_array_match(lhs.comet_planet_ids, rhs.comet_planet_ids):
+        return False
+    if not _state_int_array_match(lhs.comet_slots, rhs.comet_slots):
+        return False
+    if not _state_int_array_match(lhs.planet_collision_rank, rhs.planet_collision_rank):
+        return False
+    return True
+
+
 def _kaggle_env_modules() -> tuple[Any, Any]:
     from kaggle_environments.envs.orbit_wars import orbit_wars as ow
     from kaggle_environments.utils import structify
@@ -4577,6 +4689,9 @@ class KaggleOrbitWarsAgent:
             warn_forecast_mismatch=_warn_forecast_mismatch_enabled(),
             warn_unmatched_fleet=_warn_unmatched_fleet_enabled(),
         )
+        self._search_rollout_cache: Optional[CachedSearchRollout] = None
+        self._search_cache_hits: int = 0
+        self._search_cache_misses: int = 0
 
     def _population_member_for_player(self, player: int) -> Optional[int]:
         if self.population_size <= 1:
@@ -4622,6 +4737,501 @@ class KaggleOrbitWarsAgent:
             )
         values = out["value"].reshape(len(states), -1)[:, 0]
         return [float(v.item()) for v in values]
+
+    def _search_cache_match(
+        self,
+        runtime: SearchRuntime,
+        *,
+        ego_player: int,
+    ) -> CachedSearchRollout | None:
+        cache = self._search_rollout_cache
+        if cache is None:
+            return None
+        if cache.game_key != str(runtime.game_key) or int(cache.ego_player) != int(ego_player):
+            return None
+        if runtime.public_state is None:
+            return None
+        if not _cache_state_match(cache.root_state, runtime.public_state):
+            return None
+        return cache
+
+    def _evaluate_search_branches(
+        self,
+        runtime: SearchRuntime,
+        *,
+        ego_player: int,
+        current_state: OrbitWarsState,
+        current_micro_idx: int,
+        action_prefix: list[list[float]],
+        launch_action: list[float],
+        launch_origin_slot: int,
+        launch_send: int,
+        launch_true_target_slot: int,
+        launch_true_hit_tick: float,
+        rollout_horizon: int,
+        branch_mask: tuple[bool, bool] = (True, True),
+        timing: ModelSearchTiming | None = None,
+    ) -> tuple[list[float], list[list[CachedSearchTransition]]]:
+        reward = runtime.settings.reward
+        sim_max_micro_steps = int(self.max_micro_steps)
+        base_public_state = runtime.public_state
+        if base_public_state is None:
+            base_public_state = observation_to_state(
+                runtime.public_obs,
+                runtime.kaggle_config,
+                max_fleets=self.max_fleets,
+                step_count_override=int(runtime.step_count),
+                num_agents_override=int(runtime.num_agents),
+            )
+
+        launched_planets = np.array(np.asarray(current_state.planets), copy=True)
+        launched_incoming = np.array(np.asarray(current_state.incoming_fleets), copy=True)
+        launched_blocked = np.array(np.asarray(current_state.origin_frac_blocked), copy=True)
+        apply_micro_launch_in_place(
+            launched_planets,
+            launched_incoming,
+            ego_player=int(ego_player),
+            origin_slot=int(launch_origin_slot),
+            send=int(launch_send),
+            true_target_slot=int(launch_true_target_slot),
+            true_hit_tick=float(launch_true_hit_tick),
+        )
+        launched_state = current_state._replace(
+            planets=launched_planets,
+            incoming_fleets=launched_incoming,
+            origin_frac_blocked=launched_blocked,
+        )
+
+        branch_scores = [0.0, 0.0]
+        branch_traces: list[list[CachedSearchTransition]] = [[], []]
+        discount = 1.0
+        branch_public_obs = [copy.deepcopy(runtime.public_obs), copy.deepcopy(runtime.public_obs)]
+        branch_states_pre = [base_public_state, base_public_state]
+        branch_sim_states = [
+            _make_sim_state(runtime.public_obs, num_agents=int(runtime.num_agents), step_count=int(runtime.step_count)),
+            _make_sim_state(runtime.public_obs, num_agents=int(runtime.num_agents), step_count=int(runtime.step_count)),
+        ]
+        branch_steps = [int(runtime.step_count), int(runtime.step_count)]
+        branch_done = [not bool(branch_mask[0]), not bool(branch_mask[1])]
+
+        for depth in range(int(rollout_horizon)):
+            active_count = int(sum(0 if done else 1 for done in branch_done))
+            if active_count <= 0:
+                break
+            if timing is not None:
+                timing.rollout_steps += active_count
+
+            joint_actions_by_branch: list[list[list[float]]] = [
+                [[] for _ in range(int(runtime.num_agents))],
+                [[] for _ in range(int(runtime.num_agents))],
+            ]
+            seat_plans: list[_BatchedSearchSeatPlan] = []
+            branch_launch_geometry = [
+                _launch_geometry_from_obs(branch_public_obs[0], runtime.kaggle_config),
+                _launch_geometry_from_obs(branch_public_obs[1], runtime.kaggle_config),
+            ]
+
+            if depth == 0:
+                if not branch_done[0]:
+                    joint_actions_by_branch[0][int(ego_player)] = copy.deepcopy(action_prefix)
+                if not branch_done[1]:
+                    joint_actions_by_branch[1][int(ego_player)] = copy.deepcopy(action_prefix) + [
+                        copy.deepcopy(launch_action)
+                    ]
+                for branch_idx in range(2):
+                    if branch_done[branch_idx]:
+                        continue
+                    for player in range(int(runtime.num_agents)):
+                        if player == int(ego_player):
+                            if branch_idx == 1:
+                                seat_plans.append(
+                                    _BatchedSearchSeatPlan(
+                                        branch_idx=1,
+                                        player=int(ego_player),
+                                        state_template=current_state,
+                                        planets=np.array(np.asarray(launched_state.planets), copy=True),
+                                        incoming_fleets=np.array(np.asarray(launched_state.incoming_fleets), copy=True),
+                                        origin_frac_blocked=np.array(
+                                            np.asarray(launched_state.origin_frac_blocked),
+                                            copy=True,
+                                        ),
+                                        actions=copy.deepcopy(joint_actions_by_branch[1][int(ego_player)]),
+                                        micro_idx=int(current_micro_idx) + 1,
+                                        max_micro_steps=int(sim_max_micro_steps),
+                                    )
+                                )
+                            continue
+                        seat_plans.append(
+                            _BatchedSearchSeatPlan(
+                                branch_idx=int(branch_idx),
+                                player=int(player),
+                                state_template=base_public_state,
+                                planets=np.array(np.asarray(base_public_state.planets), copy=True),
+                                incoming_fleets=np.array(np.asarray(base_public_state.incoming_fleets), copy=True),
+                                origin_frac_blocked=np.zeros((MAX_PLANETS, len(FRACTIONS)), dtype=np.bool_),
+                                actions=[],
+                                micro_idx=0,
+                                max_micro_steps=int(sim_max_micro_steps),
+                            )
+                        )
+            else:
+                for branch_idx in range(2):
+                    if branch_done[branch_idx]:
+                        continue
+                    branch_state = branch_states_pre[branch_idx]
+                    for player in range(int(runtime.num_agents)):
+                        seat_plans.append(
+                            _BatchedSearchSeatPlan(
+                                branch_idx=int(branch_idx),
+                                player=int(player),
+                                state_template=branch_state,
+                                planets=np.array(np.asarray(branch_state.planets), copy=True),
+                                incoming_fleets=np.array(np.asarray(branch_state.incoming_fleets), copy=True),
+                                origin_frac_blocked=np.zeros((MAX_PLANETS, len(FRACTIONS)), dtype=np.bool_),
+                                actions=[],
+                                micro_idx=0,
+                                max_micro_steps=int(sim_max_micro_steps),
+                            )
+                        )
+
+            if seat_plans:
+                joint_actions_by_branch = self._plan_joint_actions_batched_single_policy(
+                    seat_plans=seat_plans,
+                    branch_joint_actions=joint_actions_by_branch,
+                    branch_launch_geometry=branch_launch_geometry,
+                    sim_step=int(branch_steps[0]),
+                    ship_speed=float(_cfg_get(runtime.kaggle_config, "shipSpeed", 6.0)),
+                    timing=timing,
+                )
+
+            for branch_idx in range(2):
+                if branch_done[branch_idx]:
+                    continue
+                ratios_pre = _reward_mix_ratios_np(branch_states_pre[branch_idx], reward)
+                if timing is not None:
+                    t0 = perf_counter()
+                _simulate_joint_step_with_kaggle_model(
+                    branch_sim_states[branch_idx],
+                    joint_actions=joint_actions_by_branch[branch_idx],
+                    config=runtime.kaggle_config,
+                )
+                if timing is not None:
+                    timing.kaggle_step_calls += 1
+                    timing.kaggle_step_s += perf_counter() - t0
+                branch_steps[branch_idx] += 1
+                branch_public_obs[branch_idx] = _public_obs_from_sim_state(
+                    branch_sim_states[branch_idx],
+                    step_count=int(branch_steps[branch_idx]),
+                )
+                if timing is not None:
+                    t0 = perf_counter()
+                state_post = observation_to_state(
+                    branch_public_obs[branch_idx],
+                    runtime.kaggle_config,
+                    max_fleets=self.max_fleets,
+                    step_count_override=int(branch_steps[branch_idx]),
+                    num_agents_override=int(runtime.num_agents),
+                )
+                if timing is not None:
+                    timing.state_rebuild_calls += 1
+                    timing.state_rebuild_s += perf_counter() - t0
+                step_reward = _reward_delta_np(branch_states_pre[branch_idx], state_post, ratios_pre, reward)
+                branch_scores[branch_idx] += discount * float(step_reward[int(ego_player)])
+                branch_states_pre[branch_idx] = state_post
+                branch_traces[branch_idx].append(
+                    CachedSearchTransition(
+                        public_obs=copy.deepcopy(branch_public_obs[branch_idx]),
+                        state=state_post,
+                        step_count=int(branch_steps[branch_idx]),
+                        step_reward=float(step_reward[int(ego_player)]),
+                        done=bool(np.asarray(state_post.done)),
+                    )
+                )
+                if bool(np.asarray(state_post.done)):
+                    branch_done[branch_idx] = True
+
+            discount *= float(reward.gamma)
+
+        remaining_states = [branch_states_pre[idx] for idx in range(2) if not branch_done[idx]]
+        remaining_players = [int(ego_player) for idx in range(2) if not branch_done[idx]]
+        if remaining_states:
+            if timing is not None:
+                t0 = perf_counter()
+            remaining_values = self._policy_values_for_states_batched(remaining_states, remaining_players)
+            if timing is not None:
+                timing.value_calls += len(remaining_values)
+                timing.value_eval_calls += len(remaining_values)
+                timing.value_s += perf_counter() - t0
+                timing.value_eval_s += perf_counter() - t0
+            value_i = 0
+            for branch_idx in range(2):
+                if branch_done[branch_idx]:
+                    continue
+                branch_scores[branch_idx] += discount * float(remaining_values[value_i])
+                value_i += 1
+
+        return branch_scores, branch_traces
+
+    def _evaluate_greedy_continuation_from_state(
+        self,
+        runtime: SearchRuntime,
+        *,
+        ego_player: int,
+        current_public_obs: Mapping[str, Any],
+        current_state: OrbitWarsState,
+        current_step: int,
+        rollout_horizon: int,
+        timing: ModelSearchTiming | None = None,
+    ) -> tuple[float, list[CachedSearchTransition]]:
+        reward = runtime.settings.reward
+        sim_max_micro_steps = int(self.max_micro_steps)
+        total = 0.0
+        discount = 1.0
+        traces: list[CachedSearchTransition] = []
+        branch_public_obs = copy.deepcopy(current_public_obs)
+        branch_state_pre = current_state
+        branch_sim_state = _make_sim_state(current_public_obs, num_agents=int(runtime.num_agents), step_count=int(current_step))
+        branch_step = int(current_step)
+        branch_done = bool(np.asarray(current_state.done))
+
+        for _depth in range(int(rollout_horizon)):
+            if branch_done:
+                break
+            if timing is not None:
+                timing.rollout_steps += 1
+            seat_plans = [
+                _BatchedSearchSeatPlan(
+                    branch_idx=0,
+                    player=int(player),
+                    state_template=branch_state_pre,
+                    planets=np.array(np.asarray(branch_state_pre.planets), copy=True),
+                    incoming_fleets=np.array(np.asarray(branch_state_pre.incoming_fleets), copy=True),
+                    origin_frac_blocked=np.zeros((MAX_PLANETS, len(FRACTIONS)), dtype=np.bool_),
+                    actions=[],
+                    micro_idx=0,
+                    max_micro_steps=int(sim_max_micro_steps),
+                )
+                for player in range(int(runtime.num_agents))
+            ]
+            joint_actions = self._plan_joint_actions_batched_single_policy(
+                seat_plans=seat_plans,
+                branch_joint_actions=[[[] for _ in range(int(runtime.num_agents))]],
+                branch_launch_geometry=[_launch_geometry_from_obs(branch_public_obs, runtime.kaggle_config)],
+                sim_step=int(branch_step),
+                ship_speed=float(_cfg_get(runtime.kaggle_config, "shipSpeed", 6.0)),
+                timing=timing,
+            )[0]
+            ratios_pre = _reward_mix_ratios_np(branch_state_pre, reward)
+            if timing is not None:
+                t0 = perf_counter()
+            _simulate_joint_step_with_kaggle_model(
+                branch_sim_state,
+                joint_actions=joint_actions,
+                config=runtime.kaggle_config,
+            )
+            if timing is not None:
+                timing.kaggle_step_calls += 1
+                timing.kaggle_step_s += perf_counter() - t0
+            branch_step += 1
+            branch_public_obs = _public_obs_from_sim_state(branch_sim_state, step_count=int(branch_step))
+            if timing is not None:
+                t0 = perf_counter()
+            state_post = observation_to_state(
+                branch_public_obs,
+                runtime.kaggle_config,
+                max_fleets=self.max_fleets,
+                step_count_override=int(branch_step),
+                num_agents_override=int(runtime.num_agents),
+            )
+            if timing is not None:
+                timing.state_rebuild_calls += 1
+                timing.state_rebuild_s += perf_counter() - t0
+            step_reward = _reward_delta_np(branch_state_pre, state_post, ratios_pre, reward)
+            total += discount * float(step_reward[int(ego_player)])
+            traces.append(
+                CachedSearchTransition(
+                    public_obs=copy.deepcopy(branch_public_obs),
+                    state=state_post,
+                    step_count=int(branch_step),
+                    step_reward=float(step_reward[int(ego_player)]),
+                    done=bool(np.asarray(state_post.done)),
+                )
+            )
+            branch_state_pre = state_post
+            branch_done = bool(np.asarray(state_post.done))
+            discount *= float(reward.gamma)
+
+        if not branch_done:
+            if timing is not None:
+                t0 = perf_counter()
+            total += discount * float(self._policy_values_for_states_batched([branch_state_pre], [int(ego_player)])[0])
+            if timing is not None:
+                timing.value_calls += 1
+                timing.value_eval_calls += 1
+                timing.value_s += perf_counter() - t0
+                timing.value_eval_s += perf_counter() - t0
+
+        return total, traces
+
+    def _score_branch_from_cache(
+        self,
+        runtime: SearchRuntime,
+        *,
+        ego_player: int,
+        cache: CachedSearchRollout,
+        rollout_horizon: int,
+        timing: ModelSearchTiming | None = None,
+    ) -> tuple[float, list[CachedSearchTransition]]:
+        reward = runtime.settings.reward
+        total = 0.0
+        discount = 1.0
+        steps_used = 0
+        end_obs = cache.root_public_obs
+        end_state = cache.root_state
+        end_step = int(cache.root_step_count)
+        used_transitions: list[CachedSearchTransition] = []
+
+        for trans in cache.transitions[: max(0, int(rollout_horizon))]:
+            if timing is not None:
+                timing.rollout_steps += 1
+            total += discount * float(trans.step_reward)
+            steps_used += 1
+            used_transitions.append(
+                CachedSearchTransition(
+                    public_obs=copy.deepcopy(trans.public_obs),
+                    state=trans.state,
+                    step_count=int(trans.step_count),
+                    step_reward=float(trans.step_reward),
+                    done=bool(trans.done),
+                )
+            )
+            end_obs = trans.public_obs
+            end_state = trans.state
+            end_step = int(trans.step_count)
+            if trans.done:
+                if timing is not None:
+                    timing.branch_rollouts += 1
+                return total, used_transitions
+            discount *= float(reward.gamma)
+
+        remaining = int(rollout_horizon) - int(steps_used)
+        if remaining > 0:
+            tail_total, tail_transitions = self._evaluate_greedy_continuation_from_state(
+                runtime,
+                ego_player=int(ego_player),
+                current_public_obs=end_obs,
+                current_state=end_state,
+                current_step=int(end_step),
+                rollout_horizon=int(remaining),
+                timing=timing,
+            )
+            total += discount * float(tail_total)
+            used_transitions.extend(tail_transitions)
+            return total, used_transitions
+
+        if not bool(np.asarray(end_state.done)):
+            if timing is not None:
+                t0 = perf_counter()
+            total += discount * float(
+                self._policy_values_for_states_batched([end_state], [int(ego_player)])[0]
+            )
+            if timing is not None:
+                timing.value_calls += 1
+                timing.value_eval_calls += 1
+                timing.value_s += perf_counter() - t0
+                timing.value_eval_s += perf_counter() - t0
+
+        return total, used_transitions
+
+    def _identify_cached_branch(
+        self,
+        runtime: SearchRuntime,
+        *,
+        ego_player: int,
+        current_state: OrbitWarsState,
+        current_micro_idx: int,
+        action_prefix: list[list[float]],
+        launch_action: list[float],
+        launch_origin_slot: int,
+        launch_send: int,
+        launch_true_target_slot: int,
+        launch_true_hit_tick: float,
+        rollout_horizon: int,
+        cache: CachedSearchRollout,
+        timing: ModelSearchTiming | None = None,
+    ) -> tuple[str | None, list[CachedSearchTransition], list[CachedSearchTransition]]:
+        if not cache.transitions:
+            return None, [], []
+        cached_next = cache.transitions[0].state
+
+        probe_scores, probe_traces = self._evaluate_search_branches(
+            runtime,
+            ego_player=int(ego_player),
+            current_state=current_state,
+            current_micro_idx=int(current_micro_idx),
+            action_prefix=copy.deepcopy(action_prefix),
+            launch_action=copy.deepcopy(launch_action),
+            launch_origin_slot=int(launch_origin_slot),
+            launch_send=int(launch_send),
+            launch_true_target_slot=int(launch_true_target_slot),
+            launch_true_hit_tick=float(launch_true_hit_tick),
+            rollout_horizon=1,
+            branch_mask=(True, True),
+            timing=timing,
+        )
+        halt_probe = probe_traces[0]
+        if halt_probe and _cache_state_match(halt_probe[0].state, cached_next):
+            return "halt", halt_probe, []
+
+        launch_probe = probe_traces[1]
+        if launch_probe and _cache_state_match(launch_probe[0].state, cached_next):
+            return "launch", halt_probe, launch_probe
+        return None, halt_probe, launch_probe
+
+    def _store_search_rollout_cache(
+        self,
+        runtime: SearchRuntime,
+        *,
+        ego_player: int,
+        chose_launch: bool,
+        branch_transitions: list[list[CachedSearchTransition]],
+    ) -> None:
+        chosen_idx = 1 if chose_launch else 0
+        self._store_search_rollout_cache_from_transitions(
+            runtime,
+            ego_player=int(ego_player),
+            transitions=branch_transitions[chosen_idx],
+        )
+
+    def _store_search_rollout_cache_from_transitions(
+        self,
+        runtime: SearchRuntime,
+        *,
+        ego_player: int,
+        transitions: list[CachedSearchTransition],
+    ) -> None:
+        chosen = transitions
+        if not chosen:
+            self._search_rollout_cache = None
+            return
+        root = chosen[0]
+        self._search_rollout_cache = CachedSearchRollout(
+            game_key=str(runtime.game_key),
+            ego_player=int(ego_player),
+            root_public_obs=copy.deepcopy(root.public_obs),
+            root_state=root.state,
+            root_step_count=int(root.step_count),
+            transitions=[
+                CachedSearchTransition(
+                    public_obs=copy.deepcopy(trans.public_obs),
+                    state=trans.state,
+                    step_count=int(trans.step_count),
+                    step_reward=float(trans.step_reward),
+                    done=bool(trans.done),
+                )
+                for trans in chosen[1:]
+            ],
+        )
 
     def _plan_joint_actions_batched_single_policy(
         self,
@@ -4924,46 +5534,6 @@ class KaggleOrbitWarsAgent:
         timing: ModelSearchTiming | None = None,
     ) -> bool:
         t_choose = perf_counter() if timing is not None else 0.0
-        reward = runtime.settings.reward
-        sim_max_micro_steps = int(self.max_micro_steps)
-        base_public_state = runtime.public_state
-        if base_public_state is None:
-            base_public_state = observation_to_state(
-                runtime.public_obs,
-                runtime.kaggle_config,
-                max_fleets=self.max_fleets,
-                step_count_override=int(runtime.step_count),
-                num_agents_override=int(runtime.num_agents),
-            )
-
-        launched_planets = np.array(np.asarray(current_state.planets), copy=True)
-        launched_incoming = np.array(np.asarray(current_state.incoming_fleets), copy=True)
-        launched_blocked = np.array(np.asarray(current_state.origin_frac_blocked), copy=True)
-        apply_micro_launch_in_place(
-            launched_planets,
-            launched_incoming,
-            ego_player=int(ego_player),
-            origin_slot=int(launch_origin_slot),
-            send=int(launch_send),
-            true_target_slot=int(launch_true_target_slot),
-            true_hit_tick=float(launch_true_hit_tick),
-        )
-        launched_state = current_state._replace(
-            planets=launched_planets,
-            incoming_fleets=launched_incoming,
-            origin_frac_blocked=launched_blocked,
-        )
-
-        branch_scores = [0.0, 0.0]
-        discount = 1.0
-        branch_public_obs = [copy.deepcopy(runtime.public_obs), copy.deepcopy(runtime.public_obs)]
-        branch_states_pre = [base_public_state, base_public_state]
-        branch_sim_states = [
-            _make_sim_state(runtime.public_obs, num_agents=int(runtime.num_agents), step_count=int(runtime.step_count)),
-            _make_sim_state(runtime.public_obs, num_agents=int(runtime.num_agents), step_count=int(runtime.step_count)),
-        ]
-        branch_steps = [int(runtime.step_count), int(runtime.step_count)]
-        branch_done = [False, False]
         rollout_horizon = _model_search_rollout_horizon(
             runtime.settings,
             launch_true_hit_tick=float(launch_true_hit_tick),
@@ -4979,164 +5549,144 @@ class KaggleOrbitWarsAgent:
             micro_idx=int(current_micro_idx),
             send=int(launch_send),
         )
-
-        for depth in range(rollout_horizon):
+        cache = self._search_cache_match(runtime, ego_player=int(ego_player))
+        cache_branch_miss = False
+        if cache is not None:
+            self._search_cache_hits += 1
             if timing is not None:
-                timing.rollout_steps += int(sum(0 if done else 1 for done in branch_done))
-
-            joint_actions_by_branch: list[list[list[float]]] = [
-                [[] for _ in range(int(runtime.num_agents))],
-                [[] for _ in range(int(runtime.num_agents))],
-            ]
-            seat_plans: list[_BatchedSearchSeatPlan] = []
-            branch_launch_geometry = [
-                _launch_geometry_from_obs(branch_public_obs[0], runtime.kaggle_config),
-                _launch_geometry_from_obs(branch_public_obs[1], runtime.kaggle_config),
-            ]
-
-            if depth == 0:
-                joint_actions_by_branch[0][int(ego_player)] = copy.deepcopy(action_prefix)
-                joint_actions_by_branch[1][int(ego_player)] = copy.deepcopy(action_prefix) + [copy.deepcopy(launch_action)]
-                for branch_idx in range(2):
-                    if branch_done[branch_idx]:
-                        continue
-                    for player in range(int(runtime.num_agents)):
-                        if player == int(ego_player):
-                            if branch_idx == 1:
-                                seat_plans.append(
-                                    _BatchedSearchSeatPlan(
-                                        branch_idx=1,
-                                        player=int(ego_player),
-                                        state_template=current_state,
-                                        planets=np.array(np.asarray(launched_state.planets), copy=True),
-                                        incoming_fleets=np.array(np.asarray(launched_state.incoming_fleets), copy=True),
-                                        origin_frac_blocked=np.array(np.asarray(launched_state.origin_frac_blocked), copy=True),
-                                        actions=copy.deepcopy(joint_actions_by_branch[1][int(ego_player)]),
-                                        micro_idx=int(current_micro_idx) + 1,
-                                        max_micro_steps=int(sim_max_micro_steps),
-                                    )
-                                )
-                            continue
-                        seat_plans.append(
-                            _BatchedSearchSeatPlan(
-                                branch_idx=int(branch_idx),
-                                player=int(player),
-                                state_template=base_public_state,
-                                planets=np.array(np.asarray(base_public_state.planets), copy=True),
-                                incoming_fleets=np.array(np.asarray(base_public_state.incoming_fleets), copy=True),
-                                origin_frac_blocked=np.zeros((MAX_PLANETS, len(FRACTIONS)), dtype=np.bool_),
-                                actions=[],
-                                micro_idx=0,
-                                max_micro_steps=int(sim_max_micro_steps),
-                            )
-                        )
-            else:
-                for branch_idx in range(2):
-                    if branch_done[branch_idx]:
-                        continue
-                    branch_state = branch_states_pre[branch_idx]
-                    for player in range(int(runtime.num_agents)):
-                        seat_plans.append(
-                            _BatchedSearchSeatPlan(
-                                branch_idx=int(branch_idx),
-                                player=int(player),
-                                state_template=branch_state,
-                                planets=np.array(np.asarray(branch_state.planets), copy=True),
-                                incoming_fleets=np.array(np.asarray(branch_state.incoming_fleets), copy=True),
-                                origin_frac_blocked=np.zeros((MAX_PLANETS, len(FRACTIONS)), dtype=np.bool_),
-                                actions=[],
-                                micro_idx=0,
-                                max_micro_steps=int(sim_max_micro_steps),
-                            )
-                        )
-
-            if seat_plans:
-                joint_actions_by_branch = self._plan_joint_actions_batched_single_policy(
-                    seat_plans=seat_plans,
-                    branch_joint_actions=joint_actions_by_branch,
-                    branch_launch_geometry=branch_launch_geometry,
-                    sim_step=int(branch_steps[0]),
-                    ship_speed=float(_cfg_get(runtime.kaggle_config, "shipSpeed", 6.0)),
+                timing.cache_hits += 1
+            cached_branch, _halt_probe, _launch_probe = self._identify_cached_branch(
+                runtime,
+                ego_player=int(ego_player),
+                current_state=current_state,
+                current_micro_idx=int(current_micro_idx),
+                action_prefix=action_prefix,
+                launch_action=launch_action,
+                launch_origin_slot=int(launch_origin_slot),
+                launch_send=int(launch_send),
+                launch_true_target_slot=int(launch_true_target_slot),
+                launch_true_hit_tick=float(launch_true_hit_tick),
+                rollout_horizon=int(rollout_horizon),
+                cache=cache,
+                timing=timing,
+            )
+            if cached_branch == "halt":
+                halt_score, halt_transitions = self._score_branch_from_cache(
+                    runtime,
+                    ego_player=int(ego_player),
+                    cache=cache,
+                    rollout_horizon=int(rollout_horizon),
                     timing=timing,
                 )
-
-            for branch_idx in range(2):
-                if branch_done[branch_idx]:
-                    continue
-                ratios_pre = _reward_mix_ratios_np(branch_states_pre[branch_idx], reward)
-                if timing is not None:
-                    t0 = perf_counter()
-                _simulate_joint_step_with_kaggle_model(
-                    branch_sim_states[branch_idx],
-                    joint_actions=joint_actions_by_branch[branch_idx],
-                    config=runtime.kaggle_config,
+                launch_scores, launch_branch_traces = self._evaluate_search_branches(
+                    runtime,
+                    ego_player=int(ego_player),
+                    current_state=current_state,
+                    current_micro_idx=int(current_micro_idx),
+                    action_prefix=copy.deepcopy(action_prefix),
+                    launch_action=copy.deepcopy(launch_action),
+                    launch_origin_slot=int(launch_origin_slot),
+                    launch_send=int(launch_send),
+                    launch_true_target_slot=int(launch_true_target_slot),
+                    launch_true_hit_tick=float(launch_true_hit_tick),
+                    rollout_horizon=int(rollout_horizon),
+                    branch_mask=(False, True),
+                    timing=timing,
                 )
-                if timing is not None:
-                    timing.kaggle_step_calls += 1
-                    timing.kaggle_step_s += perf_counter() - t0
-                branch_steps[branch_idx] += 1
-                branch_public_obs[branch_idx] = _public_obs_from_sim_state(
-                    branch_sim_states[branch_idx],
-                    step_count=int(branch_steps[branch_idx]),
+                launch_score = float(launch_scores[1])
+                launch_transitions = launch_branch_traces[1]
+            elif cached_branch == "launch":
+                launch_score, launch_transitions = self._score_branch_from_cache(
+                    runtime,
+                    ego_player=int(ego_player),
+                    cache=cache,
+                    rollout_horizon=int(rollout_horizon),
+                    timing=timing,
                 )
-                if timing is not None:
-                    t0 = perf_counter()
-                state_post = observation_to_state(
-                    branch_public_obs[branch_idx],
-                    runtime.kaggle_config,
-                    max_fleets=self.max_fleets,
-                    step_count_override=int(branch_steps[branch_idx]),
-                    num_agents_override=int(runtime.num_agents),
+                halt_scores, halt_branch_traces = self._evaluate_search_branches(
+                    runtime,
+                    ego_player=int(ego_player),
+                    current_state=current_state,
+                    current_micro_idx=int(current_micro_idx),
+                    action_prefix=copy.deepcopy(action_prefix),
+                    launch_action=copy.deepcopy(launch_action),
+                    launch_origin_slot=int(launch_origin_slot),
+                    launch_send=int(launch_send),
+                    launch_true_target_slot=int(launch_true_target_slot),
+                    launch_true_hit_tick=float(launch_true_hit_tick),
+                    rollout_horizon=int(rollout_horizon),
+                    branch_mask=(True, False),
+                    timing=timing,
                 )
+                halt_score = float(halt_scores[0])
+                halt_transitions = halt_branch_traces[0]
+            else:
+                self._search_cache_hits = max(0, self._search_cache_hits - 1)
                 if timing is not None:
-                    timing.state_rebuild_calls += 1
-                    timing.state_rebuild_s += perf_counter() - t0
-                step_reward = _reward_delta_np(branch_states_pre[branch_idx], state_post, ratios_pre, reward)
-                branch_scores[branch_idx] += discount * float(step_reward[int(ego_player)])
-                branch_states_pre[branch_idx] = state_post
-                if bool(np.asarray(state_post.done)):
-                    branch_done[branch_idx] = True
-
-            if all(branch_done):
-                if timing is not None:
-                    timing.branch_rollouts += 2
-                    timing.branch_rollout_s += perf_counter() - t_choose
-                    timing.choose_calls += 1
-                    timing.choose_s += perf_counter() - t_choose
-                chose_launch = bool(branch_scores[1] > branch_scores[0])
+                    timing.cache_hits = max(0, timing.cache_hits - 1)
                 if _model_search_debug_enabled():
                     _model_search_debug(
                         f"choose step={int(runtime.step_count)} ego={int(ego_player)} "
-                        f"halt={branch_scores[0]:.6f} launch={branch_scores[1]:.6f} -> "
-                        f"{'launch' if chose_launch else 'halt'}"
+                        f"cache stale-on-branch call={self._search_cache_hits} miss={self._search_cache_misses + 1}"
                     )
-                return chose_launch
-
-            discount *= float(reward.gamma)
-
-        remaining_states = [branch_states_pre[idx] for idx in range(2) if not branch_done[idx]]
-        remaining_players = [int(ego_player) for idx in range(2) if not branch_done[idx]]
-        if remaining_states:
+                cache = None
+                cache_branch_miss = True
+        if cache is not None:
             if timing is not None:
-                t0 = perf_counter()
-            remaining_values = self._policy_values_for_states_batched(remaining_states, remaining_players)
+                timing.choose_calls += 1
+                timing.choose_s += perf_counter() - t_choose
+            chose_launch = bool(launch_score > halt_score)
+            self._store_search_rollout_cache_from_transitions(
+                runtime,
+                ego_player=int(ego_player),
+                transitions=(launch_transitions if chose_launch else halt_transitions),
+            )
+            if _model_search_debug_enabled():
+                _model_search_debug(
+                    f"choose step={int(runtime.step_count)} ego={int(ego_player)} "
+                    f"halt={halt_score:.6f} launch={launch_score:.6f} -> "
+                    f"{'launch' if chose_launch else 'halt'} "
+                    f"(cache hit call={self._search_cache_hits} miss={self._search_cache_misses})"
+                )
+            return chose_launch
+
+        if cache is None:
+            self._search_cache_misses += 1
             if timing is not None:
-                timing.value_calls += len(remaining_values)
-                timing.value_eval_calls += len(remaining_values)
-                timing.value_s += perf_counter() - t0
-                timing.value_eval_s += perf_counter() - t0
-            value_i = 0
-            for branch_idx in range(2):
-                if branch_done[branch_idx]:
-                    continue
-                branch_scores[branch_idx] += discount * float(remaining_values[value_i])
-                value_i += 1
+                timing.cache_misses += 1
+            if _model_search_debug_enabled():
+                _model_search_debug(
+                    f"choose step={int(runtime.step_count)} ego={int(ego_player)} "
+                    f"cache {'stale' if cache_branch_miss else 'miss'} "
+                    f"call={self._search_cache_hits} miss={self._search_cache_misses}"
+                )
+        branch_scores, branch_traces = self._evaluate_search_branches(
+            runtime,
+            ego_player=int(ego_player),
+            current_state=current_state,
+            current_micro_idx=int(current_micro_idx),
+            action_prefix=copy.deepcopy(action_prefix),
+            launch_action=copy.deepcopy(launch_action),
+            launch_origin_slot=int(launch_origin_slot),
+            launch_send=int(launch_send),
+            launch_true_target_slot=int(launch_true_target_slot),
+            launch_true_hit_tick=float(launch_true_hit_tick),
+            rollout_horizon=int(rollout_horizon),
+            branch_mask=(True, True),
+            timing=timing,
+        )
         if timing is not None:
             timing.branch_rollouts += 2
             timing.branch_rollout_s += perf_counter() - t_choose
             timing.choose_calls += 1
             timing.choose_s += perf_counter() - t_choose
         chose_launch = bool(branch_scores[1] > branch_scores[0])
+        self._store_search_rollout_cache(
+            runtime,
+            ego_player=int(ego_player),
+            chose_launch=chose_launch,
+            branch_transitions=branch_traces,
+        )
         if _model_search_debug_enabled():
             _model_search_debug(
                 f"choose step={int(runtime.step_count)} ego={int(ego_player)} "
@@ -5238,6 +5788,9 @@ class KaggleOrbitWarsAgent:
             key = self._obs_game_key(obs)
             if key != self._game_key:
                 self._frozen_num_agents = None
+                self._search_rollout_cache = None
+                self._search_cache_hits = 0
+                self._search_cache_misses = 0
             self._game_key = key
             return s
 
@@ -5247,6 +5800,9 @@ class KaggleOrbitWarsAgent:
             self._next_step_count = 0
             self._last_env_step = None
             self._frozen_num_agents = None
+            self._search_rollout_cache = None
+            self._search_cache_hits = 0
+            self._search_cache_misses = 0
 
         if self._last_env_step is not None:
             ego = int(obs.get("player", 0))
@@ -5407,6 +5963,7 @@ class KaggleOrbitWarsAgent:
                 settings=self.model_search,
                 public_obs=_public_obs_for_player(obs, player=0, step_count=step_count),
                 kaggle_config=config,
+                game_key=game_key,
                 step_count=step_count,
                 num_agents=int(np.asarray(state.num_agents)),
                 public_state=state,
