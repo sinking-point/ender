@@ -6077,7 +6077,9 @@ class KaggleOrbitWarsAgent:
             context="single",
         )
         search_runtime = None
+        search_active = False
         if _model_search_enabled(self.model_search) and _model_search_allowed_for_obs(obs, self.model_search):
+            search_active = True
             search_timing = timing.model_search
             search_fleet_arrival_cache = FleetArrivalCache()
 
@@ -6173,6 +6175,8 @@ class KaggleOrbitWarsAgent:
                     f"remainingOverageTime={float(overage):.3f}s "
                     f"< min={float(self.model_search.min_overage_s):.3f}s"
                 )
+        # While halt-vs-launch search is available, force the main per-turn policy
+        # path to greedy selection so the searched branch and executed branch align.
         actions = _build_turn_actions_torch_only(
             self.policy,
             state,
@@ -6180,7 +6184,7 @@ class KaggleOrbitWarsAgent:
             self.device,
             ship_speed=ship_speed,
             max_micro_steps=self.max_micro_steps,
-            greedy=self._greedy_by_player.get(ego_player, False),
+            greedy=(search_active or self._greedy_by_player.get(ego_player, False)),
             rng=self.rng,
             n_rays=self.raycast_rays,
             samples_per_span=self.interval_samples_per_span,
