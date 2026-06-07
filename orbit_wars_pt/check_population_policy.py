@@ -120,7 +120,6 @@ def _check_identical_tails_match(policy: OrbitWarsPolicy, batch: dict[str, torch
     out1 = policy(**batch, population_idx=pop1)
     _assert_close("identical_tails.value", out0["value"], out1["value"])
     _assert_close("identical_tails.halt_logits", out0["halt_logits"], out1["halt_logits"])
-    _assert_close("identical_tails.pair_logits", out0["pair_logits"], out1["pair_logits"])
 
 
 def _check_member_isolation(policy: OrbitWarsPolicy, batch: dict[str, torch.Tensor]) -> None:

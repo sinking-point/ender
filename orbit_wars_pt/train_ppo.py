@@ -49,6 +49,7 @@ from orbit_wars_pt.model import (
     OrbitWarsPolicy,
     adapt_legacy_value_heads_for_model,
 )
+from orbit_wars_pt.kaggle_adapter import _strip_legacy_pair_head_keys
 from orbit_wars_pt.parallel_rollout import (
     EXPLOITER_MODE_SELFPLAY_2P,
     EXPLOITER_MODE_SELFPLAY_4P,
@@ -754,10 +755,11 @@ def save_checkpoint(
 def _expand_legacy_optimizer_value_head_state(
     saved_opt_state: Dict[str, Any],
     *,
+    saved_model_state: Mapping[str, Any] | None = None,
     model: OrbitWarsPolicy,
     opt: torch.optim.Optimizer,
 ) -> tuple[Dict[str, Any], bool]:
-    """Expand Adam moments for migrated critic heads to match ``model`` shapes."""
+    """Map saved Adam state onto the current model, including removed legacy params."""
 
     if not isinstance(saved_opt_state, dict):
         return saved_opt_state, False
@@ -771,20 +773,49 @@ def _expand_legacy_optimizer_value_head_state(
         return saved_opt_state, False
 
     named_params = list(model.named_parameters())
-    param_ids: list[int] = []
+    current_param_ids: list[int] = []
     for group in current_groups:
-        param_ids.extend(int(pid) for pid in group.get("params", []))
-    if len(param_ids) != len(named_params):
+        current_param_ids.extend(int(pid) for pid in group.get("params", []))
+    if len(current_param_ids) != len(named_params):
         return saved_opt_state, False
 
-    out_state = {k: dict(v) if isinstance(v, dict) else v for k, v in state.items()}
-    migrated = False
-    for (name, param), pid in zip(named_params, param_ids):
-        if not (name.endswith("value_head.weight") or name.endswith("value_head.bias")):
+    saved_param_ids: list[int] = []
+    for group in param_groups:
+        saved_param_ids.extend(int(pid) for pid in group.get("params", []))
+
+    if saved_model_state is None:
+        return saved_opt_state, False
+
+    saved_param_names: list[str] = []
+    current_name_set = {name for name, _ in named_params}
+    for key, value in saved_model_state.items():
+        key_s = str(key)
+        if key_s not in current_name_set and (
+            ".pair_q." in key_s or ".pair_k." in key_s or key_s.startswith("pair_q.") or key_s.startswith("pair_k.")
+        ):
+            saved_param_names.append(key_s)
             continue
-        entry = out_state.get(pid)
+        if key_s in current_name_set:
+            saved_param_names.append(key_s)
+
+    if len(saved_param_names) != len(saved_param_ids):
+        return saved_opt_state, False
+
+    saved_pid_by_name = {
+        name: int(pid)
+        for name, pid in zip(saved_param_names, saved_param_ids)
+    }
+
+    out_state: dict[int, Any] = {}
+    migrated = False
+    for (name, param), current_pid in zip(named_params, current_param_ids):
+        saved_pid = saved_pid_by_name.get(name)
+        if saved_pid is None:
+            continue
+        entry = state.get(saved_pid)
         if not isinstance(entry, dict):
             continue
+        entry_out = {k: v for k, v in entry.items()}
         for state_key, state_val in list(entry.items()):
             if not isinstance(state_val, torch.Tensor):
                 continue
@@ -793,14 +824,22 @@ def _expand_legacy_optimizer_value_head_state(
             if src_shape == tgt_shape:
                 continue
             if name.endswith("value_head.weight") and src_shape == (1, tgt_shape[1]) and len(tgt_shape) == 2 and tgt_shape[0] > 1:
-                entry[state_key] = state_val.repeat(tgt_shape[0], 1)
+                entry_out[state_key] = state_val.repeat(tgt_shape[0], 1)
                 migrated = True
             elif name.endswith("value_head.bias") and src_shape == (1,) and tgt_shape[0] > 1:
-                entry[state_key] = state_val.repeat(tgt_shape[0])
+                entry_out[state_key] = state_val.repeat(tgt_shape[0])
                 migrated = True
+        out_state[current_pid] = entry_out
+
+    out_groups = []
+    for saved_group, current_group in zip(param_groups, current_groups):
+        group_out = dict(saved_group)
+        group_out["params"] = list(current_group.get("params", []))
+        out_groups.append(group_out)
 
     out = dict(saved_opt_state)
     out["state"] = out_state
+    out["param_groups"] = out_groups
     return out, migrated
 
 
@@ -3436,18 +3475,26 @@ def train(args: argparse.Namespace) -> None:
             )
         _validate_checkpoint_args(ckpt["training_args"], args)
         policy_state, _ = adapt_legacy_value_heads_for_model(ckpt["policy"], policy)
+        policy_state = _strip_legacy_pair_head_keys(policy_state)
         policy.load_state_dict(policy_state)
-        opt_state, _ = _expand_legacy_optimizer_value_head_state(ckpt["optimizer"], model=policy, opt=opt)
+        opt_state, _ = _expand_legacy_optimizer_value_head_state(
+            ckpt["optimizer"],
+            saved_model_state=ckpt["policy"],
+            model=policy,
+            opt=opt,
+        )
         opt.load_state_dict(opt_state)
         if exploiter_policy is not None:
             exploiter_state, migrated_exploiter = adapt_legacy_value_heads_for_model(
                 ckpt["exploiter_policy"],
                 exploiter_policy,
             )
+            exploiter_state = _strip_legacy_pair_head_keys(exploiter_state)
             exploiter_policy.load_state_dict(exploiter_state)
             assert exploiter_opt is not None
             exploiter_opt_state, opt_migrated = _expand_legacy_optimizer_value_head_state(
                 ckpt["exploiter_optimizer"],
+                saved_model_state=ckpt["exploiter_policy"],
                 model=exploiter_policy,
                 opt=exploiter_opt,
             )

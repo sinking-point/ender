@@ -13,6 +13,7 @@ import math
 import os
 import sys
 import traceback
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import perf_counter
@@ -4526,6 +4527,16 @@ def _checkpoint_training_args(payload: Any) -> Mapping[str, Any]:
     return {}
 
 
+def _strip_legacy_pair_head_keys(state: Mapping[str, Any]) -> OrderedDict[str, Any]:
+    out = OrderedDict()
+    for key, value in state.items():
+        key_s = str(key)
+        if ".pair_q." in key_s or ".pair_k." in key_s or key_s.startswith("pair_q.") or key_s.startswith("pair_k."):
+            continue
+        out[key] = value
+    return out
+
+
 def _checkpoint_search_roots() -> list[Path]:
     """Directories to try when resolving a relative checkpoint path."""
 
@@ -4599,6 +4610,7 @@ def load_policy(
         payload_for_kwargs = payload
     policy = OrbitWarsPolicy(**_infer_policy_kwargs(payload_for_kwargs)).to(torch_device)
     policy_state_adapted, _ = adapt_legacy_value_heads_for_model(policy_state, policy)
+    policy_state_adapted = _strip_legacy_pair_head_keys(policy_state_adapted)
     policy.load_state_dict(policy_state_adapted)
     policy.eval()
     training_args = dict(_checkpoint_training_args(payload))

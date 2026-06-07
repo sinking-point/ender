@@ -197,8 +197,6 @@ class OrbitWarsPopulationTail(nn.Module):
         super().__init__()
         self.block = TransformerBlock(d_model, n_heads, rope_dims=rope_dims, dropout=dropout)
         self.norm_f = nn.LayerNorm(d_model)
-        self.pair_q = nn.Linear(d_model, d_model // 2, bias=False)
-        self.pair_k = nn.Linear(d_model, d_model // 2, bias=False)
         self.origin_frac_head = nn.Linear(d_model, NUM_FRACTIONS)
         self.target_pick_head = _make_target_pick_head(d_model)
         self.target_abort_enabled = bool(target_abort_enabled)
@@ -352,8 +350,6 @@ class OrbitWarsPolicy(nn.Module):
                 [TransformerBlock(d_model, n_heads, rope_dims=rope_dims, dropout=dropout) for _ in range(n_layers)]
             )
             self.norm_f = nn.LayerNorm(d_model)
-            self.pair_q = nn.Linear(d_model, d_model // 2, bias=False)
-            self.pair_k = nn.Linear(d_model, d_model // 2, bias=False)
             self.origin_frac_head = nn.Linear(d_model, NUM_FRACTIONS)
             self.target_pick_head = _make_target_pick_head(d_model)
             if self.target_abort_enabled:
@@ -551,8 +547,6 @@ class OrbitWarsPolicy(nn.Module):
         planet_mask: torch.Tensor,
         origin_frac_blocked: Optional[torch.Tensor] = None,
         *,
-        pair_q: nn.Linear,
-        pair_k: nn.Linear,
         origin_frac_head: nn.Linear,
         halt_head: nn.Linear,
         value_head: nn.Linear,
@@ -580,9 +574,6 @@ class OrbitWarsPolicy(nn.Module):
             blocked_mask = features[:, 1 : 1 + MAX_PLANETS, -BLOCKED_FRAC_FEATURES:] > 0.5
         elif origin_frac_blocked is not None:
             blocked_mask = self._normalize_origin_frac_blocked(origin_frac_blocked, int(h.shape[0]), h.device)
-        pq = pair_q(planet_h)
-        pk = pair_k(planet_h)
-        pair_logits = torch.matmul(pq, pk.transpose(-2, -1)) * (pq.shape[-1] ** -0.5)
 
         pm = planet_mask[:, 1 : 1 + MAX_PLANETS]
         em = entity_mask[:, 1 : 1 + MAX_PLANETS]
@@ -604,7 +595,6 @@ class OrbitWarsPolicy(nn.Module):
             "hidden": h,
             "halt_logits": halt_logits,
             "value": value,
-            "pair_logits": pair_logits,
             "pair_mask": pair_mask,
             "origin_frac_logits": origin_frac_logits,
             "origin_frac_mask": origin_frac_mask,
@@ -630,8 +620,6 @@ class OrbitWarsPolicy(nn.Module):
         target_ships: torch.Tensor,
         origin_frac_blocked: Optional[torch.Tensor] = None,
         *,
-        pair_q: nn.Linear,
-        pair_k: nn.Linear,
         origin_frac_head: nn.Linear,
         halt_head: nn.Linear,
         value_head: nn.Linear,
@@ -646,8 +634,6 @@ class OrbitWarsPolicy(nn.Module):
             entity_mask,
             planet_mask,
             origin_frac_blocked=origin_frac_blocked,
-            pair_q=pair_q,
-            pair_k=pair_k,
             origin_frac_head=origin_frac_head,
             halt_head=halt_head,
             value_head=value_head,
@@ -697,8 +683,6 @@ class OrbitWarsPolicy(nn.Module):
                 entity_mask.index_select(0, member_rows),
                 planet_mask.index_select(0, member_rows),
                 origin_frac_blocked=None if origin_frac_blocked is None else origin_frac_blocked.index_select(0, member_rows),
-                pair_q=tail.pair_q,
-                pair_k=tail.pair_k,
                 origin_frac_head=tail.origin_frac_head,
                 halt_head=tail.halt_head,
                 value_head=tail.value_head,
@@ -710,7 +694,6 @@ class OrbitWarsPolicy(nn.Module):
                     "hidden": h,
                     "halt_logits": out_m["halt_logits"].new_empty((batch_size, 2)),
                     "value": out_m["value"].new_empty((batch_size,)),
-                    "pair_logits": out_m["pair_logits"].new_empty((batch_size, MAX_PLANETS, MAX_PLANETS)),
                     "pair_mask": out_m["pair_mask"].new_zeros((batch_size, MAX_PLANETS, MAX_PLANETS)),
                     "origin_frac_logits": out_m["origin_frac_logits"].new_empty(
                         (batch_size, MAX_PLANETS, NUM_FRACTIONS)
@@ -726,7 +709,6 @@ class OrbitWarsPolicy(nn.Module):
                     )
             outputs["halt_logits"].index_copy_(0, member_rows, out_m["halt_logits"])
             outputs["value"].index_copy_(0, member_rows, out_m["value"])
-            outputs["pair_logits"].index_copy_(0, member_rows, out_m["pair_logits"])
             outputs["pair_mask"].index_copy_(0, member_rows, out_m["pair_mask"])
             outputs["origin_frac_logits"].index_copy_(0, member_rows, out_m["origin_frac_logits"])
             outputs["origin_frac_mask"].index_copy_(0, member_rows, out_m["origin_frac_mask"])
@@ -755,8 +737,6 @@ class OrbitWarsPolicy(nn.Module):
                 entity_mask,
                 planet_mask,
                 origin_frac_blocked=origin_frac_blocked,
-                pair_q=self.pair_q,
-                pair_k=self.pair_k,
                 origin_frac_head=self.origin_frac_head,
                 halt_head=self.halt_head,
                 value_head=self.value_head,
@@ -768,7 +748,6 @@ class OrbitWarsPolicy(nn.Module):
         outputs: Dict[str, Any] = {"hidden": h}
         halt_logits = []
         value = []
-        pair_logits = []
         pair_mask = []
         origin_frac_logits = []
         origin_frac_mask = []
@@ -784,8 +763,6 @@ class OrbitWarsPolicy(nn.Module):
                 entity_mask[start:stop],
                 planet_mask[start:stop],
                 origin_frac_blocked=None if origin_frac_blocked is None else origin_frac_blocked[start:stop],
-                pair_q=tail.pair_q,
-                pair_k=tail.pair_k,
                 origin_frac_head=tail.origin_frac_head,
                 halt_head=tail.halt_head,
                 value_head=tail.value_head,
@@ -794,7 +771,6 @@ class OrbitWarsPolicy(nn.Module):
             )
             halt_logits.append(out_m["halt_logits"])
             value.append(out_m["value"])
-            pair_logits.append(out_m["pair_logits"])
             pair_mask.append(out_m["pair_mask"])
             origin_frac_logits.append(out_m["origin_frac_logits"])
             origin_frac_mask.append(out_m["origin_frac_mask"])
@@ -803,7 +779,6 @@ class OrbitWarsPolicy(nn.Module):
                 abort_logits.append(out_m["abort_logits"])
         outputs["halt_logits"] = torch.cat(halt_logits, dim=0)
         outputs["value"] = torch.cat(value, dim=0)
-        outputs["pair_logits"] = torch.cat(pair_logits, dim=0)
         outputs["pair_mask"] = torch.cat(pair_mask, dim=0)
         outputs["origin_frac_logits"] = torch.cat(origin_frac_logits, dim=0)
         outputs["origin_frac_mask"] = torch.cat(origin_frac_mask, dim=0)
@@ -831,8 +806,6 @@ class OrbitWarsPolicy(nn.Module):
                 entity_mask,
                 planet_mask,
                 origin_frac_blocked=origin_frac_blocked,
-                pair_q=self.pair_q,
-                pair_k=self.pair_k,
                 origin_frac_head=self.origin_frac_head,
                 halt_head=self.halt_head,
                 value_head=self.value_head,
@@ -843,7 +816,6 @@ class OrbitWarsPolicy(nn.Module):
         outputs: Dict[str, Any] = {"hidden": h}
         halt_logits = []
         value = []
-        pair_logits = []
         pair_mask = []
         origin_frac_logits = []
         origin_frac_mask = []
@@ -862,8 +834,6 @@ class OrbitWarsPolicy(nn.Module):
                 entity_mask[start:stop],
                 planet_mask[start:stop],
                 origin_frac_blocked=None if origin_frac_blocked is None else origin_frac_blocked[start:stop],
-                pair_q=tail.pair_q,
-                pair_k=tail.pair_k,
                 origin_frac_head=tail.origin_frac_head,
                 halt_head=tail.halt_head,
                 value_head=tail.value_head,
@@ -872,7 +842,6 @@ class OrbitWarsPolicy(nn.Module):
             )
             halt_logits.append(out_m["halt_logits"])
             value.append(out_m["value"])
-            pair_logits.append(out_m["pair_logits"])
             pair_mask.append(out_m["pair_mask"])
             origin_frac_logits.append(out_m["origin_frac_logits"])
             origin_frac_mask.append(out_m["origin_frac_mask"])
@@ -882,7 +851,6 @@ class OrbitWarsPolicy(nn.Module):
             start = stop
         outputs["halt_logits"] = torch.cat(halt_logits, dim=0)
         outputs["value"] = torch.cat(value, dim=0)
-        outputs["pair_logits"] = torch.cat(pair_logits, dim=0)
         outputs["pair_mask"] = torch.cat(pair_mask, dim=0)
         outputs["origin_frac_logits"] = torch.cat(origin_frac_logits, dim=0)
         outputs["origin_frac_mask"] = torch.cat(origin_frac_mask, dim=0)
@@ -920,8 +888,6 @@ class OrbitWarsPolicy(nn.Module):
                 target_eta,
                 target_ships,
                 origin_frac_blocked=origin_frac_blocked,
-                pair_q=self.pair_q,
-                pair_k=self.pair_k,
                 origin_frac_head=self.origin_frac_head,
                 halt_head=self.halt_head,
                 value_head=self.value_head,
@@ -933,7 +899,6 @@ class OrbitWarsPolicy(nn.Module):
         outputs: Dict[str, Any] = {"hidden": h}
         halt_logits = []
         value = []
-        pair_logits = []
         pair_mask = []
         origin_frac_logits = []
         origin_frac_mask = []
@@ -958,8 +923,6 @@ class OrbitWarsPolicy(nn.Module):
                 target_eta[start:stop],
                 target_ships[start:stop],
                 origin_frac_blocked=None if origin_frac_blocked is None else origin_frac_blocked[start:stop],
-                pair_q=tail.pair_q,
-                pair_k=tail.pair_k,
                 origin_frac_head=tail.origin_frac_head,
                 halt_head=tail.halt_head,
                 value_head=tail.value_head,
@@ -969,7 +932,6 @@ class OrbitWarsPolicy(nn.Module):
             )
             halt_logits.append(out_m["halt_logits"])
             value.append(out_m["value"])
-            pair_logits.append(out_m["pair_logits"])
             pair_mask.append(out_m["pair_mask"])
             origin_frac_logits.append(out_m["origin_frac_logits"])
             origin_frac_mask.append(out_m["origin_frac_mask"])
@@ -980,7 +942,6 @@ class OrbitWarsPolicy(nn.Module):
             start = stop
         outputs["halt_logits"] = torch.cat(halt_logits, dim=0)
         outputs["value"] = torch.cat(value, dim=0)
-        outputs["pair_logits"] = torch.cat(pair_logits, dim=0)
         outputs["pair_mask"] = torch.cat(pair_mask, dim=0)
         outputs["origin_frac_logits"] = torch.cat(origin_frac_logits, dim=0)
         outputs["origin_frac_mask"] = torch.cat(origin_frac_mask, dim=0)
@@ -1063,8 +1024,6 @@ class OrbitWarsPolicy(nn.Module):
                 entity_mask,
                 planet_mask,
                 origin_frac_blocked=origin_frac_blocked,
-                pair_q=self.pair_q,
-                pair_k=self.pair_k,
                 origin_frac_head=self.origin_frac_head,
                 halt_head=self.halt_head,
                 value_head=self.value_head,
@@ -1108,8 +1067,6 @@ class OrbitWarsPolicy(nn.Module):
                 entity_mask,
                 planet_mask,
                 origin_frac_blocked=origin_frac_blocked,
-                pair_q=self.pair_q,
-                pair_k=self.pair_k,
                 origin_frac_head=self.origin_frac_head,
                 halt_head=self.halt_head,
                 value_head=self.value_head,
