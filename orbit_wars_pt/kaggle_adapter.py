@@ -1101,6 +1101,7 @@ class ModelSearchSettings:
     adaptive_horizon: bool = False
     adaptive_horizon_offset: int = 2
     min_overage_s: float = 15.0
+    greedy_launch_threshold: float | None = None
 
 
 def _model_search_enabled(settings: ModelSearchSettings) -> bool:
@@ -3673,6 +3674,7 @@ def _build_turn_actions_torch_only(
     deadline_s: float | None = None,
     population_member: Optional[int] = None,
     search_runtime: SearchRuntime | None = None,
+    search_greedy_launch_threshold: float | None = None,
 ) -> list[list[float]]:
     planets = np.array(np.asarray(state.planets), copy=True)
     incoming_fleets = np.array(np.asarray(state.incoming_fleets), copy=True)
@@ -3729,7 +3731,10 @@ def _build_turn_actions_torch_only(
             if use_search:
                 halt_action = 0
             elif greedy:
-                halt_action = int(torch.argmax(halt_logits, dim=-1).item())
+                halt_action = _greedy_halt_action_from_logits(
+                    halt_logits,
+                    launch_threshold=search_greedy_launch_threshold,
+                )
             else:
                 halt_probs = torch.softmax(halt_logits, dim=-1)
                 halt_action = int(torch.multinomial(halt_probs, 1, generator=rng).item())
@@ -3900,6 +3905,9 @@ def _build_turn_actions_torch_only(
                         deadline_s=deadline_s,
                         population_member=population_member,
                         search_runtime=None,
+                        search_greedy_launch_threshold=(
+                            search_runtime.settings.greedy_launch_threshold if search_runtime is not None else None
+                        ),
                     )
                     if timing is not None:
                         timing.model_search.ego_tail_build_calls += 1
@@ -4427,6 +4435,27 @@ def _model_search_gamma_from_env(fallback: float) -> float:
     return float(raw)
 
 
+def _model_search_greedy_launch_threshold_from_env() -> float | None:
+    raw = _env_float("ORBIT_WARS_MODEL_SEARCH_GREEDY_LAUNCH_THRESHOLD")
+    if raw is None:
+        return None
+    value = float(raw)
+    if not (0.0 <= value <= 1.0):
+        raise ValueError("ORBIT_WARS_MODEL_SEARCH_GREEDY_LAUNCH_THRESHOLD must be between 0 and 1")
+    return value
+
+
+def _greedy_halt_action_from_logits(
+    halt_logits: torch.Tensor,
+    *,
+    launch_threshold: float | None = None,
+) -> int:
+    if launch_threshold is None:
+        return int(torch.argmax(halt_logits, dim=-1).item())
+    launch_prob = float(torch.softmax(halt_logits, dim=-1)[0].item())
+    return 0 if launch_prob >= float(launch_threshold) else 1
+
+
 def _infer_policy_kwargs(payload: Any) -> dict[str, Any]:
     training_args = payload.get("training_args", {}) if isinstance(payload, Mapping) else {}
     policy_state = payload.get("policy", payload) if isinstance(payload, Mapping) else payload
@@ -4773,6 +4802,7 @@ class KaggleOrbitWarsAgent:
                 if model_search_min_overage_s is not None
                 else _model_search_min_overage_from_env()
             ),
+            greedy_launch_threshold=_model_search_greedy_launch_threshold_from_env(),
         )
         self.population_size = int(training_args.get("population_size", 1))
         self._population_member_by_player = _normalize_population_members(
@@ -5041,6 +5071,7 @@ class KaggleOrbitWarsAgent:
                     sim_step=int(branch_steps[0]),
                     ship_speed=float(_cfg_get(runtime.kaggle_config, "shipSpeed", 6.0)),
                     timing=timing,
+                    search_greedy_launch_threshold=runtime.settings.greedy_launch_threshold,
                 )
 
             for branch_idx in range(2):
@@ -5160,6 +5191,7 @@ class KaggleOrbitWarsAgent:
                 sim_step=int(branch_step),
                 ship_speed=float(_cfg_get(runtime.kaggle_config, "shipSpeed", 6.0)),
                 timing=timing,
+                search_greedy_launch_threshold=runtime.settings.greedy_launch_threshold,
             )[0]
             ratios_pre = _reward_mix_ratios_np(branch_state_pre, reward)
             if timing is not None:
@@ -5383,6 +5415,7 @@ class KaggleOrbitWarsAgent:
         sim_step: int,
         ship_speed: float,
         timing: ModelSearchTiming | None = None,
+        search_greedy_launch_threshold: float | None = None,
     ) -> list[list[list[float]]]:
         t_plan = perf_counter() if timing is not None else 0.0
         active = [plan for plan in seat_plans if int(plan.micro_idx) < int(plan.max_micro_steps)]
@@ -5446,7 +5479,10 @@ class KaggleOrbitWarsAgent:
 
             for row, plan in enumerate(active):
                 halt_logits = out["halt_logits"][row]
-                halt_action = int(torch.argmax(halt_logits, dim=-1).item())
+                halt_action = _greedy_halt_action_from_logits(
+                    halt_logits,
+                    launch_threshold=search_greedy_launch_threshold,
+                )
                 if halt_action == 1:
                     continue
 
@@ -5870,6 +5906,7 @@ class KaggleOrbitWarsAgent:
             launch_geometry=_launch_geometry_from_obs(obs, None),
             population_member=self._population_member_for_player(player),
             search_runtime=None,
+            search_greedy_launch_threshold=self.model_search.greedy_launch_threshold,
         )
 
     def _search_value_for_player(
@@ -6072,6 +6109,7 @@ class KaggleOrbitWarsAgent:
                     launch_geometry=_launch_geometry_from_obs(sim_obs, config),
                     population_member=self._population_member_for_player(player),
                     search_runtime=None,
+                    search_greedy_launch_threshold=self.model_search.greedy_launch_threshold,
                 )
                 search_timing.opponent_greedy_action_build_calls += 1
                 search_timing.opponent_greedy_action_build_s += perf_counter() - t0

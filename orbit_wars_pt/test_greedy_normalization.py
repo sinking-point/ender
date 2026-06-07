@@ -4,7 +4,15 @@ import os
 import unittest
 from unittest.mock import patch
 
-from orbit_wars_pt.kaggle_adapter import _dual_greedy_from_env, _greedy_from_env, _normalize_greedy
+import torch
+
+from orbit_wars_pt.kaggle_adapter import (
+    _dual_greedy_from_env,
+    _greedy_from_env,
+    _greedy_halt_action_from_logits,
+    _model_search_greedy_launch_threshold_from_env,
+    _normalize_greedy,
+)
 
 
 class TestGreedyNormalization(unittest.TestCase):
@@ -38,6 +46,21 @@ class TestGreedyNormalization(unittest.TestCase):
             greedy_4p, greedy_2p = _dual_greedy_from_env()
             self.assertEqual(greedy_4p, False)
             self.assertEqual(greedy_2p, True)
+
+    def test_model_search_greedy_launch_threshold_from_env(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "ORBIT_WARS_MODEL_SEARCH_GREEDY_LAUNCH_THRESHOLD": "0.75",
+            },
+            clear=False,
+        ):
+            self.assertEqual(_model_search_greedy_launch_threshold_from_env(), 0.75)
+
+    def test_greedy_halt_action_threshold_biases_toward_halt(self) -> None:
+        halt_logits = torch.tensor([0.0, 0.0], dtype=torch.float32)
+        self.assertEqual(_greedy_halt_action_from_logits(halt_logits), 0)
+        self.assertEqual(_greedy_halt_action_from_logits(halt_logits, launch_threshold=0.75), 1)
 
 
 if __name__ == "__main__":

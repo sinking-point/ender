@@ -212,6 +212,7 @@ def package_submission(
     model_search_adaptive_horizon_offset: int | None = None,
     model_search_min_overage_s: float | None = None,
     model_search_gamma: float | None = None,
+    model_search_greedy_launch_threshold: float | None = None,
     population_member: int | None = None,
     population_member_4p: int | None = None,
     population_member_2p: int | None = None,
@@ -295,6 +296,10 @@ def package_submission(
         )
     if model_search_gamma is not None:
         submission_env["ORBIT_WARS_MODEL_SEARCH_GAMMA"] = str(float(model_search_gamma))
+    if model_search_greedy_launch_threshold is not None:
+        submission_env["ORBIT_WARS_MODEL_SEARCH_GREEDY_LAUNCH_THRESHOLD"] = str(
+            float(model_search_greedy_launch_threshold)
+        )
 
     _write_main_py(
         bundle_dir / "main.py",
@@ -325,6 +330,7 @@ def package_submission(
         Model search adaptive horizon offset: {model_search_adaptive_horizon_offset if model_search_adaptive_horizon_offset is not None else 'env default'}
         Model search min overage seconds: {model_search_min_overage_s if model_search_min_overage_s is not None else 'env default'}
         Model search gamma: {model_search_gamma if model_search_gamma is not None else 'checkpoint/default'}
+        Model search greedy launch threshold: {model_search_greedy_launch_threshold if model_search_greedy_launch_threshold is not None else 'env default'}
 
         Policy selection: 4-player matches use checkpoint_4p.pt; 2-player matches
         use checkpoint_2p.pt. The first observation selects the mode for the full
@@ -513,6 +519,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--model-search-greedy-launch-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Bake ORBIT_WARS_MODEL_SEARCH_GREEDY_LAUNCH_THRESHOLD into main.py. "
+            "Applies only inside greedy search continuations; for example 0.8 requires at least 80%% launch probability."
+        ),
+    )
+    parser.add_argument(
         "--keep-dir",
         action="store_true",
         help="When --out ends with .tar.gz, keep the extracted bundle directory beside the archive.",
@@ -559,6 +574,10 @@ def main() -> None:
         raise SystemExit(
             "provide --checkpoint-2p, or --checkpoint-main with --main-as-2p or --exploiter-as-2p"
         )
+    if args.model_search_greedy_launch_threshold is not None and not (
+        0.0 <= float(args.model_search_greedy_launch_threshold) <= 1.0
+    ):
+        raise SystemExit("--model-search-greedy-launch-threshold must be between 0 and 1")
 
     result = package_submission(
         checkpoint_4p,
@@ -580,6 +599,7 @@ def main() -> None:
         model_search_adaptive_horizon_offset=args.model_search_adaptive_horizon_offset,
         model_search_min_overage_s=args.model_search_min_overage_s,
         model_search_gamma=args.model_search_gamma,
+        model_search_greedy_launch_threshold=args.model_search_greedy_launch_threshold,
         population_member=args.member,
         population_member_4p=args.member if args.member_4p is None else args.member_4p,
         population_member_2p=args.member if args.member_2p is None else args.member_2p,
