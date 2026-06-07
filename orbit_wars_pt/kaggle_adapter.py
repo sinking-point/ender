@@ -3686,6 +3686,7 @@ def _build_turn_actions_torch_only(
     actions: list[list[float]] = []
     planned_launches: list[PlannedLaunchAction] = []
     micro_idx = 0
+    search_used = False
 
     with torch.inference_mode():
         for _ in range(max_micro_steps):
@@ -3722,22 +3723,22 @@ def _build_turn_actions_torch_only(
                 timing.micro_policy_forward_s += perf_counter() - t0
 
             t0 = perf_counter()
-            use_search = (
+            search_available = (
                 search_runtime is not None
                 and _model_search_enabled(search_runtime.settings)
-                and int(micro_idx) == 0
+                and not search_used
             )
             halt_logits = out["halt_logits"][0]
-            if use_search:
-                halt_action = 0
-            elif greedy:
-                halt_action = _greedy_halt_action_from_logits(
+            if greedy:
+                policy_halt_action = _greedy_halt_action_from_logits(
                     halt_logits,
                     launch_threshold=search_greedy_launch_threshold,
                 )
             else:
                 halt_probs = torch.softmax(halt_logits, dim=-1)
-                halt_action = int(torch.multinomial(halt_probs, 1, generator=rng).item())
+                policy_halt_action = int(torch.multinomial(halt_probs, 1, generator=rng).item())
+            force_candidate_eval = search_available
+            halt_action = 0 if force_candidate_eval else policy_halt_action
             if halt_action == 1:
                 if timing is not None:
                     timing.micro_post_forward_s += perf_counter() - t0
@@ -3750,7 +3751,7 @@ def _build_turn_actions_torch_only(
                 break
             flat_logits = out["origin_frac_logits"].flatten(start_dim=1)[0]
             masked_origin_frac = flat_logits.masked_fill(~flat_mask, -1e4)
-            if greedy or use_search:
+            if greedy:
                 origin_frac_flat = int(torch.argmax(masked_origin_frac).item())
             else:
                 origin_frac_probs = torch.softmax(masked_origin_frac, dim=-1)
@@ -3810,12 +3811,16 @@ def _build_turn_actions_torch_only(
             target_mask &= ray_valid_t
             if abort_logit is not None:
                 combined_target = torch.cat([target_logits.masked_fill(~target_mask, -1e4), abort_logit.reshape(1)], dim=0)
-                if greedy or use_search:
+                if greedy:
                     target_choice = int(torch.argmax(combined_target).item())
                 else:
                     target_probs = torch.softmax(combined_target, dim=-1)
                     target_choice = int(torch.multinomial(target_probs, 1, generator=rng).item())
                 if target_choice == MAX_PLANETS:
+                    if force_candidate_eval and policy_halt_action == 1:
+                        if timing is not None:
+                            timing.micro_target_s += perf_counter() - t0
+                        break
                     origin_frac_blocked[int(o_idx), int(frac_idx)] = True
                     micro_idx += 1
                     if timing is not None:
@@ -3828,7 +3833,7 @@ def _build_turn_actions_torch_only(
                         timing.micro_target_s += perf_counter() - t0
                     break
                 masked_target = target_logits.masked_fill(~target_mask, -1e4)
-                if greedy or use_search:
+                if greedy:
                     d_idx = int(torch.argmax(masked_target).item())
                 else:
                     target_probs = torch.softmax(masked_target, dim=-1)
@@ -3844,7 +3849,8 @@ def _build_turn_actions_torch_only(
                     timing.micro_book_s += perf_counter() - t0
                 break
             angle = float(ray_angle[d_idx])
-            if use_search:
+            if search_available:
+                search_used = True
                 launch_action = [float(planets[o_idx, 0]), float(angle), int(send)]
                 if search_runtime.choose_launch is not None:
                     if not bool(
