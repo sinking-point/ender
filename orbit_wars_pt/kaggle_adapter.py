@@ -89,6 +89,31 @@ FLEET_FROM_PLANET = 5
 FLEET_SHIPS = 6
 FLEET_ROW_WIDTH = 9
 
+_FLEET_ARRIVAL_POS_ATOL = 1e-4
+_FLEET_ARRIVAL_ANGLE_SCALE = 1_000_000.0
+
+
+@dataclass
+class FleetArrivalCacheEntry:
+    owner: int
+    from_planet_id: int
+    ships: int
+    angle_key: int
+    step_count: int
+    position: tuple[float, float]
+    hit_slot: int
+    hit_tick: int
+    no_hit_ticks: int
+    comet_layout_key: tuple[int, ...]
+
+
+@dataclass
+class FleetArrivalCache:
+    entries: dict[tuple[int, int, int, int, int], FleetArrivalCacheEntry] = field(default_factory=dict)
+
+    def clear(self) -> None:
+        self.entries.clear()
+
 
 def _norm_angle(angle: float) -> float:
     return float(angle) % (2.0 * math.pi)
@@ -170,6 +195,32 @@ def _active_comet_planet_ids(
             if pid >= 0:
                 ids.append(pid)
     return frozenset(ids)
+
+
+def _comet_layout_cache_key(
+    comet_group_active: np.ndarray,
+    comet_planet_ids: np.ndarray,
+) -> tuple[int, ...]:
+    ids: list[int] = []
+    for g in range(int(comet_group_active.shape[0])):
+        if not bool(comet_group_active[g]):
+            continue
+        for pid_raw in comet_planet_ids[g]:
+            pid = int(pid_raw)
+            if pid >= 0:
+                ids.append(pid)
+    ids.sort()
+    return tuple(ids)
+
+
+def _fleet_arrival_cache_key(row: np.ndarray) -> tuple[int, int, int, int, int]:
+    return (
+        int(row[0]),
+        int(row[1]),
+        int(row[5]),
+        int(math.floor(float(row[6]))),
+        int(round(_norm_angle(float(row[4])) * _FLEET_ARRIVAL_ANGLE_SCALE)),
+    )
 
 
 def _is_comet_planet_id(planet_id: int, comet_planet_ids: np.ndarray) -> bool:
@@ -1753,6 +1804,7 @@ def _forecast_incoming_fleets(
     comet_path_lengths: np.ndarray,
     comet_group_active: np.ndarray,
     comet_path_index: np.ndarray,
+    comet_planet_ids: np.ndarray,
     comet_slots: np.ndarray,
     num_agents: int,
     step_count: int,
@@ -1762,6 +1814,7 @@ def _forecast_incoming_fleets(
     ship_speed: float = 6.0,
     horizon: int = INCOMING_TA_BINS,
     per_fleet_arrival: Optional[np.ndarray] = None,
+    fleet_arrival_cache: Optional[FleetArrivalCache] = None,
 ) -> np.ndarray:
     """Fill policy incoming bins with only public fleets that hit a planet in the forecast.
 
@@ -1785,13 +1838,57 @@ def _forecast_incoming_fleets(
     ships = np.floor(fleets_in[:, 6].astype(np.float64, copy=False))
     dirs = np.stack([np.cos(angles), np.sin(angles)], axis=1).astype(np.float64)
     speeds = np.asarray([_fleet_speed(float(s), ship_speed) for s in ships], dtype=np.float64)
+    comet_layout_key = _comet_layout_cache_key(comet_group_active, comet_planet_ids)
+    sim_horizon = min(horizon, INCOMING_TA_BINS)
 
     p = planets.copy()
     pa = planet_active.copy()
     ia = initial_active.copy()
     cpi = comet_path_index.copy()
+    skip_until_tick = np.zeros((len(fleets_in),), dtype=np.int32)
+    resume_position = positions.copy()
 
-    for t in range(min(horizon, INCOMING_TA_BINS)):
+    if fleet_arrival_cache is not None:
+        for f in range(len(fleets_in)):
+            row = fleets_in[f]
+            key = _fleet_arrival_cache_key(row)
+            entry = fleet_arrival_cache.entries.get(key)
+            if entry is None:
+                continue
+            delta = int(step_count) - int(entry.step_count)
+            if delta < 0:
+                continue
+            if entry.comet_layout_key != comet_layout_key:
+                continue
+            expected = np.asarray(entry.position, dtype=np.float64) + float(delta) * speeds[f] * dirs[f]
+            if not np.allclose(positions[f], expected, atol=_FLEET_ARRIVAL_POS_ATOL, rtol=0.0):
+                continue
+            if int(entry.hit_slot) >= 0:
+                remaining_tick = int(entry.hit_tick) - delta
+                if remaining_tick < 0 or remaining_tick >= sim_horizon:
+                    continue
+                hit_slot = int(entry.hit_slot)
+                owner = int(owners[f])
+                if not (0 <= owner < num_agents and 0 <= hit_slot < MAX_PLANETS):
+                    continue
+                add = int(min(max(int(ships[f]), 0), 65535))
+                cur = int(incoming[owner, hit_slot, remaining_tick])
+                incoming[owner, hit_slot, remaining_tick] = min(cur + add, 65535)
+                if per_fleet_arrival is not None and f < per_fleet_arrival.shape[0]:
+                    per_fleet_arrival[f, 0] = hit_slot
+                    per_fleet_arrival[f, 1] = remaining_tick
+                alive[f] = False
+                continue
+            guaranteed_miss_prefix = int(entry.no_hit_ticks) - delta
+            if guaranteed_miss_prefix <= 0:
+                continue
+            if guaranteed_miss_prefix >= sim_horizon:
+                alive[f] = False
+                continue
+            skip_until_tick[f] = guaranteed_miss_prefix
+            resume_position[f] = positions[f] + float(guaranteed_miss_prefix) * speeds[f] * dirs[f]
+
+    for t in range(sim_horizon):
         old_pos, new_pos, collision_enabled, cpi_next, pa_next, ia_next = _next_planet_positions(
             p,
             pa,
@@ -1813,6 +1910,10 @@ def _forecast_incoming_fleets(
             if owner < 0 or owner >= num_agents or ships[f] <= 0:
                 alive[f] = False
                 continue
+            if t < int(skip_until_tick[f]):
+                continue
+            if t == int(skip_until_tick[f]) and skip_until_tick[f] > 0:
+                positions[f] = resume_position[f]
             a0 = positions[f]
             a1 = a0 + speeds[f] * dirs[f]
 
@@ -1830,6 +1931,20 @@ def _forecast_incoming_fleets(
                 if per_fleet_arrival is not None and f < per_fleet_arrival.shape[0]:
                     per_fleet_arrival[f, 0] = hit_slot
                     per_fleet_arrival[f, 1] = t
+                if fleet_arrival_cache is not None:
+                    row_key = _fleet_arrival_cache_key(fleets_in[f])
+                    fleet_arrival_cache.entries[row_key] = FleetArrivalCacheEntry(
+                        owner=owner,
+                        from_planet_id=int(fleets_in[f, 5]),
+                        ships=int(ships[f]),
+                        angle_key=int(row_key[4]),
+                        step_count=int(step_count),
+                        position=(float(fleets_in[f, 2]), float(fleets_in[f, 3])),
+                        hit_slot=hit_slot,
+                        hit_tick=int(t),
+                        no_hit_ticks=0,
+                        comet_layout_key=comet_layout_key,
+                    )
                 alive[f] = False
             else:
                 if _point_to_segment_distance(np.asarray([CENTER, CENTER], dtype=np.float64), a0, a1) < SUN_RADIUS:
@@ -1844,6 +1959,24 @@ def _forecast_incoming_fleets(
         pa = pa_next
         ia = ia_next
         cpi = cpi_next
+
+    if fleet_arrival_cache is not None:
+        for f in range(len(fleets_in)):
+            if not alive[f]:
+                continue
+            row_key = _fleet_arrival_cache_key(fleets_in[f])
+            fleet_arrival_cache.entries[row_key] = FleetArrivalCacheEntry(
+                owner=int(owners[f]),
+                from_planet_id=int(fleets_in[f, 5]),
+                ships=int(ships[f]),
+                angle_key=int(row_key[4]),
+                step_count=int(step_count),
+                position=(float(fleets_in[f, 2]), float(fleets_in[f, 3])),
+                hit_slot=-1,
+                hit_tick=-1,
+                no_hit_ticks=int(sim_horizon),
+                comet_layout_key=comet_layout_key,
+            )
 
     return incoming
 
@@ -3104,6 +3237,7 @@ class SearchRuntime:
     greedy_actions_for_player: Any
     value_for_player: Any
     public_state: Optional[OrbitWarsState] = None
+    fleet_arrival_cache: Optional[FleetArrivalCache] = None
     choose_launch: Any = None
 
 
@@ -3909,6 +4043,7 @@ def observation_to_state(
     step_count_override: Optional[int] = None,
     fleet_forecast_arrival: Optional[np.ndarray] = None,
     num_agents_override: Optional[int] = None,
+    fleet_arrival_cache: Optional[FleetArrivalCache] = None,
 ) -> OrbitWarsState:
     """Convert an official Kaggle observation dict into a padded ``OrbitWarsState``.
 
@@ -4023,6 +4158,7 @@ def observation_to_state(
         comet_path_lengths,
         comet_group_active,
         comet_path_index,
+        comet_planet_ids,
         comet_slots,
         num_agents,
         step_count,
@@ -4031,6 +4167,7 @@ def observation_to_state(
         ship_speed=float(_cfg_get(config, "shipSpeed", 6.0)),
         horizon=INCOMING_TA_BINS,
         per_fleet_arrival=fleet_forecast_arrival,
+        fleet_arrival_cache=fleet_arrival_cache,
     )
     rewards = np.zeros((max(num_agents, 4),), dtype=np.float32)
 
@@ -4689,6 +4826,7 @@ class KaggleOrbitWarsAgent:
             warn_forecast_mismatch=_warn_forecast_mismatch_enabled(),
             warn_unmatched_fleet=_warn_unmatched_fleet_enabled(),
         )
+        self._fleet_arrival_cache = FleetArrivalCache()
         self._search_rollout_cache: Optional[CachedSearchRollout] = None
         self._search_cache_hits: int = 0
         self._search_cache_misses: int = 0
@@ -4782,6 +4920,7 @@ class KaggleOrbitWarsAgent:
                 max_fleets=self.max_fleets,
                 step_count_override=int(runtime.step_count),
                 num_agents_override=int(runtime.num_agents),
+                fleet_arrival_cache=runtime.fleet_arrival_cache,
             )
 
         launched_planets = np.array(np.asarray(current_state.planets), copy=True)
@@ -4931,6 +5070,7 @@ class KaggleOrbitWarsAgent:
                     max_fleets=self.max_fleets,
                     step_count_override=int(branch_steps[branch_idx]),
                     num_agents_override=int(runtime.num_agents),
+                    fleet_arrival_cache=runtime.fleet_arrival_cache,
                 )
                 if timing is not None:
                     timing.state_rebuild_calls += 1
@@ -5042,6 +5182,7 @@ class KaggleOrbitWarsAgent:
                 max_fleets=self.max_fleets,
                 step_count_override=int(branch_step),
                 num_agents_override=int(runtime.num_agents),
+                fleet_arrival_cache=runtime.fleet_arrival_cache,
             )
             if timing is not None:
                 timing.state_rebuild_calls += 1
@@ -5707,6 +5848,7 @@ class KaggleOrbitWarsAgent:
             max_fleets=self.max_fleets,
             step_count_override=step_count,
             num_agents_override=self._num_agents_for_obs(obs, None),
+            fleet_arrival_cache=self._fleet_arrival_cache,
         )
         return _build_turn_actions_torch_only(
             self.policy,
@@ -5742,6 +5884,7 @@ class KaggleOrbitWarsAgent:
             max_fleets=self.max_fleets,
             step_count_override=step_count,
             num_agents_override=self._num_agents_for_obs(obs, None),
+            fleet_arrival_cache=self._fleet_arrival_cache,
         )
         return _policy_value_for_state(
             self.policy,
@@ -5788,6 +5931,7 @@ class KaggleOrbitWarsAgent:
             key = self._obs_game_key(obs)
             if key != self._game_key:
                 self._frozen_num_agents = None
+                self._fleet_arrival_cache.clear()
                 self._search_rollout_cache = None
                 self._search_cache_hits = 0
                 self._search_cache_misses = 0
@@ -5800,6 +5944,7 @@ class KaggleOrbitWarsAgent:
             self._next_step_count = 0
             self._last_env_step = None
             self._frozen_num_agents = None
+            self._fleet_arrival_cache.clear()
             self._search_rollout_cache = None
             self._search_cache_hits = 0
             self._search_cache_misses = 0
@@ -5854,6 +5999,7 @@ class KaggleOrbitWarsAgent:
             step_count_override=step_count,
             fleet_forecast_arrival=fleet_arrivals,
             num_agents_override=self._num_agents_for_obs(obs, config),
+            fleet_arrival_cache=self._fleet_arrival_cache,
         )
         if not self._compiled_forward_warmup_done:
             _warmup_compiled_policy_batched_forward(
@@ -5890,6 +6036,7 @@ class KaggleOrbitWarsAgent:
         search_runtime = None
         if _model_search_enabled(self.model_search) and _model_search_allowed_for_obs(obs, self.model_search):
             search_timing = timing.model_search
+            search_fleet_arrival_cache = FleetArrivalCache()
 
             def _search_greedy_actions(sim_obs: Mapping[str, Any], player: int, sim_step: int) -> list[list[float]]:
                 t_total = perf_counter()
@@ -5900,6 +6047,7 @@ class KaggleOrbitWarsAgent:
                     max_fleets=self.max_fleets,
                     step_count_override=sim_step,
                     num_agents_override=int(np.asarray(state.num_agents)),
+                    fleet_arrival_cache=search_fleet_arrival_cache,
                 )
                 search_timing.opponent_greedy_obs_to_state_calls += 1
                 search_timing.opponent_greedy_obs_to_state_s += perf_counter() - t0
@@ -5940,6 +6088,7 @@ class KaggleOrbitWarsAgent:
                     max_fleets=self.max_fleets,
                     step_count_override=sim_step,
                     num_agents_override=int(np.asarray(state.num_agents)),
+                    fleet_arrival_cache=search_fleet_arrival_cache,
                 )
                 search_timing.value_obs_to_state_calls += 1
                 search_timing.value_obs_to_state_s += perf_counter() - t0
@@ -5967,6 +6116,7 @@ class KaggleOrbitWarsAgent:
                 step_count=step_count,
                 num_agents=int(np.asarray(state.num_agents)),
                 public_state=state,
+                fleet_arrival_cache=search_fleet_arrival_cache,
                 greedy_actions_for_player=_search_greedy_actions,
                 value_for_player=_search_value,
                 choose_launch=self._choose_launch_via_model_search_batched_single_policy,
