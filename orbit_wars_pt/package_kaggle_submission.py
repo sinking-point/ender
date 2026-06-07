@@ -35,6 +35,7 @@ _SUBMISSION_PACKAGE_FILES = (
     "orthogonal_geometry_np.py",
     "tangent_geometry_np.py",
     "model.py",
+    "reward_config.py",
     "kaggle_adapter.py",
 )
 

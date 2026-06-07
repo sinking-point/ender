@@ -32,6 +32,7 @@ import jax.numpy as jnp
 
 from orbit_wars_pt.batched_env import heal_terminal_env_slices, reset_env_at_index
 from orbit_wars_pt.env_wrapper import OrbitWarsEnvConfig
+from orbit_wars_pt.reward_config import resolve_reward_mix as resolve_reward_mix_config
 from orbit_wars_pt.constants import FEATURE_DIM, FRACTIONS, INCOMING_TA_BINS, MAX_PLANETS, obs_feature_dim_for_num_agents
 from orbit_wars_pt.exploiter_reset import (
     build_unified_exploiter_reset,
@@ -201,24 +202,7 @@ def _parse_optional_float_list(text: Optional[str], *, name: str) -> Optional[li
 def resolve_reward_mix(args: argparse.Namespace) -> Tuple[float, float, float, float]:
     """Resolve reward coefficients, preserving legacy ``--reward-mode`` presets."""
 
-    if args.reward_mode == "ship-mass-share":
-        ship_coef, prod_coef, terminal_coef = 1.0, 0.0, 0.0
-    elif args.reward_mode == "production-share":
-        ship_coef, prod_coef, terminal_coef = 0.0, 1.0, 0.0
-    elif args.reward_mode == "terminal-win-loss":
-        ship_coef, prod_coef, terminal_coef = 0.0, 0.0, 1.0
-    else:
-        raise ValueError(f"unknown reward mode {args.reward_mode!r}")
-    time_coef = 0.0
-    if args.reward_ship_mass_share_coef is not None:
-        ship_coef = float(args.reward_ship_mass_share_coef)
-    if args.reward_production_share_coef is not None:
-        prod_coef = float(args.reward_production_share_coef)
-    if args.reward_terminal_win_loss_coef is not None:
-        terminal_coef = float(args.reward_terminal_win_loss_coef)
-    if args.reward_time_bonus_coef is not None:
-        time_coef = float(args.reward_time_bonus_coef)
-    return float(ship_coef), float(prod_coef), float(terminal_coef), float(time_coef)
+    return resolve_reward_mix_config(args)
 
 
 def resolve_member_reward_mix(

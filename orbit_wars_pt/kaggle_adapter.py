@@ -45,6 +45,7 @@ from orbit_wars_pt.model import (
     adapt_legacy_value_heads_for_model,
     infer_value_head_count_from_state_dict,
 )
+from orbit_wars_pt.reward_config import resolve_reward_mix
 
 
 DEFAULT_CHECKPOINT = "checkpoint.pt"
@@ -1189,14 +1190,16 @@ def _reward_settings_from_training_args(training_args: Mapping[str, Any]) -> Rew
         value = training_args.get(name, default)
         return int(default if value is None else value)
 
+    ship_coef, prod_coef, terminal_coef, time_coef = resolve_reward_mix(training_args)
+
     return RewardSettings(
-        ship_mass_share_coef=_get_float("reward_ship_mass_share_coef", 1.0),
-        production_share_coef=_get_float("reward_production_share_coef", 0.0),
-        terminal_win_loss_coef=_get_float("reward_terminal_win_loss_coef", 0.0),
+        ship_mass_share_coef=float(ship_coef),
+        production_share_coef=float(prod_coef),
+        terminal_win_loss_coef=float(terminal_coef),
         terminal_loss=_get_float("reward_terminal_loss", -1.0),
         terminal_draw=_get_float("reward_terminal_draw", 0.0),
         terminal_win=_get_float("reward_terminal_win", 1.0),
-        time_bonus_coef=_get_float("reward_time_bonus_coef", 0.0),
+        time_bonus_coef=float(time_coef),
         gamma=_get_float("gamma", 1.0),
         episode_steps=_get_int("episode_steps", 500),
     )
