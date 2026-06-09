@@ -3702,6 +3702,7 @@ def _build_turn_actions_torch_only(
     population_member: Optional[int] = None,
     search_runtime: SearchRuntime | None = None,
     search_greedy_launch_threshold: float | None = None,
+    search_root_player: int | None = None,
 ) -> list[list[float]]:
     planets = np.array(np.asarray(state.planets), copy=True)
     incoming_fleets = np.array(np.asarray(state.incoming_fleets), copy=True)
@@ -3876,6 +3877,17 @@ def _build_turn_actions_torch_only(
                     timing.micro_book_s += perf_counter() - t0
                 break
             angle = float(ray_angle[d_idx])
+            if _search_opponent_should_halt_on_neutral_underlaunch(
+                planets,
+                incoming_fleets,
+                player=int(ego_player),
+                search_root_player=search_root_player,
+                send=int(send),
+                true_target_slot=int(true_planet[d_idx]),
+            ):
+                if timing is not None:
+                    timing.micro_book_s += perf_counter() - t0
+                break
             if search_available:
                 search_used = True
                 launch_action = [float(planets[o_idx, 0]), float(angle), int(send)]
@@ -3941,6 +3953,7 @@ def _build_turn_actions_torch_only(
                         search_greedy_launch_threshold=(
                             search_runtime.settings.greedy_launch_threshold if search_runtime is not None else None
                         ),
+                        search_root_player=search_root_player,
                     )
                     if timing is not None:
                         timing.model_search.ego_tail_build_calls += 1
@@ -4516,6 +4529,33 @@ def _greedy_halt_action_from_logits(
         return int(torch.argmax(halt_logits, dim=-1).item())
     launch_prob = float(torch.softmax(halt_logits, dim=-1)[0].item())
     return 0 if launch_prob >= float(launch_threshold) else 1
+
+
+def _search_opponent_should_halt_on_neutral_underlaunch(
+    planets: np.ndarray,
+    incoming_fleets: np.ndarray,
+    *,
+    player: int,
+    search_root_player: int | None,
+    send: int,
+    true_target_slot: int,
+) -> bool:
+    if search_root_player is None or int(player) == int(search_root_player):
+        return False
+    if not (0 <= int(true_target_slot) < MAX_PLANETS):
+        return False
+    if int(send) <= 0:
+        return False
+    target_owner = int(planets[int(true_target_slot), 1])
+    if target_owner >= 0:
+        return False
+    garrison = int(planets[int(true_target_slot), 5])
+    if int(send) > garrison:
+        return False
+    incoming = np.asarray(incoming_fleets)
+    if incoming.ndim != 3:
+        return False
+    return not bool(np.any(incoming[:, int(true_target_slot), :] > 0))
 
 
 def _infer_policy_kwargs(payload: Any) -> dict[str, Any]:
@@ -5213,6 +5253,7 @@ class KaggleOrbitWarsAgent:
                     branch_launch_geometry=branch_launch_geometry,
                     sim_step=int(branch_steps[0]),
                     ship_speed=float(_cfg_get(runtime.kaggle_config, "shipSpeed", 6.0)),
+                    search_root_player=int(ego_player),
                     timing=timing,
                     search_greedy_launch_threshold=runtime.settings.greedy_launch_threshold,
                 )
@@ -5336,6 +5377,7 @@ class KaggleOrbitWarsAgent:
                 branch_launch_geometry=[_launch_geometry_from_obs(branch_public_obs, runtime.kaggle_config)],
                 sim_step=int(branch_step),
                 ship_speed=float(_cfg_get(runtime.kaggle_config, "shipSpeed", 6.0)),
+                search_root_player=int(ego_player),
                 initial_policy_outputs=current_policy_outputs,
                 timing=timing,
                 search_greedy_launch_threshold=runtime.settings.greedy_launch_threshold,
@@ -5555,6 +5597,7 @@ class KaggleOrbitWarsAgent:
         branch_launch_geometry: list[LaunchGeometryInputs],
         sim_step: int,
         ship_speed: float,
+        search_root_player: int | None = None,
         initial_policy_outputs: CachedSearchPolicyOutputs | None = None,
         timing: ModelSearchTiming | None = None,
         search_greedy_launch_threshold: float | None = None,
@@ -5842,6 +5885,16 @@ class KaggleOrbitWarsAgent:
                 if d_idx < 0:
                     continue
 
+                if _search_opponent_should_halt_on_neutral_underlaunch(
+                    plan.planets,
+                    plan.incoming_fleets,
+                    player=int(plan.player),
+                    search_root_player=search_root_player,
+                    send=int(sends[idx]),
+                    true_target_slot=int(true_target_slot),
+                ):
+                    continue
+
                 action = [float(plan.planets[o_idx, 0]), float(ray_angles[idx][d_idx]), int(sends[idx])]
                 plan.actions.append(action)
                 branch_joint_actions[int(plan.branch_idx)][int(plan.player)] = copy.deepcopy(plan.actions)
@@ -6045,6 +6098,8 @@ class KaggleOrbitWarsAgent:
         obs: Mapping[str, Any],
         player: int,
         step_count: int,
+        *,
+        search_root_player: int | None = None,
     ) -> list[list[float]]:
         state = observation_to_state(
             obs,
@@ -6075,6 +6130,7 @@ class KaggleOrbitWarsAgent:
             population_member=self._population_member_for_player(player),
             search_runtime=None,
             search_greedy_launch_threshold=self.model_search.greedy_launch_threshold,
+            search_root_player=search_root_player,
         )
 
     def _search_value_for_player(
@@ -6280,6 +6336,7 @@ class KaggleOrbitWarsAgent:
                     population_member=self._population_member_for_player(player),
                     search_runtime=None,
                     search_greedy_launch_threshold=self.model_search.greedy_launch_threshold,
+                    search_root_player=int(ego_player),
                 )
                 search_timing.opponent_greedy_action_build_calls += 1
                 search_timing.opponent_greedy_action_build_s += perf_counter() - t0
