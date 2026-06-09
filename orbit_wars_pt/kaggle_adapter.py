@@ -3070,8 +3070,6 @@ def _search_first_contact_targets_np(
     horizon: int = INCOMING_TA_BINS,
     launch_geometry: LaunchGeometryInputs | None = None,
 ) -> SearchFirstContactTargets:
-    from orbit_wars_pt.tangent_geometry_np import tangent_hit_time_polyline
-
     if launch_geometry is None:
         planets = np.asarray(state.planets, dtype=np.float64)
         current_active = np.asarray(state.planet_active, dtype=bool)
@@ -3091,6 +3089,7 @@ def _search_first_contact_targets_np(
     speed = _fleet_speed(float(max(send, 1)), ship_speed)
     radii = planets[:, PLANET_RADIUS].astype(np.float64)
     collision_rank = np.asarray(state.planet_collision_rank, dtype=np.int32)
+    launch_off = float(origin_radius) + 0.1
 
     out_angle = np.zeros((MAX_PLANETS,), dtype=np.float64)
     valid = np.zeros((MAX_PLANETS,), dtype=np.bool_)
@@ -3101,28 +3100,37 @@ def _search_first_contact_targets_np(
                 continue
             if not bool(np.any(active_by_tick[:, target])):
                 continue
-            pts = np.concatenate(
-                [
-                    np.asarray(p0_by_tick[:, target, :], dtype=np.float64),
-                    np.asarray(p1_by_tick[-1:, target, :], dtype=np.float64),
-                ],
-                axis=0,
-            )
-            hit = tangent_hit_time_polyline(
-                pts,
-                float(radii[target]),
-                origin_xy,
-                float(speed),
-                float(origin_radius) + 0.1,
-                float(max(0, pts.shape[0] - 1)),
-                mode="external",
-                return_all=False,
-            )
-            if hit is None:
+            target_radius = float(radii[target])
+            best_tick = -1
+            best_residual = math.inf
+            best_pos: np.ndarray | None = None
+
+            for tick in range(int(p0_by_tick.shape[0])):
+                if not bool(active_by_tick[tick, target]):
+                    continue
+                pos = np.asarray(p0_by_tick[tick, target, :], dtype=np.float64)
+                center_dist = float(np.linalg.norm(pos - origin_xy))
+                expected_center_dist = launch_off + target_radius + float(speed) * float(tick)
+                residual = abs(center_dist - expected_center_dist)
+
+                # The fleet can move one full segment during the tick, so accept
+                # targets whose radial timing falls within roughly one move.
+                if residual > float(speed):
+                    continue
+                if best_tick < 0 or tick < best_tick or (tick == best_tick and residual < best_residual):
+                    best_tick = int(tick)
+                    best_residual = float(residual)
+                    best_pos = pos
+
+            if best_tick < 0 or best_pos is None:
                 continue
-            hit_t, _kind, angle = hit
+
+            delta = best_pos - origin_xy
+            if float(np.dot(delta, delta)) <= 1e-12:
+                continue
+            angle = math.atan2(float(delta[1]), float(delta[0]))
             out_angle[target] = float(angle % (2.0 * math.pi))
-            hit_eta[target] = float(hit_t)
+            hit_eta[target] = float(best_tick)
             valid[target] = True
 
     return SearchFirstContactTargets(
