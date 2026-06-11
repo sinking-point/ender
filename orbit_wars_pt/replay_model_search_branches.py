@@ -144,6 +144,7 @@ def main() -> None:
     parser.add_argument("--model-search-adaptive-horizon-offset", type=int, default=2)
     parser.add_argument("--model-search-min-overage-s", type=float, default=10.0)
     parser.add_argument("--model-search-gamma", type=float, default=None)
+    parser.add_argument("--model-search-launch-prob-threshold", type=float, default=None)
     parser.add_argument("--model-search-greedy-launch-threshold", type=float, default=None)
     parser.add_argument("--seed", type=int, default=0, help="Adapter RNG seed. Default: 0.")
     args = parser.parse_args()
@@ -164,6 +165,12 @@ def main() -> None:
         checkpoint = args.checkpoint_4p.expanduser()
 
     os.environ["ORBIT_WARS_INTERVAL_GEOMETRY"] = str(args.interval_geometry)
+    if args.model_search_launch_prob_threshold is None:
+        os.environ.pop("ORBIT_WARS_MODEL_SEARCH_LAUNCH_PROB_THRESHOLD", None)
+    else:
+        os.environ["ORBIT_WARS_MODEL_SEARCH_LAUNCH_PROB_THRESHOLD"] = str(
+            float(args.model_search_launch_prob_threshold)
+        )
     if args.model_search_greedy_launch_threshold is None:
         os.environ.pop("ORBIT_WARS_MODEL_SEARCH_GREEDY_LAUNCH_THRESHOLD", None)
     else:
@@ -182,6 +189,7 @@ def main() -> None:
         model_search_adaptive_horizon=bool(args.model_search_adaptive_horizon),
         model_search_adaptive_horizon_offset=int(args.model_search_adaptive_horizon_offset),
         model_search_min_overage_s=float(args.model_search_min_overage_s),
+        model_search_launch_prob_threshold=args.model_search_launch_prob_threshold,
     )
 
     obs = copy.deepcopy(record["steps"][int(args.step)][int(args.player)]["observation"])

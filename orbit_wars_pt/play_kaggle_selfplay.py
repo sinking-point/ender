@@ -269,6 +269,24 @@ def main() -> None:
         help="Optional search rollout discount override. Default: checkpoint gamma.",
     )
     parser.add_argument(
+        "--model-search-launch-prob-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Skip root halt-vs-launch search when the policy's launch probability is below this threshold. "
+            "Default: env ORBIT_WARS_MODEL_SEARCH_LAUNCH_PROB_THRESHOLD when set, otherwise disabled."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-greedy-launch-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Greedy launch threshold inside search continuations. "
+            "Default: env ORBIT_WARS_MODEL_SEARCH_GREEDY_LAUNCH_THRESHOLD when set, otherwise disabled."
+        ),
+    )
+    parser.add_argument(
         "--model-search-adaptive-horizon",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -396,6 +414,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.model_search_greedy_launch_threshold is not None and not (
+        0.0 <= float(args.model_search_greedy_launch_threshold) <= 1.0
+    ):
+        raise SystemExit("--model-search-greedy-launch-threshold must be between 0 and 1")
+    if args.model_search_launch_prob_threshold is not None and not (
+        0.0 <= float(args.model_search_launch_prob_threshold) <= 1.0
+    ):
+        raise SystemExit("--model-search-launch-prob-threshold must be between 0 and 1")
+
     if args.cpu_threads > 0:
         for name in CPU_THREAD_ENV_VARS:
             os.environ[name] = str(int(args.cpu_threads))
@@ -471,6 +498,18 @@ def main() -> None:
         os.environ["ORBIT_WARS_WARN_UNMATCHED_FLEET"] = "1" if args.warn_unmatched_fleet else "0"
     if args.interval_geometry is not None:
         os.environ["ORBIT_WARS_INTERVAL_GEOMETRY"] = str(args.interval_geometry)
+    if args.model_search_launch_prob_threshold is None:
+        os.environ.pop("ORBIT_WARS_MODEL_SEARCH_LAUNCH_PROB_THRESHOLD", None)
+    else:
+        os.environ["ORBIT_WARS_MODEL_SEARCH_LAUNCH_PROB_THRESHOLD"] = str(
+            float(args.model_search_launch_prob_threshold)
+        )
+    if args.model_search_greedy_launch_threshold is None:
+        os.environ.pop("ORBIT_WARS_MODEL_SEARCH_GREEDY_LAUNCH_THRESHOLD", None)
+    else:
+        os.environ["ORBIT_WARS_MODEL_SEARCH_GREEDY_LAUNCH_THRESHOLD"] = str(
+            float(args.model_search_greedy_launch_threshold)
+        )
 
     from kaggle_environments import make
 
@@ -703,7 +742,21 @@ def main() -> None:
             if search_enabled_by_seat[seat]
         )
         gamma_suffix = "" if args.model_search_gamma is None else f" gamma={float(args.model_search_gamma):g}"
-        print(f"[orbit_wars_pt] per-seat model search: {search_summary}{gamma_suffix}", flush=True)
+        launch_prob_suffix = (
+            ""
+            if args.model_search_launch_prob_threshold is None
+            else f" launch_prob≥{float(args.model_search_launch_prob_threshold):g}"
+        )
+        greedy_launch_suffix = (
+            ""
+            if args.model_search_greedy_launch_threshold is None
+            else f" greedy_launch≥{float(args.model_search_greedy_launch_threshold):g}"
+        )
+        print(
+            f"[orbit_wars_pt] per-seat model search: {search_summary}{gamma_suffix}"
+            f"{launch_prob_suffix}{greedy_launch_suffix}",
+            flush=True,
+        )
 
     run_agents: list[Callable[[dict[str, Any], Any], list[list[float]]]] = []
     for seat in range(int(args.num_agents)):
@@ -724,6 +777,7 @@ def main() -> None:
             model_search_gamma=args.model_search_gamma,
             model_search_adaptive_horizon=bool(model_search_adaptive_horizon_by_seat[seat]),
             model_search_adaptive_horizon_offset=int(model_search_adaptive_horizon_offset_by_seat[seat]),
+            model_search_launch_prob_threshold=args.model_search_launch_prob_threshold,
         )
         run_agent = seat_agent
         if args.swap_player_view:

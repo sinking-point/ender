@@ -1111,6 +1111,7 @@ class ModelSearchSettings:
     adaptive_horizon: bool = False
     adaptive_horizon_offset: int = 2
     min_overage_s: float = 15.0
+    launch_probability_threshold: float | None = None
     greedy_launch_threshold: float | None = None
 
 
@@ -3710,6 +3711,7 @@ def _build_turn_actions_torch_only(
     deadline_s: float | None = None,
     population_member: Optional[int] = None,
     search_runtime: SearchRuntime | None = None,
+    search_launch_probability_threshold: float | None = None,
     search_greedy_launch_threshold: float | None = None,
     search_root_player: int | None = None,
 ) -> list[list[float]]:
@@ -3766,6 +3768,11 @@ def _build_turn_actions_torch_only(
                 and not search_used
             )
             halt_logits = out["halt_logits"][0]
+            if search_available and not _launch_probability_meets_threshold(
+                halt_logits,
+                threshold=search_launch_probability_threshold,
+            ):
+                search_available = False
             halt_greedy = sampling_mode == SAMPLING_MODE_GREEDY
             origin_target_greedy = sampling_mode in {SAMPLING_MODE_GREEDY, SAMPLING_MODE_MIXED}
             if halt_greedy:
@@ -3961,6 +3968,7 @@ def _build_turn_actions_torch_only(
                         deadline_s=deadline_s,
                         population_member=population_member,
                         search_runtime=None,
+                        search_launch_probability_threshold=None,
                         search_greedy_launch_threshold=(
                             search_runtime.settings.greedy_launch_threshold if search_runtime is not None else None
                         ),
@@ -4521,14 +4529,41 @@ def _model_search_gamma_from_env(fallback: float) -> float:
     return float(raw)
 
 
+def _validate_probability_threshold(value: float | None, *, name: str) -> float | None:
+    if value is None:
+        return None
+    value = float(value)
+    if not (0.0 <= value <= 1.0):
+        raise ValueError(f"{name} must be between 0 and 1")
+    return value
+
+
 def _model_search_greedy_launch_threshold_from_env() -> float | None:
     raw = _env_float("ORBIT_WARS_MODEL_SEARCH_GREEDY_LAUNCH_THRESHOLD")
     if raw is None:
         return None
-    value = float(raw)
-    if not (0.0 <= value <= 1.0):
-        raise ValueError("ORBIT_WARS_MODEL_SEARCH_GREEDY_LAUNCH_THRESHOLD must be between 0 and 1")
-    return value
+    return _validate_probability_threshold(float(raw), name="ORBIT_WARS_MODEL_SEARCH_GREEDY_LAUNCH_THRESHOLD")
+
+
+def _model_search_launch_probability_threshold_from_env() -> float | None:
+    raw = _env_float("ORBIT_WARS_MODEL_SEARCH_LAUNCH_PROB_THRESHOLD")
+    if raw is None:
+        return None
+    return _validate_probability_threshold(float(raw), name="ORBIT_WARS_MODEL_SEARCH_LAUNCH_PROB_THRESHOLD")
+
+
+def _launch_probability_from_halt_logits(halt_logits: torch.Tensor) -> float:
+    return float(torch.softmax(halt_logits, dim=-1)[0].item())
+
+
+def _launch_probability_meets_threshold(
+    halt_logits: torch.Tensor,
+    *,
+    threshold: float | None = None,
+) -> bool:
+    if threshold is None:
+        return True
+    return _launch_probability_from_halt_logits(halt_logits) >= float(threshold)
 
 
 def _greedy_halt_action_from_logits(
@@ -4538,8 +4573,7 @@ def _greedy_halt_action_from_logits(
 ) -> int:
     if launch_threshold is None:
         return int(torch.argmax(halt_logits, dim=-1).item())
-    launch_prob = float(torch.softmax(halt_logits, dim=-1)[0].item())
-    return 0 if launch_prob >= float(launch_threshold) else 1
+    return 0 if _launch_probability_meets_threshold(halt_logits, threshold=launch_threshold) else 1
 
 
 def _search_opponent_should_halt_on_neutral_underlaunch(
@@ -4879,6 +4913,7 @@ class KaggleOrbitWarsAgent:
         model_search_adaptive_horizon: Optional[bool] = None,
         model_search_adaptive_horizon_offset: Optional[int] = None,
         model_search_min_overage_s: Optional[float] = None,
+        model_search_launch_prob_threshold: Optional[float] = None,
     ):
         _configure_cpu_threads()
         self.checkpoint_path = resolve_checkpoint_path(checkpoint_path)
@@ -4926,6 +4961,14 @@ class KaggleOrbitWarsAgent:
                 max(0.0, float(model_search_min_overage_s))
                 if model_search_min_overage_s is not None
                 else _model_search_min_overage_from_env()
+            ),
+            launch_probability_threshold=(
+                _validate_probability_threshold(
+                    model_search_launch_prob_threshold,
+                    name="model_search_launch_prob_threshold",
+                )
+                if model_search_launch_prob_threshold is not None
+                else _model_search_launch_probability_threshold_from_env()
             ),
             greedy_launch_threshold=_model_search_greedy_launch_threshold_from_env(),
         )
@@ -6159,6 +6202,7 @@ class KaggleOrbitWarsAgent:
             launch_geometry=_launch_geometry_from_obs(obs, None),
             population_member=self._population_member_for_player(player),
             search_runtime=None,
+            search_launch_probability_threshold=None,
             search_greedy_launch_threshold=self.model_search.greedy_launch_threshold,
             search_root_player=search_root_player,
         )
@@ -6365,6 +6409,7 @@ class KaggleOrbitWarsAgent:
                     launch_geometry=_launch_geometry_from_obs(sim_obs, config),
                     population_member=self._population_member_for_player(player),
                     search_runtime=None,
+                    search_launch_probability_threshold=None,
                     search_greedy_launch_threshold=self.model_search.greedy_launch_threshold,
                     search_root_player=int(ego_player),
                 )
@@ -6450,6 +6495,12 @@ class KaggleOrbitWarsAgent:
             launch_geometry=launch_geometry,
             population_member=self._population_member_for_player(ego_player),
             search_runtime=search_runtime,
+            search_launch_probability_threshold=(
+                search_runtime.settings.launch_probability_threshold if search_runtime is not None else None
+            ),
+            search_greedy_launch_threshold=(
+                search_runtime.settings.greedy_launch_threshold if search_runtime is not None else None
+            ),
             deadline_s=(
                 call_t0 + max(0.0, float(_cfg_get(config, "actTimeout", 1.0)) - 0.1)
                 if _cfg_get(config, "actTimeout", None) is not None
@@ -6503,6 +6554,7 @@ class KaggleOrbitWarsDualPolicyAgent:
         model_search_adaptive_horizon: Optional[bool] = None,
         model_search_adaptive_horizon_offset: Optional[int] = None,
         model_search_min_overage_s: Optional[float] = None,
+        model_search_launch_prob_threshold: Optional[float] = None,
     ):
         self.checkpoint_4p = resolve_checkpoint_path(checkpoint_4p)
         self.checkpoint_2p = resolve_checkpoint_path(checkpoint_2p)
@@ -6526,6 +6578,7 @@ class KaggleOrbitWarsDualPolicyAgent:
         self.model_search_adaptive_horizon = model_search_adaptive_horizon
         self.model_search_adaptive_horizon_offset = model_search_adaptive_horizon_offset
         self.model_search_min_overage_s = model_search_min_overage_s
+        self.model_search_launch_prob_threshold = model_search_launch_prob_threshold
         self._delegate: Optional[KaggleOrbitWarsAgent] = None
         self._delegate_mode: Optional[str] = None
         self._game_key: Optional[str] = None
@@ -6576,6 +6629,7 @@ class KaggleOrbitWarsDualPolicyAgent:
             model_search_adaptive_horizon=self.model_search_adaptive_horizon,
             model_search_adaptive_horizon_offset=self.model_search_adaptive_horizon_offset,
             model_search_min_overage_s=self.model_search_min_overage_s,
+            model_search_launch_prob_threshold=self.model_search_launch_prob_threshold,
         )
 
     @torch.inference_mode()
