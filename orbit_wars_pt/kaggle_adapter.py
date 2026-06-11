@@ -3281,6 +3281,7 @@ class CachedSearchTransition:
     step_count: int
     step_reward: float
     done: bool
+    ego_actions: list[list[float]] | None = None
     policy_outputs: CachedSearchPolicyOutputs | None = None
 
 
@@ -3288,7 +3289,7 @@ class CachedSearchTransition:
 class CachedSearchRollout:
     game_key: str
     ego_player: int
-    root_ego_actions: list[list[float]]
+    root_ego_actions: list[list[float]] | None
     root_public_obs: dict[str, Any]
     root_state: OrbitWarsState
     root_step_count: int
@@ -5320,6 +5321,7 @@ class KaggleOrbitWarsAgent:
                         step_count=int(branch_steps[branch_idx]),
                         step_reward=float(step_reward[int(ego_player)]),
                         done=bool(np.asarray(state_post.done)),
+                        ego_actions=copy.deepcopy(joint_actions_by_branch[branch_idx][int(ego_player)]),
                     )
                 )
                 if bool(np.asarray(state_post.done)):
@@ -5436,6 +5438,7 @@ class KaggleOrbitWarsAgent:
                     step_count=int(branch_step),
                     step_reward=float(step_reward[int(ego_player)]),
                     done=bool(np.asarray(state_post.done)),
+                    ego_actions=copy.deepcopy(joint_actions[int(ego_player)]),
                     policy_outputs=None,
                 )
             )
@@ -5489,6 +5492,7 @@ class KaggleOrbitWarsAgent:
                     step_count=int(trans.step_count),
                     step_reward=float(trans.step_reward),
                     done=bool(trans.done),
+                    ego_actions=copy.deepcopy(trans.ego_actions) if trans.ego_actions is not None else None,
                     policy_outputs=trans.policy_outputs,
                 )
             )
@@ -5542,6 +5546,8 @@ class KaggleOrbitWarsAgent:
         launch_action: list[float],
         cache: CachedSearchRollout,
     ) -> str | None:
+        if cache.root_ego_actions is None:
+            return None
         if _action_sequence_match(cache.root_ego_actions, action_prefix):
             return "halt"
         launch_actions = copy.deepcopy(action_prefix) + [copy.deepcopy(launch_action)]
@@ -5582,6 +5588,11 @@ class KaggleOrbitWarsAgent:
             self._search_rollout_cache = None
             return
         root = chosen[0]
+        next_root_actions = (
+            copy.deepcopy(chosen[1].ego_actions)
+            if len(chosen) > 1 and chosen[1].ego_actions is not None
+            else None
+        )
         cached_policy_outputs = self._cached_policy_outputs_for_states(
             [trans.state for trans in chosen],
             num_agents=int(runtime.num_agents),
@@ -5589,7 +5600,7 @@ class KaggleOrbitWarsAgent:
         self._search_rollout_cache = CachedSearchRollout(
             game_key=str(runtime.game_key),
             ego_player=int(ego_player),
-            root_ego_actions=copy.deepcopy(root_ego_actions),
+            root_ego_actions=next_root_actions,
             root_public_obs=copy.deepcopy(root.public_obs),
             root_state=root.state,
             root_step_count=int(root.step_count),
@@ -5601,6 +5612,7 @@ class KaggleOrbitWarsAgent:
                     step_count=int(trans.step_count),
                     step_reward=float(trans.step_reward),
                     done=bool(trans.done),
+                    ego_actions=copy.deepcopy(trans.ego_actions) if trans.ego_actions is not None else None,
                     policy_outputs=cached_policy_outputs[idx + 1] if (idx + 1) < len(cached_policy_outputs) else None,
                 )
                 for idx, trans in enumerate(chosen[1:])
