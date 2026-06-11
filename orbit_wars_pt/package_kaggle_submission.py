@@ -25,6 +25,8 @@ from typing import Any, Mapping
 
 import torch
 
+SAMPLING_MODE_CHOICES = ("stochastic", "greedy", "mixed")
+
 # Modules required by ``orbit_wars_pt.kaggle_adapter`` at inference time (no JAX).
 _SUBMISSION_PACKAGE_FILES = (
     "__init__.py",
@@ -202,6 +204,9 @@ def package_submission(
     greedy: bool = False,
     greedy_4p: bool | None = None,
     greedy_2p: bool | None = None,
+    sampling_mode: str | None = None,
+    sampling_mode_4p: str | None = None,
+    sampling_mode_2p: str | None = None,
     device: str = "cpu",
     extra_env: dict[str, str] | None = None,
     source_pkg: Path | None = None,
@@ -267,6 +272,12 @@ def package_submission(
         shutil.copy2(checkpoint_2p, bundle_dir / "checkpoint_2p.pt")
     _copy_inference_package(bundle_dir / "orbit_wars_pt", source_pkg=source_pkg)
     submission_env = dict(extra_env or {})
+    if sampling_mode is not None:
+        submission_env["ORBIT_WARS_SAMPLING_MODE"] = str(sampling_mode)
+    if sampling_mode_4p is not None:
+        submission_env["ORBIT_WARS_SAMPLING_MODE_4P"] = str(sampling_mode_4p)
+    if sampling_mode_2p is not None:
+        submission_env["ORBIT_WARS_SAMPLING_MODE_2P"] = str(sampling_mode_2p)
     if greedy_4p is not None:
         submission_env["ORBIT_WARS_GREEDY_4P"] = "1" if bool(greedy_4p) else "0"
     if greedy_2p is not None:
@@ -319,6 +330,9 @@ def package_submission(
         Greedy (default): {greedy}
         Greedy 4p override: {greedy_4p if greedy_4p is not None else 'default'}
         Greedy 2p override: {greedy_2p if greedy_2p is not None else 'default'}
+        Sampling mode (default): {sampling_mode if sampling_mode is not None else 'greedy fallback / adapter default'}
+        Sampling mode 4p override: {sampling_mode_4p if sampling_mode_4p is not None else 'default'}
+        Sampling mode 2p override: {sampling_mode_2p if sampling_mode_2p is not None else 'default'}
         Device: {device}
         CPU threads: 2
         Population member (fallback): {population_member if population_member is not None else 'member 0 / checkpoint default'}
@@ -431,6 +445,27 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Override the packaged 2-player policy mode. Defaults to --greedy when omitted.",
+    )
+    parser.add_argument(
+        "--sampling-mode",
+        choices=SAMPLING_MODE_CHOICES,
+        default=None,
+        help=(
+            "Bake ORBIT_WARS_SAMPLING_MODE into main.py for both policies. "
+            "Choices: stochastic, greedy, mixed. Default leaves sampling mode unset so --greedy remains the fallback."
+        ),
+    )
+    parser.add_argument(
+        "--sampling-mode-4p",
+        choices=SAMPLING_MODE_CHOICES,
+        default=None,
+        help="Override ORBIT_WARS_SAMPLING_MODE_4P in main.py. Defaults to --sampling-mode when omitted.",
+    )
+    parser.add_argument(
+        "--sampling-mode-2p",
+        choices=SAMPLING_MODE_CHOICES,
+        default=None,
+        help="Override ORBIT_WARS_SAMPLING_MODE_2P in main.py. Defaults to --sampling-mode when omitted.",
     )
     parser.add_argument(
         "--device",
@@ -587,6 +622,9 @@ def main() -> None:
         greedy=bool(args.greedy),
         greedy_4p=(None if args.greedy_4p is None else bool(args.greedy_4p)),
         greedy_2p=(None if args.greedy_2p is None else bool(args.greedy_2p)),
+        sampling_mode=args.sampling_mode,
+        sampling_mode_4p=(args.sampling_mode if args.sampling_mode_4p is None else args.sampling_mode_4p),
+        sampling_mode_2p=(args.sampling_mode if args.sampling_mode_2p is None else args.sampling_mode_2p),
         device=str(args.device),
         slim=not args.no_slim,
         target_method=args.target_method,

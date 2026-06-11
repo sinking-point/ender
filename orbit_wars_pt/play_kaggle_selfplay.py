@@ -12,6 +12,8 @@ from typing import Any, Callable
 
 import numpy as np
 
+SAMPLING_MODE_CHOICES = ("stochastic", "greedy", "mixed")
+
 CPU_THREAD_ENV_VARS = (
     "OMP_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -181,6 +183,39 @@ def main() -> None:
         type=int,
         default=0,
         help="Torch sampling seed used by the adapter when --no-greedy.",
+    )
+    parser.add_argument(
+        "--sampling-mode",
+        choices=SAMPLING_MODE_CHOICES,
+        default=None,
+        help=(
+            "Action sampling mode for all players unless overridden per seat. "
+            "Choices: stochastic, greedy, mixed. Default: unset, so the adapter falls back to --greedy."
+        ),
+    )
+    parser.add_argument(
+        "--sampling-mode-p0",
+        choices=SAMPLING_MODE_CHOICES,
+        default=None,
+        help="Sampling mode for player 0. Default: same as --sampling-mode when set; otherwise greedy fallback.",
+    )
+    parser.add_argument(
+        "--sampling-mode-p1",
+        choices=SAMPLING_MODE_CHOICES,
+        default=None,
+        help="Sampling mode for player 1. Default: same as --sampling-mode when set; otherwise greedy fallback.",
+    )
+    parser.add_argument(
+        "--sampling-mode-p2",
+        choices=SAMPLING_MODE_CHOICES,
+        default=None,
+        help="Sampling mode for player 2 in 4-player mode. Default: same as --sampling-mode when set; otherwise greedy fallback.",
+    )
+    parser.add_argument(
+        "--sampling-mode-p3",
+        choices=SAMPLING_MODE_CHOICES,
+        default=None,
+        help="Sampling mode for player 3 in 4-player mode. Default: same as --sampling-mode when set; otherwise greedy fallback.",
     )
     parser.add_argument(
         "--raycast-rays",
@@ -400,6 +435,25 @@ def main() -> None:
     os.environ["ORBIT_WARS_GREEDY_P1"] = "1" if greedy_p1 else "0"
     os.environ["ORBIT_WARS_GREEDY_P2"] = "1" if greedy_p2 else "0"
     os.environ["ORBIT_WARS_GREEDY_P3"] = "1" if greedy_p3 else "0"
+    sampling_mode_p0 = args.sampling_mode if args.sampling_mode_p0 is None else args.sampling_mode_p0
+    sampling_mode_p1 = args.sampling_mode if args.sampling_mode_p1 is None else args.sampling_mode_p1
+    sampling_mode_p2 = args.sampling_mode if args.sampling_mode_p2 is None else args.sampling_mode_p2
+    sampling_mode_p3 = args.sampling_mode if args.sampling_mode_p3 is None else args.sampling_mode_p3
+    if args.sampling_mode is None:
+        os.environ.pop("ORBIT_WARS_SAMPLING_MODE", None)
+    else:
+        os.environ["ORBIT_WARS_SAMPLING_MODE"] = str(args.sampling_mode)
+    sampling_mode_env = {
+        "ORBIT_WARS_SAMPLING_MODE_P0": sampling_mode_p0,
+        "ORBIT_WARS_SAMPLING_MODE_P1": sampling_mode_p1,
+        "ORBIT_WARS_SAMPLING_MODE_P2": sampling_mode_p2,
+        "ORBIT_WARS_SAMPLING_MODE_P3": sampling_mode_p3,
+    }
+    for key, value in sampling_mode_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = str(value)
     os.environ["ORBIT_WARS_AGENT_SEED"] = str(int(args.agent_seed))
     if args.raycast_rays is not None:
         os.environ["ORBIT_WARS_RAYCAST_RAYS"] = str(int(args.raycast_rays))
@@ -526,6 +580,12 @@ def main() -> None:
         greedy_p1,
         greedy_p2,
         greedy_p3,
+    ]
+    sampling_mode_by_seat = [
+        sampling_mode_p0,
+        sampling_mode_p1,
+        sampling_mode_p2,
+        sampling_mode_p3,
     ]
     base_checkpoint = Path(args.checkpoint).expanduser()
     checkpoint_by_seat = [
@@ -655,6 +715,7 @@ def main() -> None:
             device=str(args.device),
             policy_key=policy_key,
             greedy=bool(greedy_by_seat[seat]),
+            sampling_mode=sampling_mode_by_seat[seat],
             population_member=member_by_seat[seat],
             max_micro_steps=(None if args.max_micro_steps is None else int(args.max_micro_steps)),
             seed=int(args.agent_seed) + seat + (1000 if policy_key != "policy" else 0),

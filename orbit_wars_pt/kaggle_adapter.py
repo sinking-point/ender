@@ -57,6 +57,14 @@ DEFAULT_INTERVAL_SAMPLES_PER_SPAN = 9
 DEFAULT_TARGET_METHOD = "rays"
 DEFAULT_MAX_ACTIONS = 64
 DEFAULT_CPU_THREADS = 0
+SAMPLING_MODE_STOCHASTIC = "stochastic"
+SAMPLING_MODE_GREEDY = "greedy"
+SAMPLING_MODE_MIXED = "mixed"
+_VALID_SAMPLING_MODES = {
+    SAMPLING_MODE_STOCHASTIC,
+    SAMPLING_MODE_GREEDY,
+    SAMPLING_MODE_MIXED,
+}
 MAX_COMET_GROUPS = 5
 MAX_COMET_PATH = 40
 _SEAT_QTURNS_TO_P0_2P = np.asarray([0, 2], dtype=np.int32)
@@ -3687,7 +3695,7 @@ def _build_turn_actions_torch_only(
     *,
     ship_speed: float = 6.0,
     max_micro_steps: int = DEFAULT_MAX_ACTIONS,
-    greedy: bool = False,
+    sampling_mode: str = SAMPLING_MODE_STOCHASTIC,
     rng: Optional[torch.Generator] = None,
     n_rays: int = DEFAULT_RAYCAST_RAYS,
     samples_per_span: int = DEFAULT_INTERVAL_SAMPLES_PER_SPAN,
@@ -3757,7 +3765,9 @@ def _build_turn_actions_torch_only(
                 and not search_used
             )
             halt_logits = out["halt_logits"][0]
-            if greedy:
+            halt_greedy = sampling_mode == SAMPLING_MODE_GREEDY
+            origin_target_greedy = sampling_mode in {SAMPLING_MODE_GREEDY, SAMPLING_MODE_MIXED}
+            if halt_greedy:
                 policy_halt_action = _greedy_halt_action_from_logits(
                     halt_logits,
                     launch_threshold=search_greedy_launch_threshold,
@@ -3779,7 +3789,7 @@ def _build_turn_actions_torch_only(
                 break
             flat_logits = out["origin_frac_logits"].flatten(start_dim=1)[0]
             masked_origin_frac = flat_logits.masked_fill(~flat_mask, -1e4)
-            if greedy:
+            if origin_target_greedy:
                 origin_frac_flat = int(torch.argmax(masked_origin_frac).item())
             else:
                 origin_frac_probs = torch.softmax(masked_origin_frac, dim=-1)
@@ -3839,7 +3849,7 @@ def _build_turn_actions_torch_only(
             target_mask &= ray_valid_t
             if abort_logit is not None:
                 combined_target = torch.cat([target_logits.masked_fill(~target_mask, -1e4), abort_logit.reshape(1)], dim=0)
-                if greedy:
+                if origin_target_greedy:
                     target_choice = int(torch.argmax(combined_target).item())
                 else:
                     target_probs = torch.softmax(combined_target, dim=-1)
@@ -3861,7 +3871,7 @@ def _build_turn_actions_torch_only(
                         timing.micro_target_s += perf_counter() - t0
                     break
                 masked_target = target_logits.masked_fill(~target_mask, -1e4)
-                if greedy:
+                if origin_target_greedy:
                     d_idx = int(torch.argmax(masked_target).item())
                 else:
                     target_probs = torch.softmax(masked_target, dim=-1)
@@ -3936,7 +3946,7 @@ def _build_turn_actions_torch_only(
                         device,
                         ship_speed=ship_speed,
                         max_micro_steps=max(0, int(max_micro_steps) - int(micro_idx) - 1),
-                        greedy=True,
+                        sampling_mode=SAMPLING_MODE_GREEDY,
                         rng=rng,
                         n_rays=n_rays,
                         samples_per_span=samples_per_span,
@@ -4855,6 +4865,7 @@ class KaggleOrbitWarsAgent:
         device: Optional[str | torch.device] = None,
         policy_key: str = "policy",
         greedy: bool | Mapping[int, bool] = False,
+        sampling_mode: str | Mapping[int, str] | None = None,
         population_member: Optional[int | Mapping[int, int]] = None,
         max_micro_steps: Optional[int] = None,
         max_fleets: int = 512,
@@ -4926,6 +4937,10 @@ class KaggleOrbitWarsAgent:
         self.normalize_obs_to_p0 = bool(training_args.get("normalize_obs_to_p0", False))
         self.policy_player_count = 4 if int(training_args.get("num_agents", 2)) > 2 else 2
         self._greedy_by_player = _normalize_greedy(greedy)
+        self._sampling_mode_by_player = _normalize_sampling_mode(
+            sampling_mode,
+            fallback_greedy=self._greedy_by_player,
+        )
         self.max_micro_steps = int(
             max_micro_steps
             if max_micro_steps is not None
@@ -4978,6 +4993,9 @@ class KaggleOrbitWarsAgent:
         if self.population_size <= 1:
             return None
         return int(self._population_member_by_player.get(int(player), self._population_member_by_player[-1]))
+
+    def _sampling_mode_for_player(self, player: int) -> str:
+        return str(self._sampling_mode_by_player.get(int(player), SAMPLING_MODE_STOCHASTIC))
 
     def _num_agents_for_obs(self, obs: Mapping[str, Any], config: Any = None) -> int:
         if self._frozen_num_agents is None:
@@ -6116,7 +6134,7 @@ class KaggleOrbitWarsAgent:
             self.device,
             ship_speed=6.0,
             max_micro_steps=self.max_micro_steps,
-            greedy=True,
+            sampling_mode=SAMPLING_MODE_GREEDY,
             rng=self.rng,
             n_rays=self.raycast_rays,
             samples_per_span=self.interval_samples_per_span,
@@ -6322,7 +6340,7 @@ class KaggleOrbitWarsAgent:
                     self.device,
                     ship_speed=ship_speed,
                     max_micro_steps=self.max_micro_steps,
-                    greedy=True,
+                    sampling_mode=SAMPLING_MODE_GREEDY,
                     rng=self.rng,
                     n_rays=self.raycast_rays,
                     samples_per_span=self.interval_samples_per_span,
@@ -6403,7 +6421,11 @@ class KaggleOrbitWarsAgent:
             self.device,
             ship_speed=ship_speed,
             max_micro_steps=self.max_micro_steps,
-            greedy=(search_active or self._greedy_by_player.get(ego_player, False)),
+            sampling_mode=(
+                SAMPLING_MODE_GREEDY
+                if search_active
+                else self._sampling_mode_for_player(ego_player)
+            ),
             rng=self.rng,
             n_rays=self.raycast_rays,
             samples_per_span=self.interval_samples_per_span,
@@ -6451,8 +6473,11 @@ class KaggleOrbitWarsDualPolicyAgent:
         *,
         device: Optional[str | torch.device] = None,
         greedy: bool | Mapping[int, bool] = False,
+        sampling_mode: str | Mapping[int, str] | None = None,
         greedy_4p: bool | Mapping[int, bool] | None = None,
         greedy_2p: bool | Mapping[int, bool] | None = None,
+        sampling_mode_4p: str | Mapping[int, str] | None = None,
+        sampling_mode_2p: str | Mapping[int, str] | None = None,
         population_member_4p: Optional[int] = None,
         population_member_2p: Optional[int] = None,
         max_micro_steps: Optional[int] = None,
@@ -6471,8 +6496,11 @@ class KaggleOrbitWarsDualPolicyAgent:
         self.checkpoint_2p = resolve_checkpoint_path(checkpoint_2p)
         self.device = device
         self.greedy_default = greedy
+        self.sampling_mode_default = sampling_mode
         self.greedy_4p = greedy if greedy_4p is None else greedy_4p
         self.greedy_2p = greedy if greedy_2p is None else greedy_2p
+        self.sampling_mode_4p = sampling_mode if sampling_mode_4p is None else sampling_mode_4p
+        self.sampling_mode_2p = sampling_mode if sampling_mode_2p is None else sampling_mode_2p
         self.population_member_4p = population_member_4p
         self.population_member_2p = population_member_2p
         self.max_micro_steps = max_micro_steps
@@ -6523,6 +6551,7 @@ class KaggleOrbitWarsDualPolicyAgent:
             self.checkpoint_4p if use_4p else self.checkpoint_2p,
             device=self.device,
             greedy=self.greedy_4p if use_4p else self.greedy_2p,
+            sampling_mode=self.sampling_mode_4p if use_4p else self.sampling_mode_2p,
             population_member=self.population_member_4p if use_4p else self.population_member_2p,
             max_micro_steps=self.max_micro_steps,
             max_fleets=self.max_fleets,
@@ -6608,6 +6637,45 @@ def _normalize_greedy(greedy: bool | Mapping[int, bool]) -> dict[int, bool]:
     return {i: g for i in range(4)}
 
 
+def _normalize_sampling_mode_value(value: str) -> str:
+    mode = str(value).strip().lower().replace("-", "_")
+    aliases = {
+        "sample": SAMPLING_MODE_STOCHASTIC,
+        "stochastic": SAMPLING_MODE_STOCHASTIC,
+        "random": SAMPLING_MODE_STOCHASTIC,
+        "argmax": SAMPLING_MODE_GREEDY,
+        "greedy": SAMPLING_MODE_GREEDY,
+        "mixed": SAMPLING_MODE_MIXED,
+        "hybrid": SAMPLING_MODE_MIXED,
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in _VALID_SAMPLING_MODES:
+        raise ValueError(
+            f"invalid sampling mode {value!r}; expected one of {sorted(_VALID_SAMPLING_MODES)}"
+        )
+    return mode
+
+
+def _normalize_sampling_mode(
+    sampling_mode: str | Mapping[int, str] | None,
+    *,
+    fallback_greedy: bool | Mapping[int, bool] = False,
+) -> dict[int, str]:
+    fallback_modes = {
+        player: (SAMPLING_MODE_GREEDY if greedy else SAMPLING_MODE_STOCHASTIC)
+        for player, greedy in _normalize_greedy(fallback_greedy).items()
+    }
+    if sampling_mode is None:
+        return fallback_modes
+    if isinstance(sampling_mode, Mapping):
+        out = dict(fallback_modes)
+        for k, v in sampling_mode.items():
+            out[int(k)] = _normalize_sampling_mode_value(str(v))
+        return out
+    mode = _normalize_sampling_mode_value(str(sampling_mode))
+    return {i: mode for i in range(4)}
+
+
 def _greedy_from_env() -> bool | dict[int, bool]:
     per_player_set = [f"ORBIT_WARS_GREEDY_P{i}" in os.environ for i in range(4)]
     if any(per_player_set):
@@ -6619,11 +6687,47 @@ def _greedy_from_env() -> bool | dict[int, bool]:
     return _env_bool("ORBIT_WARS_GREEDY", False)
 
 
+def _sampling_mode_from_env() -> str | dict[int, str] | None:
+    per_player_set = [f"ORBIT_WARS_SAMPLING_MODE_P{i}" in os.environ for i in range(4)]
+    global_set = "ORBIT_WARS_SAMPLING_MODE" in os.environ
+    if any(per_player_set):
+        fallback = (
+            _normalize_sampling_mode_value(os.environ["ORBIT_WARS_SAMPLING_MODE"])
+            if global_set
+            else SAMPLING_MODE_STOCHASTIC
+        )
+        return {
+            i: (
+                _normalize_sampling_mode_value(os.environ[f"ORBIT_WARS_SAMPLING_MODE_P{i}"])
+                if per_player_set[i]
+                else fallback
+            )
+            for i in range(4)
+        }
+    if global_set:
+        return _normalize_sampling_mode_value(os.environ["ORBIT_WARS_SAMPLING_MODE"])
+    return None
+
+
 def _greedy_from_env_with_fallback(fallback: bool) -> bool | dict[int, bool]:
     per_player_set = [f"ORBIT_WARS_GREEDY_P{i}" in os.environ for i in range(4)]
     if any(per_player_set):
         return {
             i: _env_bool(f"ORBIT_WARS_GREEDY_P{i}", fallback) if per_player_set[i] else fallback
+            for i in range(4)
+        }
+    return fallback
+
+
+def _sampling_mode_from_env_with_fallback(fallback: str) -> str | dict[int, str]:
+    per_player_set = [f"ORBIT_WARS_SAMPLING_MODE_P{i}" in os.environ for i in range(4)]
+    if any(per_player_set):
+        return {
+            i: (
+                _normalize_sampling_mode_value(os.environ[f"ORBIT_WARS_SAMPLING_MODE_P{i}"])
+                if per_player_set[i]
+                else fallback
+            )
             for i in range(4)
         }
     return fallback
@@ -6638,6 +6742,21 @@ def _dual_greedy_from_env() -> tuple[bool | dict[int, bool], bool | dict[int, bo
     if "ORBIT_WARS_GREEDY_2P" in os.environ:
         greedy_2p = _greedy_from_env_with_fallback(_env_bool("ORBIT_WARS_GREEDY_2P", False))
     return greedy_4p, greedy_2p
+
+
+def _dual_sampling_mode_from_env() -> tuple[str | dict[int, str] | None, str | dict[int, str] | None]:
+    sampling_mode_default = _sampling_mode_from_env()
+    sampling_mode_4p = sampling_mode_default
+    sampling_mode_2p = sampling_mode_default
+    if "ORBIT_WARS_SAMPLING_MODE_4P" in os.environ:
+        sampling_mode_4p = _sampling_mode_from_env_with_fallback(
+            _normalize_sampling_mode_value(os.environ["ORBIT_WARS_SAMPLING_MODE_4P"])
+        )
+    if "ORBIT_WARS_SAMPLING_MODE_2P" in os.environ:
+        sampling_mode_2p = _sampling_mode_from_env_with_fallback(
+            _normalize_sampling_mode_value(os.environ["ORBIT_WARS_SAMPLING_MODE_2P"])
+        )
+    return sampling_mode_4p, sampling_mode_2p
 
 
 def _normalize_population_member(
@@ -6748,6 +6867,8 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
         device = os.environ.get("ORBIT_WARS_DEVICE")
         greedy = _greedy_from_env()
         greedy_4p, greedy_2p = _dual_greedy_from_env()
+        sampling_mode = _sampling_mode_from_env()
+        sampling_mode_4p, sampling_mode_2p = _dual_sampling_mode_from_env()
         population_members = _population_members_single_from_env()
         population_member_4p, population_member_2p = _population_members_dual_from_env()
         seed_raw = os.environ.get("ORBIT_WARS_AGENT_SEED")
@@ -6768,8 +6889,11 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
                     resolve_checkpoint_path(ckpt_2p),
                     device=device,
                     greedy=greedy,
+                    sampling_mode=sampling_mode,
                     greedy_4p=greedy_4p,
                     greedy_2p=greedy_2p,
+                    sampling_mode_4p=sampling_mode_4p,
+                    sampling_mode_2p=sampling_mode_2p,
                     population_member_4p=population_member_4p,
                     population_member_2p=population_member_2p,
                     max_micro_steps=max_micro_steps,
@@ -6786,6 +6910,7 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
                     ckpt,
                     device=device,
                     greedy=greedy,
+                    sampling_mode=sampling_mode,
                     population_member=population_members,
                     max_micro_steps=max_micro_steps,
                     seed=seed,
