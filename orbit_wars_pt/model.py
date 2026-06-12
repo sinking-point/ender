@@ -1178,7 +1178,11 @@ class OrbitWarsPolicy(nn.Module):
 
         pop = self._normalize_population_idx(population_idx, b, features.device)
         h_packed, _ = self._apply_encoder(x_packed, rope_packed, padding_mask, pop)
-        value_h_packed, _ = self._apply_critic_encoder(x_packed, rope_packed, padding_mask, pop)
+        value_h_packed = (
+            self._apply_critic_encoder(x_packed, rope_packed, padding_mask, pop)[0]
+            if self.disjoint_actor_critic
+            else h_packed
+        )
 
         # Scatter back to dense [B, L, d]. Padding rows of ``h_packed``
         # contain garbage (masked-attention output), and they get scattered
@@ -1188,8 +1192,11 @@ class OrbitWarsPolicy(nn.Module):
         # ``pair_mask`` / explicit indices, so the garbage is harmless.
         h = torch.zeros(b, l, self.d_model, dtype=h_packed.dtype, device=h_packed.device)
         h = h.scatter(1, pack_idx_d, h_packed)
-        value_h = torch.zeros(b, l, self.d_model, dtype=value_h_packed.dtype, device=value_h_packed.device)
-        value_h = value_h.scatter(1, pack_idx_d, value_h_packed)
+        if self.disjoint_actor_critic:
+            value_h = torch.zeros(b, l, self.d_model, dtype=value_h_packed.dtype, device=value_h_packed.device)
+            value_h = value_h.scatter(1, pack_idx_d, value_h_packed)
+        else:
+            value_h = h
 
         if self.population_size == 1:
             return self._compute_outputs_single(
@@ -1236,7 +1243,7 @@ class OrbitWarsPolicy(nn.Module):
         padding_mask = ~entity_mask
 
         h, pop = self._apply_encoder(x, rope_pos, padding_mask, population_idx)
-        value_h, _ = self._apply_critic_encoder(x, rope_pos, padding_mask, population_idx)
+        value_h = self._apply_critic_encoder(x, rope_pos, padding_mask, population_idx)[0] if self.disjoint_actor_critic else h
         if self.population_size == 1:
             return self._compute_outputs_single(
                 h,
@@ -1310,7 +1317,7 @@ class OrbitWarsPolicy(nn.Module):
         x = self.embed(entity_type, owner_idx, features)
         padding_mask = ~entity_mask
         h = self._apply_encoder_grouped_population(x, rope_pos, padding_mask)
-        value_h = self._apply_critic_encoder_grouped_population(x, rope_pos, padding_mask)
+        value_h = self._apply_critic_encoder_grouped_population(x, rope_pos, padding_mask) if self.disjoint_actor_critic else h
         return self._compute_outputs_grouped_population(
             h,
             value_h,
@@ -1406,7 +1413,7 @@ class OrbitWarsPolicy(nn.Module):
         x = self.embed(obs["entity_type"], obs["owner_idx"], obs["features"])
         padding_mask = ~obs["entity_mask"]
         h = self._apply_encoder_grouped_population(x, obs["rope_pos"], padding_mask)
-        value_h = self._apply_critic_encoder_grouped_population(x, obs["rope_pos"], padding_mask)
+        value_h = self._apply_critic_encoder_grouped_population(x, obs["rope_pos"], padding_mask) if self.disjoint_actor_critic else h
         return self._compute_outputs_grouped_population(
             h,
             value_h,
@@ -1447,11 +1454,18 @@ class OrbitWarsPolicy(nn.Module):
         padding_mask = arange[None, :] >= counts[:, None]
         member_counts = self._population_member_counts(population_idx, b, features.device)
         h_packed = self._apply_encoder_sorted_population(x_packed, rope_packed, padding_mask, member_counts)
-        value_h_packed = self._apply_critic_encoder_sorted_population(x_packed, rope_packed, padding_mask, member_counts)
+        value_h_packed = (
+            self._apply_critic_encoder_sorted_population(x_packed, rope_packed, padding_mask, member_counts)
+            if self.disjoint_actor_critic
+            else h_packed
+        )
         h = torch.zeros(b, l, self.d_model, dtype=h_packed.dtype, device=h_packed.device)
         h = h.scatter(1, pack_idx_d, h_packed)
-        value_h = torch.zeros(b, l, self.d_model, dtype=value_h_packed.dtype, device=value_h_packed.device)
-        value_h = value_h.scatter(1, pack_idx_d, value_h_packed)
+        if self.disjoint_actor_critic:
+            value_h = torch.zeros(b, l, self.d_model, dtype=value_h_packed.dtype, device=value_h_packed.device)
+            value_h = value_h.scatter(1, pack_idx_d, value_h_packed)
+        else:
+            value_h = h
         return self._compute_outputs_sorted_population(
             h,
             value_h,
@@ -1498,11 +1512,18 @@ class OrbitWarsPolicy(nn.Module):
         padding_mask = arange[None, :] >= counts[:, None]
         member_counts = self._population_member_counts(population_idx, b, features.device)
         h_packed = self._apply_encoder_sorted_population(x_packed, rope_packed, padding_mask, member_counts)
-        value_h_packed = self._apply_critic_encoder_sorted_population(x_packed, rope_packed, padding_mask, member_counts)
+        value_h_packed = (
+            self._apply_critic_encoder_sorted_population(x_packed, rope_packed, padding_mask, member_counts)
+            if self.disjoint_actor_critic
+            else h_packed
+        )
         h = torch.zeros(b, l, self.d_model, dtype=h_packed.dtype, device=h_packed.device)
         h = h.scatter(1, pack_idx_d, h_packed)
-        value_h = torch.zeros(b, l, self.d_model, dtype=value_h_packed.dtype, device=value_h_packed.device)
-        value_h = value_h.scatter(1, pack_idx_d, value_h_packed)
+        if self.disjoint_actor_critic:
+            value_h = torch.zeros(b, l, self.d_model, dtype=value_h_packed.dtype, device=value_h_packed.device)
+            value_h = value_h.scatter(1, pack_idx_d, value_h_packed)
+        else:
+            value_h = h
         return self._compute_ppo_outputs_sorted_population(
             h,
             value_h,
