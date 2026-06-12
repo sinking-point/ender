@@ -47,7 +47,7 @@ from orbit_wars_pt.gpu_mem import (
 from orbit_wars_pt.jax_setup import configure_jax_for_training
 from orbit_wars_pt.model import (
     OrbitWarsPolicy,
-    adapt_legacy_value_heads_for_model,
+    adapt_checkpoint_state_for_model,
 )
 from orbit_wars_pt.kaggle_adapter import _strip_legacy_pair_head_keys
 from orbit_wars_pt.parallel_rollout import (
@@ -626,6 +626,7 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "num_agents",
         "population_size",
         "target_abort_enabled",
+        "disjoint_actor_critic",
         "exploiter_mode",
         "activation_checkpointing",
         "device",
@@ -706,9 +707,11 @@ def save_checkpoint(
     *,
     next_iteration: int,
     policy: OrbitWarsPolicy,
-    opt: torch.optim.Optimizer,
+    actor_opt: torch.optim.Optimizer,
+    critic_opt: Optional[torch.optim.Optimizer],
     exploiter_policy: Optional[OrbitWarsPolicy],
-    exploiter_opt: Optional[torch.optim.Optimizer],
+    exploiter_actor_opt: Optional[torch.optim.Optimizer],
+    exploiter_critic_opt: Optional[torch.optim.Optimizer],
     rng: torch.Generator,
     rnd: np.random.Generator,
     rollout_env_seed: Any,
@@ -728,9 +731,13 @@ def save_checkpoint(
         "version": CHECKPOINT_VERSION,
         "iteration": next_iteration,
         "policy": policy.state_dict(),
-        "optimizer": opt.state_dict(),
+        "optimizer": actor_opt.state_dict(),
+        "actor_optimizer": actor_opt.state_dict(),
+        "critic_optimizer": None if critic_opt is None else critic_opt.state_dict(),
         "exploiter_policy": None if exploiter_policy is None else exploiter_policy.state_dict(),
-        "exploiter_optimizer": None if exploiter_opt is None else exploiter_opt.state_dict(),
+        "exploiter_optimizer": None if exploiter_actor_opt is None else exploiter_actor_opt.state_dict(),
+        "exploiter_actor_optimizer": None if exploiter_actor_opt is None else exploiter_actor_opt.state_dict(),
+        "exploiter_critic_optimizer": None if exploiter_critic_opt is None else exploiter_critic_opt.state_dict(),
         "torch_rng": rng.get_state(),
         "numpy_rng_state": rnd.bit_generator.state,
         "rollout_env_seed": rollout_env_seed,
@@ -756,7 +763,8 @@ def _expand_legacy_optimizer_value_head_state(
     saved_opt_state: Dict[str, Any],
     *,
     saved_model_state: Mapping[str, Any] | None = None,
-    model: OrbitWarsPolicy,
+    model: Optional[OrbitWarsPolicy] = None,
+    named_params: Optional[list[tuple[str, torch.nn.Parameter]]] = None,
     opt: torch.optim.Optimizer,
 ) -> tuple[Dict[str, Any], bool]:
     """Map saved Adam state onto the current model, including removed legacy params."""
@@ -772,7 +780,10 @@ def _expand_legacy_optimizer_value_head_state(
     if len(param_groups) != len(current_groups):
         return saved_opt_state, False
 
-    named_params = list(model.named_parameters())
+    if named_params is None:
+        if model is None:
+            return saved_opt_state, False
+        named_params = list(model.named_parameters())
     current_param_ids: list[int] = []
     for group in current_groups:
         current_param_ids.extend(int(pid) for pid in group.get("params", []))
@@ -786,16 +797,39 @@ def _expand_legacy_optimizer_value_head_state(
     if saved_model_state is None:
         return saved_opt_state, False
 
-    saved_param_names: list[str] = []
     current_name_set = {name for name, _ in named_params}
+    reference_name_set = (
+        {name for name, _ in model.named_parameters()} if model is not None else set(current_name_set)
+    )
+
+    def _fallback_saved_name(name: str) -> Optional[str]:
+        if name.startswith("critic_shared_blocks."):
+            return "shared_blocks." + name[len("critic_shared_blocks."):]
+        if name.startswith("critic_population_tails."):
+            return "population_tails." + name[len("critic_population_tails."):]
+        if name.startswith("critic_blocks."):
+            return "blocks." + name[len("critic_blocks."):]
+        if name.startswith("critic_norm_f."):
+            return "norm_f." + name[len("critic_norm_f."):]
+        if name.startswith("critic_value_head."):
+            return "value_head." + name[len("critic_value_head."):]
+        return None
+
+    allowed_saved_name_set = set(reference_name_set)
+    for name in reference_name_set:
+        fallback = _fallback_saved_name(name)
+        if fallback is not None:
+            allowed_saved_name_set.add(fallback)
+
+    saved_param_names: list[str] = []
     for key, value in saved_model_state.items():
         key_s = str(key)
-        if key_s not in current_name_set and (
+        if key_s not in allowed_saved_name_set and (
             ".pair_q." in key_s or ".pair_k." in key_s or key_s.startswith("pair_q.") or key_s.startswith("pair_k.")
         ):
             saved_param_names.append(key_s)
             continue
-        if key_s in current_name_set:
+        if key_s in allowed_saved_name_set:
             saved_param_names.append(key_s)
 
     if len(saved_param_names) != len(saved_param_ids):
@@ -809,7 +843,14 @@ def _expand_legacy_optimizer_value_head_state(
     out_state: dict[int, Any] = {}
     migrated = False
     for (name, param), current_pid in zip(named_params, current_param_ids):
+        fallback_name = None
         saved_pid = saved_pid_by_name.get(name)
+        if saved_pid is None:
+            fallback_name = _fallback_saved_name(name)
+            if fallback_name is not None:
+                saved_pid = saved_pid_by_name.get(fallback_name)
+                if saved_pid is not None:
+                    migrated = True
         if saved_pid is None:
             continue
         entry = state.get(saved_pid)
@@ -841,6 +882,33 @@ def _expand_legacy_optimizer_value_head_state(
     out["state"] = out_state
     out["param_groups"] = out_groups
     return out, migrated
+
+
+def _named_params_for_optimizer(policy: OrbitWarsPolicy, role: str) -> list[tuple[str, torch.nn.Parameter]]:
+    if role == "actor":
+        return list(policy.actor_named_parameters())
+    if role == "critic":
+        return list(policy.critic_named_parameters())
+    raise ValueError(f"unsupported optimizer role {role!r}")
+
+
+def _make_policy_optimizers(
+    policy: OrbitWarsPolicy,
+    *,
+    lr: float,
+) -> tuple[torch.optim.Optimizer, Optional[torch.optim.Optimizer]]:
+    if not bool(getattr(policy, "disjoint_actor_critic", False)):
+        return optim.Adam(policy.parameters(), lr=lr), None
+    actor_params = policy.actor_parameters()
+    critic_params = policy.critic_parameters()
+    return optim.Adam(actor_params, lr=lr), optim.Adam(critic_params, lr=lr)
+
+
+def _clip_grad_norm_for_named_params(named_params: list[tuple[str, torch.nn.Parameter]], max_grad_norm: float) -> float:
+    params = [param for _, param in named_params if param.requires_grad]
+    if not params:
+        return 0.0
+    return float(torch.nn.utils.clip_grad_norm_(params, max_grad_norm))
 
 
 def _restore_torch_generator_from_checkpoint(saved: Any, rng: torch.Generator) -> None:
@@ -2500,6 +2568,7 @@ def _torch_ppo_loss_from_replay(
     obs_feature_dim: int = FEATURE_DIM,
     policy_loss_mask: Optional[torch.Tensor] = None,
     check_rollout_logp: bool = False,
+    loss_mode: str = "total",
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     del ship_speed
     target_valid = actions["target_planet_reachable"].to(device=adv.device, dtype=torch.bool)
@@ -2548,6 +2617,7 @@ def _torch_ppo_loss_from_replay(
                 actions["value_head_idx"].to(device=adv.device, dtype=torch.long),
                 policy_loss_mask,
                 check_rollout_logp,
+                loss_mode,
             )
         fn = loss_fn if loss_fn is not None else compute_ppo_loss_torch
         return fn(
@@ -2581,7 +2651,8 @@ def _torch_ppo_loss_from_replay(
             actions["value_head_idx"].to(device=adv.device, dtype=torch.long),
             policy_loss_mask,
             check_rollout_logp,
-    )
+            loss_mode,
+        )
 
 
 def _opportunistic_drain_reset_prefetch(
@@ -2597,6 +2668,7 @@ def _opportunistic_drain_reset_prefetch(
 def ppo_iteration(
     policy: OrbitWarsPolicy,
     opt: torch.optim.Optimizer,
+    critic_opt: Optional[torch.optim.Optimizer],
     segment: RolloutSegment,
     samples: dict,
     device: torch.device,
@@ -2680,79 +2752,183 @@ def ppo_iteration(
             timing.gather_s += perf_counter() - t0
 
             check_rollout_logp = not checked_rollout_logp
-            t0 = perf_counter()
-            loss, mb_stats = _torch_ppo_loss_from_replay(
-                obs=obs,
-                actions=actions,
-                adv=adv,
-                returns=ret_t,
-                old_logp=old_logp,
-                old_v=old_v,
-                policy=policy,
-                ship_speed=ship_speed,
-                clip_eps=clip_eps,
-                vf_coef=vf_coef,
-                entropy_coef=entropy_coef,
-                loss_fn=loss_fn,
-                compressed_loss_fn=compressed_loss_fn,
-                amp_dtype=amp_dtype,
-                member_counts=member_counts,
-                obs_feature_dim=obs_feature_dim,
-                policy_loss_mask=policy_loss_mask,
-                check_rollout_logp=check_rollout_logp,
-            )
-            timing.compiled_loss_s += perf_counter() - t0
-
-            if check_rollout_logp:
-                _verify_rollout_logp_from_loss(
-                    mb_stats=mb_stats,
-                    old_logp=old_logp,
+            actor_named_params = _named_params_for_optimizer(policy, "actor") if critic_opt is not None else []
+            critic_named_params = _named_params_for_optimizer(policy, "critic") if critic_opt is not None else []
+            if critic_opt is None:
+                t0 = perf_counter()
+                loss, mb_stats = _torch_ppo_loss_from_replay(
                     obs=obs,
                     actions=actions,
-                    advantages=adv,
+                    adv=adv,
                     returns=ret_t,
-                    old_value=old_v,
-                    policy_loss_mask=policy_loss_mask,
-                    players=torch.as_tensor(mb_player, device="cpu"),
-                    t_idx=torch.as_tensor(mb_t, device="cpu"),
-                    n_idx=torch.as_tensor(mb_n, device="cpu"),
-                    policy_id=(
-                        None
-                        if policy_id is None
-                        else torch.as_tensor(policy_id[mb_idx], device="cpu")
-                    ),
-                    env_mode=(
-                        None if env_mode is None else torch.as_tensor(env_mode[mb_idx], device="cpu")
-                    ),
-                    obs_feature_dim=obs_feature_dim,
-                    dump_dir=logp_check_dump_dir,
-                    policy_label=logp_check_label,
-                    train_iter=logp_check_iter,
+                    old_logp=old_logp,
+                    old_v=old_v,
+                    policy=policy,
+                    ship_speed=ship_speed,
                     clip_eps=clip_eps,
                     vf_coef=vf_coef,
                     entropy_coef=entropy_coef,
-                    population_size=population_size,
-                    member_counts=member_counts,
+                    loss_fn=loss_fn,
+                    compressed_loss_fn=compressed_loss_fn,
                     amp_dtype=amp_dtype,
+                    member_counts=member_counts,
+                    obs_feature_dim=obs_feature_dim,
+                    policy_loss_mask=policy_loss_mask,
+                    check_rollout_logp=check_rollout_logp,
+                    loss_mode="total",
                 )
-                checked_rollout_logp = True
+                timing.compiled_loss_s += perf_counter() - t0
+
+                if check_rollout_logp:
+                    _verify_rollout_logp_from_loss(
+                        mb_stats=mb_stats,
+                        old_logp=old_logp,
+                        obs=obs,
+                        actions=actions,
+                        advantages=adv,
+                        returns=ret_t,
+                        old_value=old_v,
+                        policy_loss_mask=policy_loss_mask,
+                        players=torch.as_tensor(mb_player, device="cpu"),
+                        t_idx=torch.as_tensor(mb_t, device="cpu"),
+                        n_idx=torch.as_tensor(mb_n, device="cpu"),
+                        policy_id=(
+                            None
+                            if policy_id is None
+                            else torch.as_tensor(policy_id[mb_idx], device="cpu")
+                        ),
+                        env_mode=(
+                            None if env_mode is None else torch.as_tensor(env_mode[mb_idx], device="cpu")
+                        ),
+                        obs_feature_dim=obs_feature_dim,
+                        dump_dir=logp_check_dump_dir,
+                        policy_label=logp_check_label,
+                        train_iter=logp_check_iter,
+                        clip_eps=clip_eps,
+                        vf_coef=vf_coef,
+                        entropy_coef=entropy_coef,
+                        population_size=population_size,
+                        member_counts=member_counts,
+                        amp_dtype=amp_dtype,
+                    )
+                    checked_rollout_logp = True
+
+                t0 = perf_counter()
+                opt.zero_grad()
+                loss.backward()
+                grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+                )
+                timing.backward_s += perf_counter() - t0
+
+                t0 = perf_counter()
+                opt.step()
+                timing.optim_s += perf_counter() - t0
+                total_loss_value = float(loss.item())
+            else:
+                t0 = perf_counter()
+                critic_loss, _critic_stats = _torch_ppo_loss_from_replay(
+                    obs=obs,
+                    actions=actions,
+                    adv=adv,
+                    returns=ret_t,
+                    old_logp=old_logp,
+                    old_v=old_v,
+                    policy=policy,
+                    ship_speed=ship_speed,
+                    clip_eps=clip_eps,
+                    vf_coef=vf_coef,
+                    entropy_coef=entropy_coef,
+                    loss_fn=loss_fn,
+                    compressed_loss_fn=compressed_loss_fn,
+                    amp_dtype=amp_dtype,
+                    member_counts=member_counts,
+                    obs_feature_dim=obs_feature_dim,
+                    policy_loss_mask=policy_loss_mask,
+                    check_rollout_logp=False,
+                    loss_mode="critic",
+                )
+                timing.compiled_loss_s += perf_counter() - t0
+                t0 = perf_counter()
+                critic_opt.zero_grad()
+                critic_loss.backward()
+                critic_grad_norm = _clip_grad_norm_for_named_params(critic_named_params, max_grad_norm)
+                timing.backward_s += perf_counter() - t0
+                t0 = perf_counter()
+                critic_opt.step()
+                timing.optim_s += perf_counter() - t0
+
+                t0 = perf_counter()
+                actor_loss, mb_stats = _torch_ppo_loss_from_replay(
+                    obs=obs,
+                    actions=actions,
+                    adv=adv,
+                    returns=ret_t,
+                    old_logp=old_logp,
+                    old_v=old_v,
+                    policy=policy,
+                    ship_speed=ship_speed,
+                    clip_eps=clip_eps,
+                    vf_coef=vf_coef,
+                    entropy_coef=entropy_coef,
+                    loss_fn=loss_fn,
+                    compressed_loss_fn=compressed_loss_fn,
+                    amp_dtype=amp_dtype,
+                    member_counts=member_counts,
+                    obs_feature_dim=obs_feature_dim,
+                    policy_loss_mask=policy_loss_mask,
+                    check_rollout_logp=check_rollout_logp,
+                    loss_mode="actor",
+                )
+                timing.compiled_loss_s += perf_counter() - t0
+
+                if check_rollout_logp:
+                    _verify_rollout_logp_from_loss(
+                        mb_stats=mb_stats,
+                        old_logp=old_logp,
+                        obs=obs,
+                        actions=actions,
+                        advantages=adv,
+                        returns=ret_t,
+                        old_value=old_v,
+                        policy_loss_mask=policy_loss_mask,
+                        players=torch.as_tensor(mb_player, device="cpu"),
+                        t_idx=torch.as_tensor(mb_t, device="cpu"),
+                        n_idx=torch.as_tensor(mb_n, device="cpu"),
+                        policy_id=(
+                            None
+                            if policy_id is None
+                            else torch.as_tensor(policy_id[mb_idx], device="cpu")
+                        ),
+                        env_mode=(
+                            None if env_mode is None else torch.as_tensor(env_mode[mb_idx], device="cpu")
+                        ),
+                        obs_feature_dim=obs_feature_dim,
+                        dump_dir=logp_check_dump_dir,
+                        policy_label=logp_check_label,
+                        train_iter=logp_check_iter,
+                        clip_eps=clip_eps,
+                        vf_coef=vf_coef,
+                        entropy_coef=entropy_coef,
+                        population_size=population_size,
+                        member_counts=member_counts,
+                        amp_dtype=amp_dtype,
+                    )
+                    checked_rollout_logp = True
+
+                t0 = perf_counter()
+                opt.zero_grad()
+                actor_loss.backward()
+                actor_grad_norm = _clip_grad_norm_for_named_params(actor_named_params, max_grad_norm)
+                timing.backward_s += perf_counter() - t0
+                t0 = perf_counter()
+                opt.step()
+                timing.optim_s += perf_counter() - t0
+                grad_norm = max(actor_grad_norm, critic_grad_norm)
+                total_loss_value = float(actor_loss.item() + critic_loss.item())
 
             t0 = perf_counter()
-            opt.zero_grad()
-            loss.backward()
-            # ``clip_grad_norm_`` returns the total parameter grad L2 norm
-            # *pre-clip*, which is what we want as a diagnostic.
-            grad_norm = float(
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
-            )
-            timing.backward_s += perf_counter() - t0
-
-            t0 = perf_counter()
-            opt.step()
-            timing.optim_s += perf_counter() - t0
-
-            t0 = perf_counter()
-            total_loss_sum += float(loss.item())
+            total_loss_sum += total_loss_value
             stats.update(mb_stats, grad_norm)
             timing.sync_s += perf_counter() - t0
             n_mb += 1
@@ -2765,6 +2941,7 @@ def ppo_iteration(
 def ppo_iteration_host_staged(
     policy: OrbitWarsPolicy,
     opt: torch.optim.Optimizer,
+    critic_opt: Optional[torch.optim.Optimizer],
     member_stores: list[HostReplayMemberStore],
     device: torch.device,
     minibatch_size: int,
@@ -2889,69 +3066,171 @@ def ppo_iteration_host_staged(
             timing.gather_s += perf_counter() - t0
 
             check_rollout_logp = not checked_rollout_logp
-            t0 = perf_counter()
-            loss, mb_stats = _torch_ppo_loss_from_replay(
-                obs=obs,
-                actions=actions,
-                adv=adv,
-                returns=ret_t,
-                old_logp=old_logp,
-                old_v=old_v,
-                policy=policy,
-                ship_speed=ship_speed,
-                clip_eps=clip_eps,
-                vf_coef=vf_coef,
-                entropy_coef=entropy_coef,
-                loss_fn=loss_fn,
-                compressed_loss_fn=compressed_loss_fn,
-                amp_dtype=amp_dtype,
-                member_counts=member_counts,
-                obs_feature_dim=obs_feature_dim,
-                policy_loss_mask=policy_loss_mask,
-                check_rollout_logp=check_rollout_logp,
-            )
-            timing.compiled_loss_s += perf_counter() - t0
-
-            if check_rollout_logp:
-                _verify_rollout_logp_from_loss(
-                    mb_stats=mb_stats,
-                    old_logp=old_logp,
+            actor_named_params = _named_params_for_optimizer(policy, "actor") if critic_opt is not None else []
+            critic_named_params = _named_params_for_optimizer(policy, "critic") if critic_opt is not None else []
+            if critic_opt is None:
+                t0 = perf_counter()
+                loss, mb_stats = _torch_ppo_loss_from_replay(
                     obs=obs,
                     actions=actions,
-                    advantages=adv,
+                    adv=adv,
                     returns=ret_t,
-                    old_value=old_v,
-                    policy_loss_mask=policy_loss_mask,
-                    players=players_mb,
-                    t_idx=t_idx_mb,
-                    n_idx=n_idx_mb,
-                    policy_id=policy_id_mb,
-                    env_mode=env_mode_mb,
-                    obs_feature_dim=obs_feature_dim,
-                    dump_dir=logp_check_dump_dir,
-                    policy_label=logp_check_label,
-                    train_iter=logp_check_iter,
+                    old_logp=old_logp,
+                    old_v=old_v,
+                    policy=policy,
+                    ship_speed=ship_speed,
                     clip_eps=clip_eps,
                     vf_coef=vf_coef,
                     entropy_coef=entropy_coef,
-                    population_size=population_size,
-                    member_counts=member_counts,
+                    loss_fn=loss_fn,
+                    compressed_loss_fn=compressed_loss_fn,
                     amp_dtype=amp_dtype,
+                    member_counts=member_counts,
+                    obs_feature_dim=obs_feature_dim,
+                    policy_loss_mask=policy_loss_mask,
+                    check_rollout_logp=check_rollout_logp,
+                    loss_mode="total",
                 )
-                checked_rollout_logp = True
+                timing.compiled_loss_s += perf_counter() - t0
+
+                if check_rollout_logp:
+                    _verify_rollout_logp_from_loss(
+                        mb_stats=mb_stats,
+                        old_logp=old_logp,
+                        obs=obs,
+                        actions=actions,
+                        advantages=adv,
+                        returns=ret_t,
+                        old_value=old_v,
+                        policy_loss_mask=policy_loss_mask,
+                        players=players_mb,
+                        t_idx=t_idx_mb,
+                        n_idx=n_idx_mb,
+                        policy_id=policy_id_mb,
+                        env_mode=env_mode_mb,
+                        obs_feature_dim=obs_feature_dim,
+                        dump_dir=logp_check_dump_dir,
+                        policy_label=logp_check_label,
+                        train_iter=logp_check_iter,
+                        clip_eps=clip_eps,
+                        vf_coef=vf_coef,
+                        entropy_coef=entropy_coef,
+                        population_size=population_size,
+                        member_counts=member_counts,
+                        amp_dtype=amp_dtype,
+                    )
+                    checked_rollout_logp = True
+
+                t0 = perf_counter()
+                opt.zero_grad()
+                loss.backward()
+                grad_norm = float(
+                    torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+                )
+                timing.backward_s += perf_counter() - t0
+
+                t0 = perf_counter()
+                opt.step()
+                timing.optim_s += perf_counter() - t0
+                total_loss_value = float(loss.item())
+            else:
+                t0 = perf_counter()
+                critic_loss, _critic_stats = _torch_ppo_loss_from_replay(
+                    obs=obs,
+                    actions=actions,
+                    adv=adv,
+                    returns=ret_t,
+                    old_logp=old_logp,
+                    old_v=old_v,
+                    policy=policy,
+                    ship_speed=ship_speed,
+                    clip_eps=clip_eps,
+                    vf_coef=vf_coef,
+                    entropy_coef=entropy_coef,
+                    loss_fn=loss_fn,
+                    compressed_loss_fn=compressed_loss_fn,
+                    amp_dtype=amp_dtype,
+                    member_counts=member_counts,
+                    obs_feature_dim=obs_feature_dim,
+                    policy_loss_mask=policy_loss_mask,
+                    check_rollout_logp=False,
+                    loss_mode="critic",
+                )
+                timing.compiled_loss_s += perf_counter() - t0
+                t0 = perf_counter()
+                critic_opt.zero_grad()
+                critic_loss.backward()
+                critic_grad_norm = _clip_grad_norm_for_named_params(critic_named_params, max_grad_norm)
+                timing.backward_s += perf_counter() - t0
+                t0 = perf_counter()
+                critic_opt.step()
+                timing.optim_s += perf_counter() - t0
+
+                t0 = perf_counter()
+                actor_loss, mb_stats = _torch_ppo_loss_from_replay(
+                    obs=obs,
+                    actions=actions,
+                    adv=adv,
+                    returns=ret_t,
+                    old_logp=old_logp,
+                    old_v=old_v,
+                    policy=policy,
+                    ship_speed=ship_speed,
+                    clip_eps=clip_eps,
+                    vf_coef=vf_coef,
+                    entropy_coef=entropy_coef,
+                    loss_fn=loss_fn,
+                    compressed_loss_fn=compressed_loss_fn,
+                    amp_dtype=amp_dtype,
+                    member_counts=member_counts,
+                    obs_feature_dim=obs_feature_dim,
+                    policy_loss_mask=policy_loss_mask,
+                    check_rollout_logp=check_rollout_logp,
+                    loss_mode="actor",
+                )
+                timing.compiled_loss_s += perf_counter() - t0
+
+                if check_rollout_logp:
+                    _verify_rollout_logp_from_loss(
+                        mb_stats=mb_stats,
+                        old_logp=old_logp,
+                        obs=obs,
+                        actions=actions,
+                        advantages=adv,
+                        returns=ret_t,
+                        old_value=old_v,
+                        policy_loss_mask=policy_loss_mask,
+                        players=players_mb,
+                        t_idx=t_idx_mb,
+                        n_idx=n_idx_mb,
+                        policy_id=policy_id_mb,
+                        env_mode=env_mode_mb,
+                        obs_feature_dim=obs_feature_dim,
+                        dump_dir=logp_check_dump_dir,
+                        policy_label=logp_check_label,
+                        train_iter=logp_check_iter,
+                        clip_eps=clip_eps,
+                        vf_coef=vf_coef,
+                        entropy_coef=entropy_coef,
+                        population_size=population_size,
+                        member_counts=member_counts,
+                        amp_dtype=amp_dtype,
+                    )
+                    checked_rollout_logp = True
+
+                t0 = perf_counter()
+                opt.zero_grad()
+                actor_loss.backward()
+                actor_grad_norm = _clip_grad_norm_for_named_params(actor_named_params, max_grad_norm)
+                timing.backward_s += perf_counter() - t0
+                t0 = perf_counter()
+                opt.step()
+                timing.optim_s += perf_counter() - t0
+                grad_norm = max(actor_grad_norm, critic_grad_norm)
+                total_loss_value = float(actor_loss.item() + critic_loss.item())
 
             t0 = perf_counter()
-            opt.zero_grad()
-            loss.backward()
-            grad_norm = float(torch.nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm))
-            timing.backward_s += perf_counter() - t0
-
-            t0 = perf_counter()
-            opt.step()
-            timing.optim_s += perf_counter() - t0
-
-            t0 = perf_counter()
-            total_loss_sum += float(loss.item())
+            total_loss_sum += total_loss_value
             stats.update(mb_stats, grad_norm)
             timing.sync_s += perf_counter() - t0
             n_mb += 1
@@ -3366,6 +3645,7 @@ def train(args: argparse.Namespace) -> None:
             population_size=args.population_size,
             rope_dims=policy_rope_dims,
             target_abort_enabled=bool(args.target_abort_enabled),
+            disjoint_actor_critic=bool(args.disjoint_actor_critic),
             halt_init_prob=args.halt_init_prob,
             fraction_init_weights=fraction_init_weights,
             value_head_count=(
@@ -3374,9 +3654,12 @@ def train(args: argparse.Namespace) -> None:
         ).to(device)
 
     policy = _make_policy()
-    opt = optim.Adam(policy.parameters(), lr=args.lr)
+    opt, critic_opt = _make_policy_optimizers(policy, lr=args.lr)
     exploiter_policy = _make_policy() if args.exploiter_mode else None
-    exploiter_opt = optim.Adam(exploiter_policy.parameters(), lr=args.lr) if exploiter_policy is not None else None
+    if exploiter_policy is not None:
+        exploiter_opt, exploiter_critic_opt = _make_policy_optimizers(exploiter_policy, lr=args.lr)
+    else:
+        exploiter_opt, exploiter_critic_opt = None, None
 
     # Compile targets:
     #   * ``compiled_loss_fn`` — the PPO consolidated function (encoder
@@ -3474,36 +3757,65 @@ def train(args: argparse.Namespace) -> None:
                 f"Unsupported checkpoint version {ckpt.get('version')!r} (expected 6 or {CHECKPOINT_VERSION})"
             )
         _validate_checkpoint_args(ckpt["training_args"], args)
-        policy_state, _ = adapt_legacy_value_heads_for_model(ckpt["policy"], policy)
+        policy_state, migrated_policy = adapt_checkpoint_state_for_model(ckpt["policy"], policy)
         policy_state = _strip_legacy_pair_head_keys(policy_state)
         policy.load_state_dict(policy_state)
-        opt_state, _ = _expand_legacy_optimizer_value_head_state(
-            ckpt["optimizer"],
+        actor_opt_state, migrated_opt = _expand_legacy_optimizer_value_head_state(
+            ckpt.get("actor_optimizer", ckpt["optimizer"]),
             saved_model_state=ckpt["policy"],
+            named_params=_named_params_for_optimizer(policy, "actor") if critic_opt is not None else None,
             model=policy,
             opt=opt,
         )
-        opt.load_state_dict(opt_state)
+        opt.load_state_dict(actor_opt_state)
+        migrated_critic_opt = False
+        if critic_opt is not None:
+            critic_source = ckpt.get("critic_optimizer", ckpt.get("actor_optimizer", ckpt["optimizer"]))
+            critic_opt_state, migrated_critic_opt = _expand_legacy_optimizer_value_head_state(
+                critic_source,
+                saved_model_state=ckpt["policy"],
+                named_params=_named_params_for_optimizer(policy, "critic"),
+                model=policy,
+                opt=critic_opt,
+            )
+            critic_opt.load_state_dict(critic_opt_state)
         if exploiter_policy is not None:
-            exploiter_state, migrated_exploiter = adapt_legacy_value_heads_for_model(
+            exploiter_state, migrated_exploiter = adapt_checkpoint_state_for_model(
                 ckpt["exploiter_policy"],
                 exploiter_policy,
             )
             exploiter_state = _strip_legacy_pair_head_keys(exploiter_state)
             exploiter_policy.load_state_dict(exploiter_state)
             assert exploiter_opt is not None
-            exploiter_opt_state, opt_migrated = _expand_legacy_optimizer_value_head_state(
-                ckpt["exploiter_optimizer"],
+            exploiter_actor_opt_state, opt_migrated = _expand_legacy_optimizer_value_head_state(
+                ckpt.get("exploiter_actor_optimizer", ckpt["exploiter_optimizer"]),
                 saved_model_state=ckpt["exploiter_policy"],
+                named_params=_named_params_for_optimizer(exploiter_policy, "actor") if exploiter_critic_opt is not None else None,
                 model=exploiter_policy,
                 opt=exploiter_opt,
             )
-            exploiter_opt.load_state_dict(exploiter_opt_state)
-            if migrated_exploiter or opt_migrated:
+            exploiter_opt.load_state_dict(exploiter_actor_opt_state)
+            exploiter_critic_opt_migrated = False
+            if exploiter_critic_opt is not None:
+                critic_source = ckpt.get("exploiter_critic_optimizer", ckpt.get("exploiter_actor_optimizer", ckpt["exploiter_optimizer"]))
+                exploiter_critic_opt_state, exploiter_critic_opt_migrated = _expand_legacy_optimizer_value_head_state(
+                    critic_source,
+                    saved_model_state=ckpt["exploiter_policy"],
+                    named_params=_named_params_for_optimizer(exploiter_policy, "critic"),
+                    model=exploiter_policy,
+                    opt=exploiter_critic_opt,
+                )
+                exploiter_critic_opt.load_state_dict(exploiter_critic_opt_state)
+            if migrated_exploiter or opt_migrated or exploiter_critic_opt_migrated:
                 print(
                     "[orbit_wars_pt] migrated legacy exploiter critic checkpoint to 3 egocentric value heads",
                     flush=True,
                 )
+        if migrated_policy or migrated_opt or migrated_critic_opt:
+            print(
+                "[orbit_wars_pt] cloned actor weights into disjoint critic when loading checkpoint",
+                flush=True,
+            )
         _restore_torch_generator_from_checkpoint(ckpt["torch_rng"], rng)
         rnd.bit_generator.state = ckpt["numpy_rng_state"]
         rollout_env_seed = ckpt["rollout_env_seed"]
@@ -3637,8 +3949,10 @@ def train(args: argparse.Namespace) -> None:
             cfg,
             policy,
             opt,
+            critic_opt,
             exploiter_policy,
             exploiter_opt,
+            exploiter_critic_opt,
             compiled_loss_fn,
             compiled_compressed_loss_fn,
             rng,
@@ -3672,8 +3986,10 @@ def _train_loop(
     cfg: OrbitWarsEnvConfig,
     policy: OrbitWarsPolicy,
     opt: torch.optim.Optimizer,
+    critic_opt: Optional[torch.optim.Optimizer],
     exploiter_policy: Optional[OrbitWarsPolicy],
     exploiter_opt: Optional[torch.optim.Optimizer],
+    exploiter_critic_opt: Optional[torch.optim.Optimizer],
     compiled_loss_fn: Optional[Any],
     compiled_compressed_loss_fn: Optional[Any],
     rng: torch.Generator,
@@ -4061,6 +4377,7 @@ def _train_loop(
                     loss_mb_i, ppo_t_i, ppo_stats_i = ppo_iteration_host_staged(
                         policy,
                         opt,
+                        critic_opt,
                         main_member_stores,
                         device,
                         args.minibatch_size,
@@ -4091,6 +4408,7 @@ def _train_loop(
                     loss_mb_i, ppo_t_i, ppo_stats_i = ppo_iteration(
                         policy,
                         opt,
+                        critic_opt,
                         segment,
                         main_samples,
                         device,
@@ -4123,6 +4441,7 @@ def _train_loop(
                     loss_mb_i, ppo_t_i, ppo_stats_i = ppo_iteration_host_staged(
                         exploiter_policy,
                         exploiter_opt,
+                        exploiter_critic_opt,
                         exploiter_member_stores,
                         device,
                         args.minibatch_size,
@@ -4153,6 +4472,7 @@ def _train_loop(
                     loss_mb_i, ppo_t_i, ppo_stats_i = ppo_iteration(
                         exploiter_policy,
                         exploiter_opt,
+                        exploiter_critic_opt,
                         segment,
                         exploiter_samples,
                         device,
@@ -4283,9 +4603,11 @@ def _train_loop(
                     ckpt_path,
                     next_iteration=it + 1,
                     policy=policy,
-                    opt=opt,
+                    actor_opt=opt,
+                    critic_opt=critic_opt,
                     exploiter_policy=exploiter_policy,
-                    exploiter_opt=exploiter_opt,
+                    exploiter_actor_opt=exploiter_opt,
+                    exploiter_critic_opt=exploiter_critic_opt,
                     rng=rng,
                     rnd=rnd,
                     rollout_env_seed=rollout_env_seed,
@@ -4476,6 +4798,7 @@ def _train_loop(
                 loss_mb, ppo_t, ppo_stats = ppo_iteration_host_staged(
                     policy,
                     opt,
+                    critic_opt,
                     host_member_stores if host_member_stores is not None else [],
                     device,
                     args.minibatch_size,
@@ -4502,6 +4825,7 @@ def _train_loop(
                 loss_mb, ppo_t, ppo_stats = ppo_iteration(
                     policy,
                     opt,
+                    critic_opt,
                     segment,
                     samples,
                     device,
@@ -4575,9 +4899,11 @@ def _train_loop(
                 ckpt_path,
                 next_iteration=it + 1,
                 policy=policy,
-                opt=opt,
+                actor_opt=opt,
+                critic_opt=critic_opt,
                 exploiter_policy=exploiter_policy,
-                exploiter_opt=exploiter_opt,
+                exploiter_actor_opt=exploiter_opt,
+                exploiter_critic_opt=exploiter_critic_opt,
                 rng=rng,
                 rnd=rnd,
                 rollout_env_seed=rollout_env_seed,
@@ -4938,6 +5264,16 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Enable target-stage abort with per-turn origin/fraction blocking.",
+    )
+    p.add_argument(
+        "--disjoint-actor-critic",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use separate transformer/value backbones for actor and critic. Fresh init creates "
+            "both networks independently; resuming a legacy shared checkpoint requires --force, "
+            "which clones the actor backbone into the new critic path."
+        ),
     )
     p.add_argument(
         "--activation-checkpointing",

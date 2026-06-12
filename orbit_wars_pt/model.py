@@ -215,6 +215,24 @@ class OrbitWarsPopulationTail(nn.Module):
         )
 
 
+class OrbitWarsCriticPopulationTail(nn.Module):
+    """One population member's private critic final block + value head."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        *,
+        rope_dims: int,
+        dropout: float = 0.0,
+        value_head_count: int = 1,
+    ):
+        super().__init__()
+        self.block = TransformerBlock(d_model, n_heads, rope_dims=rope_dims, dropout=dropout)
+        self.norm_f = nn.LayerNorm(d_model)
+        self.value_head = nn.Linear(d_model, int(value_head_count))
+
+
 def _halt_logit_for_prob(prob: float) -> float:
     p = float(prob)
     if not math.isfinite(p) or not (0.0 < p < 1.0):
@@ -296,6 +314,40 @@ def adapt_legacy_value_heads_for_model(
     return out, migrated
 
 
+def adapt_checkpoint_state_for_model(
+    state: Mapping[str, Any],
+    model: nn.Module,
+) -> tuple[OrderedDict[str, Any], bool]:
+    """Map saved weights onto ``model``, cloning actor weights into critic-only params when needed."""
+
+    out, migrated = adapt_legacy_value_heads_for_model(state, model)
+    target_state = model.state_dict()
+    current = OrderedDict((key, value) for key, value in out.items() if key in target_state)
+
+    def _clone_from_actor_name(name: str) -> Optional[str]:
+        if name.startswith("critic_shared_blocks."):
+            return "shared_blocks." + name[len("critic_shared_blocks."):]
+        if name.startswith("critic_population_tails."):
+            return "population_tails." + name[len("critic_population_tails."):]
+        if name.startswith("critic_blocks."):
+            return "blocks." + name[len("critic_blocks."):]
+        if name.startswith("critic_norm_f."):
+            return "norm_f." + name[len("critic_norm_f."):]
+        if name.startswith("critic_value_head."):
+            return "value_head." + name[len("critic_value_head."):]
+        return None
+
+    for key in target_state:
+        if key in current:
+            continue
+        actor_key = _clone_from_actor_name(str(key))
+        if actor_key is None or actor_key not in out:
+            continue
+        current[key] = out[actor_key].clone()
+        migrated = True
+    return current, migrated
+
+
 class OrbitWarsPolicy(nn.Module):
     """Encoder-only transformer; optional population-specific final block + heads."""
 
@@ -310,6 +362,7 @@ class OrbitWarsPolicy(nn.Module):
         population_size: int = 1,
         rope_dims: int = 2,
         value_head_count: int = 1,
+        disjoint_actor_critic: bool = False,
         target_abort_enabled: bool = False,
         halt_init_prob: Optional[float] = None,
         fraction_init_weights: Optional[Tuple[float, ...]] = None,
@@ -331,6 +384,7 @@ class OrbitWarsPolicy(nn.Module):
         self.activation_checkpointing = activation_checkpointing
         self.population_size = int(population_size)
         self.value_head_count = int(value_head_count)
+        self.disjoint_actor_critic = bool(disjoint_actor_critic)
         self.target_abort_enabled = bool(target_abort_enabled)
         self.halt_init_prob = None if halt_init_prob is None else float(halt_init_prob)
         self.fraction_init_weights = (
@@ -365,6 +419,12 @@ class OrbitWarsPolicy(nn.Module):
                 halt_init_prob=self.halt_init_prob,
                 fraction_init_weights=self.fraction_init_weights,
             )
+            if self.disjoint_actor_critic:
+                self.critic_blocks = nn.ModuleList(
+                    [TransformerBlock(d_model, n_heads, rope_dims=rope_dims, dropout=dropout) for _ in range(n_layers)]
+                )
+                self.critic_norm_f = nn.LayerNorm(d_model)
+                self.critic_value_head = nn.Linear(d_model, self.value_head_count)
         else:
             shared_layers = max(0, int(n_layers) - 1)
             self.shared_blocks = nn.ModuleList(
@@ -385,8 +445,36 @@ class OrbitWarsPolicy(nn.Module):
                     for _ in range(self.population_size)
                 ]
             )
+            if self.disjoint_actor_critic:
+                self.critic_shared_blocks = nn.ModuleList(
+                    [TransformerBlock(d_model, n_heads, rope_dims=rope_dims, dropout=dropout) for _ in range(shared_layers)]
+                )
+                self.critic_population_tails = nn.ModuleList(
+                    [
+                        OrbitWarsCriticPopulationTail(
+                            d_model,
+                            n_heads,
+                            rope_dims=rope_dims,
+                            dropout=dropout,
+                            value_head_count=self.value_head_count,
+                        )
+                        for _ in range(self.population_size)
+                    ]
+                )
 
         self.register_buffer("_frac_const", torch.tensor(FRACTIONS, dtype=torch.float32))
+
+    def actor_named_parameters(self) -> list[tuple[str, nn.Parameter]]:
+        return [(name, param) for name, param in self.named_parameters() if not str(name).startswith("critic_")]
+
+    def critic_named_parameters(self) -> list[tuple[str, nn.Parameter]]:
+        return [(name, param) for name, param in self.named_parameters() if str(name).startswith("critic_")]
+
+    def actor_parameters(self) -> list[nn.Parameter]:
+        return [param for _, param in self.actor_named_parameters()]
+
+    def critic_parameters(self) -> list[nn.Parameter]:
+        return [param for _, param in self.critic_named_parameters()]
 
     def embed(self, entity_type: torch.Tensor, owner_idx: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
         t_ok = entity_type.clamp(0, NUM_ENTITY_TYPES - 1)
@@ -448,6 +536,38 @@ class OrbitWarsPolicy(nn.Module):
             h.index_copy_(0, member_rows, tail.norm_f(x_m))
         return h, pop
 
+    def _apply_critic_encoder(
+        self,
+        x: torch.Tensor,
+        rope_pos: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor],
+        population_idx: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.disjoint_actor_critic:
+            return self._apply_encoder(x, rope_pos, key_padding_mask, population_idx)
+
+        batch_size = int(x.shape[0])
+        pop = self._normalize_population_idx(population_idx, batch_size, x.device)
+        if self.population_size == 1:
+            for blk in self.critic_blocks:
+                x = self._run_block(blk, x, rope_pos, key_padding_mask)
+            return self.critic_norm_f(x), pop
+
+        for blk in self.critic_shared_blocks:
+            x = self._run_block(blk, x, rope_pos, key_padding_mask)
+
+        h = torch.empty_like(x)
+        for member_idx, tail in enumerate(self.critic_population_tails):
+            member_rows = torch.nonzero(pop == member_idx, as_tuple=False).squeeze(-1)
+            if member_rows.numel() == 0:
+                continue
+            x_m = x.index_select(0, member_rows)
+            rope_m = rope_pos.index_select(0, member_rows)
+            mask_m = None if key_padding_mask is None else key_padding_mask.index_select(0, member_rows)
+            x_m = self._run_block(tail.block, x_m, rope_m, mask_m)
+            h.index_copy_(0, member_rows, tail.norm_f(x_m))
+        return h, pop
+
     def _population_group_size(self, batch_size: int) -> int:
         if self.population_size <= 1:
             return int(batch_size)
@@ -474,6 +594,34 @@ class OrbitWarsPolicy(nn.Module):
         group_size = self._population_group_size(int(x.shape[0]))
         chunks = []
         for member_idx, tail in enumerate(self.population_tails):
+            start = member_idx * group_size
+            stop = start + group_size
+            x_m = x[start:stop]
+            rope_m = rope_pos[start:stop]
+            mask_m = None if key_padding_mask is None else key_padding_mask[start:stop]
+            x_m = self._run_block(tail.block, x_m, rope_m, mask_m)
+            chunks.append(tail.norm_f(x_m))
+        return torch.cat(chunks, dim=0)
+
+    def _apply_critic_encoder_grouped_population(
+        self,
+        x: torch.Tensor,
+        rope_pos: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if not self.disjoint_actor_critic:
+            return self._apply_encoder_grouped_population(x, rope_pos, key_padding_mask)
+        if self.population_size == 1:
+            for blk in self.critic_blocks:
+                x = self._run_block(blk, x, rope_pos, key_padding_mask)
+            return self.critic_norm_f(x)
+
+        for blk in self.critic_shared_blocks:
+            x = self._run_block(blk, x, rope_pos, key_padding_mask)
+
+        group_size = self._population_group_size(int(x.shape[0]))
+        chunks = []
+        for member_idx, tail in enumerate(self.critic_population_tails):
             start = member_idx * group_size
             stop = start + group_size
             x_m = x[start:stop]
@@ -541,6 +689,7 @@ class OrbitWarsPolicy(nn.Module):
     def _compute_outputs_single(
         self,
         h: torch.Tensor,
+        value_h: torch.Tensor,
         owner_idx: torch.Tensor,
         features: torch.Tensor,
         entity_mask: torch.Tensor,
@@ -555,8 +704,9 @@ class OrbitWarsPolicy(nn.Module):
     ) -> Dict[str, Any]:
         b = h.shape[0]
         cls_h = h[:, 0, :]
+        value_cls_h = value_h[:, 0, :]
         halt_logits = halt_head(cls_h)
-        value_all = value_head(cls_h)
+        value_all = value_head(value_cls_h)
         if int(value_all.shape[-1]) == 1:
             value = value_all.squeeze(-1)
         else:
@@ -609,6 +759,7 @@ class OrbitWarsPolicy(nn.Module):
     def _compute_ppo_outputs_single(
         self,
         h: torch.Tensor,
+        value_h: torch.Tensor,
         owner_idx: torch.Tensor,
         features: torch.Tensor,
         entity_mask: torch.Tensor,
@@ -629,6 +780,7 @@ class OrbitWarsPolicy(nn.Module):
     ) -> Dict[str, Any]:
         out = self._compute_outputs_single(
             h,
+            value_h,
             owner_idx,
             features,
             entity_mask,
@@ -658,9 +810,15 @@ class OrbitWarsPolicy(nn.Module):
             ]
         return out
 
+    def _value_head_for_population_member(self, member_idx: int) -> nn.Linear:
+        if not self.disjoint_actor_critic:
+            return self.population_tails[member_idx].value_head
+        return self.critic_population_tails[member_idx].value_head
+
     def _compute_outputs_population(
         self,
         h: torch.Tensor,
+        value_h: torch.Tensor,
         owner_idx: torch.Tensor,
         features: torch.Tensor,
         entity_mask: torch.Tensor,
@@ -676,8 +834,10 @@ class OrbitWarsPolicy(nn.Module):
             member_rows = torch.nonzero(population_idx == member_idx, as_tuple=False).squeeze(-1)
             if member_rows.numel() == 0:
                 continue
+            value_head = self._value_head_for_population_member(member_idx)
             out_m = self._compute_outputs_single(
                 h.index_select(0, member_rows),
+                value_h.index_select(0, member_rows),
                 owner_idx.index_select(0, member_rows),
                 features.index_select(0, member_rows),
                 entity_mask.index_select(0, member_rows),
@@ -685,7 +845,7 @@ class OrbitWarsPolicy(nn.Module):
                 origin_frac_blocked=None if origin_frac_blocked is None else origin_frac_blocked.index_select(0, member_rows),
                 origin_frac_head=tail.origin_frac_head,
                 halt_head=tail.halt_head,
-                value_head=tail.value_head,
+                value_head=value_head,
                 abort_head=getattr(tail, "abort_head", None),
                 value_head_idx=None if value_head_idx is None else value_head_idx.index_select(0, member_rows),
             )
@@ -722,6 +882,7 @@ class OrbitWarsPolicy(nn.Module):
     def _compute_outputs_grouped_population(
         self,
         h: torch.Tensor,
+        value_h: torch.Tensor,
         owner_idx: torch.Tensor,
         features: torch.Tensor,
         entity_mask: torch.Tensor,
@@ -732,6 +893,7 @@ class OrbitWarsPolicy(nn.Module):
         if self.population_size == 1:
             return self._compute_outputs_single(
                 h,
+                value_h,
                 owner_idx,
                 features,
                 entity_mask,
@@ -739,7 +901,7 @@ class OrbitWarsPolicy(nn.Module):
                 origin_frac_blocked=origin_frac_blocked,
                 origin_frac_head=self.origin_frac_head,
                 halt_head=self.halt_head,
-                value_head=self.value_head,
+                value_head=(self.critic_value_head if self.disjoint_actor_critic else self.value_head),
                 abort_head=getattr(self, "abort_head", None),
                 value_head_idx=value_head_idx,
             )
@@ -756,8 +918,10 @@ class OrbitWarsPolicy(nn.Module):
         for member_idx, tail in enumerate(self.population_tails):
             start = member_idx * group_size
             stop = start + group_size
+            value_head = self._value_head_for_population_member(member_idx)
             out_m = self._compute_outputs_single(
                 h[start:stop],
+                value_h[start:stop],
                 owner_idx[start:stop],
                 features[start:stop],
                 entity_mask[start:stop],
@@ -765,7 +929,7 @@ class OrbitWarsPolicy(nn.Module):
                 origin_frac_blocked=None if origin_frac_blocked is None else origin_frac_blocked[start:stop],
                 origin_frac_head=tail.origin_frac_head,
                 halt_head=tail.halt_head,
-                value_head=tail.value_head,
+                value_head=value_head,
                 abort_head=getattr(tail, "abort_head", None),
                 value_head_idx=None if value_head_idx is None else value_head_idx[start:stop],
             )
@@ -790,6 +954,7 @@ class OrbitWarsPolicy(nn.Module):
     def _compute_outputs_sorted_population(
         self,
         h: torch.Tensor,
+        value_h: torch.Tensor,
         owner_idx: torch.Tensor,
         features: torch.Tensor,
         entity_mask: torch.Tensor,
@@ -801,6 +966,7 @@ class OrbitWarsPolicy(nn.Module):
         if self.population_size == 1:
             return self._compute_outputs_single(
                 h,
+                value_h,
                 owner_idx,
                 features,
                 entity_mask,
@@ -808,7 +974,7 @@ class OrbitWarsPolicy(nn.Module):
                 origin_frac_blocked=origin_frac_blocked,
                 origin_frac_head=self.origin_frac_head,
                 halt_head=self.halt_head,
-                value_head=self.value_head,
+                value_head=(self.critic_value_head if self.disjoint_actor_critic else self.value_head),
                 abort_head=getattr(self, "abort_head", None),
                 value_head_idx=value_head_idx,
             )
@@ -827,8 +993,10 @@ class OrbitWarsPolicy(nn.Module):
             if count <= 0:
                 continue
             stop = start + count
+            value_head = self._value_head_for_population_member(member_idx)
             out_m = self._compute_outputs_single(
                 h[start:stop],
+                value_h[start:stop],
                 owner_idx[start:stop],
                 features[start:stop],
                 entity_mask[start:stop],
@@ -836,7 +1004,7 @@ class OrbitWarsPolicy(nn.Module):
                 origin_frac_blocked=None if origin_frac_blocked is None else origin_frac_blocked[start:stop],
                 origin_frac_head=tail.origin_frac_head,
                 halt_head=tail.halt_head,
-                value_head=tail.value_head,
+                value_head=value_head,
                 abort_head=getattr(tail, "abort_head", None),
                 value_head_idx=None if value_head_idx is None else value_head_idx[start:stop],
             )
@@ -862,6 +1030,7 @@ class OrbitWarsPolicy(nn.Module):
     def _compute_ppo_outputs_sorted_population(
         self,
         h: torch.Tensor,
+        value_h: torch.Tensor,
         owner_idx: torch.Tensor,
         features: torch.Tensor,
         entity_mask: torch.Tensor,
@@ -878,6 +1047,7 @@ class OrbitWarsPolicy(nn.Module):
         if self.population_size == 1:
             return self._compute_ppo_outputs_single(
                 h,
+                value_h,
                 owner_idx,
                 features,
                 entity_mask,
@@ -890,7 +1060,7 @@ class OrbitWarsPolicy(nn.Module):
                 origin_frac_blocked=origin_frac_blocked,
                 origin_frac_head=self.origin_frac_head,
                 halt_head=self.halt_head,
-                value_head=self.value_head,
+                value_head=(self.critic_value_head if self.disjoint_actor_critic else self.value_head),
                 target_pick_head=self.target_pick_head,
                 abort_head=getattr(self, "abort_head", None),
                 value_head_idx=value_head_idx,
@@ -911,8 +1081,10 @@ class OrbitWarsPolicy(nn.Module):
             if count <= 0:
                 continue
             stop = start + count
+            value_head = self._value_head_for_population_member(member_idx)
             out_m = self._compute_ppo_outputs_single(
                 h[start:stop],
+                value_h[start:stop],
                 owner_idx[start:stop],
                 features[start:stop],
                 entity_mask[start:stop],
@@ -925,7 +1097,7 @@ class OrbitWarsPolicy(nn.Module):
                 origin_frac_blocked=None if origin_frac_blocked is None else origin_frac_blocked[start:stop],
                 origin_frac_head=tail.origin_frac_head,
                 halt_head=tail.halt_head,
-                value_head=tail.value_head,
+                value_head=value_head,
                 target_pick_head=tail.target_pick_head,
                 abort_head=getattr(tail, "abort_head", None),
                 value_head_idx=None if value_head_idx is None else value_head_idx[start:stop],
@@ -1006,6 +1178,7 @@ class OrbitWarsPolicy(nn.Module):
 
         pop = self._normalize_population_idx(population_idx, b, features.device)
         h_packed, _ = self._apply_encoder(x_packed, rope_packed, padding_mask, pop)
+        value_h_packed, _ = self._apply_critic_encoder(x_packed, rope_packed, padding_mask, pop)
 
         # Scatter back to dense [B, L, d]. Padding rows of ``h_packed``
         # contain garbage (masked-attention output), and they get scattered
@@ -1015,10 +1188,13 @@ class OrbitWarsPolicy(nn.Module):
         # ``pair_mask`` / explicit indices, so the garbage is harmless.
         h = torch.zeros(b, l, self.d_model, dtype=h_packed.dtype, device=h_packed.device)
         h = h.scatter(1, pack_idx_d, h_packed)
+        value_h = torch.zeros(b, l, self.d_model, dtype=value_h_packed.dtype, device=value_h_packed.device)
+        value_h = value_h.scatter(1, pack_idx_d, value_h_packed)
 
         if self.population_size == 1:
             return self._compute_outputs_single(
                 h,
+                value_h,
                 owner_idx,
                 features,
                 entity_mask,
@@ -1026,12 +1202,13 @@ class OrbitWarsPolicy(nn.Module):
                 origin_frac_blocked=origin_frac_blocked,
                 origin_frac_head=self.origin_frac_head,
                 halt_head=self.halt_head,
-                value_head=self.value_head,
+                value_head=(self.critic_value_head if self.disjoint_actor_critic else self.value_head),
                 abort_head=getattr(self, "abort_head", None),
                 value_head_idx=value_head_idx,
             )
         return self._compute_outputs_population(
             h,
+            value_h,
             owner_idx,
             features,
             entity_mask,
@@ -1059,9 +1236,11 @@ class OrbitWarsPolicy(nn.Module):
         padding_mask = ~entity_mask
 
         h, pop = self._apply_encoder(x, rope_pos, padding_mask, population_idx)
+        value_h, _ = self._apply_critic_encoder(x, rope_pos, padding_mask, population_idx)
         if self.population_size == 1:
             return self._compute_outputs_single(
                 h,
+                value_h,
                 owner_idx,
                 features,
                 entity_mask,
@@ -1069,12 +1248,13 @@ class OrbitWarsPolicy(nn.Module):
                 origin_frac_blocked=origin_frac_blocked,
                 origin_frac_head=self.origin_frac_head,
                 halt_head=self.halt_head,
-                value_head=self.value_head,
+                value_head=(self.critic_value_head if self.disjoint_actor_critic else self.value_head),
                 abort_head=getattr(self, "abort_head", None),
                 value_head_idx=value_head_idx,
             )
         return self._compute_outputs_population(
             h,
+            value_h,
             owner_idx,
             features,
             entity_mask,
@@ -1130,8 +1310,10 @@ class OrbitWarsPolicy(nn.Module):
         x = self.embed(entity_type, owner_idx, features)
         padding_mask = ~entity_mask
         h = self._apply_encoder_grouped_population(x, rope_pos, padding_mask)
+        value_h = self._apply_critic_encoder_grouped_population(x, rope_pos, padding_mask)
         return self._compute_outputs_grouped_population(
             h,
+            value_h,
             owner_idx,
             features,
             entity_mask,
@@ -1224,8 +1406,10 @@ class OrbitWarsPolicy(nn.Module):
         x = self.embed(obs["entity_type"], obs["owner_idx"], obs["features"])
         padding_mask = ~obs["entity_mask"]
         h = self._apply_encoder_grouped_population(x, obs["rope_pos"], padding_mask)
+        value_h = self._apply_critic_encoder_grouped_population(x, obs["rope_pos"], padding_mask)
         return self._compute_outputs_grouped_population(
             h,
+            value_h,
             obs["owner_idx"],
             obs["features"],
             obs["entity_mask"],
@@ -1263,10 +1447,14 @@ class OrbitWarsPolicy(nn.Module):
         padding_mask = arange[None, :] >= counts[:, None]
         member_counts = self._population_member_counts(population_idx, b, features.device)
         h_packed = self._apply_encoder_sorted_population(x_packed, rope_packed, padding_mask, member_counts)
+        value_h_packed = self._apply_critic_encoder_sorted_population(x_packed, rope_packed, padding_mask, member_counts)
         h = torch.zeros(b, l, self.d_model, dtype=h_packed.dtype, device=h_packed.device)
         h = h.scatter(1, pack_idx_d, h_packed)
+        value_h = torch.zeros(b, l, self.d_model, dtype=value_h_packed.dtype, device=value_h_packed.device)
+        value_h = value_h.scatter(1, pack_idx_d, value_h_packed)
         return self._compute_outputs_sorted_population(
             h,
+            value_h,
             owner_idx,
             features,
             entity_mask,
@@ -1310,10 +1498,14 @@ class OrbitWarsPolicy(nn.Module):
         padding_mask = arange[None, :] >= counts[:, None]
         member_counts = self._population_member_counts(population_idx, b, features.device)
         h_packed = self._apply_encoder_sorted_population(x_packed, rope_packed, padding_mask, member_counts)
+        value_h_packed = self._apply_critic_encoder_sorted_population(x_packed, rope_packed, padding_mask, member_counts)
         h = torch.zeros(b, l, self.d_model, dtype=h_packed.dtype, device=h_packed.device)
         h = h.scatter(1, pack_idx_d, h_packed)
+        value_h = torch.zeros(b, l, self.d_model, dtype=value_h_packed.dtype, device=value_h_packed.device)
+        value_h = value_h.scatter(1, pack_idx_d, value_h_packed)
         return self._compute_ppo_outputs_sorted_population(
             h,
+            value_h,
             owner_idx,
             features,
             entity_mask,
@@ -1327,6 +1519,38 @@ class OrbitWarsPolicy(nn.Module):
             origin_frac_blocked=origin_frac_blocked,
             value_head_idx=value_head_idx,
         )
+
+    def _apply_critic_encoder_sorted_population(
+        self,
+        x: torch.Tensor,
+        rope_pos: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor],
+        member_counts: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.disjoint_actor_critic:
+            return self._apply_encoder_sorted_population(x, rope_pos, key_padding_mask, member_counts)
+        if self.population_size == 1:
+            for blk in self.critic_blocks:
+                x = self._run_block(blk, x, rope_pos, key_padding_mask)
+            return self.critic_norm_f(x)
+
+        for blk in self.critic_shared_blocks:
+            x = self._run_block(blk, x, rope_pos, key_padding_mask)
+
+        chunks = []
+        start = 0
+        for member_idx, tail in enumerate(self.critic_population_tails):
+            count = int(member_counts[member_idx].item())
+            if count <= 0:
+                continue
+            stop = start + count
+            x_m = x[start:stop]
+            rope_m = rope_pos[start:stop]
+            mask_m = None if key_padding_mask is None else key_padding_mask[start:stop]
+            x_m = self._run_block(tail.block, x_m, rope_m, mask_m)
+            chunks.append(tail.norm_f(x_m))
+            start = stop
+        return torch.cat(chunks, dim=0) if chunks else x.new_empty((0,) + x.shape[1:])
 
     def target_logits_for_origin_fraction(
         self,

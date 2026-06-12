@@ -235,6 +235,7 @@ def compute_ppo_loss_torch(
     value_head_idx: Optional[torch.Tensor] = None,
     policy_loss_mask: Optional[torch.Tensor] = None,
     check_rollout_logp: bool = False,
+    loss_mode: str = "total",
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Full PPO scalar loss + diagnostics on one minibatch.
 
@@ -419,7 +420,16 @@ def compute_ppo_loss_torch(
         entropy = torch.stack(entropy_parts).mean()
 
     loss_ent = -entropy_coef * entropy
-    loss = loss_pi + vf_coef * loss_vf + loss_ent
+    actor_loss = loss_pi + loss_ent
+    critic_loss = vf_coef * loss_vf
+    if loss_mode == "total":
+        loss = actor_loss + critic_loss
+    elif loss_mode == "actor":
+        loss = actor_loss
+    elif loss_mode == "critic":
+        loss = critic_loss
+    else:
+        raise ValueError(f"unsupported loss_mode {loss_mode!r}")
 
     with torch.no_grad():
         if member_counts is None or population_idx is None or int(getattr(policy, "population_size", 1)) <= 1:
@@ -506,6 +516,8 @@ def compute_ppo_loss_torch(
     stats: Dict[str, torch.Tensor] = {
         "loss_pi": loss_pi.detach(),
         "loss_vf": loss_vf.detach(),
+        "loss_actor": actor_loss.detach(),
+        "loss_critic": critic_loss.detach(),
         "entropy": entropy.detach(),
         "entropy_halt": entropy_halt,
         "entropy_origin_frac": entropy_origin_frac,
@@ -569,6 +581,7 @@ def compute_ppo_loss_compressed_torch(
     value_head_idx: Optional[torch.Tensor] = None,
     policy_loss_mask: Optional[torch.Tensor] = None,
     check_rollout_logp: bool = False,
+    loss_mode: str = "total",
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     comp = CompressedObservationBuffer(
         token_meta=token_meta,
@@ -614,6 +627,7 @@ def compute_ppo_loss_compressed_torch(
         value_head_idx,
         policy_loss_mask,
         check_rollout_logp,
+        loss_mode,
     )
 
 

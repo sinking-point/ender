@@ -43,7 +43,7 @@ from orbit_wars_pt.constants import (
 from orbit_wars_pt.geometry import estimate_time_to_hit, planet_pred_velocity
 from orbit_wars_pt.model import (
     OrbitWarsPolicy,
-    adapt_legacy_value_heads_for_model,
+    adapt_checkpoint_state_for_model,
     infer_value_head_count_from_state_dict,
 )
 from orbit_wars_pt.reward_config import resolve_reward_mix
@@ -4614,6 +4614,7 @@ def _infer_policy_kwargs(payload: Any) -> dict[str, Any]:
         "population_size": int(training_args.get("population_size", 1)),
         "rope_dims": int(training_args.get("rope_dims", 3)),
         "value_head_count": int(training_args.get("value_head_count", 1)),
+        "disjoint_actor_critic": bool(training_args.get("disjoint_actor_critic", False)),
         "target_abort_enabled": bool(training_args.get("target_abort_enabled", False)),
         "halt_init_prob": training_args.get("halt_init_prob"),
     }
@@ -4631,21 +4632,24 @@ def _infer_policy_kwargs(payload: Any) -> dict[str, Any]:
         shared_layer_ids = []
         pop_ids = []
         for key in policy_state:
-            if "abort_head." in str(key):
+            key_s = str(key)
+            if "abort_head." in key_s:
                 kwargs["target_abort_enabled"] = True
-            if key.startswith("blocks."):
+            if key_s.startswith("critic_"):
+                kwargs["disjoint_actor_critic"] = True
+            if key_s.startswith("blocks."):
                 try:
-                    layer_ids.append(int(key.split(".")[1]))
+                    layer_ids.append(int(key_s.split(".")[1]))
                 except (IndexError, ValueError):
                     pass
-            elif key.startswith("shared_blocks."):
+            elif key_s.startswith("shared_blocks."):
                 try:
-                    shared_layer_ids.append(int(key.split(".")[1]))
+                    shared_layer_ids.append(int(key_s.split(".")[1]))
                 except (IndexError, ValueError):
                     pass
-            elif key.startswith("population_tails."):
+            elif key_s.startswith("population_tails."):
                 try:
-                    pop_ids.append(int(key.split(".")[1]))
+                    pop_ids.append(int(key_s.split(".")[1]))
                 except (IndexError, ValueError):
                     pass
         if layer_ids:
@@ -4746,7 +4750,7 @@ def load_policy(
         policy_state = payload
         payload_for_kwargs = payload
     policy = OrbitWarsPolicy(**_infer_policy_kwargs(payload_for_kwargs)).to(torch_device)
-    policy_state_adapted, _ = adapt_legacy_value_heads_for_model(policy_state, policy)
+    policy_state_adapted, _ = adapt_checkpoint_state_for_model(policy_state, policy)
     policy_state_adapted = _strip_legacy_pair_head_keys(policy_state_adapted)
     policy.load_state_dict(policy_state_adapted)
     policy.eval()

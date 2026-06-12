@@ -32,7 +32,7 @@ from typing import Any, Callable, Optional
 
 from orbit_wars_pt.compressed_observation import CompressedObservationBuffer
 from orbit_wars_pt.constants import FRACTIONS, MAX_PLANETS, obs_feature_dim_for_num_agents
-from orbit_wars_pt.model import OrbitWarsPolicy
+from orbit_wars_pt.model import OrbitWarsPolicy, adapt_checkpoint_state_for_model
 from orbit_wars_pt.ppo_replay import compute_ppo_loss_compressed_torch
 from orbit_wars_pt.train_ppo import _population_member_counts_torch, _torch_ppo_loss_from_replay
 
@@ -152,11 +152,13 @@ def load_policy_and_loss_fn(args: argparse.Namespace, device: torch.device) -> t
         population_size=int(ta.get("population_size", 1)),
         rope_dims=int(ta.get("rope_dims", 2)),
         target_abort_enabled=bool(args.target_abort_enabled),
+        disjoint_actor_critic=bool(ta.get("disjoint_actor_critic", False)),
         value_head_count=value_head_count,
     ).to(device)
     state = ckpt.get(args.policy_key)
     if state is None:
         raise SystemExit(f"checkpoint missing state dict key {args.policy_key!r}")
+    state, _ = adapt_checkpoint_state_for_model(state, policy)
     policy.load_state_dict(state)
 
     compile_loss = args.compile if args.compile_loss is None else bool(args.compile_loss)

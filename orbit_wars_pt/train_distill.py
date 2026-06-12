@@ -28,7 +28,7 @@ from orbit_wars_pt.constants import FRACTIONS, MAX_PLANETS, obs_feature_dim_for_
 from orbit_wars_pt.env_wrapper import OrbitWarsEnvConfig
 from orbit_wars_pt.jax_setup import configure_jax_for_training
 from orbit_wars_pt.kaggle_adapter import _strip_legacy_pair_head_keys
-from orbit_wars_pt.model import OrbitWarsPolicy, adapt_legacy_value_heads_for_model, infer_value_head_count_from_state_dict
+from orbit_wars_pt.model import OrbitWarsPolicy, adapt_checkpoint_state_for_model, infer_value_head_count_from_state_dict
 from orbit_wars_pt.parallel_rollout import RolloutCarry, RolloutSegment, collect_parallel_micro_rollouts, make_device_reset_bank
 from orbit_wars_pt.reset_prefetch import RolloutResetPrefetch
 from orbit_wars_pt.torch_replay import select_stored_compressed_minibatch_torch
@@ -89,11 +89,12 @@ def _teacher_policy_from_checkpoint(path: Path, device: torch.device) -> tuple[O
         population_size=int(train_args.get("population_size", 1)),
         rope_dims=rope_dims,
         value_head_count=value_head_count,
+        disjoint_actor_critic=bool(train_args.get("disjoint_actor_critic", False)),
         target_abort_enabled=target_abort_enabled,
         halt_init_prob=train_args.get("halt_init_prob"),
         fraction_init_weights=_parse_fraction_init_weights(train_args.get("fraction_init_ratio")),
     ).to(device)
-    state, _ = adapt_legacy_value_heads_for_model(ckpt["policy"], policy)
+    state, _ = adapt_checkpoint_state_for_model(ckpt["policy"], policy)
     state = _strip_legacy_pair_head_keys(state)
     policy.load_state_dict(state)
     policy.eval()
@@ -121,6 +122,7 @@ def _student_policy_from_args(args: argparse.Namespace, teacher_args: dict[str, 
         population_size=population_size,
         rope_dims=int(args.rope_dims if args.rope_dims is not None else teacher_args.get("rope_dims", 2)),
         value_head_count=value_head_count,
+        disjoint_actor_critic=bool(teacher_args.get("disjoint_actor_critic", False)),
         target_abort_enabled=target_abort_enabled,
         halt_init_prob=(args.halt_init_prob if args.halt_init_prob is not None else teacher_args.get("halt_init_prob")),
         fraction_init_weights=_parse_fraction_init_weights(fraction_init_raw),
