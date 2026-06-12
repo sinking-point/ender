@@ -836,6 +836,29 @@ def _stage_plain_reset_bank(
     target = int(device_reset_bank.capacity) if target_size is None else max(0, int(target_size))
     target = min(target, int(device_reset_bank.capacity))
     staged = 0
+    fill_t0 = perf_counter()
+    last_fill_log_t = fill_t0
+
+    def _log_fill_progress(*, force: bool = False) -> None:
+        nonlocal last_fill_log_t
+        if target <= 0:
+            return
+        now = perf_counter()
+        if not force and (now - last_fill_log_t) < 1.0:
+            return
+        done = int(device_reset_bank.size())
+        remaining = max(0, target - done)
+        elapsed = max(now - fill_t0, 1e-9)
+        rate = float(done) / elapsed
+        print(
+            f"[orbit_wars_pt] initial reset prefill {done}/{target} done "
+            f"remaining {remaining} rate {rate:.2f}/s",
+            flush=True,
+        )
+        last_fill_log_t = now
+
+    if target > 0:
+        print(f"[orbit_wars_pt] initial reset prefill starting target={target}", flush=True)
     while device_reset_bank.size() < target:
         host_items: list[tuple[int, Any]] = []
         target_n = target - int(device_reset_bank.size())
@@ -861,6 +884,7 @@ def _stage_plain_reset_bank(
                     break
             host_items.append(item)
         if not host_items:
+            _log_fill_progress()
             break
         seeds = [int(seed) for seed, _ in host_items]
         if sync_policy_timing and device is not None:
@@ -894,6 +918,9 @@ def _stage_plain_reset_bank(
                 timing.init_reset_bank_submit_s += perf_counter() - t_submit0
             device_reset_bank.next_submit_seed += len(host_items)
         staged += len(host_items)
+        _log_fill_progress()
+    if target > 0:
+        _log_fill_progress(force=True)
     return staged
 
 

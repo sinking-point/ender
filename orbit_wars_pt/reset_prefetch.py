@@ -11,14 +11,15 @@ Uses ``spawn`` so workers do not inherit the parent CUDA context. Workers set
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import queue
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from multiprocessing.context import BaseContext
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from orbit_wars_pt.exploiter_reset import build_unified_exploiter_state_variant
 
 
 @dataclass
@@ -30,14 +31,68 @@ class PrefetchPopMeta:
     fallback_used: bool = False
 
 
-def _worker_loop(task_q: "mp.Queue[Optional[Tuple[int, int, int, int, Optional[int]]]]", result_q: "mp.Queue[Any]") -> None:
-    import os
+def _coerce_host_state_type(state: Any) -> Any:
+    """Convert worker-produced NumPy namedtuples back to the exact JAX pytree type."""
 
-    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+    try:
+        from jax_orbit_wars import OrbitWarsState
+    except Exception:
+        return state
+    if isinstance(state, OrbitWarsState):
+        return state
+    fields = getattr(state, "_fields", None)
+    if fields == OrbitWarsState._fields:
+        return OrbitWarsState(*[getattr(state, name) for name in OrbitWarsState._fields])
+    return state
+
+
+@contextmanager
+def _spawn_cpu_only_jax_env():
+    """Temporarily force CPU-only JAX/CUDA visibility for spawned worker import."""
+
+    keys = (
+        "JAX_PLATFORMS",
+        "JAX_PLATFORM_NAME",
+        "JAX_CUDA_VISIBLE_DEVICES",
+        "CUDA_VISIBLE_DEVICES",
+        "OMP_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "TF_NUM_INTRAOP_THREADS",
+        "TF_NUM_INTEROP_THREADS",
+        "XLA_FLAGS",
+    )
+    prev = {k: os.environ.get(k) for k in keys}
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    os.environ["JAX_PLATFORM_NAME"] = "cpu"
+    os.environ["JAX_CUDA_VISIBLE_DEVICES"] = ""
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
+    os.environ["TF_NUM_INTEROP_THREADS"] = "1"
+    xla_flags = os.environ.get("XLA_FLAGS", "").strip()
+    extra_flags = "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
+    if extra_flags not in xla_flags:
+        os.environ["XLA_FLAGS"] = f"{xla_flags} {extra_flags}".strip()
+    try:
+        yield
+    finally:
+        for key, value in prev.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
-    import jax
-    import jax_orbit_wars as jow
+
+def _worker_loop(task_q: "mp.Queue[Optional[Tuple[int, int, int, int, Optional[int]]]]", result_q: "mp.Queue[Any]") -> None:
+    from orbit_wars_pt.reset_numpy import (
+        build_unified_exploiter_state_variant_numpy,
+        reset_from_reference_numpy,
+    )
 
     while True:
         msg = task_q.get()
@@ -45,14 +100,13 @@ def _worker_loop(task_q: "mp.Queue[Optional[Tuple[int, int, int, int, Optional[i
             break
         gen, seed, num_agents, max_fleets, mode_code = msg
         if mode_code is None:
-            st = jow.reset_from_reference(int(seed), int(num_agents), max_fleets=int(max_fleets))
+            np_st = reset_from_reference_numpy(int(seed), int(num_agents), max_fleets=int(max_fleets))
         else:
-            st = build_unified_exploiter_state_variant(
+            np_st = build_unified_exploiter_state_variant_numpy(
                 int(seed),
                 active_seat_count=int(mode_code),
                 max_fleets=int(max_fleets),
             )
-        np_st = jax.device_get(st)
         result_q.put((gen, int(seed), int(num_agents), int(max_fleets), mode_code, np_st))
 
 
@@ -84,10 +138,11 @@ class RolloutResetPrefetch:
     def start(self) -> None:
         if self._started:
             return
-        for _ in range(self._num_workers):
-            p = self._ctx.Process(target=_worker_loop, args=(self._task_q, self._result_q), daemon=True)
-            p.start()
-            self._procs.append(p)
+        with _spawn_cpu_only_jax_env():
+            for _ in range(self._num_workers):
+                p = self._ctx.Process(target=_worker_loop, args=(self._task_q, self._result_q), daemon=True)
+                p.start()
+                self._procs.append(p)
         self._started = True
 
     def stop(self, timeout: float = 5.0) -> None:
@@ -150,6 +205,7 @@ class RolloutResetPrefetch:
                 break
             rkey = (gen_r, seed_r, na_r, mf_r, mode_r)
             self._outstanding.discard(rkey)
+            np_st = _coerce_host_state_type(np_st)
             self._bank[rkey] = np_st
             drained += 1
         return drained
@@ -244,6 +300,7 @@ class RolloutResetPrefetch:
                 continue
             rkey = (gen_r, seed_r, na_r, mf_r, mode_r)
             self._outstanding.discard(rkey)
+            np_st = _coerce_host_state_type(np_st)
             if gen_r == g and na_r == na and mf_r == mf and mode_r == mode:
                 return int(seed_r), np_st
             self._bank[rkey] = np_st
@@ -381,6 +438,7 @@ class RolloutResetPrefetch:
             meta.drained_results += 1
             rkey = (gen_r, seed_r, na_r, mf_r, mode_r)
             self._outstanding.discard(rkey)
+            np_st = _coerce_host_state_type(np_st)
             if rkey == key:
                 meta.wait_s = time.perf_counter() - t_wait0
                 return (np_st, meta) if return_meta else np_st
@@ -439,6 +497,7 @@ class RolloutResetPrefetch:
             meta.drained_results += 1
             rkey = (gen_r, seed_r, na_r, mf_r, mode_r)
             self._outstanding.discard(rkey)
+            np_st = _coerce_host_state_type(np_st)
             if rkey == key:
                 meta.wait_s = time.perf_counter() - t_wait0
                 return (np_st, meta) if return_meta else np_st
