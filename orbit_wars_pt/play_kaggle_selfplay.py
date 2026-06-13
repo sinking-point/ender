@@ -32,6 +32,36 @@ def _json_default(obj: Any) -> Any:
     return str(obj)
 
 
+def _winner_summary(steps: list[Any], num_agents: int) -> str:
+    if not steps:
+        return "winner: unknown"
+    final_step = steps[-1]
+    if not isinstance(final_step, list) or not final_step:
+        return "winner: unknown"
+
+    rewards: list[tuple[int, float]] = []
+    for seat, entry in enumerate(final_step[:num_agents]):
+        reward = None
+        if isinstance(entry, dict):
+            reward = entry.get("reward")
+        else:
+            reward = getattr(entry, "reward", None)
+        if reward is None:
+            continue
+        rewards.append((seat, float(reward)))
+
+    if not rewards:
+        return "winner: unknown"
+
+    max_reward = max(reward for _, reward in rewards)
+    winners = [seat for seat, reward in rewards if np.isclose(reward, max_reward)]
+    reward_summary = " ".join(f"p{seat}={reward:g}" for seat, reward in rewards)
+    if len(winners) == 1:
+        return f"winner: p{winners[0]} ({reward_summary})"
+    winner_summary = ", ".join(f"p{seat}" for seat in winners)
+    return f"draw: {winner_summary} ({reward_summary})"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -804,6 +834,7 @@ def main() -> None:
     aim_report = format_interval_aim_stats()
     if aim_report:
         print(aim_report)
+    print(_winner_summary(env.steps, int(args.num_agents)))
     print(f"saved {out_path} ({len(env.steps)} steps)")
 
 
