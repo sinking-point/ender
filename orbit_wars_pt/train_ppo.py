@@ -3770,7 +3770,9 @@ def train(args: argparse.Namespace) -> None:
         opt.load_state_dict(actor_opt_state)
         migrated_critic_opt = False
         if critic_opt is not None:
-            critic_source = ckpt.get("critic_optimizer", ckpt.get("actor_optimizer", ckpt["optimizer"]))
+            critic_source = ckpt.get("critic_optimizer")
+            if critic_source is None:
+                critic_source = ckpt.get("actor_optimizer", ckpt["optimizer"])
             critic_opt_state, migrated_critic_opt = _expand_legacy_optimizer_value_head_state(
                 critic_source,
                 saved_model_state=ckpt["policy"],
@@ -3797,7 +3799,9 @@ def train(args: argparse.Namespace) -> None:
             exploiter_opt.load_state_dict(exploiter_actor_opt_state)
             exploiter_critic_opt_migrated = False
             if exploiter_critic_opt is not None:
-                critic_source = ckpt.get("exploiter_critic_optimizer", ckpt.get("exploiter_actor_optimizer", ckpt["exploiter_optimizer"]))
+                critic_source = ckpt.get("exploiter_critic_optimizer")
+                if critic_source is None:
+                    critic_source = ckpt.get("exploiter_actor_optimizer", ckpt["exploiter_optimizer"])
                 exploiter_critic_opt_state, exploiter_critic_opt_migrated = _expand_legacy_optimizer_value_head_state(
                     critic_source,
                     saved_model_state=ckpt["exploiter_policy"],
