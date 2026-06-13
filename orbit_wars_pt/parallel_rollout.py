@@ -1738,6 +1738,12 @@ def _run_async_micro_step_multi(
         off += n_p
     n_active = int(off)
     total_env_rows = int(virt_b.planets.shape[0])
+    expected_total_env_rows = int(n_ego) * int(num_envs)
+    if total_env_rows != expected_total_env_rows:
+        raise ValueError(
+            f"virt_b env-row count {total_env_rows} != n_ego*num_envs {expected_total_env_rows}; "
+            "rollout carry/state batch width is stale"
+        )
     if n_active == 0:
         return virt_b, bufs, obs_bufs, None
 
@@ -2685,6 +2691,18 @@ def collect_parallel_micro_rollouts(
     if profile_rollout:
         log_cuda_mem("rollout enter (before env work)", device)
 
+    requested_num_envs = int(num_envs)
+    if carry_in is not None:
+        carry_num_envs = int(carry_in.state_b.planets.shape[0])
+        if carry_num_envs != requested_num_envs:
+            if carry_in.env_mode_by_env is not None and env_mode_by_env is None:
+                raise ValueError(
+                    f"carry_in state has {carry_num_envs} envs but requested num_envs {requested_num_envs}; "
+                    "cannot reset unified exploiter rollout without matching env_mode_by_env"
+                )
+            carry_in = None
+    num_envs = requested_num_envs
+
     seeds_consumed = 0
     t_init0 = perf_counter()
     policies = [policy] + list(additional_policies or [])
@@ -2854,36 +2872,6 @@ def collect_parallel_micro_rollouts(
         if len(episode_turns) != num_envs:
             episode_turns = [0] * num_envs
         mode_arr = None if carry_in.env_mode_by_env is None else np.asarray(carry_in.env_mode_by_env, dtype=np.int32)
-        pd = carry_in.player_done
-        if pd is None:
-            if carry_in.controller_assignments is not None:
-                player_done = np.asarray(np.asarray(carry_in.controller_assignments, dtype=np.int32) < 0, dtype=np.bool_)
-            else:
-                player_done = np.zeros((int(cfg.num_agents), num_envs), dtype=np.bool_)
-        else:
-            player_done = np.asarray(pd, dtype=np.bool_)
-            if player_done.shape != (int(cfg.num_agents), num_envs):
-                if carry_in.controller_assignments is not None:
-                    player_done = np.asarray(np.asarray(carry_in.controller_assignments, dtype=np.int32) < 0, dtype=np.bool_)
-                else:
-                    player_done = np.zeros((int(cfg.num_agents), num_envs), dtype=np.bool_)
-        pet = carry_in.pending_exploiter_terminal
-        if pet is None:
-            pending_exploiter_terminal = np.zeros((int(cfg.num_agents), num_envs), dtype=np.bool_)
-        else:
-            pending_exploiter_terminal = np.asarray(pet, dtype=np.bool_)
-            if pending_exploiter_terminal.shape != (int(cfg.num_agents), num_envs):
-                pending_exploiter_terminal = np.zeros((int(cfg.num_agents), num_envs), dtype=np.bool_)
-        pop = carry_in.population_assignments
-        if pop is None:
-            population_assignments = np.zeros((int(cfg.num_agents), num_envs), dtype=np.int32)
-        else:
-            population_assignments = np.asarray(pop, dtype=np.int32)
-            if population_assignments.shape != (int(cfg.num_agents), num_envs):
-                population_assignments = np.zeros((int(cfg.num_agents), num_envs), dtype=np.int32)
-        total_rows = int(cfg.num_agents) * int(num_envs)
-        rows_per_member = _population_rows_per_member(total_rows, population_size)
-        prs = carry_in.policy_row_for_seat
         ca = carry_in.controller_assignments
         if ca is None:
             controller_assignments = np.stack(
@@ -2903,6 +2891,30 @@ def collect_parallel_micro_rollouts(
                     ],
                     axis=1,
                 )
+        pd = carry_in.player_done
+        if pd is None:
+            player_done = np.asarray(controller_assignments < 0, dtype=np.bool_)
+        else:
+            player_done = np.asarray(pd, dtype=np.bool_)
+            if player_done.shape != (int(cfg.num_agents), num_envs):
+                player_done = np.asarray(controller_assignments < 0, dtype=np.bool_)
+        pet = carry_in.pending_exploiter_terminal
+        if pet is None:
+            pending_exploiter_terminal = np.zeros((int(cfg.num_agents), num_envs), dtype=np.bool_)
+        else:
+            pending_exploiter_terminal = np.asarray(pet, dtype=np.bool_)
+            if pending_exploiter_terminal.shape != (int(cfg.num_agents), num_envs):
+                pending_exploiter_terminal = np.zeros((int(cfg.num_agents), num_envs), dtype=np.bool_)
+        pop = carry_in.population_assignments
+        if pop is None:
+            population_assignments = np.zeros((int(cfg.num_agents), num_envs), dtype=np.int32)
+        else:
+            population_assignments = np.asarray(pop, dtype=np.int32)
+            if population_assignments.shape != (int(cfg.num_agents), num_envs):
+                population_assignments = np.zeros((int(cfg.num_agents), num_envs), dtype=np.int32)
+        total_rows = int(cfg.num_agents) * int(num_envs)
+        rows_per_member = _population_rows_per_member(total_rows, population_size)
+        prs = carry_in.policy_row_for_seat
         mpm = carry_in.main_player_mask
         if mpm is None:
             main_player_mask = np.stack(
