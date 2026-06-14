@@ -656,6 +656,14 @@ class OrbitWarsPolicy(nn.Module):
             raise ValueError(f"origin_frac_blocked shape {tuple(blocked.shape)} != {expected}")
         return blocked
 
+    def _heads_autocast_disabled(self, device: torch.device) -> torch.autocast:
+        """Disable autocast for post-trunk head math so logits/value stay in fp32."""
+
+        return torch.autocast(device_type=device.type, enabled=False)
+
+    def _fp32_head_input(self, t: torch.Tensor) -> torch.Tensor:
+        return t.float() if t.is_floating_point() else t
+
     def _apply_encoder_sorted_population(
         self,
         x: torch.Tensor,
@@ -702,59 +710,63 @@ class OrbitWarsPolicy(nn.Module):
         abort_head: Optional[nn.Linear] = None,
         value_head_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
-        b = h.shape[0]
-        cls_h = h[:, 0, :]
-        value_cls_h = value_h[:, 0, :]
-        halt_logits = halt_head(cls_h)
-        value_all = value_head(value_cls_h)
-        if int(value_all.shape[-1]) == 1:
-            value = value_all.squeeze(-1)
-        else:
-            if value_head_idx is None:
-                value = value_all[:, 0]
+        with self._heads_autocast_disabled(h.device):
+            h = self._fp32_head_input(h)
+            value_h = self._fp32_head_input(value_h)
+            features = self._fp32_head_input(features)
+            b = h.shape[0]
+            cls_h = h[:, 0, :]
+            value_cls_h = value_h[:, 0, :]
+            halt_logits = halt_head(cls_h)
+            value_all = value_head(value_cls_h)
+            if int(value_all.shape[-1]) == 1:
+                value = value_all.squeeze(-1)
             else:
-                value = value_all.gather(
-                    1,
-                    value_head_idx.to(device=value_all.device, dtype=torch.long).reshape(-1, 1),
-                ).squeeze(-1)
+                if value_head_idx is None:
+                    value = value_all[:, 0]
+                else:
+                    value = value_all.gather(
+                        1,
+                        value_head_idx.to(device=value_all.device, dtype=torch.long).reshape(-1, 1),
+                    ).squeeze(-1)
 
-        planet_h = h[:, 1 : 1 + MAX_PLANETS, :]
-        blocked_mask = None
-        if self.target_abort_enabled and int(features.shape[-1]) in (FEATURE_DIM_ABORT, FEATURE_DIM_MULTI_ABORT):
-            blocked_mask = features[:, 1 : 1 + MAX_PLANETS, -BLOCKED_FRAC_FEATURES:] > 0.5
-        elif origin_frac_blocked is not None:
-            blocked_mask = self._normalize_origin_frac_blocked(origin_frac_blocked, int(h.shape[0]), h.device)
+            planet_h = h[:, 1 : 1 + MAX_PLANETS, :]
+            blocked_mask = None
+            if self.target_abort_enabled and int(features.shape[-1]) in (FEATURE_DIM_ABORT, FEATURE_DIM_MULTI_ABORT):
+                blocked_mask = features[:, 1 : 1 + MAX_PLANETS, -BLOCKED_FRAC_FEATURES:] > 0.5
+            elif origin_frac_blocked is not None:
+                blocked_mask = self._normalize_origin_frac_blocked(origin_frac_blocked, int(h.shape[0]), h.device)
 
-        pm = planet_mask[:, 1 : 1 + MAX_PLANETS]
-        em = entity_mask[:, 1 : 1 + MAX_PLANETS]
-        active_planet = pm & em
-        eye = torch.eye(MAX_PLANETS, device=h.device, dtype=torch.bool).unsqueeze(0).expand(b, -1, -1)
-        owned_self = owner_idx[:, 1 : 1 + MAX_PLANETS] == 1
-        ships = features[:, 1 : 1 + MAX_PLANETS, 1] * 1000.0
-        has_ships = ships > 0.5
-        origin_ok = active_planet & owned_self & has_ships
-        dest_ok = active_planet
-        pair_mask = origin_ok[:, :, None] & dest_ok[:, None, :] & ~eye
-        sends = torch.floor(self._frac_const.to(features.dtype)[None, None, :] * ships[:, :, None])
-        origin_frac_mask = origin_ok[:, :, None] & (sends >= 1.0)
-        if blocked_mask is not None:
-            origin_frac_mask = origin_frac_mask & (~blocked_mask)
-        origin_frac_logits = origin_frac_head(planet_h)
+            pm = planet_mask[:, 1 : 1 + MAX_PLANETS]
+            em = entity_mask[:, 1 : 1 + MAX_PLANETS]
+            active_planet = pm & em
+            eye = torch.eye(MAX_PLANETS, device=h.device, dtype=torch.bool).unsqueeze(0).expand(b, -1, -1)
+            owned_self = owner_idx[:, 1 : 1 + MAX_PLANETS] == 1
+            ships = features[:, 1 : 1 + MAX_PLANETS, 1] * 1000.0
+            has_ships = ships > 0.5
+            origin_ok = active_planet & owned_self & has_ships
+            dest_ok = active_planet
+            pair_mask = origin_ok[:, :, None] & dest_ok[:, None, :] & ~eye
+            sends = torch.floor(self._frac_const.to(features.dtype)[None, None, :] * ships[:, :, None])
+            origin_frac_mask = origin_ok[:, :, None] & (sends >= 1.0)
+            if blocked_mask is not None:
+                origin_frac_mask = origin_frac_mask & (~blocked_mask)
+            origin_frac_logits = origin_frac_head(planet_h)
 
-        return {
-            "hidden": h,
-            "halt_logits": halt_logits,
-            "value": value,
-            "pair_mask": pair_mask,
-            "origin_frac_logits": origin_frac_logits,
-            "origin_frac_mask": origin_frac_mask,
-            "planet_hidden": planet_h,
-            **(
-                {"abort_logits": abort_head(planet_h)}
-                if self.target_abort_enabled and abort_head is not None
-                else {}
-            ),
-        }
+            return {
+                "hidden": h,
+                "halt_logits": halt_logits,
+                "value": value,
+                "pair_mask": pair_mask,
+                "origin_frac_logits": origin_frac_logits,
+                "origin_frac_mask": origin_frac_mask,
+                "planet_hidden": planet_h,
+                **(
+                    {"abort_logits": abort_head(planet_h)}
+                    if self.target_abort_enabled and abort_head is not None
+                    else {}
+                ),
+            }
 
     def _compute_ppo_outputs_single(
         self,
@@ -778,37 +790,38 @@ class OrbitWarsPolicy(nn.Module):
         abort_head: Optional[nn.Linear] = None,
         value_head_idx: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
-        out = self._compute_outputs_single(
-            h,
-            value_h,
-            owner_idx,
-            features,
-            entity_mask,
-            planet_mask,
-            origin_frac_blocked=origin_frac_blocked,
-            origin_frac_head=origin_frac_head,
-            halt_head=halt_head,
-            value_head=value_head,
-            abort_head=abort_head,
-            value_head_idx=value_head_idx,
-        )
-        planet_hidden = out["planet_hidden"]
-        fleet_scalar = (fleet_size.to(device=planet_hidden.device, dtype=planet_hidden.dtype) / 1000.0).reshape(-1, 1, 1)
-        fleet_feat = fleet_scalar.expand(-1, planet_hidden.shape[1], -1)
-        eta_feat = (target_eta.to(device=planet_hidden.device, dtype=planet_hidden.dtype) / 500.0).unsqueeze(-1)
-        target_ships_t = target_ships.to(device=planet_hidden.device, dtype=planet_hidden.dtype)
-        is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
-        target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
-        target_logits = target_pick_head(target_in).squeeze(-1)
-        out["target_logits"] = target_logits
-        if self.target_abort_enabled and "abort_logits" in out:
-            batch_idx = torch.arange(origin_idx.shape[0], device=planet_hidden.device)
-            out["abort_logit"] = out["abort_logits"][
-                batch_idx,
-                origin_idx.to(device=planet_hidden.device, dtype=torch.long),
-                frac_idx.to(device=planet_hidden.device, dtype=torch.long),
-            ]
-        return out
+        with self._heads_autocast_disabled(h.device):
+            out = self._compute_outputs_single(
+                h,
+                value_h,
+                owner_idx,
+                features,
+                entity_mask,
+                planet_mask,
+                origin_frac_blocked=origin_frac_blocked,
+                origin_frac_head=origin_frac_head,
+                halt_head=halt_head,
+                value_head=value_head,
+                abort_head=abort_head,
+                value_head_idx=value_head_idx,
+            )
+            planet_hidden = out["planet_hidden"]
+            fleet_scalar = (fleet_size.to(device=planet_hidden.device, dtype=planet_hidden.dtype) / 1000.0).reshape(-1, 1, 1)
+            fleet_feat = fleet_scalar.expand(-1, planet_hidden.shape[1], -1)
+            eta_feat = (target_eta.to(device=planet_hidden.device, dtype=planet_hidden.dtype) / 500.0).unsqueeze(-1)
+            target_ships_t = target_ships.to(device=planet_hidden.device, dtype=planet_hidden.dtype)
+            is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
+            target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
+            target_logits = target_pick_head(target_in).squeeze(-1)
+            out["target_logits"] = target_logits
+            if self.target_abort_enabled and "abort_logits" in out:
+                batch_idx = torch.arange(origin_idx.shape[0], device=planet_hidden.device)
+                out["abort_logit"] = out["abort_logits"][
+                    batch_idx,
+                    origin_idx.to(device=planet_hidden.device, dtype=torch.long),
+                    frac_idx.to(device=planet_hidden.device, dtype=torch.long),
+                ]
+            return out
 
     def _value_head_for_population_member(self, member_idx: int) -> nn.Linear:
         if not self.disjoint_actor_critic:
@@ -1590,42 +1603,43 @@ class OrbitWarsPolicy(nn.Module):
         fixed, the launch angle is chosen by first-hit geometry.
         """
 
-        b = origin_idx.shape[0]
-        device = planet_hidden.device
-        del frac_idx
-        if fleet_size is None:
-            fleet_scalar = torch.zeros((b, 1, 1), device=device, dtype=planet_hidden.dtype)
-        else:
-            fleet_scalar = (fleet_size.to(device=device, dtype=planet_hidden.dtype) / 1000.0).reshape(b, 1, 1)
-        fleet_feat = fleet_scalar.expand(-1, planet_hidden.shape[1], -1)
-        if target_eta is None:
-            eta_feat = torch.zeros(
-                (b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype
-            )
-        else:
-            eta_feat = (target_eta.to(device=device, dtype=planet_hidden.dtype) / 500.0).unsqueeze(-1)
-        if target_ships is None:
-            is_bigger = torch.zeros((b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype)
-        else:
-            target_ships_t = target_ships.to(device=device, dtype=planet_hidden.dtype)
-            is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
-        target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
-        if self.population_size == 1:
-            return self.target_pick_head(target_in).squeeze(-1)
+        with self._heads_autocast_disabled(planet_hidden.device):
+            planet_hidden = self._fp32_head_input(planet_hidden)
+            b = origin_idx.shape[0]
+            device = planet_hidden.device
+            del frac_idx
+            if fleet_size is None:
+                fleet_scalar = torch.zeros((b, 1, 1), device=device, dtype=planet_hidden.dtype)
+            else:
+                fleet_scalar = (fleet_size.to(device=device, dtype=planet_hidden.dtype) / 1000.0).reshape(b, 1, 1)
+            fleet_feat = fleet_scalar.expand(-1, planet_hidden.shape[1], -1)
+            if target_eta is None:
+                eta_feat = torch.zeros(
+                    (b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype
+                )
+            else:
+                eta_feat = (target_eta.to(device=device, dtype=planet_hidden.dtype) / 500.0).unsqueeze(-1)
+            if target_ships is None:
+                is_bigger = torch.zeros((b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype)
+            else:
+                target_ships_t = target_ships.to(device=device, dtype=planet_hidden.dtype)
+                is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
+            target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
+            if self.population_size == 1:
+                return self.target_pick_head(target_in).squeeze(-1)
 
-        pop = self._normalize_population_idx(population_idx, b, planet_hidden.device)
-        logits: Optional[torch.Tensor] = None
-        for member_idx, tail in enumerate(self.population_tails):
-            member_rows = torch.nonzero(pop == member_idx, as_tuple=False).squeeze(-1)
-            if member_rows.numel() == 0:
-                continue
-            logits_m = tail.target_pick_head(target_in.index_select(0, member_rows)).squeeze(-1)
-            if logits is None:
-                logits = logits_m.new_empty((b, planet_hidden.shape[1]))
-            logits.index_copy_(0, member_rows, logits_m)
-        assert logits is not None
-        return logits
-
+            pop = self._normalize_population_idx(population_idx, b, planet_hidden.device)
+            logits: Optional[torch.Tensor] = None
+            for member_idx, tail in enumerate(self.population_tails):
+                member_rows = torch.nonzero(pop == member_idx, as_tuple=False).squeeze(-1)
+                if member_rows.numel() == 0:
+                    continue
+                logits_m = tail.target_pick_head(target_in.index_select(0, member_rows)).squeeze(-1)
+                if logits is None:
+                    logits = logits_m.new_empty((b, planet_hidden.shape[1]))
+                logits.index_copy_(0, member_rows, logits_m)
+            assert logits is not None
+            return logits
     def target_logits_for_origin_fraction_grouped_population(
         self,
         planet_hidden: torch.Tensor,
@@ -1637,37 +1651,38 @@ class OrbitWarsPolicy(nn.Module):
     ) -> torch.Tensor:
         """Grouped rollout target logits for contiguous per-member batch chunks."""
 
-        b = origin_idx.shape[0]
-        device = planet_hidden.device
-        del frac_idx
-        if fleet_size is None:
-            fleet_scalar = torch.zeros((b, 1, 1), device=device, dtype=planet_hidden.dtype)
-        else:
-            fleet_scalar = (fleet_size.to(device=device, dtype=planet_hidden.dtype) / 1000.0).reshape(b, 1, 1)
-        fleet_feat = fleet_scalar.expand(-1, planet_hidden.shape[1], -1)
-        if target_eta is None:
-            eta_feat = torch.zeros(
-                (b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype
-            )
-        else:
-            eta_feat = (target_eta.to(device=device, dtype=planet_hidden.dtype) / 500.0).unsqueeze(-1)
-        if target_ships is None:
-            is_bigger = torch.zeros((b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype)
-        else:
-            target_ships_t = target_ships.to(device=device, dtype=planet_hidden.dtype)
-            is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
-        target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
-        if self.population_size == 1:
-            return self.target_pick_head(target_in).squeeze(-1)
+        with self._heads_autocast_disabled(planet_hidden.device):
+            planet_hidden = self._fp32_head_input(planet_hidden)
+            b = origin_idx.shape[0]
+            device = planet_hidden.device
+            del frac_idx
+            if fleet_size is None:
+                fleet_scalar = torch.zeros((b, 1, 1), device=device, dtype=planet_hidden.dtype)
+            else:
+                fleet_scalar = (fleet_size.to(device=device, dtype=planet_hidden.dtype) / 1000.0).reshape(b, 1, 1)
+            fleet_feat = fleet_scalar.expand(-1, planet_hidden.shape[1], -1)
+            if target_eta is None:
+                eta_feat = torch.zeros(
+                    (b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype
+                )
+            else:
+                eta_feat = (target_eta.to(device=device, dtype=planet_hidden.dtype) / 500.0).unsqueeze(-1)
+            if target_ships is None:
+                is_bigger = torch.zeros((b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype)
+            else:
+                target_ships_t = target_ships.to(device=device, dtype=planet_hidden.dtype)
+                is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
+            target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
+            if self.population_size == 1:
+                return self.target_pick_head(target_in).squeeze(-1)
 
-        group_size = self._population_group_size(b)
-        logits = []
-        for member_idx, tail in enumerate(self.population_tails):
-            start = member_idx * group_size
-            stop = start + group_size
-            logits.append(tail.target_pick_head(target_in[start:stop]).squeeze(-1))
-        return torch.cat(logits, dim=0)
-
+            group_size = self._population_group_size(b)
+            logits = []
+            for member_idx, tail in enumerate(self.population_tails):
+                start = member_idx * group_size
+                stop = start + group_size
+                logits.append(tail.target_pick_head(target_in[start:stop]).squeeze(-1))
+            return torch.cat(logits, dim=0)
     def target_logits_for_origin_fraction_sorted_population(
         self,
         planet_hidden: torch.Tensor,
@@ -1680,41 +1695,42 @@ class OrbitWarsPolicy(nn.Module):
     ) -> torch.Tensor:
         """Target logits assuming rows are already contiguous by population member."""
 
-        b = origin_idx.shape[0]
-        device = planet_hidden.device
-        del frac_idx
-        if fleet_size is None:
-            fleet_scalar = torch.zeros((b, 1, 1), device=device, dtype=planet_hidden.dtype)
-        else:
-            fleet_scalar = (fleet_size.to(device=device, dtype=planet_hidden.dtype) / 1000.0).reshape(b, 1, 1)
-        fleet_feat = fleet_scalar.expand(-1, planet_hidden.shape[1], -1)
-        if target_eta is None:
-            eta_feat = torch.zeros(
-                (b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype
-            )
-        else:
-            eta_feat = (target_eta.to(device=device, dtype=planet_hidden.dtype) / 500.0).unsqueeze(-1)
-        if target_ships is None:
-            is_bigger = torch.zeros((b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype)
-        else:
-            target_ships_t = target_ships.to(device=device, dtype=planet_hidden.dtype)
-            is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
-        target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
-        if self.population_size == 1:
-            return self.target_pick_head(target_in).squeeze(-1)
+        with self._heads_autocast_disabled(planet_hidden.device):
+            planet_hidden = self._fp32_head_input(planet_hidden)
+            b = origin_idx.shape[0]
+            device = planet_hidden.device
+            del frac_idx
+            if fleet_size is None:
+                fleet_scalar = torch.zeros((b, 1, 1), device=device, dtype=planet_hidden.dtype)
+            else:
+                fleet_scalar = (fleet_size.to(device=device, dtype=planet_hidden.dtype) / 1000.0).reshape(b, 1, 1)
+            fleet_feat = fleet_scalar.expand(-1, planet_hidden.shape[1], -1)
+            if target_eta is None:
+                eta_feat = torch.zeros(
+                    (b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype
+                )
+            else:
+                eta_feat = (target_eta.to(device=device, dtype=planet_hidden.dtype) / 500.0).unsqueeze(-1)
+            if target_ships is None:
+                is_bigger = torch.zeros((b, planet_hidden.shape[1], 1), device=device, dtype=planet_hidden.dtype)
+            else:
+                target_ships_t = target_ships.to(device=device, dtype=planet_hidden.dtype)
+                is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
+            target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
+            if self.population_size == 1:
+                return self.target_pick_head(target_in).squeeze(-1)
 
-        member_counts = self._population_member_counts(population_idx, b, planet_hidden.device)
-        logits = []
-        start = 0
-        for member_idx, tail in enumerate(self.population_tails):
-            count = int(member_counts[member_idx].item())
-            if count <= 0:
-                continue
-            stop = start + count
-            logits.append(tail.target_pick_head(target_in[start:stop]).squeeze(-1))
-            start = stop
-        return torch.cat(logits, dim=0) if logits else target_in.new_empty((0, target_in.shape[1]))
-
+            member_counts = self._population_member_counts(population_idx, b, planet_hidden.device)
+            logits = []
+            start = 0
+            for member_idx, tail in enumerate(self.population_tails):
+                count = int(member_counts[member_idx].item())
+                if count <= 0:
+                    continue
+                stop = start + count
+                logits.append(tail.target_pick_head(target_in[start:stop]).squeeze(-1))
+                start = stop
+            return torch.cat(logits, dim=0) if logits else target_in.new_empty((0, target_in.shape[1]))
     def fraction_logits(
         self,
         planet_hidden: torch.Tensor,
@@ -1725,37 +1741,39 @@ class OrbitWarsPolicy(nn.Module):
     ) -> torch.Tensor:
         """times_norm: [B, NUM_FRACTIONS] — eta_k / 500 per fraction head."""
 
-        b = origin_idx.shape[0]
-        device = planet_hidden.device
-        ho = planet_hidden[torch.arange(b, device=device), origin_idx]
-        hd = planet_hidden[torch.arange(b, device=device), dest_idx]
-        if self.population_size == 1:
-            logits = []
-            for k in range(NUM_FRACTIONS):
-                tt = times_norm[:, k : k + 1]
-                te = self.time_proj(tt)
-                z = torch.cat([ho, hd, te], dim=-1)
-                logits.append(self.frac_heads[k](z).squeeze(-1))
-            return torch.stack(logits, dim=-1)
+        with self._heads_autocast_disabled(planet_hidden.device):
+            planet_hidden = self._fp32_head_input(planet_hidden)
+            times_norm = self._fp32_head_input(times_norm)
+            b = origin_idx.shape[0]
+            device = planet_hidden.device
+            ho = planet_hidden[torch.arange(b, device=device), origin_idx]
+            hd = planet_hidden[torch.arange(b, device=device), dest_idx]
+            if self.population_size == 1:
+                logits = []
+                for k in range(NUM_FRACTIONS):
+                    tt = times_norm[:, k : k + 1]
+                    te = self.time_proj(tt)
+                    z = torch.cat([ho, hd, te], dim=-1)
+                    logits.append(self.frac_heads[k](z).squeeze(-1))
+                return torch.stack(logits, dim=-1)
 
-        pop = self._normalize_population_idx(population_idx, b, planet_hidden.device)
-        logits: Optional[torch.Tensor] = None
-        for member_idx, tail in enumerate(self.population_tails):
-            member_rows = torch.nonzero(pop == member_idx, as_tuple=False).squeeze(-1)
-            if member_rows.numel() == 0:
-                continue
-            ho_m = ho.index_select(0, member_rows)
-            hd_m = hd.index_select(0, member_rows)
-            times_m = times_norm.index_select(0, member_rows)
-            out_m = []
-            for k in range(NUM_FRACTIONS):
-                tt = times_m[:, k : k + 1]
-                te = tail.time_proj(tt)
-                z = torch.cat([ho_m, hd_m, te], dim=-1)
-                out_m.append(tail.frac_heads[k](z).squeeze(-1))
-            logits_m = torch.stack(out_m, dim=-1)
-            if logits is None:
-                logits = logits_m.new_empty((b, NUM_FRACTIONS))
-            logits.index_copy_(0, member_rows, logits_m)
-        assert logits is not None
-        return logits
+            pop = self._normalize_population_idx(population_idx, b, planet_hidden.device)
+            logits: Optional[torch.Tensor] = None
+            for member_idx, tail in enumerate(self.population_tails):
+                member_rows = torch.nonzero(pop == member_idx, as_tuple=False).squeeze(-1)
+                if member_rows.numel() == 0:
+                    continue
+                ho_m = ho.index_select(0, member_rows)
+                hd_m = hd.index_select(0, member_rows)
+                logits_m = []
+                for k in range(NUM_FRACTIONS):
+                    tt = times_norm.index_select(0, member_rows)[:, k : k + 1]
+                    te = tail.time_proj(tt)
+                    z = torch.cat([ho_m, hd_m, te], dim=-1)
+                    logits_m.append(tail.frac_heads[k](z).squeeze(-1))
+                logits_m_t = torch.stack(logits_m, dim=-1)
+                if logits is None:
+                    logits = logits_m_t.new_empty((b, NUM_FRACTIONS))
+                logits.index_copy_(0, member_rows, logits_m_t)
+            assert logits is not None
+            return logits
