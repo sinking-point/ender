@@ -2,7 +2,7 @@
 
 The bundle is a directory (or ``.tar.gz``) with ``main.py`` at the root, a
 minimal ``orbit_wars_pt`` inference package, and two policy checkpoints (4-player
-FFA and 2-player endgame).  Both policies are loaded at startup.
+FFA and 2-player endgame). Optional search-only checkpoints can also be included.
 
 Example::
 
@@ -201,6 +201,8 @@ def package_submission(
     checkpoint_2p: Path | None,
     out: Path,
     *,
+    search_checkpoint_4p: Path | None = None,
+    search_checkpoint_2p: Path | None = None,
     greedy: bool = False,
     greedy_4p: bool | None = None,
     greedy_2p: bool | None = None,
@@ -236,6 +238,14 @@ def package_submission(
         raise FileNotFoundError(checkpoint_4p)
     if not checkpoint_2p.is_file():
         raise FileNotFoundError(checkpoint_2p)
+    if search_checkpoint_4p is not None:
+        search_checkpoint_4p = search_checkpoint_4p.expanduser().resolve()
+        if not search_checkpoint_4p.is_file():
+            raise FileNotFoundError(search_checkpoint_4p)
+    if search_checkpoint_2p is not None:
+        search_checkpoint_2p = search_checkpoint_2p.expanduser().resolve()
+        if not search_checkpoint_2p.is_file():
+            raise FileNotFoundError(search_checkpoint_2p)
 
     source_pkg = (source_pkg or Path(__file__).resolve().parent).resolve()
     out = out.expanduser().resolve()
@@ -271,8 +281,16 @@ def package_submission(
     else:
         shutil.copy2(checkpoint_4p, bundle_dir / "checkpoint_4p.pt")
         shutil.copy2(checkpoint_2p, bundle_dir / "checkpoint_2p.pt")
+    if search_checkpoint_4p is not None:
+        shutil.copy2(search_checkpoint_4p, bundle_dir / "search_checkpoint_4p.pt")
+    if search_checkpoint_2p is not None:
+        shutil.copy2(search_checkpoint_2p, bundle_dir / "search_checkpoint_2p.pt")
     _copy_inference_package(bundle_dir / "orbit_wars_pt", source_pkg=source_pkg)
     submission_env = dict(extra_env or {})
+    if search_checkpoint_4p is not None:
+        submission_env["ORBIT_WARS_SEARCH_CHECKPOINT_4P"] = "search_checkpoint_4p.pt"
+    if search_checkpoint_2p is not None:
+        submission_env["ORBIT_WARS_SEARCH_CHECKPOINT_2P"] = "search_checkpoint_2p.pt"
     if sampling_mode is not None:
         submission_env["ORBIT_WARS_SAMPLING_MODE"] = str(sampling_mode)
     if sampling_mode_4p is not None:
@@ -332,6 +350,8 @@ def package_submission(
 
         4-player checkpoint: {checkpoint_4p.name} (copied to checkpoint_4p.pt)
         2-player checkpoint: {checkpoint_2p.name} (copied to checkpoint_2p.pt)
+        4-player search checkpoint: {search_checkpoint_4p.name if search_checkpoint_4p is not None else 'none'}
+        2-player search checkpoint: {search_checkpoint_2p.name if search_checkpoint_2p is not None else 'none'}
         Greedy (default): {greedy}
         Greedy 4p override: {greedy_4p if greedy_4p is not None else 'default'}
         Greedy 2p override: {greedy_2p if greedy_2p is not None else 'default'}
@@ -355,7 +375,8 @@ def package_submission(
 
         Policy selection: 4-player matches use checkpoint_4p.pt; 2-player matches
         use checkpoint_2p.pt. The first observation selects the mode for the full
-        episode; there is no mid-game policy switching.
+        episode; there is no mid-game policy switching. When present, search-only
+        checkpoints are used only for model-search rollouts.
 
         Test locally (from this directory):
 
@@ -394,6 +415,18 @@ def main() -> None:
         type=Path,
         default=None,
         help="2-player training checkpoint (.pt) shipped as checkpoint_2p.pt.",
+    )
+    parser.add_argument(
+        "--search-checkpoint-4p",
+        type=Path,
+        default=None,
+        help="Optional 4-player search-only checkpoint (.pt) shipped as search_checkpoint_4p.pt.",
+    )
+    parser.add_argument(
+        "--search-checkpoint-2p",
+        type=Path,
+        default=None,
+        help="Optional 2-player search-only checkpoint (.pt) shipped as search_checkpoint_2p.pt.",
     )
     parser.add_argument(
         "--checkpoint-main",
@@ -638,6 +671,8 @@ def main() -> None:
         checkpoint_4p,
         checkpoint_2p,
         args.out,
+        search_checkpoint_4p=args.search_checkpoint_4p,
+        search_checkpoint_2p=args.search_checkpoint_2p,
         greedy=bool(args.greedy),
         greedy_4p=(None if args.greedy_4p is None else bool(args.greedy_4p)),
         greedy_2p=(None if args.greedy_2p is None else bool(args.greedy_2p)),

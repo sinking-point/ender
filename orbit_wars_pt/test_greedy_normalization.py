@@ -10,6 +10,7 @@ import torch
 
 from orbit_wars_pt.kaggle_adapter import (
     KaggleOrbitWarsAgent,
+    KaggleOrbitWarsDualPolicyAgent,
     LaunchGeometryInputs,
     ModelSearchSettings,
     RewardSettings,
@@ -144,6 +145,78 @@ class TestGreedyNormalization(unittest.TestCase):
         halt_logits = torch.tensor([0.0, 0.0], dtype=torch.float32)
         self.assertTrue(_launch_probability_meets_threshold(halt_logits, threshold=0.5))
         self.assertFalse(_launch_probability_meets_threshold(halt_logits, threshold=0.75))
+
+    def test_agent_can_load_distinct_search_checkpoint(self) -> None:
+        main_policy = torch.nn.Linear(1, 1)
+        search_policy = torch.nn.Linear(1, 1)
+        load_calls: list[str] = []
+
+        def fake_load_policy(path, *, device=None, policy_key="policy"):
+            load_calls.append(str(path))
+            if str(path) == "/resolved/main.pt":
+                return (
+                    main_policy,
+                    torch.device("cpu"),
+                    {
+                        "population_size": 4,
+                        "normalize_obs_to_p0": False,
+                        "num_agents": 2,
+                        "max_micro_steps": 7,
+                    },
+                )
+            if str(path) == "/resolved/search.pt":
+                return (
+                    search_policy,
+                    torch.device("cpu"),
+                    {
+                        "population_size": 1,
+                        "normalize_obs_to_p0": True,
+                        "num_agents": 2,
+                        "max_micro_steps": 7,
+                    },
+                )
+            raise AssertionError(path)
+
+        with patch("orbit_wars_pt.kaggle_adapter.resolve_checkpoint_path", side_effect=lambda path: f"/resolved/{path}"), patch(
+            "orbit_wars_pt.kaggle_adapter.load_policy",
+            side_effect=fake_load_policy,
+        ), patch(
+            "orbit_wars_pt.kaggle_adapter._maybe_compile_policy_batched_forward_for_inference",
+            side_effect=lambda policy: policy,
+        ):
+            agent = KaggleOrbitWarsAgent(
+                "main.pt",
+                search_checkpoint_path="search.pt",
+                device="cpu",
+                population_member=3,
+            )
+
+        self.assertEqual(load_calls, ["/resolved/main.pt", "/resolved/search.pt"])
+        self.assertIs(agent.policy, main_policy)
+        self.assertIs(agent.search_policy, search_policy)
+        self.assertEqual(agent.search_checkpoint_path, "/resolved/search.pt")
+        self.assertEqual(agent._population_member_for_player(0), 3)
+        self.assertIsNone(agent._search_population_member_for_player(0))
+        self.assertFalse(agent._search_compiled_forward_warmup_done)
+        self.assertTrue(agent.search_normalize_obs_to_p0)
+
+    def test_dual_agent_threads_mode_specific_search_checkpoints(self) -> None:
+        with patch("orbit_wars_pt.kaggle_adapter.resolve_checkpoint_path", side_effect=lambda path: f"/resolved/{path}"):
+            agent = KaggleOrbitWarsDualPolicyAgent(
+                "main4.pt",
+                "main2.pt",
+                search_checkpoint_4p="search4.pt",
+                search_checkpoint_2p="search2.pt",
+            )
+
+        with patch("orbit_wars_pt.kaggle_adapter.KaggleOrbitWarsAgent") as delegate_cls:
+            agent._build_delegate("4p")
+            agent._build_delegate("2p")
+
+        first_kwargs = delegate_cls.call_args_list[0].kwargs
+        second_kwargs = delegate_cls.call_args_list[1].kwargs
+        self.assertEqual(first_kwargs["search_checkpoint_path"], "/resolved/search4.pt")
+        self.assertEqual(second_kwargs["search_checkpoint_path"], "/resolved/search2.pt")
 
     def test_search_active_keeps_root_sampling_mode_greedy_even_with_launch_threshold(self) -> None:
         agent = object.__new__(KaggleOrbitWarsAgent)

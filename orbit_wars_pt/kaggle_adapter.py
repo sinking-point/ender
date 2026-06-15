@@ -52,6 +52,8 @@ from orbit_wars_pt.reward_config import resolve_reward_mix
 DEFAULT_CHECKPOINT = "checkpoint.pt"
 DEFAULT_CHECKPOINT_4P = "checkpoint_4p.pt"
 DEFAULT_CHECKPOINT_2P = "checkpoint_2p.pt"
+DEFAULT_SEARCH_CHECKPOINT_4P = "search_checkpoint_4p.pt"
+DEFAULT_SEARCH_CHECKPOINT_2P = "search_checkpoint_2p.pt"
 DEFAULT_RAYCAST_RAYS = 256
 DEFAULT_INTERVAL_SAMPLES_PER_SPAN = 9
 DEFAULT_TARGET_METHOD = "rays"
@@ -4901,6 +4903,7 @@ class KaggleOrbitWarsAgent:
         self,
         checkpoint_path: str | os.PathLike[str] = DEFAULT_CHECKPOINT,
         *,
+        search_checkpoint_path: str | os.PathLike[str] | None = None,
         device: Optional[str | torch.device] = None,
         policy_key: str = "policy",
         greedy: bool | Mapping[int, bool] = False,
@@ -4921,6 +4924,11 @@ class KaggleOrbitWarsAgent:
     ):
         _configure_cpu_threads()
         self.checkpoint_path = resolve_checkpoint_path(checkpoint_path)
+        self.search_checkpoint_path = (
+            resolve_checkpoint_path(search_checkpoint_path)
+            if search_checkpoint_path is not None
+            else None
+        )
         self.policy_key = str(policy_key)
         self.policy, self.device, training_args = load_policy(
             self.checkpoint_path,
@@ -4928,6 +4936,15 @@ class KaggleOrbitWarsAgent:
             policy_key=self.policy_key,
         )
         self.policy = _maybe_compile_policy_batched_forward_for_inference(self.policy)
+        self.search_policy = self.policy
+        search_training_args = training_args
+        if self.search_checkpoint_path is not None:
+            self.search_policy, _search_device, search_training_args = load_policy(
+                self.search_checkpoint_path,
+                device=self.device,
+                policy_key=self.policy_key,
+            )
+            self.search_policy = _maybe_compile_policy_batched_forward_for_inference(self.search_policy)
         self.reward_settings = _reward_settings_from_training_args(training_args)
         self.reward_settings = RewardSettings(
             ship_mass_share_coef=self.reward_settings.ship_mass_share_coef,
@@ -4984,6 +5001,14 @@ class KaggleOrbitWarsAgent:
         )
         self.normalize_obs_to_p0 = bool(training_args.get("normalize_obs_to_p0", False))
         self.policy_player_count = 4 if int(training_args.get("num_agents", 2)) > 2 else 2
+        self.search_population_size = int(search_training_args.get("population_size", 1))
+        self._search_population_member_by_player = _normalize_population_members(
+            population_member,
+            population_size=self.search_population_size,
+            context="single:search",
+        )
+        self.search_normalize_obs_to_p0 = bool(search_training_args.get("normalize_obs_to_p0", False))
+        self.search_policy_player_count = 4 if int(search_training_args.get("num_agents", 2)) > 2 else 2
         self._greedy_by_player = _normalize_greedy(greedy)
         self._sampling_mode_by_player = _normalize_sampling_mode(
             sampling_mode,
@@ -5026,6 +5051,7 @@ class KaggleOrbitWarsAgent:
         self._last_call_timing: Optional[KaggleAgentCallTiming] = None
         self._sanity_warnings: set[str] = set()
         self._compiled_forward_warmup_done = False
+        self._search_compiled_forward_warmup_done = self.search_policy is self.policy
         warn_oob = os.environ.get("ORBIT_WARS_WARN_OOB_LAUNCHES", "1").lower() not in {"0", "false", "no", "off"}
         self.launch_tracker = FleetLaunchDebugTracker(
             warn_oob=warn_oob,
@@ -5042,6 +5068,27 @@ class KaggleOrbitWarsAgent:
             return None
         return int(self._population_member_by_player.get(int(player), self._population_member_by_player[-1]))
 
+    def _search_population_member_for_player(self, player: int) -> Optional[int]:
+        if not hasattr(self, "search_population_size"):
+            return self._population_member_for_player(player)
+        if self.search_population_size <= 1:
+            return None
+        return int(
+            self._search_population_member_by_player.get(
+                int(player),
+                self._search_population_member_by_player[-1],
+            )
+        )
+
+    def _search_policy_obj(self) -> OrbitWarsPolicy:
+        return getattr(self, "search_policy", self.policy)
+
+    def _search_policy_player_count_value(self) -> int:
+        return int(getattr(self, "search_policy_player_count", self.policy_player_count))
+
+    def _search_normalize_obs_to_p0_value(self) -> bool:
+        return bool(getattr(self, "search_normalize_obs_to_p0", self.normalize_obs_to_p0))
+
     def _sampling_mode_for_player(self, player: int) -> str:
         return str(self._sampling_mode_by_player.get(int(player), SAMPLING_MODE_STOCHASTIC))
 
@@ -5057,18 +5104,31 @@ class KaggleOrbitWarsAgent:
         self,
         states: list[OrbitWarsState],
         players: list[int],
+        *,
+        policy: OrbitWarsPolicy | None = None,
+        policy_player_count: int | None = None,
+        normalize_obs_to_p0: bool | None = None,
+        population_member_for_player: Any = None,
     ) -> list[float]:
         if not states:
             return []
+        policy = self.policy if policy is None else policy
+        policy_player_count = self.policy_player_count if policy_player_count is None else int(policy_player_count)
+        normalize_obs_to_p0 = self.normalize_obs_to_p0 if normalize_obs_to_p0 is None else bool(normalize_obs_to_p0)
+        population_member_for_player = (
+            self._population_member_for_player
+            if population_member_for_player is None
+            else population_member_for_player
+        )
         batch = _obs_tensors_for_states(
             states,
             players,
             self.device,
-            policy_player_count=self.policy_player_count,
-            target_abort_enabled=bool(getattr(self.policy, "target_abort_enabled", False)),
-            normalize_obs_to_p0=self.normalize_obs_to_p0,
+            policy_player_count=policy_player_count,
+            target_abort_enabled=bool(getattr(policy, "target_abort_enabled", False)),
+            normalize_obs_to_p0=normalize_obs_to_p0,
         )
-        population_members = [self._population_member_for_player(player) for player in players]
+        population_members = [population_member_for_player(player) for player in players]
         population_idx = None
         if any(member is not None for member in population_members):
             population_idx = torch.tensor(
@@ -5078,7 +5138,7 @@ class KaggleOrbitWarsAgent:
             )
         with torch.inference_mode():
             out = _policy_forward_inference(
-                self.policy,
+                policy,
                 batch,
                 population_idx=population_idx,
             )
@@ -5089,18 +5149,31 @@ class KaggleOrbitWarsAgent:
         self,
         states: list[OrbitWarsState],
         players: list[int],
+        *,
+        policy: OrbitWarsPolicy | None = None,
+        policy_player_count: int | None = None,
+        normalize_obs_to_p0: bool | None = None,
+        population_member_for_player: Any = None,
     ) -> dict[str, Any]:
         if not states:
             return {}
+        policy = self.policy if policy is None else policy
+        policy_player_count = self.policy_player_count if policy_player_count is None else int(policy_player_count)
+        normalize_obs_to_p0 = self.normalize_obs_to_p0 if normalize_obs_to_p0 is None else bool(normalize_obs_to_p0)
+        population_member_for_player = (
+            self._population_member_for_player
+            if population_member_for_player is None
+            else population_member_for_player
+        )
         batch = _obs_tensors_for_states(
             states,
             players,
             self.device,
-            policy_player_count=self.policy_player_count,
-            target_abort_enabled=bool(getattr(self.policy, "target_abort_enabled", False)),
-            normalize_obs_to_p0=self.normalize_obs_to_p0,
+            policy_player_count=policy_player_count,
+            target_abort_enabled=bool(getattr(policy, "target_abort_enabled", False)),
+            normalize_obs_to_p0=normalize_obs_to_p0,
         )
-        population_members = [self._population_member_for_player(player) for player in players]
+        population_members = [population_member_for_player(player) for player in players]
         population_idx = None
         if any(member is not None for member in population_members):
             population_idx = torch.tensor(
@@ -5110,7 +5183,7 @@ class KaggleOrbitWarsAgent:
             )
         with torch.inference_mode():
             return _policy_forward_inference(
-                self.policy,
+                policy,
                 batch,
                 population_idx=population_idx,
             )
@@ -5129,7 +5202,14 @@ class KaggleOrbitWarsAgent:
             for player in range(int(num_agents)):
                 batch_states.append(state)
                 batch_players.append(int(player))
-        out = self._policy_outputs_for_states_batched(batch_states, batch_players)
+        out = self._policy_outputs_for_states_batched(
+            batch_states,
+            batch_players,
+            policy=self._search_policy_obj(),
+            policy_player_count=self._search_policy_player_count_value(),
+            normalize_obs_to_p0=self._search_normalize_obs_to_p0_value(),
+            population_member_for_player=self._search_population_member_for_player,
+        )
         cached: list[CachedSearchPolicyOutputs] = []
         stride = int(num_agents)
         abort_logits_all = out.get("abort_logits")
@@ -6351,6 +6431,21 @@ class KaggleOrbitWarsAgent:
                 population_member=self._population_member_for_player(ego_player),
             )
             self._compiled_forward_warmup_done = True
+        if not getattr(
+            self,
+            "_search_compiled_forward_warmup_done",
+            self._search_policy_obj() is self.policy,
+        ):
+            _warmup_compiled_policy_batched_forward(
+                self._search_policy_obj(),
+                state,
+                ego_player,
+                self.device,
+                policy_player_count=self._search_policy_player_count_value(),
+                normalize_obs_to_p0=self._search_normalize_obs_to_p0_value(),
+                population_member=self._search_population_member_for_player(ego_player),
+            )
+            self._search_compiled_forward_warmup_done = True
         launch_geometry = _launch_geometry_from_obs(obs, config)
         timing.obs_to_state_s = perf_counter() - t0
         self.launch_tracker.check_forecast_vs_raycast(
@@ -6394,7 +6489,7 @@ class KaggleOrbitWarsAgent:
                 search_timing.opponent_greedy_obs_to_state_s += perf_counter() - t0
                 t0 = perf_counter()
                 actions = _build_turn_actions_torch_only(
-                    self.policy,
+                    self._search_policy_obj(),
                     sim_state,
                     player,
                     self.device,
@@ -6408,10 +6503,10 @@ class KaggleOrbitWarsAgent:
                     timing=None,
                     launch_tracker=None,
                     game_step=sim_step,
-                    policy_player_count=self.policy_player_count,
-                    normalize_obs_to_p0=self.normalize_obs_to_p0,
+                    policy_player_count=self._search_policy_player_count_value(),
+                    normalize_obs_to_p0=self._search_normalize_obs_to_p0_value(),
                     launch_geometry=_launch_geometry_from_obs(sim_obs, config),
-                    population_member=self._population_member_for_player(player),
+                    population_member=self._search_population_member_for_player(player),
                     search_runtime=None,
                     search_launch_probability_threshold=None,
                     search_greedy_launch_threshold=self.model_search.greedy_launch_threshold,
@@ -6438,13 +6533,13 @@ class KaggleOrbitWarsAgent:
                 search_timing.value_obs_to_state_s += perf_counter() - t0
                 t0 = perf_counter()
                 value = _policy_value_for_state(
-                    self.policy,
+                    self._search_policy_obj(),
                     sim_state,
                     player,
                     self.device,
-                    policy_player_count=self.policy_player_count,
-                    normalize_obs_to_p0=self.normalize_obs_to_p0,
-                    population_member=self._population_member_for_player(player),
+                    policy_player_count=self._search_policy_player_count_value(),
+                    normalize_obs_to_p0=self._search_normalize_obs_to_p0_value(),
+                    population_member=self._search_population_member_for_player(player),
                 )
                 search_timing.value_eval_calls += 1
                 search_timing.value_eval_s += perf_counter() - t0
@@ -6538,6 +6633,8 @@ class KaggleOrbitWarsDualPolicyAgent:
         checkpoint_4p: str | os.PathLike[str],
         checkpoint_2p: str | os.PathLike[str],
         *,
+        search_checkpoint_4p: str | os.PathLike[str] | None = None,
+        search_checkpoint_2p: str | os.PathLike[str] | None = None,
         device: Optional[str | torch.device] = None,
         greedy: bool | Mapping[int, bool] = False,
         sampling_mode: str | Mapping[int, str] | None = None,
@@ -6562,6 +6659,16 @@ class KaggleOrbitWarsDualPolicyAgent:
     ):
         self.checkpoint_4p = resolve_checkpoint_path(checkpoint_4p)
         self.checkpoint_2p = resolve_checkpoint_path(checkpoint_2p)
+        self.search_checkpoint_4p = (
+            resolve_checkpoint_path(search_checkpoint_4p)
+            if search_checkpoint_4p is not None
+            else None
+        )
+        self.search_checkpoint_2p = (
+            resolve_checkpoint_path(search_checkpoint_2p)
+            if search_checkpoint_2p is not None
+            else None
+        )
         self.device = device
         self.greedy_default = greedy
         self.sampling_mode_default = sampling_mode
@@ -6618,6 +6725,7 @@ class KaggleOrbitWarsDualPolicyAgent:
         use_4p = mode == "4p"
         return KaggleOrbitWarsAgent(
             self.checkpoint_4p if use_4p else self.checkpoint_2p,
+            search_checkpoint_path=(self.search_checkpoint_4p if use_4p else self.search_checkpoint_2p),
             device=self.device,
             greedy=self.greedy_4p if use_4p else self.greedy_2p,
             sampling_mode=self.sampling_mode_4p if use_4p else self.sampling_mode_2p,
@@ -6926,10 +7034,14 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
     """Kaggle entry point.
 
     Single-policy: set ``ORBIT_WARS_CHECKPOINT`` (default ``checkpoint.pt``).
+    Optionally set ``ORBIT_WARS_SEARCH_CHECKPOINT`` to use a separate policy for
+    search rollouts only.
 
     Two-checkpoint submission mode: set ``ORBIT_WARS_CHECKPOINT_4P`` and
-    ``ORBIT_WARS_CHECKPOINT_2P``. The first observation picks the 4p or 2p
-    policy for the whole episode; there is no mid-game switching.
+    ``ORBIT_WARS_CHECKPOINT_2P``. Optionally set
+    ``ORBIT_WARS_SEARCH_CHECKPOINT_4P`` and/or ``ORBIT_WARS_SEARCH_CHECKPOINT_2P``
+    for search-only rollouts. The first observation picks the 4p or 2p policy
+    for the whole episode; there is no mid-game switching.
     """
 
     global _AGENT
@@ -6952,11 +7064,24 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
         max_micro_steps = int(max_micro_raw) if max_micro_raw is not None else None
         ckpt_4p = os.environ.get("ORBIT_WARS_CHECKPOINT_4P")
         ckpt_2p = os.environ.get("ORBIT_WARS_CHECKPOINT_2P")
+        search_ckpt = os.environ.get("ORBIT_WARS_SEARCH_CHECKPOINT")
+        search_ckpt_4p = os.environ.get("ORBIT_WARS_SEARCH_CHECKPOINT_4P")
+        search_ckpt_2p = os.environ.get("ORBIT_WARS_SEARCH_CHECKPOINT_2P")
         try:
             if ckpt_4p and ckpt_2p:
                 _AGENT = KaggleOrbitWarsDualPolicyAgent(
                     resolve_checkpoint_path(ckpt_4p),
                     resolve_checkpoint_path(ckpt_2p),
+                    search_checkpoint_4p=(
+                        resolve_checkpoint_path(search_ckpt_4p)
+                        if search_ckpt_4p
+                        else None
+                    ),
+                    search_checkpoint_2p=(
+                        resolve_checkpoint_path(search_ckpt_2p)
+                        if search_ckpt_2p
+                        else None
+                    ),
                     device=device,
                     greedy=greedy,
                     sampling_mode=sampling_mode,
@@ -6978,6 +7103,11 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
                 )
                 _AGENT = KaggleOrbitWarsAgent(
                     ckpt,
+                    search_checkpoint_path=(
+                        resolve_checkpoint_path(search_ckpt)
+                        if search_ckpt
+                        else None
+                    ),
                     device=device,
                     greedy=greedy,
                     sampling_mode=sampling_mode,
