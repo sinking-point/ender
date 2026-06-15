@@ -9,10 +9,10 @@ import re
 import sys
 import time
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -49,7 +49,7 @@ from orbit_wars_pt.model import (
     OrbitWarsPolicy,
     adapt_checkpoint_state_for_model,
 )
-from orbit_wars_pt.kaggle_adapter import _strip_legacy_pair_head_keys
+from orbit_wars_pt.kaggle_adapter import _strip_legacy_pair_head_keys, load_policy
 from orbit_wars_pt.parallel_rollout import (
     EXPLOITER_MODE_SELFPLAY_2P,
     EXPLOITER_MODE_SELFPLAY_4P,
@@ -77,7 +77,7 @@ from orbit_wars_pt.compressed_observation import (
 
 from jax_orbit_wars import OrbitWarsState
 
-CHECKPOINT_VERSION = 7
+CHECKPOINT_VERSION = 8
 
 # Exploiter mode: main-vs-exploiter win rate is smoothed with a mild EMA before
 # it is compared against the skip/mask thresholds, so per-iteration sampling
@@ -156,6 +156,228 @@ class SamplePrepTiming:
             + self.final_select_s
             + self.advantage_norm_s
         )
+
+
+@dataclass
+class LeagueOpponentRecord:
+    """Persistent recent-result summary for one historical checkpoint."""
+
+    checkpoint_name: str
+    checkpoint_path: str
+    checkpoint_iteration: int
+    games: int = 0
+    main_wins: int = 0
+    main_winrate_ema: float = 0.5
+    selected_count: int = 0
+    last_selected_iter: int = -1
+    last_played_iter: int = -1
+
+    @property
+    def opponent_winrate_ema(self) -> float:
+        return float(1.0 - float(self.main_winrate_ema))
+
+
+@dataclass
+class LeagueState:
+    """Checkpoint league metadata stored inside training checkpoints."""
+
+    opponents: dict[str, LeagueOpponentRecord] = field(default_factory=dict)
+
+
+LEAGUE_ENV_MODE_SELFPLAY = 0
+LEAGUE_ENV_MODE_CHECKPOINT = 1
+
+
+def _checkpoint_iteration_from_path(path: Path) -> int:
+    stem = path.stem
+    try:
+        return int(stem.split("_", 1)[1])
+    except (IndexError, ValueError):
+        return -1
+
+
+def _serialize_league_state(state: Optional[LeagueState]) -> Optional[dict[str, Any]]:
+    if state is None:
+        return None
+    return {
+        "opponents": {
+            key: asdict(record)
+            for key, record in state.opponents.items()
+        }
+    }
+
+
+def _deserialize_league_state(obj: Any) -> LeagueState:
+    out = LeagueState()
+    if not isinstance(obj, Mapping):
+        return out
+    opponents_obj = obj.get("opponents", {})
+    if not isinstance(opponents_obj, Mapping):
+        return out
+    for key, raw in opponents_obj.items():
+        if not isinstance(raw, Mapping):
+            continue
+        try:
+            record = LeagueOpponentRecord(
+                checkpoint_name=str(raw.get("checkpoint_name", key)),
+                checkpoint_path=str(raw.get("checkpoint_path", key)),
+                checkpoint_iteration=int(raw.get("checkpoint_iteration", _checkpoint_iteration_from_path(Path(str(key))))),
+                games=int(raw.get("games", 0)),
+                main_wins=int(raw.get("main_wins", 0)),
+                main_winrate_ema=float(raw.get("main_winrate_ema", 0.5)),
+                selected_count=int(raw.get("selected_count", 0)),
+                last_selected_iter=int(raw.get("last_selected_iter", -1)),
+                last_played_iter=int(raw.get("last_played_iter", -1)),
+            )
+        except (TypeError, ValueError):
+            continue
+        out.opponents[str(key)] = record
+    return out
+
+
+def _league_candidate_paths(
+    checkpoints_dir: Path,
+    *,
+    current_iteration: int,
+    max_pool_size: int,
+) -> list[Path]:
+    items = [
+        p
+        for p in checkpoints_dir.glob("iter_*.pt")
+        if p.is_file() and 0 <= _checkpoint_iteration_from_path(p) < int(current_iteration)
+    ]
+    items.sort(key=_checkpoint_iteration_from_path)
+    if int(max_pool_size) > 0:
+        items = items[-int(max_pool_size) :]
+    return items
+
+
+def _sync_league_state(
+    state: Optional[LeagueState],
+    checkpoints_dir: Path,
+    *,
+    current_iteration: int,
+    max_pool_size: int,
+) -> LeagueState:
+    out = LeagueState() if state is None else state
+    live_keys: set[str] = set()
+    for path in _league_candidate_paths(
+        checkpoints_dir,
+        current_iteration=int(current_iteration),
+        max_pool_size=int(max_pool_size),
+    ):
+        key = path.name
+        live_keys.add(key)
+        record = out.opponents.get(key)
+        if record is None:
+            out.opponents[key] = LeagueOpponentRecord(
+                checkpoint_name=path.name,
+                checkpoint_path=str(path),
+                checkpoint_iteration=_checkpoint_iteration_from_path(path),
+            )
+        else:
+            record.checkpoint_name = path.name
+            record.checkpoint_path = str(path)
+            record.checkpoint_iteration = _checkpoint_iteration_from_path(path)
+    stale = [key for key in out.opponents if key not in live_keys]
+    for key in stale:
+        del out.opponents[key]
+    return out
+
+
+def _select_league_opponent(
+    state: LeagueState,
+    rnd: np.random.Generator,
+    *,
+    selection_iter: int,
+    priority_floor: float,
+    priority_temperature: float,
+) -> Optional[LeagueOpponentRecord]:
+    if not state.opponents:
+        return None
+    keys = sorted(
+        state.opponents,
+        key=lambda key: (
+            state.opponents[key].last_selected_iter,
+            state.opponents[key].checkpoint_iteration,
+        ),
+    )
+    weights = []
+    for key in keys:
+        record = state.opponents[key]
+        base = max(0.0, min(1.0, float(record.opponent_winrate_ema)))
+        weight = float(priority_floor) + float(np.power(max(base, 1e-6), float(priority_temperature)))
+        if record.games <= 0:
+            weight += 0.25
+        weights.append(max(weight, 1e-6))
+    probs = np.asarray(weights, dtype=np.float64)
+    probs /= probs.sum()
+    choice = int(rnd.choice(len(keys), p=probs))
+    record = state.opponents[keys[choice]]
+    record.selected_count += 1
+    record.last_selected_iter = int(selection_iter)
+    return record
+
+
+def _update_league_record_from_games(
+    record: LeagueOpponentRecord,
+    *,
+    game_stats: RolloutGameStats,
+    ema_alpha: float,
+    train_iter: int,
+) -> None:
+    games = int(game_stats.main_vs_exploiter_games)
+    if games <= 0:
+        return
+    wins = int(game_stats.main_vs_exploiter_wins)
+    record.games += games
+    record.main_wins += wins
+    winrate = float(wins) / float(games)
+    alpha = float(np.clip(ema_alpha, 0.0, 1.0))
+    record.main_winrate_ema = (
+        winrate if record.last_played_iter < 0 else (alpha * winrate + (1.0 - alpha) * float(record.main_winrate_ema))
+    )
+    record.last_played_iter = int(train_iter)
+
+
+def _league_policy_winrate(record: LeagueOpponentRecord) -> float:
+    if int(record.games) <= 0:
+        return float("nan")
+    return float(record.main_wins) / float(record.games)
+
+
+def _top_league_checkpoint_summary(
+    state: LeagueState,
+    *,
+    limit: int = 3,
+) -> str:
+    if not state.opponents:
+        return "none"
+    played_records = [rec for rec in state.opponents.values() if int(rec.games) > 0]
+    unplayed_records = [rec for rec in state.opponents.values() if int(rec.games) <= 0]
+    played_records.sort(
+        key=lambda rec: (
+            _league_policy_winrate(rec),
+            -rec.games,
+            -rec.last_played_iter,
+            -rec.checkpoint_iteration,
+        )
+    )
+    unplayed_records.sort(
+        key=lambda rec: (
+            -rec.main_winrate_ema,
+            -rec.checkpoint_iteration,
+        )
+    )
+    records = played_records + unplayed_records
+    parts: list[str] = []
+    for rec in records[: max(1, int(limit))]:
+        wr = _league_policy_winrate(rec)
+        wr_text = "nan" if wr != wr else f"{wr:.3f}"
+        parts.append(
+            f"{rec.checkpoint_name}:pol_wr={wr_text},ema={rec.main_winrate_ema:.3f},g={int(rec.games)}"
+        )
+    return " | ".join(parts)
 
 
 def _sanitize_experiment_name(name: str) -> str:
@@ -562,6 +784,42 @@ def _merge_rollout_carry_envs(base: RolloutCarry, sub: RolloutCarry, start: int,
     )
 
 
+def _concat_rollout_carries_env_axis(parts: list[RolloutCarry]) -> RolloutCarry:
+    if not parts:
+        raise ValueError("cannot concatenate zero rollout carries")
+    cfg = parts[0].cfg
+    state_b = jax.tree.map(lambda *xs: jnp.concatenate(xs, axis=0), *[part.state_b for part in parts])
+
+    def _concat_arr(
+        values: list[Optional[np.ndarray]],
+        *,
+        dtype: Optional[np.dtype] = None,
+    ) -> Optional[np.ndarray]:
+        present = [v for v in values if v is not None]
+        if not present:
+            return None
+        arrs = [np.asarray(v if dtype is None else np.asarray(v, dtype=dtype)) for v in present]
+        if arrs[0].ndim == 1:
+            return np.concatenate(arrs, axis=0)
+        return np.concatenate(arrs, axis=1)
+
+    return RolloutCarry(
+        state_b=state_b,
+        cfg=cfg,
+        episode_turns=sum((list(part.episode_turns) for part in parts), []),
+        player_done=_concat_arr([part.player_done for part in parts], dtype=np.bool_),
+        population_assignments=_concat_arr([part.population_assignments for part in parts], dtype=np.int32),
+        policy_row_for_seat=_concat_arr([part.policy_row_for_seat for part in parts], dtype=np.int32),
+        controller_assignments=_concat_arr([part.controller_assignments for part in parts], dtype=np.int32),
+        main_player_mask=_concat_arr([part.main_player_mask for part in parts], dtype=np.bool_),
+        env_mode_by_env=_concat_arr([part.env_mode_by_env for part in parts], dtype=np.int32),
+        pending_exploiter_terminal=_concat_arr(
+            [part.pending_exploiter_terminal for part in parts],
+            dtype=np.bool_,
+        ),
+    )
+
+
 def find_latest_checkpoint(checkpoints_dir: Path) -> Optional[Path]:
     if not checkpoints_dir.is_dir():
         return None
@@ -635,6 +893,12 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "matmul_precision",
         "amp",
         "earlygame_env_turn_limit",
+        "league_fraction",
+        "league_min_checkpoints",
+        "league_max_pool_size",
+        "league_priority_ema_alpha",
+        "league_priority_floor",
+        "league_priority_temperature",
         "experiment",
         "experiment_root",
     )
@@ -720,6 +984,7 @@ def save_checkpoint(
     args: argparse.Namespace,
     main_win_rate_2p_ema: Optional[float] = None,
     main_win_rate_4p_ema: Optional[float] = None,
+    league_state: Optional[LeagueState] = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     training_args = _checkpoint_training_args(args)
@@ -744,6 +1009,7 @@ def save_checkpoint(
         "skip_main_next_iter": bool(skip_main_next_iter),
         "main_win_rate_2p_ema": (None if main_win_rate_2p_ema is None else float(main_win_rate_2p_ema)),
         "main_win_rate_4p_ema": (None if main_win_rate_4p_ema is None else float(main_win_rate_4p_ema)),
+        "league_state": _serialize_league_state(league_state),
         "rollout_carry": (
             {
                 key: (_serialize_rollout_carry(val) if val is not None else None)
@@ -1418,6 +1684,66 @@ def _normalize_chunk_advantages(chunks: list[HostRolloutChunk]) -> None:
         offset += size
 
 
+def _split_league_env_counts(num_envs: int, league_fraction: float) -> tuple[int, int]:
+    league_envs = int(round(float(num_envs) * float(league_fraction)))
+    if float(league_fraction) > 0.0:
+        league_envs = max(1, league_envs)
+    league_envs = min(int(num_envs) - 1, max(0, league_envs))
+    return int(num_envs - league_envs), int(league_envs)
+
+
+def _prepare_league_runtime_policy(
+    *,
+    cached_key: Optional[str],
+    cached_policy: Optional[OrbitWarsPolicy],
+    opponent: LeagueOpponentRecord,
+    device: torch.device,
+    expected_num_agents: int,
+    expected_target_abort_enabled: bool,
+    compile_helpers: bool,
+    compile_mode: str,
+) -> tuple[str, OrbitWarsPolicy]:
+    if cached_policy is not None and cached_key == opponent.checkpoint_name:
+        return cached_key, cached_policy
+    policy_obj, _loaded_device, training_args = load_policy(opponent.checkpoint_path, device=device)
+    policy_obj.train()
+    if int(training_args.get("num_agents", expected_num_agents)) != int(expected_num_agents):
+        raise RuntimeError(
+            f"league checkpoint {opponent.checkpoint_name} has num_agents="
+            f"{training_args.get('num_agents')} but current run uses num_agents={expected_num_agents}"
+        )
+    if bool(training_args.get("target_abort_enabled", expected_target_abort_enabled)) != bool(expected_target_abort_enabled):
+        raise RuntimeError(
+            f"league checkpoint {opponent.checkpoint_name} has target_abort_enabled="
+            f"{training_args.get('target_abort_enabled')} but current run uses "
+            f"target_abort_enabled={expected_target_abort_enabled}"
+        )
+    if compile_helpers:
+        helper_compile_mode = "default" if compile_mode == "reduce-overhead" else compile_mode
+        policy_obj.forward_dense_rollout = torch.compile(  # type: ignore[assignment]
+            policy_obj.forward_dense_rollout,
+            mode=helper_compile_mode,
+            dynamic=True,
+        )
+        if hasattr(policy_obj, "forward_dense_rollout_compressed"):
+            policy_obj.forward_dense_rollout_compressed = torch.compile(  # type: ignore[assignment]
+                policy_obj.forward_dense_rollout_compressed,
+                mode=helper_compile_mode,
+                dynamic=True,
+            )
+        policy_obj.target_logits_for_origin_fraction = torch.compile(  # type: ignore[assignment]
+            policy_obj.target_logits_for_origin_fraction,
+            mode=helper_compile_mode,
+            dynamic=True,
+        )
+        policy_obj.fraction_logits = torch.compile(  # type: ignore[assignment]
+            policy_obj.fraction_logits,
+            mode=helper_compile_mode,
+            dynamic=True,
+        )
+    return opponent.checkpoint_name, policy_obj
+
+
 def _stratified_population_minibatches(
     population_idx: np.ndarray,
     minibatch_size: int,
@@ -1886,6 +2212,62 @@ def _combine_segments_for_stats(segments: list[RolloutSegment]) -> RolloutSegmen
             None if first.env_mode_by_env is None else np.asarray(first.env_mode_by_env, dtype=np.int32)
         ),
         first_reset_event=first.first_reset_event,
+    )
+
+
+def _concat_segment_samples_env_axis(samples: Optional[dict], env_offset: int) -> Optional[dict]:
+    if samples is None:
+        return None
+    out = {key: np.asarray(value).copy() for key, value in samples.items()}
+    if "n_idx" in out:
+        out["n_idx"] = (np.asarray(out["n_idx"], dtype=np.int32) + int(env_offset)).astype(np.int32, copy=False)
+    return out
+
+
+def _concat_rollout_segments_env_axis(segments: list[RolloutSegment]) -> RolloutSegment:
+    if not segments:
+        raise ValueError("cannot concatenate zero rollout segments")
+    first = segments[0]
+    P = len(first.bufs)
+
+    def _concat_torch_transition(bufs: list[TorchTransitionBuffer]) -> TorchTransitionBuffer:
+        return TorchTransitionBuffer(
+            **{
+                field: torch.cat([getattr(buf, field) for buf in bufs], dim=1)
+                for field in TorchTransitionBuffer._fields
+            }
+        )
+
+    def _concat_obs(bufs: list[CompressedObservationBuffer]) -> CompressedObservationBuffer:
+        return CompressedObservationBuffer(
+            **{
+                field: torch.cat([getattr(buf, field) for buf in bufs], dim=1)
+                for field in CompressedObservationBuffer._fields
+            }
+        )
+
+    env_mode_parts = [
+        np.asarray(seg.env_mode_by_env, dtype=np.int32)
+        for seg in segments
+        if seg.env_mode_by_env is not None
+    ]
+    first_reset_event = next((seg.first_reset_event for seg in segments if seg.first_reset_event is not None), None)
+    return RolloutSegment(
+        bufs=[_concat_torch_transition([seg.bufs[p] for seg in segments]) for p in range(P)],
+        obs_bufs=[_concat_obs([seg.obs_bufs[p] for seg in segments]) for p in range(P)],
+        write_idx=[np.concatenate([seg.write_idx[p] for seg in segments], axis=0) for p in range(P)],
+        valid=[np.concatenate([seg.valid[p] for seg in segments], axis=1) for p in range(P)],
+        old_logprob=[np.concatenate([seg.old_logprob[p] for seg in segments], axis=1) for p in range(P)],
+        old_value=[np.concatenate([seg.old_value[p] for seg in segments], axis=1) for p in range(P)],
+        reward=[np.concatenate([seg.reward[p] for seg in segments], axis=1) for p in range(P)],
+        done=[np.concatenate([seg.done[p] for seg in segments], axis=1) for p in range(P)],
+        bootstrap=[np.concatenate([seg.bootstrap[p] for seg in segments], axis=0) for p in range(P)],
+        bootstrap_valid=[np.concatenate([seg.bootstrap_valid[p] for seg in segments], axis=0) for p in range(P)],
+        trunc_bootstrap=[np.concatenate([seg.trunc_bootstrap[p] for seg in segments], axis=1) for p in range(P)],
+        trunc_bootstrap_valid=[np.concatenate([seg.trunc_bootstrap_valid[p] for seg in segments], axis=1) for p in range(P)],
+        env_steps_per_env=np.concatenate([seg.env_steps_per_env for seg in segments], axis=0),
+        env_mode_by_env=(None if not env_mode_parts else np.concatenate(env_mode_parts, axis=0)),
+        first_reset_event=first_reset_event,
     )
 
 
@@ -3491,6 +3873,12 @@ def train(args: argparse.Namespace) -> None:
         raise SystemExit("--exploiter-mode currently requires --population-size=1")
     if args.exploiter_mode and int(args.num_agents) != 4:
         raise SystemExit("--exploiter-mode currently requires --num-agents=4")
+    if not (0.0 <= float(args.league_fraction) < 1.0):
+        raise SystemExit("--league-fraction must be in [0, 1)")
+    if int(args.league_min_checkpoints) < 1:
+        raise SystemExit("--league-min-checkpoints must be >= 1")
+    if int(args.league_max_pool_size) < 0:
+        raise SystemExit("--league-max-pool-size must be >= 0")
     if args.halt_init_prob is not None and not (0.0 < float(args.halt_init_prob) < 1.0):
         raise SystemExit("--halt-init-prob must be between 0 and 1")
     try:
@@ -3743,6 +4131,7 @@ def train(args: argparse.Namespace) -> None:
     skip_main_next_iter = False
     main_win_rate_2p_ema: Optional[float] = None
     main_win_rate_4p_ema: Optional[float] = None
+    league_state = LeagueState()
 
     if resume_path is not None:
         ckpt = resume_ckpt
@@ -3752,7 +4141,7 @@ def train(args: argparse.Namespace) -> None:
             except TypeError:
                 ckpt = torch.load(resume_path, map_location="cpu")
         ckpt_version = int(ckpt.get("version", 0))
-        if ckpt_version not in (6, CHECKPOINT_VERSION):
+        if ckpt_version not in (6, 7, CHECKPOINT_VERSION):
             raise RuntimeError(
                 f"Unsupported checkpoint version {ckpt.get('version')!r} (expected 6 or {CHECKPOINT_VERSION})"
             )
@@ -3828,6 +4217,7 @@ def train(args: argparse.Namespace) -> None:
         _ema_4p = ckpt.get("main_win_rate_4p_ema")
         main_win_rate_2p_ema = None if _ema_2p is None else float(_ema_2p)
         main_win_rate_4p_ema = None if _ema_4p is None else float(_ema_4p)
+        league_state = _deserialize_league_state(ckpt.get("league_state"))
         rc = ckpt["rollout_carry"]
         if args.exploiter_mode:
             if rc is None:
@@ -3840,32 +4230,45 @@ def train(args: argparse.Namespace) -> None:
                     for key, val in dict(rc or {}).items()
                 }
         else:
-            rollout_carry = _deserialize_rollout_carry(rc) if rc is not None else None
+            if isinstance(rc, dict) and "state_b" not in rc:
+                rollout_carry_map = {
+                    key: (_deserialize_rollout_carry(val) if val is not None else None)
+                    for key, val in dict(rc or {}).items()
+                }
+                carry_parts = [carry for carry in (rollout_carry_map.get("selfplay"), rollout_carry_map.get("league")) if carry is not None]
+                rollout_carry = None if not carry_parts else _concat_rollout_carries_env_axis(carry_parts)
+                if isinstance(rollout_env_seed, dict):
+                    rollout_env_seed = int(rollout_env_seed.get("selfplay", args.seed))
+            else:
+                rollout_carry = _deserialize_rollout_carry(rc) if rc is not None else None
         start_iter = int(ckpt["iteration"])
         if (not args.exploiter_mode) and rollout_carry is not None:
-            cfg = rollout_carry.cfg
+            heal_carry = rollout_carry
+            cfg = heal_carry.cfg
+            heal_seed = int(rollout_env_seed)
             heal_sb, heal_seeds, heal_et = heal_terminal_env_slices(
-                rollout_carry.state_b,
-                rollout_carry.cfg,
-                rollout_carry.episode_turns,
-                rollout_env_seed,
+                heal_carry.state_b,
+                heal_carry.cfg,
+                heal_carry.episode_turns,
+                heal_seed,
             )
-            rollout_carry = RolloutCarry(
+            healed_carry = RolloutCarry(
                 state_b=heal_sb,
-                cfg=rollout_carry.cfg,
+                cfg=heal_carry.cfg,
                 episode_turns=heal_et,
-                player_done=rollout_carry.player_done,
-                population_assignments=rollout_carry.population_assignments,
-                policy_row_for_seat=rollout_carry.policy_row_for_seat,
-                controller_assignments=rollout_carry.controller_assignments,
-                main_player_mask=rollout_carry.main_player_mask,
-                env_mode_by_env=rollout_carry.env_mode_by_env,
-                pending_exploiter_terminal=rollout_carry.pending_exploiter_terminal,
+                player_done=heal_carry.player_done,
+                population_assignments=heal_carry.population_assignments,
+                policy_row_for_seat=heal_carry.policy_row_for_seat,
+                controller_assignments=heal_carry.controller_assignments,
+                main_player_mask=heal_carry.main_player_mask,
+                env_mode_by_env=heal_carry.env_mode_by_env,
+                pending_exploiter_terminal=heal_carry.pending_exploiter_terminal,
             )
-            rollout_env_seed += heal_seeds
-            if int(rollout_carry.cfg.num_agents) != int(args.num_agents):
+            rollout_carry = healed_carry
+            rollout_env_seed = heal_seed + int(heal_seeds)
+            if int(heal_carry.cfg.num_agents) != int(args.num_agents):
                 raise RuntimeError(
-                    f"Checkpoint rollout state is num_agents={rollout_carry.cfg.num_agents} but "
+                    f"Checkpoint rollout state is num_agents={heal_carry.cfg.num_agents} but "
                     f"--num-agents={args.num_agents}; use matching player count to resume."
                 )
         elif args.exploiter_mode and rollout_carry:
@@ -3966,6 +4369,7 @@ def train(args: argparse.Namespace) -> None:
             skip_main_next_iter,
             main_win_rate_2p_ema,
             main_win_rate_4p_ema,
+            league_state,
             start_iter,
             writer,
             ckpt_dir,
@@ -4003,6 +4407,7 @@ def _train_loop(
     skip_main_next_iter: bool,
     main_win_rate_2p_ema: Optional[float],
     main_win_rate_4p_ema: Optional[float],
+    league_state: LeagueState,
     start_iter: int,
     writer: SummaryWriter,
     ckpt_dir: Path,
@@ -4011,6 +4416,8 @@ def _train_loop(
     rollout_device_reset_bank: Optional[Any],
     consistency_proc: Optional[Any] = None,
 ) -> None:
+    league_policy_key: Optional[str] = None
+    league_policy_runtime: Optional[OrbitWarsPolicy] = None
     for it in range(start_iter, args.iterations):
         iter_start = time.perf_counter()
         if mem_dbg and device.type == "cuda":
@@ -4620,10 +5027,69 @@ def _train_loop(
                     args=args,
                     main_win_rate_2p_ema=main_win_rate_2p_ema,
                     main_win_rate_4p_ema=main_win_rate_4p_ema,
+                    league_state=league_state,
                 )
                 print(f"[orbit_wars_pt] saved checkpoint {ckpt_path}", flush=True)
             writer.flush()
             continue
+
+        league_selected: Optional[LeagueOpponentRecord] = None
+        league_games = 0
+        league_wins = 0
+        league_envs = 0
+        selfplay_envs = int(args.num_envs)
+        league_enabled = (not args.exploiter_mode) and float(args.league_fraction) > 0.0
+        if league_enabled:
+            league_state = _sync_league_state(
+                league_state,
+                ckpt_dir,
+                current_iteration=max(0, int(it)),
+                max_pool_size=int(args.league_max_pool_size),
+            )
+            if len(league_state.opponents) >= int(args.league_min_checkpoints):
+                selfplay_envs, league_envs = _split_league_env_counts(int(args.num_envs), float(args.league_fraction))
+                if league_envs > 0 and selfplay_envs > 0:
+                    league_selected = _select_league_opponent(
+                        league_state,
+                        rnd,
+                        selection_iter=int(it),
+                        priority_floor=float(args.league_priority_floor),
+                        priority_temperature=float(args.league_priority_temperature),
+                    )
+        if league_selected is not None:
+            league_policy_key, league_policy_runtime = _prepare_league_runtime_policy(
+                cached_key=league_policy_key,
+                cached_policy=league_policy_runtime,
+                opponent=league_selected,
+                device=device,
+                expected_num_agents=int(args.num_agents),
+                expected_target_abort_enabled=bool(args.target_abort_enabled),
+                compile_helpers=bool(args.compile),
+                compile_mode=str(args.compile_mode),
+            )
+        controller_assignment_template = None
+        main_player_mask_template = None
+        termination_requires_all_main_dead = False
+        additional_policies: Optional[list[OrbitWarsPolicy]] = None
+        controller_counts: Optional[tuple[int, ...]] = None
+        termination_controller: Optional[int] = None
+        if league_selected is not None and league_policy_runtime is not None:
+            additional_policies = [league_policy_runtime]
+            controller_counts = (1, int(cfg.num_agents) - 1)
+            termination_controller = 0
+            controller_assignment_template = np.zeros((int(cfg.num_agents), int(args.num_envs)), dtype=np.int32)
+            main_player_mask_template = np.zeros((int(cfg.num_agents), int(args.num_envs)), dtype=np.bool_)
+            if league_envs > 0:
+                league_slice = slice(int(selfplay_envs), int(selfplay_envs + league_envs))
+                if int(cfg.num_agents) == 4:
+                    controller_assignment_template[:, league_slice] = np.asarray([[0], [1], [0], [1]], dtype=np.int32)
+                    main_player_mask_template[:, league_slice] = np.asarray([[True], [False], [True], [False]], dtype=np.bool_)
+                    termination_requires_all_main_dead = True
+                else:
+                    controller_assignment_template[:, league_slice] = np.asarray([[0], [1]], dtype=np.int32)
+                    main_player_mask_template[:, league_slice] = np.asarray([[True], [False]], dtype=np.bool_)
+        carry_in_mixed = rollout_carry if isinstance(rollout_carry, RolloutCarry) else None
+        seed_base_mixed = int(rollout_env_seed) if not isinstance(rollout_env_seed, dict) else int(rollout_env_seed.get("selfplay", args.seed))
 
         host_chunks: Optional[list[HostRolloutChunk]] = None
         host_member_stores: Optional[list[HostReplayMemberStore]] = None
@@ -4634,19 +5100,20 @@ def _train_loop(
             host_chunks = []
             samples_t0 = time.perf_counter()
             samples_s = 0.0
+            first_consistency_segment: Optional[RolloutSegment] = None
             for chunk_i in range(int(args.rollout_host_chunks)):
-                segment_i, rt_i, rollout_carry, seeds_used, game_stats_i = collect_parallel_micro_rollouts(
+                segment_i, rt_i, carry_in_mixed, seeds_used, game_stats_i = collect_parallel_micro_rollouts(
                     policy,
                     cfg,
-                    args.num_envs,
+                    int(args.num_envs),
                     device,
-                    seed_base=rollout_env_seed,
+                    seed_base=seed_base_mixed,
                     rng=rng,
                     greedy=False,
                     ship_speed=args.ship_speed,
                     max_micro_steps_per_player=args.max_micro_steps,
                     rollout_micro_horizon=args.rollout_micro_horizon,
-                    carry_in=rollout_carry,
+                    carry_in=carry_in_mixed,
                     mem_debug=mem_dbg if chunk_i == 0 else 0,
                     train_iter=it,
                     amp_dtype=amp_dtype,
@@ -4659,10 +5126,19 @@ def _train_loop(
                     first_hit_method=str(args.first_hit_method),
                     micro_step_penalty=float(args.micro_step_penalty),
                     sync_policy_timing=bool(args.sync_rollout_timing),
+                    additional_policies=additional_policies,
+                    controller_counts=controller_counts,
+                    termination_controller=termination_controller,
+                    controller_assignment_template=controller_assignment_template,
+                    main_player_mask_template=main_player_mask_template,
+                    termination_requires_all_main_dead=termination_requires_all_main_dead,
                     earlygame_env_turn_limit=int(args.earlygame_env_turn_limit),
                 )
-                rollout_env_seed += seeds_used
-                cfg.max_fleets = rollout_carry.cfg.max_fleets
+                seed_base_mixed += int(seeds_used)
+                cfg.max_fleets = carry_in_mixed.cfg.max_fleets
+                samples_i = build_ppo_samples(segment_i, args.gamma, args.lam)
+                if league_selected is not None:
+                    samples_i = _filter_sample_dict(samples_i, policy_id=0)
                 chunk_sample_count = int(sum(segment_i.write_idx[p].sum() for p in range(len(segment_i.bufs))))
                 t_host0 = time.perf_counter()
                 host_segment_i = _rollout_segment_to_host(segment_i)
@@ -4671,19 +5147,26 @@ def _train_loop(
                 chunk_segments.append(host_segment_i)
                 chunk_timings.append(rt_i)
                 chunk_stats.append(game_stats_i)
+                if samples_i is not None:
+                    host_chunks.append(HostRolloutChunk(segment=host_segment_i, samples=samples_i))
+                if first_consistency_segment is None:
+                    first_consistency_segment = host_segment_i
+                league_games += int(game_stats_i.main_vs_exploiter_games)
+                league_wins += int(game_stats_i.main_vs_exploiter_wins)
+                if league_selected is not None:
+                    _update_league_record_from_games(
+                        league_selected,
+                        game_stats=game_stats_i,
+                        ema_alpha=float(args.league_priority_ema_alpha),
+                        train_iter=int(it),
+                    )
                 print(
                     f"iter {it:4d} host rollout chunk {chunk_i + 1}/{args.rollout_host_chunks} "
                     f"raw_samples {chunk_sample_count} host_transfer {host_transfer_s:.3f}s "
                     f"| {_rollout_timing_str(rt_i)}",
                     flush=True,
                 )
-            chunk_sample_dicts = _build_host_chunk_samples(chunk_segments, args.gamma, args.lam)
-            if chunk_sample_dicts is not None:
-                host_chunks = [
-                    HostRolloutChunk(segment=segment_i, samples=samples_i)
-                    for segment_i, samples_i in zip(chunk_segments, chunk_sample_dicts)
-                    if samples_i
-                ]
+            if host_chunks:
                 _normalize_chunk_advantages(host_chunks)
                 host_member_stores = _build_host_member_replay_stores(host_chunks, int(args.population_size))
                 segment = _combine_segments_for_stats(chunk_segments)
@@ -4692,11 +5175,11 @@ def _train_loop(
                 samples = _concat_sample_dicts([c.samples for c in host_chunks])
                 samples_s = time.perf_counter() - samples_t0
                 _release_rollout_device_refs(device)
-                if consistency_proc is not None and chunk_segments[0].first_reset_event is not None:
+                if consistency_proc is not None and first_consistency_segment is not None and first_consistency_segment.first_reset_event is not None:
                     from orbit_wars_pt.consistency_check import build_trajectory_from_segment
 
                     traj = build_trajectory_from_segment(
-                        chunk_segments[0],
+                        first_consistency_segment,
                         iter_id=int(it),
                         num_agents=int(cfg.num_agents),
                         ship_speed=float(args.ship_speed),
@@ -4707,7 +5190,6 @@ def _train_loop(
                     if traj is not None:
                         consistency_proc.submit(traj)
             else:
-                # Keep a tiny empty segment around for the existing skipped-iteration logging.
                 segment = _combine_segments_for_stats(chunk_segments)
                 rt = _combine_rollout_timing(chunk_timings)
                 game_stats = _combine_game_stats(chunk_stats)
@@ -4715,19 +5197,19 @@ def _train_loop(
                 samples_s = time.perf_counter() - samples_t0
                 _release_rollout_device_refs(device)
         else:
-            seed_base = rollout_env_seed
-            segment, rt, rollout_carry, seeds_used, game_stats = collect_parallel_micro_rollouts(
+            t_samples0 = time.perf_counter()
+            segment, rt, carry_in_mixed, seeds_used, game_stats = collect_parallel_micro_rollouts(
                 policy,
                 cfg,
-                args.num_envs,
+                int(args.num_envs),
                 device,
-                seed_base=seed_base,
+                seed_base=seed_base_mixed,
                 rng=rng,
                 greedy=False,
                 ship_speed=args.ship_speed,
                 max_micro_steps_per_player=args.max_micro_steps,
                 rollout_micro_horizon=args.rollout_micro_horizon,
-                carry_in=rollout_carry,
+                carry_in=carry_in_mixed,
                 mem_debug=mem_dbg,
                 train_iter=it,
                 amp_dtype=amp_dtype,
@@ -4740,19 +5222,41 @@ def _train_loop(
                 first_hit_method=str(args.first_hit_method),
                 micro_step_penalty=float(args.micro_step_penalty),
                 sync_policy_timing=bool(args.sync_rollout_timing),
+                additional_policies=additional_policies,
+                controller_counts=controller_counts,
+                termination_controller=termination_controller,
+                controller_assignment_template=controller_assignment_template,
+                main_player_mask_template=main_player_mask_template,
+                termination_requires_all_main_dead=termination_requires_all_main_dead,
                 earlygame_env_turn_limit=int(args.earlygame_env_turn_limit),
             )
-            rollout_env_seed += seeds_used
-            t_samples0 = time.perf_counter()
+            seed_base_mixed += int(seeds_used)
             samples = build_ppo_samples(segment, args.gamma, args.lam)
+            if league_selected is not None:
+                league_games = int(game_stats.main_vs_exploiter_games)
+                league_wins = int(game_stats.main_vs_exploiter_wins)
+                _update_league_record_from_games(
+                    league_selected,
+                    game_stats=game_stats,
+                    ema_alpha=float(args.league_priority_ema_alpha),
+                    train_iter=int(it),
+                )
+                samples = _filter_sample_dict(samples, policy_id=0)
             if samples is not None:
                 normalize_advantages(samples)
             samples_s = time.perf_counter() - t_samples0
-        cfg.max_fleets = rollout_carry.cfg.max_fleets
-        num_fleets, mean_fleets_per_env = _fleet_counts_from_state(rollout_carry.state_b)
+        rollout_carry = carry_in_mixed
+        rollout_env_seed = seed_base_mixed
+        primary_carry = carry_in_mixed
+        if primary_carry is None:
+            raise RuntimeError("no rollout carry produced for the standard training loop")
+        cfg.max_fleets = int(primary_carry.cfg.max_fleets)
+        num_fleets, mean_fleets_per_env = _fleet_counts_from_state(primary_carry.state_b)
+        league_winrate = (float(league_wins) / float(league_games)) if league_games > 0 else float("nan")
+        league_top_summary = _top_league_checkpoint_summary(league_state, limit=3)
         population_summary = _population_metric_summary(
             samples=samples,
-            population_assignments=rollout_carry.population_assignments,
+            population_assignments=primary_carry.population_assignments,
             game_stats=game_stats,
             population_size=int(args.population_size),
         )
@@ -4770,7 +5274,11 @@ def _train_loop(
             _, _, _, mean_r0 = _segment_rollout_counts(segment)
             print(
                 f"iter {it:4d} skipped (empty rollout) iter_s {iter_dt:.3f} "
-                f"env_steps {total_env_steps} env/s {env_per_sec:.1f} | samples {samples_s:.3f}s | {_rollout_timing_str(rt)}"
+                f"env_steps {total_env_steps} env/s {env_per_sec:.1f} "
+                f"| league_envs {league_envs} league_ckpt {('none' if league_selected is None else league_selected.checkpoint_name)} "
+                f"league_wr {('nan' if league_winrate != league_winrate else f'{league_winrate:.3f}')} "
+                f"| league_top {league_top_summary} "
+                f"| samples {samples_s:.3f}s | {_rollout_timing_str(rt)}"
             )
             _log_iter_tensorboard(
                 writer,
@@ -4786,6 +5294,20 @@ def _train_loop(
                 population_summary=population_summary,
                 abort_summary=abort_summary,
             )
+            writer.add_scalar("league/envs", float(league_envs), it)
+            writer.add_scalar("league/pool_size", float(len(league_state.opponents)), it)
+            if league_games > 0:
+                writer.add_scalar("league/main_win_rate", league_winrate, it)
+                writer.add_scalar("league/policy_win_rate", league_winrate, it)
+            if league_selected is not None:
+                selected_wr = _league_policy_winrate(league_selected)
+                if selected_wr == selected_wr:
+                    writer.add_scalar("league/selected_checkpoint_policy_win_rate", selected_wr, it)
+                writer.add_scalar(
+                    "league/selected_checkpoint_policy_win_rate_ema",
+                    float(league_selected.main_winrate_ema),
+                    it,
+                )
         else:
             if mem_dbg and device.type == "cuda":
                 log_cuda_mem(
@@ -4871,6 +5393,9 @@ def _train_loop(
                 f"mean_r0 {mean_r0:.6f} num_fleets {num_fleets} max_fleets {cfg.max_fleets} iter_s {iter_dt:.3f} "
                 f"micro_steps {total_micro} micro/s {micro_per_sec:.1f} "
                 f"env_steps {total_env_steps} env/s {env_per_sec:.1f} "
+                f"| league_envs {league_envs} league_ckpt {('none' if league_selected is None else league_selected.checkpoint_name)} "
+                f"league_wr {('nan' if league_winrate != league_winrate else f'{league_winrate:.3f}')} "
+                f"| league_top {league_top_summary} "
                 f"| {_rollout_game_stats_str(game_stats)} "
                 f"| samples+gae {samples_s:.3f}s ppo {ppo_s:.3f}s "
                 f"| ppo_stats {_ppo_stats_str(ppo_stats.summary())} "
@@ -4896,6 +5421,20 @@ def _train_loop(
                 rt=rt,
                 ppo_t=ppo_t,
             )
+            writer.add_scalar("league/envs", float(league_envs), it)
+            writer.add_scalar("league/pool_size", float(len(league_state.opponents)), it)
+            if league_games > 0:
+                writer.add_scalar("league/main_win_rate", league_winrate, it)
+                writer.add_scalar("league/policy_win_rate", league_winrate, it)
+            if league_selected is not None:
+                selected_wr = _league_policy_winrate(league_selected)
+                if selected_wr == selected_wr:
+                    writer.add_scalar("league/selected_checkpoint_policy_win_rate", selected_wr, it)
+                writer.add_scalar(
+                    "league/selected_checkpoint_policy_win_rate_ema",
+                    float(league_selected.main_winrate_ema),
+                    it,
+                )
 
         if (it + 1) % args.checkpoint_every == 0:
             ckpt_path = ckpt_dir / f"iter_{it + 1:08d}.pt"
@@ -4914,6 +5453,7 @@ def _train_loop(
                 rollout_carry=rollout_carry,
                 skip_main_next_iter=skip_main_next_iter,
                 args=args,
+                league_state=league_state,
             )
             print(f"[orbit_wars_pt] saved checkpoint {ckpt_path}", flush=True)
 
@@ -4993,6 +5533,48 @@ def parse_args() -> argparse.Namespace:
             "Train a second fully disjoint exploiter policy against the main policy. "
             "Uses four rollout buckets per iteration: main self-play 2p/4p plus "
             "main-vs-exploiter 2p/4p."
+        ),
+    )
+    p.add_argument(
+        "--league-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of rollout envs reserved for main-vs-past-checkpoint league games. "
+            "0 keeps pure self-play."
+        ),
+    )
+    p.add_argument(
+        "--league-min-checkpoints",
+        type=int,
+        default=1,
+        help="Minimum number of historical checkpoints required before league rollouts activate.",
+    )
+    p.add_argument(
+        "--league-max-pool-size",
+        type=int,
+        default=0,
+        help="If >0, keep only the newest N checkpoints in the league candidate pool. 0 keeps all.",
+    )
+    p.add_argument(
+        "--league-priority-ema-alpha",
+        type=float,
+        default=0.2,
+        help="EMA alpha for recent main win rate against each league checkpoint.",
+    )
+    p.add_argument(
+        "--league-priority-floor",
+        type=float,
+        default=0.1,
+        help="Exploration floor added to every league checkpoint sampling weight.",
+    )
+    p.add_argument(
+        "--league-priority-temperature",
+        type=float,
+        default=1.0,
+        help=(
+            "Exponent applied to checkpoint opponent winrate when sampling league opponents. "
+            "Higher values bias harder opponents more strongly."
         ),
     )
     p.add_argument(

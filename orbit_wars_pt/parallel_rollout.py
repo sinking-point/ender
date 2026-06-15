@@ -260,6 +260,48 @@ def _sample_main_player_mask_for_env(
     return out.astype(np.bool_)
 
 
+def _broadcast_controller_assignment_template(
+    template: np.ndarray,
+    *,
+    num_envs: int,
+    num_agents: int,
+) -> np.ndarray:
+    templ = np.asarray(template, dtype=np.int32)
+    if templ.ndim == 1:
+        if templ.shape[0] != int(num_agents):
+            raise ValueError(
+                f"controller_assignment_template length {templ.shape[0]} != num_agents={int(num_agents)}"
+            )
+        return np.broadcast_to(templ[:, None], (int(num_agents), int(num_envs))).astype(np.int32, copy=True)
+    if templ.ndim == 2 and templ.shape == (int(num_agents), int(num_envs)):
+        return templ.astype(np.int32, copy=True)
+    raise ValueError(
+        "controller_assignment_template must have shape "
+        f"({int(num_agents)},) or ({int(num_agents)}, {int(num_envs)}), got {templ.shape}"
+    )
+
+
+def _broadcast_main_player_mask_template(
+    template: np.ndarray,
+    *,
+    num_envs: int,
+    num_agents: int,
+) -> np.ndarray:
+    templ = np.asarray(template, dtype=np.bool_)
+    if templ.ndim == 1:
+        if templ.shape[0] != int(num_agents):
+            raise ValueError(
+                f"main_player_mask_template length {templ.shape[0]} != num_agents={int(num_agents)}"
+            )
+        return np.broadcast_to(templ[:, None], (int(num_agents), int(num_envs))).astype(np.bool_, copy=True)
+    if templ.ndim == 2 and templ.shape == (int(num_agents), int(num_envs)):
+        return templ.astype(np.bool_, copy=True)
+    raise ValueError(
+        "main_player_mask_template must have shape "
+        f"({int(num_agents)},) or ({int(num_agents)}, {int(num_envs)}), got {templ.shape}"
+    )
+
+
 def _relative_main_value_head_idx_for_rows(
     *,
     ego_idx: np.ndarray,
@@ -2664,6 +2706,9 @@ def collect_parallel_micro_rollouts(
     additional_policies: Optional[list[OrbitWarsPolicy]] = None,
     controller_counts: Optional[tuple[int, ...]] = None,
     termination_controller: Optional[int] = None,
+    controller_assignment_template: Optional[np.ndarray] = None,
+    main_player_mask_template: Optional[np.ndarray] = None,
+    termination_requires_all_main_dead: bool = False,
     env_mode_by_env: Optional[np.ndarray] = None,
     earlygame_env_turn_limit: int = 0,
 ) -> Tuple[RolloutSegment, RolloutTiming, RolloutCarry, int, RolloutGameStats]:
@@ -2718,6 +2763,24 @@ def collect_parallel_micro_rollouts(
             f"controller_counts {controller_counts} must sum to cfg_template.num_agents={int(cfg_template.num_agents)}"
         )
     versus_controller_rollout = len(policies) > 1 and int(controller_counts[0]) > 0 and termination_controller is not None
+    fixed_controller_assignments = (
+        None
+        if controller_assignment_template is None
+        else _broadcast_controller_assignment_template(
+            np.asarray(controller_assignment_template, dtype=np.int32),
+            num_envs=int(num_envs),
+            num_agents=int(cfg_template.num_agents),
+        )
+    )
+    fixed_main_player_mask = (
+        None
+        if main_player_mask_template is None
+        else _broadcast_main_player_mask_template(
+            np.asarray(main_player_mask_template, dtype=np.bool_),
+            num_envs=int(num_envs),
+            num_agents=int(cfg_template.num_agents),
+        )
+    )
     carry_mode_arr = None if carry_in is None or carry_in.env_mode_by_env is None else np.asarray(carry_in.env_mode_by_env)
     unified_exploiter_rollout = (env_mode_by_env is not None) or (carry_mode_arr is not None)
     plain_device_bank_mode = (reset_prefetch is not None) and (not unified_exploiter_rollout)
@@ -2834,25 +2897,31 @@ def collect_parallel_micro_rollouts(
                 axis=1,
             )
         if controller_assignments is None:
-            controller_assignments = np.stack(
-                [
-                    _sample_controller_assignments_for_env(
-                        int(init_env_seeds[env_i]),
-                        int(cfg.num_agents),
-                        controller_counts,
-                    )
-                    for env_i in range(num_envs)
-                ],
-                axis=1,
-            )
+            if fixed_controller_assignments is not None:
+                controller_assignments = np.asarray(fixed_controller_assignments, dtype=np.int32).copy()
+            else:
+                controller_assignments = np.stack(
+                    [
+                        _sample_controller_assignments_for_env(
+                            int(init_env_seeds[env_i]),
+                            int(cfg.num_agents),
+                            controller_counts,
+                        )
+                        for env_i in range(num_envs)
+                    ],
+                    axis=1,
+                )
         if main_player_mask is None:
-            main_player_mask = np.stack(
-                [
-                    _sample_main_player_mask_for_env(controller_assignments[:, env_i], termination_controller)
-                    for env_i in range(num_envs)
-                ],
-                axis=1,
-            )
+            if fixed_main_player_mask is not None:
+                main_player_mask = np.asarray(fixed_main_player_mask, dtype=np.bool_).copy()
+            else:
+                main_player_mask = np.stack(
+                    [
+                        _sample_main_player_mask_for_env(controller_assignments[:, env_i], termination_controller)
+                        for env_i in range(num_envs)
+                    ],
+                    axis=1,
+                )
     else:
         state_b, cfg = carry_in.state_b, carry_in.cfg
         cfg.reward_mode = cfg_template.reward_mode
@@ -2874,16 +2943,9 @@ def collect_parallel_micro_rollouts(
         mode_arr = None if carry_in.env_mode_by_env is None else np.asarray(carry_in.env_mode_by_env, dtype=np.int32)
         ca = carry_in.controller_assignments
         if ca is None:
-            controller_assignments = np.stack(
-                [
-                    _sample_controller_assignments_for_env(seed_base + env_i, int(cfg.num_agents), controller_counts)
-                    for env_i in range(num_envs)
-                ],
-                axis=1,
-            )
-        else:
-            controller_assignments = np.asarray(ca, dtype=np.int32)
-            if controller_assignments.shape != (int(cfg.num_agents), num_envs):
+            if fixed_controller_assignments is not None:
+                controller_assignments = np.asarray(fixed_controller_assignments, dtype=np.int32).copy()
+            else:
                 controller_assignments = np.stack(
                     [
                         _sample_controller_assignments_for_env(seed_base + env_i, int(cfg.num_agents), controller_counts)
@@ -2891,6 +2953,19 @@ def collect_parallel_micro_rollouts(
                     ],
                     axis=1,
                 )
+        else:
+            controller_assignments = np.asarray(ca, dtype=np.int32)
+            if controller_assignments.shape != (int(cfg.num_agents), num_envs):
+                if fixed_controller_assignments is not None:
+                    controller_assignments = np.asarray(fixed_controller_assignments, dtype=np.int32).copy()
+                else:
+                    controller_assignments = np.stack(
+                        [
+                            _sample_controller_assignments_for_env(seed_base + env_i, int(cfg.num_agents), controller_counts)
+                            for env_i in range(num_envs)
+                        ],
+                        axis=1,
+                    )
         pd = carry_in.player_done
         if pd is None:
             player_done = np.asarray(controller_assignments < 0, dtype=np.bool_)
@@ -2917,16 +2992,9 @@ def collect_parallel_micro_rollouts(
         prs = carry_in.policy_row_for_seat
         mpm = carry_in.main_player_mask
         if mpm is None:
-            main_player_mask = np.stack(
-                [
-                    _sample_main_player_mask_for_env(controller_assignments[:, env_i], termination_controller)
-                    for env_i in range(num_envs)
-                ],
-                axis=1,
-            )
-        else:
-            main_player_mask = np.asarray(mpm, dtype=np.bool_)
-            if main_player_mask.shape != (int(cfg.num_agents), num_envs):
+            if fixed_main_player_mask is not None:
+                main_player_mask = np.asarray(fixed_main_player_mask, dtype=np.bool_).copy()
+            else:
                 main_player_mask = np.stack(
                     [
                         _sample_main_player_mask_for_env(controller_assignments[:, env_i], termination_controller)
@@ -2934,6 +3002,19 @@ def collect_parallel_micro_rollouts(
                     ],
                     axis=1,
                 )
+        else:
+            main_player_mask = np.asarray(mpm, dtype=np.bool_)
+            if main_player_mask.shape != (int(cfg.num_agents), num_envs):
+                if fixed_main_player_mask is not None:
+                    main_player_mask = np.asarray(fixed_main_player_mask, dtype=np.bool_).copy()
+                else:
+                    main_player_mask = np.stack(
+                        [
+                            _sample_main_player_mask_for_env(controller_assignments[:, env_i], termination_controller)
+                            for env_i in range(num_envs)
+                        ],
+                        axis=1,
+                    )
         if grouped_population_rollout:
             if prs is None:
                 policy_row_for_seat = _init_policy_row_mapping(
@@ -3223,10 +3304,16 @@ def collect_parallel_micro_rollouts(
                     env_i = int(env_i)
                     env_steps_per_env[env_i] += 1
                     episode_turns[env_i] += 1
-                    main_dead = bool(
-                        versus_controller_rollout
-                        and np.any(main_player_mask[:, env_i] & (~alive_post_np[env_i, : int(cfg.num_agents)]))
-                    )
+                    main_alive_mask = np.asarray(alive_post_np[env_i, : int(cfg.num_agents)], dtype=np.bool_)
+                    env_controller_assignments = np.asarray(controller_assignments[:, env_i], dtype=np.int32)
+                    env_has_secondary_policy = bool(np.any(env_controller_assignments == 1))
+                    main_slots_mask = np.asarray(main_player_mask[:, env_i], dtype=np.bool_)
+                    main_dead = False
+                    if env_has_secondary_policy and np.any(main_slots_mask):
+                        if bool(termination_requires_all_main_dead) or int(np.count_nonzero(main_slots_mask)) > 1:
+                            main_dead = bool(np.all(~main_alive_mask[main_slots_mask]))
+                        else:
+                            main_dead = bool(np.any(~main_alive_mask[main_slots_mask]))
                     env_done_now = bool(done_np[env_i]) or main_dead
                     grouped_earlygame_truncate_now = (
                         grouped_population_rollout
@@ -3252,13 +3339,17 @@ def collect_parallel_micro_rollouts(
                     reset_env_now = env_done_now or grouped_earlygame_truncate_now or earlygame_reset_now
                     main_policy_win: Optional[bool] = None
                     time_bonus_scale = 0.0
-                    if versus_controller_rollout and env_done_now:
+                    if env_has_secondary_policy and env_done_now:
                         main_slots = np.flatnonzero(main_player_mask[:, env_i]).astype(np.int32)
-                        main_slot = int(main_slots[0]) if main_slots.size else 0
                         if main_dead:
                             main_policy_win = False
                         else:
-                            main_policy_win = bool(float(rewards_np[env_i, main_slot]) > 0.0)
+                            if main_slots.size > 0:
+                                main_policy_win = bool(
+                                    np.any(np.asarray(rewards_np[env_i, main_slots], dtype=np.float32) > 0.0)
+                                )
+                            else:
+                                main_policy_win = False
                         timeout_step = int(step_count_np[env_i]) >= episode_timeout_step_count
                         if (not timeout_step) and (not bool(main_policy_win)):
                             timeout_turn = max(1.0, float(episode_lim - 2))
@@ -3270,7 +3361,7 @@ def collect_parallel_micro_rollouts(
                             seat_dead = not bool(alive_post_np[env_i, p])
                             local_done = reset_env_now or earlygame_bootstrap_now or seat_dead
                             delta_r = float(dr_np[env_i, p])
-                            if versus_controller_rollout and int(controller_assignments[p, env_i]) == 1:
+                            if env_has_secondary_policy and int(controller_assignments[p, env_i]) == 1:
                                 delta_r = 0.0
                                 if env_done_now and main_policy_win is not None:
                                     terminal_coef = float(terminal_reward_coef_bucket[env_i, p])
@@ -3294,7 +3385,7 @@ def collect_parallel_micro_rollouts(
                             player_done[p, env_i] = True
                         if (
                             env_done_now
-                            and versus_controller_rollout
+                            and env_has_secondary_policy
                             and int(controller_assignments[p, env_i]) == 1
                             and bool(pending_exploiter_terminal[p, env_i])
                         ):
@@ -3628,12 +3719,18 @@ def collect_parallel_micro_rollouts(
                         policy_row_for_seat, rows_per_member, population_size
                     )
                     for env_i in done_envs_np:
-                        controller_assignments[:, env_i] = _sample_controller_assignments_for_env(
-                            done_env_seed[int(env_i)], int(cfg.num_agents), controller_counts
-                        )
-                        main_player_mask[:, env_i] = _sample_main_player_mask_for_env(
-                            controller_assignments[:, env_i], termination_controller
-                        )
+                        if fixed_controller_assignments is not None:
+                            controller_assignments[:, env_i] = fixed_controller_assignments[:, env_i]
+                        else:
+                            controller_assignments[:, env_i] = _sample_controller_assignments_for_env(
+                                done_env_seed[int(env_i)], int(cfg.num_agents), controller_counts
+                            )
+                        if fixed_main_player_mask is not None:
+                            main_player_mask[:, env_i] = fixed_main_player_mask[:, env_i]
+                        else:
+                            main_player_mask[:, env_i] = _sample_main_player_mask_for_env(
+                                controller_assignments[:, env_i], termination_controller
+                            )
                     pending_exploiter_terminal[:, done_envs_np] = False
                     player_done[:, done_envs_np] = False
                     halted[:, done_envs_np] = False
@@ -3645,12 +3742,18 @@ def collect_parallel_micro_rollouts(
                             done_env_seed[env_i], int(cfg.num_agents), population_size
                         )
                         if mode_arr is None:
-                            controller_assignments[:, env_i] = _sample_controller_assignments_for_env(
-                                done_env_seed[env_i], int(cfg.num_agents), controller_counts
-                            )
-                            main_player_mask[:, env_i] = _sample_main_player_mask_for_env(
-                                controller_assignments[:, env_i], termination_controller
-                            )
+                            if fixed_controller_assignments is not None:
+                                controller_assignments[:, env_i] = fixed_controller_assignments[:, env_i]
+                            else:
+                                controller_assignments[:, env_i] = _sample_controller_assignments_for_env(
+                                    done_env_seed[env_i], int(cfg.num_agents), controller_counts
+                                )
+                            if fixed_main_player_mask is not None:
+                                main_player_mask[:, env_i] = fixed_main_player_mask[:, env_i]
+                            else:
+                                main_player_mask[:, env_i] = _sample_main_player_mask_for_env(
+                                    controller_assignments[:, env_i], termination_controller
+                                )
                 timing.env_python_s += perf_counter() - t_py0
 
                 t_book0 = perf_counter()
@@ -3956,12 +4059,18 @@ def collect_parallel_micro_rollouts(
                     deferred_seed[env_i], int(cfg.num_agents), population_size
                 )
                 if mode_arr is None:
-                    controller_assignments[:, env_i] = _sample_controller_assignments_for_env(
-                        deferred_seed[env_i], int(cfg.num_agents), controller_counts
-                    )
-                    main_player_mask[:, env_i] = _sample_main_player_mask_for_env(
-                        controller_assignments[:, env_i], termination_controller
-                    )
+                    if fixed_controller_assignments is not None:
+                        controller_assignments[:, env_i] = fixed_controller_assignments[:, env_i]
+                    else:
+                        controller_assignments[:, env_i] = _sample_controller_assignments_for_env(
+                            deferred_seed[env_i], int(cfg.num_agents), controller_counts
+                        )
+                    if fixed_main_player_mask is not None:
+                        main_player_mask[:, env_i] = fixed_main_player_mask[:, env_i]
+                    else:
+                        main_player_mask[:, env_i] = _sample_main_player_mask_for_env(
+                            controller_assignments[:, env_i], termination_controller
+                        )
                 player_done[:, env_i] = controller_assignments[:, env_i] < 0 if mode_arr is not None else False
                 earlygame_bootstrap_row[:, env_i] = -1
         fallback_dt = perf_counter() - t_fallback0
