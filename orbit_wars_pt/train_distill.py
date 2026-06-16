@@ -172,6 +172,37 @@ def _compile_policy_modules(policy: OrbitWarsPolicy, helper_compile_mode: str) -
     )
 
 
+def _resolved_checkpoint_training_args(args: argparse.Namespace, teacher_args: dict[str, Any]) -> dict[str, Any]:
+    """Persist concrete student/runtime settings rather than raw CLI ``None`` values."""
+
+    resolved = dict(teacher_args)
+    resolved.update(vars(args).copy())
+    resolved["d_model"] = int(args.d_model if args.d_model is not None else teacher_args["d_model"])
+    resolved["n_heads"] = int(args.n_heads if args.n_heads is not None else teacher_args["n_heads"])
+    resolved["n_layers"] = int(args.n_layers if args.n_layers is not None else teacher_args["n_layers"])
+    resolved["rope_dims"] = int(args.rope_dims if args.rope_dims is not None else teacher_args.get("rope_dims", 2))
+    resolved["halt_init_prob"] = (
+        args.halt_init_prob if args.halt_init_prob is not None else teacher_args.get("halt_init_prob")
+    )
+    resolved["fraction_init_ratio"] = (
+        args.fraction_init_ratio if args.fraction_init_ratio is not None else teacher_args.get("fraction_init_ratio")
+    )
+    for key in (
+        "num_envs",
+        "max_micro_steps",
+        "rollout_micro_horizon",
+        "ship_speed",
+        "first_hit_n_rays",
+        "first_hit_ray_chunk_size",
+        "first_hit_method",
+        "micro_step_penalty",
+        "earlygame_env_turn_limit",
+    ):
+        if resolved.get(key) is None and key in teacher_args:
+            resolved[key] = teacher_args[key]
+    return resolved
+
+
 def _save_checkpoint(
     path: Path,
     *,
@@ -183,19 +214,22 @@ def _save_checkpoint(
     rollout_env_seed: int,
     rollout_carry: Optional[RolloutCarry],
     args: argparse.Namespace,
+    teacher_args: dict[str, Any],
     teacher_checkpoint: str,
 ) -> None:
+    student_state = student.state_dict()
     payload = {
         "version": DISTILL_CHECKPOINT_VERSION,
         "iteration": int(iteration),
-        "student": student.state_dict(),
+        "student": student_state,
+        "policy": student_state,
         "optimizer": optimizer.state_dict(),
         "torch_rng": rng.get_state(),
         "numpy_rng_state": rnd.bit_generator.state,
         "rollout_env_seed": int(rollout_env_seed),
         "rollout_carry": _serialize_rollout_carry(rollout_carry) if rollout_carry is not None else None,
         "teacher_checkpoint": str(teacher_checkpoint),
-        "training_args": vars(args).copy(),
+        "training_args": _resolved_checkpoint_training_args(args, teacher_args),
     }
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, tmp)
@@ -253,6 +287,37 @@ def _masked_kl_from_logits(
     teacher_p = torch.softmax(teacher_logits / t, dim=-1)
     loss = F.kl_div(student_lp, teacher_p, reduction="batchmean") * (t * t)
     return loss, int(student_logits.shape[0])
+
+
+def _masked_top1_agreement(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    valid_mask: Optional[torch.Tensor],
+    *,
+    row_mask: Optional[torch.Tensor] = None,
+) -> tuple[int, int]:
+    if row_mask is None:
+        row_valid = torch.ones((student_logits.shape[0],), device=student_logits.device, dtype=torch.bool)
+    else:
+        row_valid = row_mask.to(device=student_logits.device, dtype=torch.bool)
+    if valid_mask is not None:
+        mask = valid_mask.to(device=student_logits.device, dtype=torch.bool)
+        row_valid = row_valid & mask.any(dim=-1)
+        if not bool(row_valid.any().item()):
+            return 0, 0
+        mask = mask[row_valid]
+        student_logits = student_logits[row_valid].masked_fill(~mask, -1e4)
+        teacher_logits = teacher_logits[row_valid].masked_fill(~mask, -1e4)
+    else:
+        if not bool(row_valid.any().item()):
+            return 0, 0
+        student_logits = student_logits[row_valid]
+        teacher_logits = teacher_logits[row_valid]
+    student_top = student_logits.argmax(dim=-1)
+    teacher_top = teacher_logits.argmax(dim=-1)
+    matches = int((student_top == teacher_top).sum().item())
+    rows = int(student_logits.shape[0])
+    return matches, rows
 
 
 def _distill_minibatch(
@@ -330,9 +395,16 @@ def _distill_minibatch(
     total_loss = total_loss + float(halt_coef) * halt_loss
     metrics["loss_halt"] = float(halt_loss.detach().item()) if halt_rows > 0 else 0.0
     metrics["rows_halt"] = float(halt_rows)
+    halt_matches, _halt_acc_rows = _masked_top1_agreement(
+        student_out["halt_logits"],
+        teacher_out["halt_logits"],
+        None,
+        row_mask=halt_row_mask,
+    )
+    metrics["top1_halt_matches"] = float(halt_matches)
+    metrics["top1_halt_rows"] = float(halt_rows)
 
     bsz = int(actions["pair_flat"].shape[0])
-    num_fracs = len(FRACTIONS)
     flat_mask_teacher = teacher_out["origin_frac_mask"].flatten(start_dim=1)
     flat_mask_student = student_out["origin_frac_mask"].flatten(start_dim=1)
     flat_mask = flat_mask_teacher & flat_mask_student
@@ -347,6 +419,14 @@ def _distill_minibatch(
     total_loss = total_loss + float(origin_frac_coef) * origin_loss
     metrics["loss_origin_frac"] = float(origin_loss.detach().item()) if origin_rows > 0 else 0.0
     metrics["rows_origin_frac"] = float(origin_rows)
+    origin_matches, _origin_acc_rows = _masked_top1_agreement(
+        student_out["origin_frac_logits"].flatten(start_dim=1),
+        teacher_out["origin_frac_logits"].flatten(start_dim=1),
+        flat_mask,
+        row_mask=origin_row_mask,
+    )
+    metrics["top1_origin_frac_matches"] = float(origin_matches)
+    metrics["top1_origin_frac_rows"] = float(origin_rows)
 
     pair_flat = actions["pair_flat"].to(device=device, dtype=torch.long)
     frac_idx = actions["frac_idx"].to(device=device, dtype=torch.long)
@@ -400,6 +480,12 @@ def _distill_minibatch(
             temperature=temperature,
             row_mask=target_row_mask,
         )
+        target_matches, _target_acc_rows = _masked_top1_agreement(
+            student_combined,
+            teacher_combined,
+            combined_mask,
+            row_mask=target_row_mask,
+        )
     else:
         target_loss, target_rows = _masked_kl_from_logits(
             student_target_logits,
@@ -408,9 +494,17 @@ def _distill_minibatch(
             temperature=temperature,
             row_mask=target_row_mask,
         )
+        target_matches, _target_acc_rows = _masked_top1_agreement(
+            student_target_logits,
+            teacher_target_logits,
+            target_mask,
+            row_mask=target_row_mask,
+        )
     total_loss = total_loss + float(target_coef) * target_loss
     metrics["loss_target"] = float(target_loss.detach().item()) if target_rows > 0 else 0.0
     metrics["rows_target"] = float(target_rows)
+    metrics["top1_target_matches"] = float(target_matches)
+    metrics["top1_target_rows"] = float(target_rows)
 
     if float(value_coef) != 0.0:
         value_loss = F.mse_loss(student_out["value"], teacher_out["value"])
@@ -590,6 +684,12 @@ def train(args: argparse.Namespace) -> None:
                 "rows_halt": 0.0,
                 "rows_origin_frac": 0.0,
                 "rows_target": 0.0,
+                "top1_halt_matches": 0.0,
+                "top1_halt_rows": 0.0,
+                "top1_origin_frac_matches": 0.0,
+                "top1_origin_frac_rows": 0.0,
+                "top1_target_matches": 0.0,
+                "top1_target_rows": 0.0,
             }
             update_count = 0
 
@@ -635,13 +735,19 @@ def train(args: argparse.Namespace) -> None:
                             stat_sums[key] += float(metrics.get(key, 0.0))
 
             denom = max(1, update_count)
+            halt_top1 = stat_sums["top1_halt_matches"] / max(1.0, stat_sums["top1_halt_rows"])
+            origin_top1 = stat_sums["top1_origin_frac_matches"] / max(1.0, stat_sums["top1_origin_frac_rows"])
+            target_top1 = stat_sums["top1_target_matches"] / max(1.0, stat_sums["top1_target_rows"])
             print(
                 f"[orbit_wars_pt] iter={iteration + 1} samples={total_samples} updates={update_count} "
                 f"loss={stat_sums['loss_total'] / denom:.5f} "
                 f"halt={stat_sums['loss_halt'] / denom:.5f} "
                 f"origin_frac={stat_sums['loss_origin_frac'] / denom:.5f} "
                 f"target={stat_sums['loss_target'] / denom:.5f} "
-                f"value={stat_sums['loss_value'] / denom:.5f}",
+                f"value={stat_sums['loss_value'] / denom:.5f} "
+                f"acc_halt={halt_top1:.3f} "
+                f"acc_origin_frac={origin_top1:.3f} "
+                f"acc_target={target_top1:.3f}",
                 flush=True,
             )
             writer.add_scalar("distill/loss_total", stat_sums["loss_total"] / denom, iteration + 1)
@@ -649,6 +755,9 @@ def train(args: argparse.Namespace) -> None:
             writer.add_scalar("distill/loss_origin_frac", stat_sums["loss_origin_frac"] / denom, iteration + 1)
             writer.add_scalar("distill/loss_target", stat_sums["loss_target"] / denom, iteration + 1)
             writer.add_scalar("distill/loss_value", stat_sums["loss_value"] / denom, iteration + 1)
+            writer.add_scalar("distill/top1_halt_accuracy", halt_top1, iteration + 1)
+            writer.add_scalar("distill/top1_origin_frac_accuracy", origin_top1, iteration + 1)
+            writer.add_scalar("distill/top1_target_accuracy", target_top1, iteration + 1)
             writer.add_scalar("distill/samples", total_samples, iteration + 1)
 
             if (iteration + 1) % int(args.checkpoint_every) == 0:
@@ -663,6 +772,7 @@ def train(args: argparse.Namespace) -> None:
                     rollout_env_seed=rollout_env_seed,
                     rollout_carry=rollout_carry,
                     args=args,
+                    teacher_args=teacher_args,
                     teacher_checkpoint=str(teacher_path),
                 )
                 print(f"[orbit_wars_pt] saved checkpoint {ckpt_path}", flush=True)
