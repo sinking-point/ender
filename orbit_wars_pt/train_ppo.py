@@ -66,6 +66,7 @@ from orbit_wars_pt.parallel_rollout import (
 from orbit_wars_pt.reset_prefetch import RolloutResetPrefetch
 from orbit_wars_pt.ppo_replay import compute_ppo_loss_compressed_torch, compute_ppo_loss_torch
 from orbit_wars_pt.transition_buffer import TorchTransitionBuffer
+from orbit_wars_pt.league_templates import league_controller_templates
 from orbit_wars_pt.torch_replay import (
     select_stored_compressed_minibatch_torch,
     select_stored_observation_minibatch_torch,
@@ -6266,13 +6267,11 @@ def _train_loop(
             main_player_mask_template = np.zeros((int(cfg.num_agents), int(args.num_envs)), dtype=np.bool_)
             if league_envs > 0:
                 league_slice = slice(int(selfplay_envs), int(selfplay_envs + league_envs))
-                if int(cfg.num_agents) == 4:
-                    controller_assignment_template[:, league_slice] = np.asarray([[0], [1], [0], [1]], dtype=np.int32)
-                    main_player_mask_template[:, league_slice] = np.asarray([[True], [False], [True], [False]], dtype=np.bool_)
-                    termination_requires_all_main_dead = True
-                else:
-                    controller_assignment_template[:, league_slice] = np.asarray([[0], [1]], dtype=np.int32)
-                    main_player_mask_template[:, league_slice] = np.asarray([[True], [False]], dtype=np.bool_)
+                league_controller_template, league_main_mask_template, termination_requires_all_main_dead = (
+                    league_controller_templates(int(cfg.num_agents))
+                )
+                controller_assignment_template[:, league_slice] = league_controller_template
+                main_player_mask_template[:, league_slice] = league_main_mask_template
         carry_in_mixed = rollout_carry if isinstance(rollout_carry, RolloutCarry) else None
         seed_base_mixed = int(rollout_env_seed) if not isinstance(rollout_env_seed, dict) else int(rollout_env_seed.get("selfplay", args.seed))
 
