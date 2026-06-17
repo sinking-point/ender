@@ -18,6 +18,7 @@ import numpy as np
 
 import jax
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 
@@ -77,7 +78,7 @@ from orbit_wars_pt.compressed_observation import (
 
 from jax_orbit_wars import OrbitWarsState
 
-CHECKPOINT_VERSION = 8
+CHECKPOINT_VERSION = 9
 
 # Exploiter mode: main-vs-exploiter win rate is smoothed with a mild EMA before
 # it is compared against the skip/mask thresholds, so per-iteration sampling
@@ -129,6 +130,62 @@ class HostReplayMemberStore:
     n_idx: torch.Tensor
     policy_id: torch.Tensor
     env_mode: torch.Tensor
+
+
+@dataclass
+class StudentDistillStats:
+    loss_total_sum: float = 0.0
+    loss_halt_sum: float = 0.0
+    loss_origin_frac_sum: float = 0.0
+    loss_target_sum: float = 0.0
+    loss_value_sum: float = 0.0
+    top1_halt_matches: float = 0.0
+    top1_halt_rows: float = 0.0
+    top1_origin_frac_matches: float = 0.0
+    top1_origin_frac_rows: float = 0.0
+    top1_target_matches: float = 0.0
+    top1_target_rows: float = 0.0
+    n_updates: int = 0
+    n_samples: int = 0
+
+    def update(self, metrics: dict[str, float], sample_count: int) -> None:
+        self.loss_total_sum += float(metrics.get("loss_total", 0.0))
+        self.loss_halt_sum += float(metrics.get("loss_halt", 0.0))
+        self.loss_origin_frac_sum += float(metrics.get("loss_origin_frac", 0.0))
+        self.loss_target_sum += float(metrics.get("loss_target", 0.0))
+        self.loss_value_sum += float(metrics.get("loss_value", 0.0))
+        self.top1_halt_matches += float(metrics.get("top1_halt_matches", 0.0))
+        self.top1_halt_rows += float(metrics.get("top1_halt_rows", 0.0))
+        self.top1_origin_frac_matches += float(metrics.get("top1_origin_frac_matches", 0.0))
+        self.top1_origin_frac_rows += float(metrics.get("top1_origin_frac_rows", 0.0))
+        self.top1_target_matches += float(metrics.get("top1_target_matches", 0.0))
+        self.top1_target_rows += float(metrics.get("top1_target_rows", 0.0))
+        self.n_updates += 1
+        self.n_samples += int(sample_count)
+
+    def summary(self) -> dict[str, float]:
+        denom = float(max(1, self.n_updates))
+        out = {
+            "loss_total": self.loss_total_sum / denom,
+            "loss_halt": self.loss_halt_sum / denom,
+            "loss_origin_frac": self.loss_origin_frac_sum / denom,
+            "loss_target": self.loss_target_sum / denom,
+            "loss_value": self.loss_value_sum / denom,
+            "updates": float(self.n_updates),
+            "samples": float(self.n_samples),
+        }
+        out["top1_halt_acc"] = (
+            self.top1_halt_matches / self.top1_halt_rows if self.top1_halt_rows > 0.0 else float("nan")
+        )
+        out["top1_origin_frac_acc"] = (
+            self.top1_origin_frac_matches / self.top1_origin_frac_rows
+            if self.top1_origin_frac_rows > 0.0
+            else float("nan")
+        )
+        out["top1_target_acc"] = (
+            self.top1_target_matches / self.top1_target_rows if self.top1_target_rows > 0.0 else float("nan")
+        )
+        return out
 
 
 @dataclass
@@ -878,6 +935,15 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "d_model",
         "n_heads",
         "n_layers",
+        "student_d_model",
+        "student_n_heads",
+        "student_n_layers",
+        "student_lr",
+        "student_temperature",
+        "student_halt_coef",
+        "student_origin_frac_coef",
+        "student_target_coef",
+        "student_value_coef",
         "halt_init_prob",
         "fraction_init_ratio",
         "max_fleets",
@@ -973,6 +1039,8 @@ def save_checkpoint(
     policy: OrbitWarsPolicy,
     actor_opt: torch.optim.Optimizer,
     critic_opt: Optional[torch.optim.Optimizer],
+    student_policy: Optional[OrbitWarsPolicy],
+    student_optimizer: Optional[torch.optim.Optimizer],
     exploiter_policy: Optional[OrbitWarsPolicy],
     exploiter_actor_opt: Optional[torch.optim.Optimizer],
     exploiter_critic_opt: Optional[torch.optim.Optimizer],
@@ -990,6 +1058,12 @@ def save_checkpoint(
     training_args = _checkpoint_training_args(args)
     training_args["rope_dims"] = int(getattr(policy, "rope_dims", 2))
     training_args["value_head_count"] = int(getattr(policy, "value_head_count", 1))
+    training_args["student_rope_dims"] = int(getattr(student_policy, "rope_dims", 2))
+    training_args["student_value_head_count"] = int(getattr(student_policy, "value_head_count", 1))
+    training_args["student_feature_dim"] = int(
+        getattr(getattr(student_policy, "feat_proj", None), "in_features", 0)
+    )
+    training_args["student_num_agents"] = int(training_args.get("num_agents", 2))
     if exploiter_policy is not None:
         training_args["exploiter_value_head_count"] = int(getattr(exploiter_policy, "value_head_count", 1))
     payload = {
@@ -999,6 +1073,8 @@ def save_checkpoint(
         "optimizer": actor_opt.state_dict(),
         "actor_optimizer": actor_opt.state_dict(),
         "critic_optimizer": None if critic_opt is None else critic_opt.state_dict(),
+        "student_policy": student_policy.state_dict(),
+        "student_optimizer": student_optimizer.state_dict(),
         "exploiter_policy": None if exploiter_policy is None else exploiter_policy.state_dict(),
         "exploiter_optimizer": None if exploiter_actor_opt is None else exploiter_actor_opt.state_dict(),
         "exploiter_actor_optimizer": None if exploiter_actor_opt is None else exploiter_actor_opt.state_dict(),
@@ -1804,6 +1880,762 @@ def _concat_compressed_parts(parts: list[CompressedObservationBuffer]) -> Compre
 def _index_compressed_observation(comp: CompressedObservationBuffer, idx: torch.Tensor) -> CompressedObservationBuffer:
     return CompressedObservationBuffer(
         **{field: getattr(comp, field).index_select(0, idx) for field in comp._fields}
+    )
+
+
+def _masked_kl_from_logits(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    valid_mask: Optional[torch.Tensor],
+    *,
+    temperature: float,
+    row_mask: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, int]:
+    if row_mask is None:
+        row_valid = torch.ones((student_logits.shape[0],), device=student_logits.device, dtype=torch.bool)
+    else:
+        row_valid = row_mask.to(device=student_logits.device, dtype=torch.bool)
+    if valid_mask is not None:
+        mask = valid_mask.to(device=student_logits.device, dtype=torch.bool)
+        row_valid = row_valid & mask.any(dim=-1)
+        if not bool(row_valid.any().item()):
+            return student_logits.sum() * 0.0, 0
+        mask = mask[row_valid]
+        student_logits = student_logits[row_valid].masked_fill(~mask, -1e4)
+        teacher_logits = teacher_logits[row_valid].masked_fill(~mask, -1e4)
+    else:
+        if not bool(row_valid.any().item()):
+            return student_logits.sum() * 0.0, 0
+        student_logits = student_logits[row_valid]
+        teacher_logits = teacher_logits[row_valid]
+    temp = float(max(1e-6, temperature))
+    student_logp = F.log_softmax(student_logits / temp, dim=-1)
+    teacher_p = F.softmax(teacher_logits / temp, dim=-1)
+    loss = F.kl_div(student_logp, teacher_p, reduction="batchmean") * (temp * temp)
+    return loss, int(student_logits.shape[0])
+
+
+def _masked_top1_agreement(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    valid_mask: Optional[torch.Tensor],
+    *,
+    row_mask: Optional[torch.Tensor] = None,
+) -> tuple[int, int]:
+    if row_mask is None:
+        row_valid = torch.ones((student_logits.shape[0],), device=student_logits.device, dtype=torch.bool)
+    else:
+        row_valid = row_mask.to(device=student_logits.device, dtype=torch.bool)
+    if valid_mask is not None:
+        mask = valid_mask.to(device=student_logits.device, dtype=torch.bool)
+        row_valid = row_valid & mask.any(dim=-1)
+        if not bool(row_valid.any().item()):
+            return 0, 0
+        mask = mask[row_valid]
+        student_logits = student_logits[row_valid].masked_fill(~mask, -1e4)
+        teacher_logits = teacher_logits[row_valid].masked_fill(~mask, -1e4)
+    else:
+        if not bool(row_valid.any().item()):
+            return 0, 0
+        student_logits = student_logits[row_valid]
+        teacher_logits = teacher_logits[row_valid]
+    student_top = student_logits.argmax(dim=-1)
+    teacher_top = teacher_logits.argmax(dim=-1)
+    matches = int((student_top == teacher_top).sum().item())
+    rows = int(student_logits.shape[0])
+    return matches, rows
+
+
+def _distill_student_minibatch(
+    *,
+    teacher: OrbitWarsPolicy,
+    student: OrbitWarsPolicy,
+    comp: CompressedObservationBuffer,
+    actions: dict[str, torch.Tensor],
+    temperature: float,
+    halt_coef: float,
+    origin_frac_coef: float,
+    target_coef: float,
+    value_coef: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    device = next(student.parameters()).device
+    feature_dim = int(student.feat_proj.in_features)
+    pop_idx = actions["population_idx"].to(device=device, dtype=torch.long)
+    value_head_idx = actions["value_head_idx"].to(device=device, dtype=torch.long)
+
+    comp_dev = CompressedObservationBuffer(
+        token_meta=comp.token_meta.to(device),
+        owner_idx=comp.owner_idx.to(device),
+        production=comp.production.to(device),
+        ships=comp.ships.to(device),
+        velocity=comp.velocity.to(device),
+        xy=comp.xy.to(device),
+        turn_progress=comp.turn_progress.to(device),
+        incoming_net=comp.incoming_net.to(device),
+        incoming_survivor=comp.incoming_survivor.to(device),
+        origin_frac_blocked=comp.origin_frac_blocked.to(device),
+    )
+    with torch.no_grad():
+        teacher_out = teacher.forward_dense_rollout_compressed(
+            comp_dev.token_meta,
+            comp_dev.owner_idx,
+            comp_dev.production,
+            comp_dev.ships,
+            comp_dev.velocity,
+            comp_dev.xy,
+            comp_dev.turn_progress,
+            comp_dev.incoming_net,
+            comp_dev.incoming_survivor,
+            feature_dim,
+            origin_frac_blocked=comp_dev.origin_frac_blocked,
+            population_idx=pop_idx,
+            value_head_idx=value_head_idx,
+        )
+    student_out = student.forward_dense_rollout_compressed(
+        comp_dev.token_meta,
+        comp_dev.owner_idx,
+        comp_dev.production,
+        comp_dev.ships,
+        comp_dev.velocity,
+        comp_dev.xy,
+        comp_dev.turn_progress,
+        comp_dev.incoming_net,
+        comp_dev.incoming_survivor,
+        feature_dim,
+        origin_frac_blocked=comp_dev.origin_frac_blocked,
+        population_idx=pop_idx,
+        value_head_idx=value_head_idx,
+    )
+
+    metrics: dict[str, float] = {}
+    total_loss = student_out["value"].sum() * 0.0
+
+    halt_row_mask = ~actions["must_halt_no_ships"].to(device=device, dtype=torch.bool)
+    halt_loss, halt_rows = _masked_kl_from_logits(
+        student_out["halt_logits"],
+        teacher_out["halt_logits"],
+        None,
+        temperature=temperature,
+        row_mask=halt_row_mask,
+    )
+    total_loss = total_loss + float(halt_coef) * halt_loss
+    metrics["loss_halt"] = float(halt_loss.detach().item()) if halt_rows > 0 else 0.0
+    halt_matches, _ = _masked_top1_agreement(
+        student_out["halt_logits"],
+        teacher_out["halt_logits"],
+        None,
+        row_mask=halt_row_mask,
+    )
+    metrics["top1_halt_matches"] = float(halt_matches)
+    metrics["top1_halt_rows"] = float(halt_rows)
+
+    flat_mask_teacher = teacher_out["origin_frac_mask"].flatten(start_dim=1)
+    flat_mask_student = student_out["origin_frac_mask"].flatten(start_dim=1)
+    flat_mask = flat_mask_teacher & flat_mask_student
+    origin_row_mask = (~actions["must_halt_no_ships"].to(device=device, dtype=torch.bool)) & flat_mask_teacher.any(dim=-1)
+    origin_loss, origin_rows = _masked_kl_from_logits(
+        student_out["origin_frac_logits"].flatten(start_dim=1),
+        teacher_out["origin_frac_logits"].flatten(start_dim=1),
+        flat_mask,
+        temperature=temperature,
+        row_mask=origin_row_mask,
+    )
+    total_loss = total_loss + float(origin_frac_coef) * origin_loss
+    metrics["loss_origin_frac"] = float(origin_loss.detach().item()) if origin_rows > 0 else 0.0
+    origin_matches, _ = _masked_top1_agreement(
+        student_out["origin_frac_logits"].flatten(start_dim=1),
+        teacher_out["origin_frac_logits"].flatten(start_dim=1),
+        flat_mask,
+        row_mask=origin_row_mask,
+    )
+    metrics["top1_origin_frac_matches"] = float(origin_matches)
+    metrics["top1_origin_frac_rows"] = float(origin_rows)
+
+    bsz = int(actions["pair_flat"].shape[0])
+    pair_flat = actions["pair_flat"].to(device=device, dtype=torch.long)
+    frac_idx = actions["frac_idx"].to(device=device, dtype=torch.long)
+    origin_idx = torch.div(pair_flat, MAX_PLANETS, rounding_mode="floor")
+    batch_idx = torch.arange(bsz, device=device)
+    ships = comp_dev.ships.to(torch.float32)
+    origin_ships = ships[batch_idx, origin_idx].clamp_min(0.0)
+    frac_values = origin_ships.new_tensor(FRACTIONS)
+    fleet_size = torch.floor(origin_ships * frac_values[frac_idx])
+    target_hit_tick = actions["target_hit_tick"].to(device=device, dtype=torch.float32)
+    target_reachable = actions["target_planet_reachable"].to(device=device, dtype=torch.bool)
+    planet_ships = ships.to(torch.float32)
+
+    with torch.no_grad():
+        teacher_target_logits = teacher.target_logits_for_origin_fraction(
+            teacher_out["planet_hidden"],
+            origin_idx,
+            frac_idx,
+            fleet_size=fleet_size,
+            target_eta=target_hit_tick,
+            target_ships=planet_ships,
+            population_idx=pop_idx,
+        )
+    student_target_logits = student.target_logits_for_origin_fraction(
+        student_out["planet_hidden"],
+        origin_idx,
+        frac_idx,
+        fleet_size=fleet_size,
+        target_eta=target_hit_tick,
+        target_ships=planet_ships,
+        population_idx=pop_idx,
+    )
+    pair_mask_teacher = teacher_out["pair_mask"][batch_idx, origin_idx, :]
+    pair_mask_student = student_out["pair_mask"][batch_idx, origin_idx, :]
+    target_mask = pair_mask_teacher & pair_mask_student & target_reachable
+    target_row_mask = flat_mask_teacher.any(dim=-1) & target_mask.any(dim=-1)
+
+    if teacher.target_abort_enabled:
+        teacher_abort = teacher_out["abort_logits"][batch_idx, origin_idx, frac_idx]
+        student_abort = student_out["abort_logits"][batch_idx, origin_idx, frac_idx]
+        teacher_combined = torch.cat([teacher_target_logits, teacher_abort[:, None]], dim=-1)
+        student_combined = torch.cat([student_target_logits, student_abort[:, None]], dim=-1)
+        combined_mask = torch.cat(
+            [target_mask, torch.ones((bsz, 1), dtype=torch.bool, device=device)],
+            dim=-1,
+        )
+        target_loss, target_rows = _masked_kl_from_logits(
+            student_combined,
+            teacher_combined,
+            combined_mask,
+            temperature=temperature,
+            row_mask=target_row_mask,
+        )
+        target_matches, _ = _masked_top1_agreement(
+            student_combined,
+            teacher_combined,
+            combined_mask,
+            row_mask=target_row_mask,
+        )
+    else:
+        target_loss, target_rows = _masked_kl_from_logits(
+            student_target_logits,
+            teacher_target_logits,
+            target_mask,
+            temperature=temperature,
+            row_mask=target_row_mask,
+        )
+        target_matches, _ = _masked_top1_agreement(
+            student_target_logits,
+            teacher_target_logits,
+            target_mask,
+            row_mask=target_row_mask,
+        )
+    total_loss = total_loss + float(target_coef) * target_loss
+    metrics["loss_target"] = float(target_loss.detach().item()) if target_rows > 0 else 0.0
+    metrics["top1_target_matches"] = float(target_matches)
+    metrics["top1_target_rows"] = float(target_rows)
+
+    if float(value_coef) != 0.0:
+        value_loss = F.mse_loss(student_out["value"], teacher_out["value"])
+        total_loss = total_loss + float(value_coef) * value_loss
+        metrics["loss_value"] = float(value_loss.detach().item())
+    else:
+        metrics["loss_value"] = 0.0
+
+    metrics["loss_total"] = float(total_loss.detach().item())
+    return total_loss, metrics
+
+
+def _student_outputs_for_obs(
+    student: OrbitWarsPolicy,
+    obs: dict[str, torch.Tensor] | CompressedObservationBuffer,
+    actions: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    device = next(student.parameters()).device
+    pop_idx = actions["population_idx"].to(device=device, dtype=torch.long)
+    value_head_idx = actions["value_head_idx"].to(device=device, dtype=torch.long)
+    pair_flat = actions["pair_flat"].to(device=device, dtype=torch.long)
+    frac_idx = actions["frac_idx"].to(device=device, dtype=torch.long)
+    origin_idx = torch.div(pair_flat, MAX_PLANETS, rounding_mode="floor")
+    bsz = int(pair_flat.shape[0])
+    batch_idx = torch.arange(bsz, device=device)
+
+    if isinstance(obs, CompressedObservationBuffer):
+        comp = CompressedObservationBuffer(
+            token_meta=obs.token_meta.to(device),
+            owner_idx=obs.owner_idx.to(device),
+            production=obs.production.to(device),
+            ships=obs.ships.to(device),
+            velocity=obs.velocity.to(device),
+            xy=obs.xy.to(device),
+            turn_progress=obs.turn_progress.to(device),
+            incoming_net=obs.incoming_net.to(device),
+            incoming_survivor=obs.incoming_survivor.to(device),
+            origin_frac_blocked=obs.origin_frac_blocked.to(device),
+        )
+        feature_dim = int(student.feat_proj.in_features)
+        out = student.forward_dense_rollout_compressed(
+            comp.token_meta,
+            comp.owner_idx,
+            comp.production,
+            comp.ships,
+            comp.velocity,
+            comp.xy,
+            comp.turn_progress,
+            comp.incoming_net,
+            comp.incoming_survivor,
+            feature_dim,
+            origin_frac_blocked=comp.origin_frac_blocked,
+            population_idx=pop_idx,
+            value_head_idx=value_head_idx,
+        )
+        ships = comp.ships.to(torch.float32)
+    else:
+        features = obs["features"].to(device=device, dtype=torch.float32)
+        out = student(
+            entity_type=obs["entity_type"].to(device=device, dtype=torch.long),
+            owner_idx=obs["owner_idx"].to(device=device, dtype=torch.long),
+            features=features,
+            rope_pos=obs["rope_pos"].to(device=device, dtype=torch.float32),
+            entity_mask=obs["entity_mask"].to(device=device, dtype=torch.bool),
+            planet_mask=obs["planet_mask"].to(device=device, dtype=torch.bool),
+            origin_frac_blocked=(
+                None
+                if "origin_frac_blocked" not in obs
+                else obs["origin_frac_blocked"].to(device=device, dtype=torch.bool)
+            ),
+            population_idx=pop_idx,
+            value_head_idx=value_head_idx,
+        )
+        ships = features[:, 1 : 1 + MAX_PLANETS, 1] * 1000.0
+
+    origin_ships = ships[batch_idx, origin_idx].clamp_min(0.0)
+    frac_values = origin_ships.new_tensor(FRACTIONS)
+    fleet_size = torch.floor(origin_ships * frac_values[frac_idx])
+    target_hit_tick = actions["target_hit_tick"].to(device=device, dtype=torch.float32)
+    target_reachable = actions["target_planet_reachable"].to(device=device, dtype=torch.bool)
+    student_target_logits = student.target_logits_for_origin_fraction(
+        out["planet_hidden"],
+        origin_idx,
+        frac_idx,
+        fleet_size=fleet_size,
+        target_eta=target_hit_tick,
+        target_ships=ships.to(torch.float32),
+        population_idx=pop_idx,
+    )
+    target_mask = out["pair_mask"][batch_idx, origin_idx, :] & target_reachable
+    if student.target_abort_enabled:
+        student_abort = out["abort_logits"][batch_idx, origin_idx, frac_idx]
+        student_target_combined = torch.cat([student_target_logits, student_abort[:, None]], dim=-1)
+        student_target_mask = torch.cat(
+            [target_mask, torch.ones((bsz, 1), dtype=torch.bool, device=device)],
+            dim=-1,
+        )
+    else:
+        student_target_combined = student_target_logits
+        student_target_mask = target_mask
+    return {
+        "halt_logits": out["halt_logits"],
+        "origin_frac_logits": out["origin_frac_logits"],
+        "origin_frac_mask": out["origin_frac_mask"],
+        "target_logits": student_target_combined,
+        "target_mask": student_target_mask,
+        "value": out["value"],
+    }
+
+
+def _distill_student_from_teacher_stats(
+    *,
+    student: OrbitWarsPolicy,
+    obs: dict[str, torch.Tensor] | CompressedObservationBuffer,
+    actions: dict[str, torch.Tensor],
+    teacher_stats: dict[str, torch.Tensor],
+    temperature: float,
+    halt_coef: float,
+    origin_frac_coef: float,
+    target_coef: float,
+    value_coef: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    device = next(student.parameters()).device
+    student_out = _student_outputs_for_obs(student, obs, actions)
+    teacher_halt_logits = teacher_stats["teacher_halt_logits"].to(device=device)
+    teacher_origin_frac_logits = teacher_stats["teacher_origin_frac_logits"].to(device=device)
+    teacher_origin_frac_mask = teacher_stats["teacher_origin_frac_mask"].to(device=device, dtype=torch.bool)
+    teacher_target_logits = teacher_stats["teacher_target_logits"].to(device=device)
+    teacher_target_mask = teacher_stats["teacher_target_mask"].to(device=device, dtype=torch.bool)
+    teacher_value = teacher_stats["teacher_value"].to(device=device)
+
+    metrics: dict[str, float] = {}
+    total_loss = student_out["value"].sum() * 0.0
+
+    halt_row_mask = ~actions["must_halt_no_ships"].to(device=device, dtype=torch.bool)
+    halt_loss, halt_rows = _masked_kl_from_logits(
+        student_out["halt_logits"],
+        teacher_halt_logits,
+        None,
+        temperature=temperature,
+        row_mask=halt_row_mask,
+    )
+    total_loss = total_loss + float(halt_coef) * halt_loss
+    metrics["loss_halt"] = float(halt_loss.detach().item()) if halt_rows > 0 else 0.0
+    halt_matches, _ = _masked_top1_agreement(
+        student_out["halt_logits"],
+        teacher_halt_logits,
+        None,
+        row_mask=halt_row_mask,
+    )
+    metrics["top1_halt_matches"] = float(halt_matches)
+    metrics["top1_halt_rows"] = float(halt_rows)
+
+    flat_mask = teacher_origin_frac_mask & student_out["origin_frac_mask"]
+    origin_row_mask = (~actions["must_halt_no_ships"].to(device=device, dtype=torch.bool)) & teacher_origin_frac_mask.flatten(start_dim=1).any(dim=-1)
+    origin_loss, origin_rows = _masked_kl_from_logits(
+        student_out["origin_frac_logits"].flatten(start_dim=1),
+        teacher_origin_frac_logits.flatten(start_dim=1),
+        flat_mask.flatten(start_dim=1),
+        temperature=temperature,
+        row_mask=origin_row_mask,
+    )
+    total_loss = total_loss + float(origin_frac_coef) * origin_loss
+    metrics["loss_origin_frac"] = float(origin_loss.detach().item()) if origin_rows > 0 else 0.0
+    origin_matches, _ = _masked_top1_agreement(
+        student_out["origin_frac_logits"].flatten(start_dim=1),
+        teacher_origin_frac_logits.flatten(start_dim=1),
+        flat_mask.flatten(start_dim=1),
+        row_mask=origin_row_mask,
+    )
+    metrics["top1_origin_frac_matches"] = float(origin_matches)
+    metrics["top1_origin_frac_rows"] = float(origin_rows)
+
+    target_mask = teacher_target_mask & student_out["target_mask"]
+    target_row_mask = target_mask.any(dim=-1) & teacher_origin_frac_mask.flatten(start_dim=1).any(dim=-1)
+    target_loss, target_rows = _masked_kl_from_logits(
+        student_out["target_logits"],
+        teacher_target_logits,
+        target_mask,
+        temperature=temperature,
+        row_mask=target_row_mask,
+    )
+    total_loss = total_loss + float(target_coef) * target_loss
+    metrics["loss_target"] = float(target_loss.detach().item()) if target_rows > 0 else 0.0
+    target_matches, _ = _masked_top1_agreement(
+        student_out["target_logits"],
+        teacher_target_logits,
+        target_mask,
+        row_mask=target_row_mask,
+    )
+    metrics["top1_target_matches"] = float(target_matches)
+    metrics["top1_target_rows"] = float(target_rows)
+
+    if float(value_coef) != 0.0:
+        value_loss = F.mse_loss(student_out["value"], teacher_value)
+        total_loss = total_loss + float(value_coef) * value_loss
+        metrics["loss_value"] = float(value_loss.detach().item())
+    else:
+        metrics["loss_value"] = 0.0
+    metrics["loss_total"] = float(total_loss.detach().item())
+    return total_loss, metrics
+
+
+def compute_student_distill_loss_torch(
+    student: OrbitWarsPolicy,
+    entity_type: torch.Tensor,
+    owner_idx: torch.Tensor,
+    features: torch.Tensor,
+    rope_pos: torch.Tensor,
+    entity_mask: torch.Tensor,
+    planet_mask: torch.Tensor,
+    origin_frac_blocked: Optional[torch.Tensor],
+    halt_action: torch.Tensor,
+    pair_flat: torch.Tensor,
+    frac_idx: torch.Tensor,
+    target_hit_tick: torch.Tensor,
+    target_reachable: torch.Tensor,
+    must_halt_no_ships: torch.Tensor,
+    population_idx: torch.Tensor,
+    value_head_idx: torch.Tensor,
+    teacher_halt_logits: torch.Tensor,
+    teacher_origin_frac_logits: torch.Tensor,
+    teacher_origin_frac_mask: torch.Tensor,
+    teacher_target_logits: torch.Tensor,
+    teacher_target_mask: torch.Tensor,
+    teacher_value: torch.Tensor,
+    temperature: float,
+    halt_coef: float,
+    origin_frac_coef: float,
+    target_coef: float,
+    value_coef: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    device = features.device
+    bsz = int(pair_flat.shape[0])
+    batch_idx = torch.arange(bsz, device=device)
+    origin_idx = torch.div(pair_flat, MAX_PLANETS, rounding_mode="floor")
+    out = student(
+        entity_type=entity_type,
+        owner_idx=owner_idx,
+        features=features,
+        rope_pos=rope_pos,
+        entity_mask=entity_mask,
+        planet_mask=planet_mask,
+        origin_frac_blocked=origin_frac_blocked,
+        population_idx=population_idx,
+        value_head_idx=value_head_idx,
+    )
+    ships = features[:, 1 : 1 + MAX_PLANETS, 1] * 1000.0
+    origin_ships = ships[batch_idx, origin_idx].clamp_min(0.0)
+    frac_values = origin_ships.new_tensor(FRACTIONS)
+    fleet_size = torch.floor(origin_ships * frac_values[frac_idx])
+    student_target_logits = student.target_logits_for_origin_fraction(
+        out["planet_hidden"],
+        origin_idx,
+        frac_idx,
+        fleet_size=fleet_size,
+        target_eta=target_hit_tick,
+        target_ships=ships.to(torch.float32),
+        population_idx=population_idx,
+    )
+    target_mask = out["pair_mask"][batch_idx, origin_idx, :] & target_reachable
+    if student.target_abort_enabled:
+        student_abort = out["abort_logits"][batch_idx, origin_idx, frac_idx]
+        student_target_combined = torch.cat([student_target_logits, student_abort[:, None]], dim=-1)
+        student_target_mask = torch.cat(
+            [target_mask, torch.ones((bsz, 1), dtype=torch.bool, device=device)],
+            dim=-1,
+        )
+    else:
+        student_target_combined = student_target_logits
+        student_target_mask = target_mask
+
+    total_loss = out["value"].sum() * 0.0
+    temp = float(max(1e-6, temperature))
+    halt_row_mask = ~must_halt_no_ships
+    halt_rows = halt_row_mask.sum().to(torch.float32)
+    if bool(halt_row_mask.any().item()):
+        student_halt = out["halt_logits"][halt_row_mask]
+        teacher_halt = teacher_halt_logits[halt_row_mask]
+        halt_loss = F.kl_div(
+            F.log_softmax(student_halt / temp, dim=-1),
+            F.softmax(teacher_halt / temp, dim=-1),
+            reduction="batchmean",
+        ) * (temp * temp)
+        halt_matches = (student_halt.argmax(dim=-1) == teacher_halt.argmax(dim=-1)).sum().to(torch.float32)
+    else:
+        halt_loss = total_loss * 0.0
+        halt_matches = halt_rows * 0.0
+    total_loss = total_loss + float(halt_coef) * halt_loss
+
+    student_origin_logits = out["origin_frac_logits"].flatten(start_dim=1)
+    teacher_origin_logits = teacher_origin_frac_logits.flatten(start_dim=1)
+    joint_origin_mask = (teacher_origin_frac_mask & out["origin_frac_mask"]).flatten(start_dim=1)
+    origin_valid_rows = halt_row_mask & joint_origin_mask.any(dim=-1)
+    if bool(origin_valid_rows.any().item()):
+        origin_mask = joint_origin_mask[origin_valid_rows]
+        s_origin = student_origin_logits[origin_valid_rows].masked_fill(~origin_mask, -1e4)
+        t_origin = teacher_origin_logits[origin_valid_rows].masked_fill(~origin_mask, -1e4)
+        origin_loss = F.kl_div(
+            F.log_softmax(s_origin / temp, dim=-1),
+            F.softmax(t_origin / temp, dim=-1),
+            reduction="batchmean",
+        ) * (temp * temp)
+        origin_rows = origin_valid_rows.sum().to(torch.float32)
+        origin_matches = (s_origin.argmax(dim=-1) == t_origin.argmax(dim=-1)).sum().to(torch.float32)
+    else:
+        origin_loss = total_loss * 0.0
+        origin_rows = halt_rows * 0.0
+        origin_matches = halt_rows * 0.0
+    total_loss = total_loss + float(origin_frac_coef) * origin_loss
+
+    joint_target_mask = teacher_target_mask & student_target_mask
+    target_valid_rows = joint_target_mask.any(dim=-1) & teacher_origin_frac_mask.flatten(start_dim=1).any(dim=-1)
+    if bool(target_valid_rows.any().item()):
+        target_mask_rows = joint_target_mask[target_valid_rows]
+        s_target = student_target_combined[target_valid_rows].masked_fill(~target_mask_rows, -1e4)
+        t_target = teacher_target_logits[target_valid_rows].masked_fill(~target_mask_rows, -1e4)
+        target_loss = F.kl_div(
+            F.log_softmax(s_target / temp, dim=-1),
+            F.softmax(t_target / temp, dim=-1),
+            reduction="batchmean",
+        ) * (temp * temp)
+        target_rows = target_valid_rows.sum().to(torch.float32)
+        target_matches = (s_target.argmax(dim=-1) == t_target.argmax(dim=-1)).sum().to(torch.float32)
+    else:
+        target_loss = total_loss * 0.0
+        target_rows = halt_rows * 0.0
+        target_matches = halt_rows * 0.0
+    total_loss = total_loss + float(target_coef) * target_loss
+
+    if float(value_coef) != 0.0:
+        value_loss = F.mse_loss(out["value"], teacher_value)
+        total_loss = total_loss + float(value_coef) * value_loss
+    else:
+        value_loss = total_loss * 0.0
+
+    return total_loss, {
+        "loss_total": total_loss.detach().float(),
+        "loss_halt": halt_loss.detach().float(),
+        "loss_origin_frac": origin_loss.detach().float(),
+        "loss_target": target_loss.detach().float(),
+        "loss_value": value_loss.detach().float(),
+        "top1_halt_matches": halt_matches.detach().float(),
+        "top1_halt_rows": halt_rows.detach().float(),
+        "top1_origin_frac_matches": origin_matches.detach().float(),
+        "top1_origin_frac_rows": origin_rows.detach().float(),
+        "top1_target_matches": target_matches.detach().float(),
+        "top1_target_rows": target_rows.detach().float(),
+    }
+
+
+def compute_student_distill_loss_compressed_torch(
+    student: OrbitWarsPolicy,
+    token_meta: torch.Tensor,
+    owner_idx_comp: torch.Tensor,
+    production: torch.Tensor,
+    ships_comp: torch.Tensor,
+    velocity: torch.Tensor,
+    xy: torch.Tensor,
+    turn_progress: torch.Tensor,
+    incoming_net: torch.Tensor,
+    incoming_survivor: torch.Tensor,
+    origin_frac_blocked: torch.Tensor,
+    feature_dim: int,
+    halt_action: torch.Tensor,
+    pair_flat: torch.Tensor,
+    frac_idx: torch.Tensor,
+    target_hit_tick: torch.Tensor,
+    target_reachable: torch.Tensor,
+    must_halt_no_ships: torch.Tensor,
+    population_idx: torch.Tensor,
+    value_head_idx: torch.Tensor,
+    teacher_halt_logits: torch.Tensor,
+    teacher_origin_frac_logits: torch.Tensor,
+    teacher_origin_frac_mask: torch.Tensor,
+    teacher_target_logits: torch.Tensor,
+    teacher_target_mask: torch.Tensor,
+    teacher_value: torch.Tensor,
+    temperature: float,
+    halt_coef: float,
+    origin_frac_coef: float,
+    target_coef: float,
+    value_coef: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    comp = CompressedObservationBuffer(
+        token_meta=token_meta,
+        owner_idx=owner_idx_comp,
+        production=production,
+        ships=ships_comp,
+        velocity=velocity,
+        xy=xy,
+        turn_progress=turn_progress,
+        incoming_net=incoming_net,
+        incoming_survivor=incoming_survivor,
+        origin_frac_blocked=origin_frac_blocked.to(device=token_meta.device, dtype=torch.bool),
+    )
+    obs = decode_observation(comp, feature_dim=int(feature_dim))
+    return compute_student_distill_loss_torch(
+        student,
+        obs["entity_type"],
+        obs["owner_idx"],
+        obs["features"],
+        obs["rope_pos"],
+        obs["entity_mask"],
+        obs["planet_mask"],
+        comp.origin_frac_blocked,
+        halt_action,
+        pair_flat,
+        frac_idx,
+        target_hit_tick,
+        target_reachable,
+        must_halt_no_ships,
+        population_idx,
+        value_head_idx,
+        teacher_halt_logits,
+        teacher_origin_frac_logits,
+        teacher_origin_frac_mask,
+        teacher_target_logits,
+        teacher_target_mask,
+        teacher_value,
+        temperature,
+        halt_coef,
+        origin_frac_coef,
+        target_coef,
+        value_coef,
+    )
+
+
+def _torch_student_loss_from_teacher_replay(
+    *,
+    obs: dict[str, torch.Tensor] | CompressedObservationBuffer,
+    actions: dict[str, torch.Tensor],
+    teacher_stats: dict[str, torch.Tensor],
+    student: OrbitWarsPolicy,
+    compiled_loss_fn: Optional[Any],
+    compiled_compressed_loss_fn: Optional[Any],
+    obs_feature_dim: int,
+    temperature: float,
+    halt_coef: float,
+    origin_frac_coef: float,
+    target_coef: float,
+    value_coef: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    device = next(student.parameters()).device
+    if isinstance(obs, CompressedObservationBuffer):
+        fn = compiled_compressed_loss_fn or compute_student_distill_loss_compressed_torch
+        return fn(
+            student,
+            obs.token_meta.to(device=device),
+            obs.owner_idx.to(device=device),
+            obs.production.to(device=device),
+            obs.ships.to(device=device),
+            obs.velocity.to(device=device),
+            obs.xy.to(device=device),
+            obs.turn_progress.to(device=device),
+            obs.incoming_net.to(device=device),
+            obs.incoming_survivor.to(device=device),
+            obs.origin_frac_blocked.to(device=device),
+            int(obs_feature_dim),
+            actions["halt_action"].to(device=device, dtype=torch.long),
+            actions["pair_flat"].to(device=device, dtype=torch.long),
+            actions["frac_idx"].to(device=device, dtype=torch.long),
+            actions["target_hit_tick"].to(device=device, dtype=torch.float32),
+            actions["target_planet_reachable"].to(device=device, dtype=torch.bool),
+            actions["must_halt_no_ships"].to(device=device, dtype=torch.bool),
+            actions["population_idx"].to(device=device, dtype=torch.long),
+            actions["value_head_idx"].to(device=device, dtype=torch.long),
+            teacher_stats["teacher_halt_logits"].to(device=device),
+            teacher_stats["teacher_origin_frac_logits"].to(device=device),
+            teacher_stats["teacher_origin_frac_mask"].to(device=device, dtype=torch.bool),
+            teacher_stats["teacher_target_logits"].to(device=device),
+            teacher_stats["teacher_target_mask"].to(device=device, dtype=torch.bool),
+            teacher_stats["teacher_value"].to(device=device),
+            temperature,
+            halt_coef,
+            origin_frac_coef,
+            target_coef,
+            value_coef,
+        )
+    fn = compiled_loss_fn or compute_student_distill_loss_torch
+    return fn(
+        student,
+        obs["entity_type"].to(device=device, dtype=torch.long),
+        obs["owner_idx"].to(device=device, dtype=torch.long),
+        obs["features"].to(device=device, dtype=torch.float32),
+        obs["rope_pos"].to(device=device, dtype=torch.float32),
+        obs["entity_mask"].to(device=device, dtype=torch.bool),
+        obs["planet_mask"].to(device=device, dtype=torch.bool),
+        None if "origin_frac_blocked" not in obs else obs["origin_frac_blocked"].to(device=device, dtype=torch.bool),
+        actions["halt_action"].to(device=device, dtype=torch.long),
+        actions["pair_flat"].to(device=device, dtype=torch.long),
+        actions["frac_idx"].to(device=device, dtype=torch.long),
+        actions["target_hit_tick"].to(device=device, dtype=torch.float32),
+        actions["target_planet_reachable"].to(device=device, dtype=torch.bool),
+        actions["must_halt_no_ships"].to(device=device, dtype=torch.bool),
+        actions["population_idx"].to(device=device, dtype=torch.long),
+        actions["value_head_idx"].to(device=device, dtype=torch.long),
+        teacher_stats["teacher_halt_logits"].to(device=device),
+        teacher_stats["teacher_origin_frac_logits"].to(device=device),
+        teacher_stats["teacher_origin_frac_mask"].to(device=device, dtype=torch.bool),
+        teacher_stats["teacher_target_logits"].to(device=device),
+        teacher_stats["teacher_target_mask"].to(device=device, dtype=torch.bool),
+        teacher_stats["teacher_value"].to(device=device),
+        temperature,
+        halt_coef,
+        origin_frac_coef,
+        target_coef,
+        value_coef,
     )
 
 
@@ -3051,6 +3883,8 @@ def ppo_iteration(
     policy: OrbitWarsPolicy,
     opt: torch.optim.Optimizer,
     critic_opt: Optional[torch.optim.Optimizer],
+    student_policy: Optional[OrbitWarsPolicy],
+    student_optimizer: Optional[torch.optim.Optimizer],
     segment: RolloutSegment,
     samples: dict,
     device: torch.device,
@@ -3067,6 +3901,8 @@ def ppo_iteration(
     rnd: np.random.Generator,
     loss_fn: Optional[Any] = None,
     compressed_loss_fn: Optional[Any] = None,
+    student_loss_fn: Optional[Any] = None,
+    student_compressed_loss_fn: Optional[Any] = None,
     amp_dtype: Optional[torch.dtype] = None,
     obs_feature_dim: int,
     population_size: int,
@@ -3074,7 +3910,12 @@ def ppo_iteration(
     logp_check_label: str = "policy",
     logp_check_iter: int = 0,
     reset_prefetch: Optional[RolloutResetPrefetch] = None,
-) -> Tuple[float, PPOTiming, PPOStats]:
+    student_temperature: float = 1.0,
+    student_halt_coef: float = 1.0,
+    student_origin_frac_coef: float = 1.0,
+    student_target_coef: float = 1.0,
+    student_value_coef: float = 0.25,
+) -> Tuple[float, PPOTiming, PPOStats, StudentDistillStats]:
     """Multiple epochs of clipped PPO surrogate with minibatches.
 
     Minibatches are selected/replayed from PyTorch-backed rollout buffers;
@@ -3098,10 +3939,11 @@ def ppo_iteration(
     n_mb = 0
     timing = PPOTiming()
     stats = PPOStats()
+    student_stats = StudentDistillStats()
     t_total0 = perf_counter()
     checked_rollout_logp = False
 
-    for _ in range(ppo_epochs):
+    for epoch_idx in range(ppo_epochs):
         minibatches = _stratified_population_minibatches(samples["population_idx"], minibatch_size, population_size, rnd)
         for mb_idx in minibatches:
             _opportunistic_drain_reset_prefetch(reset_prefetch)
@@ -3194,6 +4036,29 @@ def ppo_iteration(
                         amp_dtype=amp_dtype,
                     )
                     checked_rollout_logp = True
+
+                if student_policy is not None and student_optimizer is not None and epoch_idx == 0:
+                    t0 = perf_counter()
+                    student_optimizer.zero_grad()
+                    student_loss, student_metrics_t = _torch_student_loss_from_teacher_replay(
+                        obs=obs,
+                        actions=actions,
+                        teacher_stats=mb_stats,
+                        student=student_policy,
+                        compiled_loss_fn=student_loss_fn,
+                        compiled_compressed_loss_fn=student_compressed_loss_fn,
+                        obs_feature_dim=obs_feature_dim,
+                        temperature=student_temperature,
+                        halt_coef=student_halt_coef,
+                        origin_frac_coef=student_origin_frac_coef,
+                        target_coef=student_target_coef,
+                        value_coef=student_value_coef,
+                    )
+                    student_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(student_policy.parameters(), max_grad_norm)
+                    student_optimizer.step()
+                    timing.optim_s += perf_counter() - t0
+                    student_stats.update({k: float(v.detach().item()) for k, v in student_metrics_t.items()}, int(len(mb_idx)))
 
                 t0 = perf_counter()
                 opt.zero_grad()
@@ -3298,6 +4163,29 @@ def ppo_iteration(
                     )
                     checked_rollout_logp = True
 
+                if student_policy is not None and student_optimizer is not None and epoch_idx == 0:
+                    t0 = perf_counter()
+                    student_optimizer.zero_grad()
+                    student_loss, student_metrics_t = _torch_student_loss_from_teacher_replay(
+                        obs=obs,
+                        actions=actions,
+                        teacher_stats=mb_stats,
+                        student=student_policy,
+                        compiled_loss_fn=student_loss_fn,
+                        compiled_compressed_loss_fn=student_compressed_loss_fn,
+                        obs_feature_dim=obs_feature_dim,
+                        temperature=student_temperature,
+                        halt_coef=student_halt_coef,
+                        origin_frac_coef=student_origin_frac_coef,
+                        target_coef=student_target_coef,
+                        value_coef=student_value_coef,
+                    )
+                    student_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(student_policy.parameters(), max_grad_norm)
+                    student_optimizer.step()
+                    timing.optim_s += perf_counter() - t0
+                    student_stats.update({k: float(v.detach().item()) for k, v in student_metrics_t.items()}, int(len(mb_idx)))
+
                 t0 = perf_counter()
                 opt.zero_grad()
                 actor_loss.backward()
@@ -3317,13 +4205,15 @@ def ppo_iteration(
             _opportunistic_drain_reset_prefetch(reset_prefetch)
     timing.n_minibatches = n_mb
     timing.total_s = perf_counter() - t_total0
-    return total_loss_sum / max(1, n_mb), timing, stats
+    return total_loss_sum / max(1, n_mb), timing, stats, student_stats
 
 
 def ppo_iteration_host_staged(
     policy: OrbitWarsPolicy,
     opt: torch.optim.Optimizer,
     critic_opt: Optional[torch.optim.Optimizer],
+    student_policy: Optional[OrbitWarsPolicy],
+    student_optimizer: Optional[torch.optim.Optimizer],
     member_stores: list[HostReplayMemberStore],
     device: torch.device,
     minibatch_size: int,
@@ -3339,6 +4229,8 @@ def ppo_iteration_host_staged(
     rnd: np.random.Generator,
     loss_fn: Optional[Any] = None,
     compressed_loss_fn: Optional[Any] = None,
+    student_loss_fn: Optional[Any] = None,
+    student_compressed_loss_fn: Optional[Any] = None,
     amp_dtype: Optional[torch.dtype] = None,
     obs_feature_dim: int,
     population_size: int,
@@ -3346,19 +4238,25 @@ def ppo_iteration_host_staged(
     logp_check_label: str = "policy",
     logp_check_iter: int = 0,
     reset_prefetch: Optional[RolloutResetPrefetch] = None,
-) -> Tuple[float, PPOTiming, PPOStats]:
+    student_temperature: float = 1.0,
+    student_halt_coef: float = 1.0,
+    student_origin_frac_coef: float = 1.0,
+    student_target_coef: float = 1.0,
+    student_value_coef: float = 0.25,
+) -> Tuple[float, PPOTiming, PPOStats, StudentDistillStats]:
     """PPO over flattened host-side replay, staging only minibatches to device."""
 
     total_loss_sum = 0.0
     n_mb = 0
     timing = PPOTiming()
     stats = PPOStats()
+    student_stats = StudentDistillStats()
     t_total0 = perf_counter()
     total_samples = int(sum(store.advantages.shape[0] for store in member_stores))
     n_batches = max(1, int(np.ceil(float(total_samples) / float(max(1, minibatch_size)))))
     checked_rollout_logp = False
 
-    for _ in range(ppo_epochs):
+    for epoch_idx in range(ppo_epochs):
         shuffled_stores: list[HostReplayMemberStore] = []
         batch_ranges: list[list[tuple[int, int]]] = []
         for member in range(max(1, int(population_size))):
@@ -3503,6 +4401,29 @@ def ppo_iteration_host_staged(
                     )
                     checked_rollout_logp = True
 
+                if student_policy is not None and student_optimizer is not None and epoch_idx == 0:
+                    t0 = perf_counter()
+                    student_optimizer.zero_grad()
+                    student_loss, student_metrics_t = _torch_student_loss_from_teacher_replay(
+                        obs=obs,
+                        actions=actions,
+                        teacher_stats=mb_stats,
+                        student=student_policy,
+                        compiled_loss_fn=student_loss_fn,
+                        compiled_compressed_loss_fn=student_compressed_loss_fn,
+                        obs_feature_dim=obs_feature_dim,
+                        temperature=student_temperature,
+                        halt_coef=student_halt_coef,
+                        origin_frac_coef=student_origin_frac_coef,
+                        target_coef=student_target_coef,
+                        value_coef=student_value_coef,
+                    )
+                    student_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(student_policy.parameters(), max_grad_norm)
+                    student_optimizer.step()
+                    timing.optim_s += perf_counter() - t0
+                    student_stats.update({k: float(v.detach().item()) for k, v in student_metrics_t.items()}, int(actions["halt_action"].shape[0]))
+
                 t0 = perf_counter()
                 opt.zero_grad()
                 loss.backward()
@@ -3600,6 +4521,29 @@ def ppo_iteration_host_staged(
                     )
                     checked_rollout_logp = True
 
+                if student_policy is not None and student_optimizer is not None and epoch_idx == 0:
+                    t0 = perf_counter()
+                    student_optimizer.zero_grad()
+                    student_loss, student_metrics_t = _torch_student_loss_from_teacher_replay(
+                        obs=obs,
+                        actions=actions,
+                        teacher_stats=mb_stats,
+                        student=student_policy,
+                        compiled_loss_fn=student_loss_fn,
+                        compiled_compressed_loss_fn=student_compressed_loss_fn,
+                        obs_feature_dim=obs_feature_dim,
+                        temperature=student_temperature,
+                        halt_coef=student_halt_coef,
+                        origin_frac_coef=student_origin_frac_coef,
+                        target_coef=student_target_coef,
+                        value_coef=student_value_coef,
+                    )
+                    student_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(student_policy.parameters(), max_grad_norm)
+                    student_optimizer.step()
+                    timing.optim_s += perf_counter() - t0
+                    student_stats.update({k: float(v.detach().item()) for k, v in student_metrics_t.items()}, int(actions["halt_action"].shape[0]))
+
                 t0 = perf_counter()
                 opt.zero_grad()
                 actor_loss.backward()
@@ -3619,7 +4563,157 @@ def ppo_iteration_host_staged(
             _opportunistic_drain_reset_prefetch(reset_prefetch)
     timing.n_minibatches = n_mb
     timing.total_s = perf_counter() - t_total0
-    return total_loss_sum / max(1, n_mb), timing, stats
+    return total_loss_sum / max(1, n_mb), timing, stats, student_stats
+
+
+def student_distill_iteration(
+    teacher: OrbitWarsPolicy,
+    student: OrbitWarsPolicy,
+    optimizer: torch.optim.Optimizer,
+    segment: RolloutSegment,
+    samples: dict,
+    device: torch.device,
+    minibatch_size: int,
+    *,
+    rnd: np.random.Generator,
+    population_size: int,
+    temperature: float,
+    halt_coef: float,
+    origin_frac_coef: float,
+    target_coef: float,
+    value_coef: float,
+    max_grad_norm: float,
+) -> tuple[float, StudentDistillStats]:
+    pop_idx = samples["population_idx"]
+    players = samples["players"]
+    t_idx = samples["t_idx"]
+    n_idx = samples["n_idx"]
+    minibatches = _stratified_population_minibatches(pop_idx, minibatch_size, population_size, rnd)
+    stats = StudentDistillStats()
+    total_loss_sum = 0.0
+    for mb_idx in minibatches:
+        comp, actions = select_stored_compressed_minibatch_torch(
+            segment,
+            np.asarray(players[mb_idx], dtype=np.int32),
+            np.asarray(t_idx[mb_idx], dtype=np.int32),
+            np.asarray(n_idx[mb_idx], dtype=np.int32),
+            replay_device=device,
+            timing=None,
+        )
+        optimizer.zero_grad()
+        loss, metrics = _distill_student_minibatch(
+            teacher=teacher,
+            student=student,
+            comp=comp,
+            actions=actions,
+            temperature=temperature,
+            halt_coef=halt_coef,
+            origin_frac_coef=origin_frac_coef,
+            target_coef=target_coef,
+            value_coef=value_coef,
+        )
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(student.parameters(), max_grad_norm)
+        optimizer.step()
+        stats.update(metrics, int(len(mb_idx)))
+        total_loss_sum += float(loss.detach().item())
+    return total_loss_sum / float(max(1, stats.n_updates)), stats
+
+
+def student_distill_iteration_host_staged(
+    teacher: OrbitWarsPolicy,
+    student: OrbitWarsPolicy,
+    optimizer: torch.optim.Optimizer,
+    member_stores: list[HostReplayMemberStore],
+    device: torch.device,
+    minibatch_size: int,
+    *,
+    rnd: np.random.Generator,
+    population_size: int,
+    temperature: float,
+    halt_coef: float,
+    origin_frac_coef: float,
+    target_coef: float,
+    value_coef: float,
+    max_grad_norm: float,
+) -> tuple[float, StudentDistillStats]:
+    stats = StudentDistillStats()
+    total_samples = int(sum(store.advantages.shape[0] for store in member_stores))
+    n_batches = max(1, int(np.ceil(float(total_samples) / float(max(1, minibatch_size)))))
+    total_loss_sum = 0.0
+
+    shuffled_stores: list[HostReplayMemberStore] = []
+    batch_ranges: list[list[tuple[int, int]]] = []
+    for member in range(max(1, int(population_size))):
+        store = member_stores[member]
+        count = int(store.advantages.shape[0])
+        if count > 0:
+            perm_np = np.arange(count, dtype=np.int32)
+            rnd.shuffle(perm_np)
+            perm = torch.as_tensor(perm_np, dtype=torch.long)
+            shuffled = HostReplayMemberStore(
+                obs=_index_compressed_observation(store.obs, perm),
+                actions={k: v.index_select(0, perm) for k, v in store.actions.items()},
+                advantages=store.advantages.index_select(0, perm),
+                returns=store.returns.index_select(0, perm),
+                old_logprob=store.old_logprob.index_select(0, perm),
+                old_value=store.old_value.index_select(0, perm),
+                policy_loss_mask=store.policy_loss_mask.index_select(0, perm),
+                players=store.players.index_select(0, perm),
+                t_idx=store.t_idx.index_select(0, perm),
+                n_idx=store.n_idx.index_select(0, perm),
+                policy_id=store.policy_id.index_select(0, perm),
+                env_mode=store.env_mode.index_select(0, perm),
+            )
+        else:
+            shuffled = store
+        shuffled_stores.append(shuffled)
+        base = count // n_batches
+        rem = count % n_batches
+        start = 0
+        ranges: list[tuple[int, int]] = []
+        for batch_i in range(n_batches):
+            take = base + (1 if batch_i < rem else 0)
+            stop = start + take
+            ranges.append((start, stop))
+            start = stop
+        batch_ranges.append(ranges)
+
+    for batch_i in range(n_batches):
+        obs_parts: list[CompressedObservationBuffer] = []
+        action_parts: list[dict[str, torch.Tensor]] = []
+        sample_count = 0
+        for member in range(max(1, int(population_size))):
+            start, stop = batch_ranges[member][batch_i]
+            if stop <= start:
+                continue
+            store = shuffled_stores[member]
+            sl = torch.arange(start, stop, dtype=torch.long)
+            obs_parts.append(_index_compressed_observation(store.obs, sl))
+            action_parts.append({k: v.index_select(0, sl) for k, v in store.actions.items()})
+            sample_count += int(stop - start)
+        if not obs_parts:
+            continue
+        comp = _concat_compressed_parts(obs_parts)
+        actions = {k: torch.cat([part[k] for part in action_parts], dim=0).to(device) for k in action_parts[0]}
+        optimizer.zero_grad()
+        loss, metrics = _distill_student_minibatch(
+            teacher=teacher,
+            student=student,
+            comp=comp,
+            actions=actions,
+            temperature=temperature,
+            halt_coef=halt_coef,
+            origin_frac_coef=origin_frac_coef,
+            target_coef=target_coef,
+            value_coef=value_coef,
+        )
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(student.parameters(), max_grad_norm)
+        optimizer.step()
+        stats.update(metrics, sample_count)
+        total_loss_sum += float(loss.detach().item())
+    return total_loss_sum / float(max(1, stats.n_updates)), stats
 
 
 def _log_iter_tensorboard(
@@ -4041,8 +5135,29 @@ def train(args: argparse.Namespace) -> None:
             ),
         ).to(device)
 
+    def _make_student_policy() -> OrbitWarsPolicy:
+        return OrbitWarsPolicy(
+            d_model=int(args.student_d_model),
+            n_heads=int(args.student_n_heads),
+            n_layers=int(args.student_n_layers),
+            activation_checkpointing=bool(args.activation_checkpointing),
+            feature_dim=obs_feature_dim_for_num_agents(
+                policy_feature_agents,
+                target_abort_enabled=bool(args.target_abort_enabled),
+            ),
+            population_size=args.population_size,
+            rope_dims=policy_rope_dims,
+            target_abort_enabled=bool(args.target_abort_enabled),
+            disjoint_actor_critic=bool(args.disjoint_actor_critic),
+            halt_init_prob=args.halt_init_prob,
+            fraction_init_weights=fraction_init_weights,
+            value_head_count=int(policy_value_head_count),
+        ).to(device)
+
     policy = _make_policy()
     opt, critic_opt = _make_policy_optimizers(policy, lr=args.lr)
+    student_policy = _make_student_policy()
+    student_optimizer = optim.Adam(student_policy.parameters(), lr=float(args.student_lr))
     exploiter_policy = _make_policy() if args.exploiter_mode else None
     if exploiter_policy is not None:
         exploiter_opt, exploiter_critic_opt = _make_policy_optimizers(exploiter_policy, lr=args.lr)
@@ -4059,6 +5174,8 @@ def train(args: argparse.Namespace) -> None:
     #     keeps the packed forward path, which benchmarks faster there.
     compiled_loss_fn: Optional[Any] = None
     compiled_compressed_loss_fn: Optional[Any] = None
+    compiled_student_loss_fn: Optional[Any] = None
+    compiled_student_compressed_loss_fn: Optional[Any] = None
     def _compile_policy_modules(policy_obj: OrbitWarsPolicy, helper_compile_mode: str) -> None:
         policy_obj.forward = torch.compile(  # type: ignore[assignment]
             policy_obj.forward, mode=helper_compile_mode, dynamic=True
@@ -4107,7 +5224,14 @@ def train(args: argparse.Namespace) -> None:
         compiled_compressed_loss_fn = torch.compile(
             compute_ppo_loss_compressed_torch, mode=compile_mode, dynamic=True
         )
+        compiled_student_loss_fn = torch.compile(
+            compute_student_distill_loss_torch, mode=compile_mode, dynamic=True
+        )
+        compiled_student_compressed_loss_fn = torch.compile(
+            compute_student_distill_loss_compressed_torch, mode=compile_mode, dynamic=True
+        )
         _compile_policy_modules(policy, helper_compile_mode)
+        _compile_policy_modules(student_policy, helper_compile_mode)
         if exploiter_policy is not None:
             _compile_policy_modules(exploiter_policy, helper_compile_mode)
 
@@ -4141,9 +5265,9 @@ def train(args: argparse.Namespace) -> None:
             except TypeError:
                 ckpt = torch.load(resume_path, map_location="cpu")
         ckpt_version = int(ckpt.get("version", 0))
-        if ckpt_version not in (6, 7, CHECKPOINT_VERSION):
+        if ckpt_version not in (6, 7, 8, CHECKPOINT_VERSION):
             raise RuntimeError(
-                f"Unsupported checkpoint version {ckpt.get('version')!r} (expected 6 or {CHECKPOINT_VERSION})"
+                f"Unsupported checkpoint version {ckpt.get('version')!r} (expected 6, 7, 8 or {CHECKPOINT_VERSION})"
             )
         _validate_checkpoint_args(ckpt["training_args"], args)
         policy_state, migrated_policy = adapt_checkpoint_state_for_model(ckpt["policy"], policy)
@@ -4207,6 +5331,24 @@ def train(args: argparse.Namespace) -> None:
         if migrated_policy or migrated_opt or migrated_critic_opt:
             print(
                 "[orbit_wars_pt] cloned actor weights into disjoint critic when loading checkpoint",
+                flush=True,
+            )
+        saved_student_state = ckpt.get("student_policy")
+        if saved_student_state is not None:
+            student_state, migrated_student = adapt_checkpoint_state_for_model(saved_student_state, student_policy)
+            student_state = _strip_legacy_pair_head_keys(student_state)
+            student_policy.load_state_dict(student_state)
+            saved_student_opt = ckpt.get("student_optimizer")
+            if saved_student_opt is not None:
+                student_optimizer.load_state_dict(saved_student_opt)
+            if migrated_student:
+                print(
+                    "[orbit_wars_pt] migrated saved student checkpoint into current student architecture",
+                    flush=True,
+                )
+        else:
+            print(
+                "[orbit_wars_pt] resume checkpoint has no student model; initialized a fresh student",
                 flush=True,
             )
         _restore_torch_generator_from_checkpoint(ckpt["torch_rng"], rng)
@@ -4357,11 +5499,15 @@ def train(args: argparse.Namespace) -> None:
             policy,
             opt,
             critic_opt,
+            student_policy,
+            student_optimizer,
             exploiter_policy,
             exploiter_opt,
             exploiter_critic_opt,
             compiled_loss_fn,
             compiled_compressed_loss_fn,
+            compiled_student_loss_fn,
+            compiled_student_compressed_loss_fn,
             rng,
             rnd,
             rollout_carry,
@@ -4395,11 +5541,15 @@ def _train_loop(
     policy: OrbitWarsPolicy,
     opt: torch.optim.Optimizer,
     critic_opt: Optional[torch.optim.Optimizer],
+    student_policy: Optional[OrbitWarsPolicy],
+    student_optimizer: Optional[torch.optim.Optimizer],
     exploiter_policy: Optional[OrbitWarsPolicy],
     exploiter_opt: Optional[torch.optim.Optimizer],
     exploiter_critic_opt: Optional[torch.optim.Optimizer],
     compiled_loss_fn: Optional[Any],
     compiled_compressed_loss_fn: Optional[Any],
+    compiled_student_loss_fn: Optional[Any],
+    compiled_student_compressed_loss_fn: Optional[Any],
     rng: torch.Generator,
     rnd: np.random.Generator,
     rollout_carry: Any,
@@ -4781,14 +5931,17 @@ def _train_loop(
             exploiter_ppo_summary: Optional[dict[str, float]] = None
             main_ppo_timing: Optional[PPOTiming] = None
             exploiter_ppo_timing: Optional[PPOTiming] = None
+            student_distill_summary: Optional[dict[str, float]] = None
             t_ppo0 = time.perf_counter()
             if not skip_main and args.rollout_storage == "host":
                 if main_host_chunks:
                     main_member_stores = _build_host_member_replay_stores(main_host_chunks, 1)
-                    loss_mb_i, ppo_t_i, ppo_stats_i = ppo_iteration_host_staged(
+                    loss_mb_i, ppo_t_i, ppo_stats_i, student_stats_i = ppo_iteration_host_staged(
                         policy,
                         opt,
                         critic_opt,
+                        student_policy,
+                        student_optimizer,
                         main_member_stores,
                         device,
                         args.minibatch_size,
@@ -4803,6 +5956,8 @@ def _train_loop(
                         rnd=rnd,
                         loss_fn=compiled_loss_fn,
                         compressed_loss_fn=compiled_compressed_loss_fn,
+                        student_loss_fn=compiled_student_loss_fn,
+                        student_compressed_loss_fn=compiled_student_compressed_loss_fn,
                         amp_dtype=amp_dtype,
                         obs_feature_dim=obs_fd,
                         population_size=1,
@@ -4810,16 +5965,24 @@ def _train_loop(
                         logp_check_label="main",
                         logp_check_iter=it,
                         reset_prefetch=reset_prefetch,
+                        student_temperature=float(args.student_temperature),
+                        student_halt_coef=float(args.student_halt_coef),
+                        student_origin_frac_coef=float(args.student_origin_frac_coef),
+                        student_target_coef=float(args.student_target_coef),
+                        student_value_coef=float(args.student_value_coef),
                     )
                     main_loss_parts.append(float(loss_mb_i))
                     main_ppo_summary = ppo_stats_i.summary()
                     main_ppo_timing = ppo_t_i
+                    student_distill_summary = student_stats_i.summary()
             elif not skip_main:
                 if main_samples is not None:
-                    loss_mb_i, ppo_t_i, ppo_stats_i = ppo_iteration(
+                    loss_mb_i, ppo_t_i, ppo_stats_i, student_stats_i = ppo_iteration(
                         policy,
                         opt,
                         critic_opt,
+                        student_policy,
+                        student_optimizer,
                         segment,
                         main_samples,
                         device,
@@ -4835,6 +5998,8 @@ def _train_loop(
                         rnd=rnd,
                         loss_fn=compiled_loss_fn,
                         compressed_loss_fn=compiled_compressed_loss_fn,
+                        student_loss_fn=compiled_student_loss_fn,
+                        student_compressed_loss_fn=compiled_student_compressed_loss_fn,
                         amp_dtype=amp_dtype,
                         obs_feature_dim=obs_fd,
                         population_size=1,
@@ -4842,17 +6007,25 @@ def _train_loop(
                         logp_check_label="main",
                         logp_check_iter=it,
                         reset_prefetch=reset_prefetch,
+                        student_temperature=float(args.student_temperature),
+                        student_halt_coef=float(args.student_halt_coef),
+                        student_origin_frac_coef=float(args.student_origin_frac_coef),
+                        student_target_coef=float(args.student_target_coef),
+                        student_value_coef=float(args.student_value_coef),
                     )
                     main_loss_parts.append(float(loss_mb_i))
                     main_ppo_summary = ppo_stats_i.summary()
                     main_ppo_timing = ppo_t_i
+                    student_distill_summary = student_stats_i.summary()
             if not skip_exploiter and args.rollout_storage == "host":
                 if exploiter_host_chunks:
                     exploiter_member_stores = _build_host_member_replay_stores(exploiter_host_chunks, 1)
-                    loss_mb_i, ppo_t_i, ppo_stats_i = ppo_iteration_host_staged(
+                    loss_mb_i, ppo_t_i, ppo_stats_i, _student_stats_unused = ppo_iteration_host_staged(
                         exploiter_policy,
                         exploiter_opt,
                         exploiter_critic_opt,
+                        None,
+                        None,
                         exploiter_member_stores,
                         device,
                         args.minibatch_size,
@@ -4867,6 +6040,8 @@ def _train_loop(
                         rnd=rnd,
                         loss_fn=compiled_loss_fn,
                         compressed_loss_fn=compiled_compressed_loss_fn,
+                        student_loss_fn=None,
+                        student_compressed_loss_fn=None,
                         amp_dtype=amp_dtype,
                         obs_feature_dim=obs_fd,
                         population_size=1,
@@ -4880,10 +6055,12 @@ def _train_loop(
                     exploiter_ppo_timing = ppo_t_i
             elif not skip_exploiter:
                 if exploiter_samples is not None:
-                    loss_mb_i, ppo_t_i, ppo_stats_i = ppo_iteration(
+                    loss_mb_i, ppo_t_i, ppo_stats_i, _student_stats_unused = ppo_iteration(
                         exploiter_policy,
                         exploiter_opt,
                         exploiter_critic_opt,
+                        None,
+                        None,
                         segment,
                         exploiter_samples,
                         device,
@@ -4899,6 +6076,8 @@ def _train_loop(
                         rnd=rnd,
                         loss_fn=compiled_loss_fn,
                         compressed_loss_fn=compiled_compressed_loss_fn,
+                        student_loss_fn=None,
+                        student_compressed_loss_fn=None,
                         amp_dtype=amp_dtype,
                         obs_feature_dim=obs_fd,
                         population_size=1,
@@ -5001,6 +6180,10 @@ def _train_loop(
                 for k, v in main_ppo_summary.items():
                     if isinstance(v, float) and v == v:
                         writer.add_scalar(f"ppo_main/{k}", v, it)
+            if student_distill_summary is not None:
+                for k, v in student_distill_summary.items():
+                    if isinstance(v, float) and v == v:
+                        writer.add_scalar(f"student/{k}", v, it)
             if mean_exploiter_loss == mean_exploiter_loss:
                 writer.add_scalar("ppo_exploiter/loss_mb", mean_exploiter_loss, it)
             if exploiter_ppo_summary is not None:
@@ -5016,6 +6199,8 @@ def _train_loop(
                     policy=policy,
                     actor_opt=opt,
                     critic_opt=critic_opt,
+                    student_policy=student_policy,
+                    student_optimizer=student_optimizer,
                     exploiter_policy=exploiter_policy,
                     exploiter_actor_opt=exploiter_opt,
                     exploiter_critic_opt=exploiter_critic_opt,
@@ -5320,11 +6505,14 @@ def _train_loop(
                 int(cfg.num_agents),
                 target_abort_enabled=bool(args.target_abort_enabled),
             )
+            student_distill_summary: Optional[dict[str, float]] = None
             if host_chunks is not None:
-                loss_mb, ppo_t, ppo_stats = ppo_iteration_host_staged(
+                loss_mb, ppo_t, ppo_stats, student_stats = ppo_iteration_host_staged(
                     policy,
                     opt,
                     critic_opt,
+                    student_policy,
+                    student_optimizer,
                     host_member_stores if host_member_stores is not None else [],
                     device,
                     args.minibatch_size,
@@ -5339,6 +6527,8 @@ def _train_loop(
                     rnd=rnd,
                     loss_fn=compiled_loss_fn,
                     compressed_loss_fn=compiled_compressed_loss_fn,
+                    student_loss_fn=compiled_student_loss_fn,
+                    student_compressed_loss_fn=compiled_student_compressed_loss_fn,
                     amp_dtype=amp_dtype,
                     obs_feature_dim=obs_fd,
                     population_size=int(args.population_size),
@@ -5346,12 +6536,19 @@ def _train_loop(
                     logp_check_label="policy",
                     logp_check_iter=it,
                     reset_prefetch=reset_prefetch,
+                    student_temperature=float(args.student_temperature),
+                    student_halt_coef=float(args.student_halt_coef),
+                    student_origin_frac_coef=float(args.student_origin_frac_coef),
+                    student_target_coef=float(args.student_target_coef),
+                    student_value_coef=float(args.student_value_coef),
                 )
             else:
-                loss_mb, ppo_t, ppo_stats = ppo_iteration(
+                loss_mb, ppo_t, ppo_stats, student_stats = ppo_iteration(
                     policy,
                     opt,
                     critic_opt,
+                    student_policy,
+                    student_optimizer,
                     segment,
                     samples,
                     device,
@@ -5367,6 +6564,8 @@ def _train_loop(
                     rnd=rnd,
                     loss_fn=compiled_loss_fn,
                     compressed_loss_fn=compiled_compressed_loss_fn,
+                    student_loss_fn=compiled_student_loss_fn,
+                    student_compressed_loss_fn=compiled_student_compressed_loss_fn,
                     amp_dtype=amp_dtype,
                     obs_feature_dim=obs_fd,
                     population_size=int(args.population_size),
@@ -5374,7 +6573,13 @@ def _train_loop(
                     logp_check_label="policy",
                     logp_check_iter=it,
                     reset_prefetch=reset_prefetch,
+                    student_temperature=float(args.student_temperature),
+                    student_halt_coef=float(args.student_halt_coef),
+                    student_origin_frac_coef=float(args.student_origin_frac_coef),
+                    student_target_coef=float(args.student_target_coef),
+                    student_value_coef=float(args.student_value_coef),
                 )
+            student_distill_summary = student_stats.summary()
             ppo_s = time.perf_counter() - t_ppo0
             if host_chunks is not None:
                 _release_rollout_device_refs(device)
@@ -5435,6 +6640,10 @@ def _train_loop(
                     float(league_selected.main_winrate_ema),
                     it,
                 )
+            if student_distill_summary is not None:
+                for k, v in student_distill_summary.items():
+                    if isinstance(v, float) and v == v:
+                        writer.add_scalar(f"student/{k}", v, it)
 
         if (it + 1) % args.checkpoint_every == 0:
             ckpt_path = ckpt_dir / f"iter_{it + 1:08d}.pt"
@@ -5444,6 +6653,8 @@ def _train_loop(
                 policy=policy,
                 actor_opt=opt,
                 critic_opt=critic_opt,
+                student_policy=student_policy,
+                student_optimizer=student_optimizer,
                 exploiter_policy=exploiter_policy,
                 exploiter_actor_opt=exploiter_opt,
                 exploiter_critic_opt=exploiter_critic_opt,
@@ -5662,6 +6873,15 @@ def parse_args() -> argparse.Namespace:
         default=512,
         help="Transitions per minibatch (capped automatically if buffer smaller).",
     )
+    p.add_argument("--student-d-model", type=int, default=64)
+    p.add_argument("--student-n-heads", type=int, default=4)
+    p.add_argument("--student-n-layers", type=int, default=2)
+    p.add_argument("--student-lr", type=float, default=1e-4)
+    p.add_argument("--student-temperature", type=float, default=1.0)
+    p.add_argument("--student-halt-coef", type=float, default=1.0)
+    p.add_argument("--student-origin-frac-coef", type=float, default=1.0)
+    p.add_argument("--student-target-coef", type=float, default=1.0)
+    p.add_argument("--student-value-coef", type=float, default=0.25)
     p.add_argument("--ship-speed", type=float, default=6.0)
     p.add_argument(
         "--first-hit-n-rays",

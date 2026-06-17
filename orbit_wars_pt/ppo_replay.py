@@ -155,6 +155,10 @@ def _compute_logp_value_entropy_torch(
     if policy.target_abort_enabled:
         abort_logits = out["abort_logits"][n_idx, o_idx, frac_idx]
         combined_target_logits = torch.cat([target_logits.masked_fill(~target_mask, -1e4), abort_logits[:, None]], dim=-1)
+        combined_target_mask = torch.cat(
+            [target_mask, torch.ones((mb, 1), dtype=torch.bool, device=target_mask.device)],
+            dim=-1,
+        )
         target_lp = torch.log_softmax(combined_target_logits, dim=-1)
         target_choice = torch.where(
             target_abort.to(device=halt_action.device, dtype=torch.bool),
@@ -165,6 +169,8 @@ def _compute_logp_value_entropy_torch(
         new_target_entropy = -(target_lp.exp() * target_lp).sum(dim=-1)
     else:
         masked_target = target_logits.masked_fill(~target_mask, -1e4)
+        combined_target_logits = target_logits
+        combined_target_mask = target_mask
         target_lp = torch.log_softmax(masked_target, dim=-1)
         new_target_logp = target_lp.gather(1, d_idx[:, None]).squeeze(-1)
         new_target_entropy = -(target_lp.exp() * target_lp).sum(dim=-1)
@@ -201,6 +207,9 @@ def _compute_logp_value_entropy_torch(
         halt_lp,
         out["origin_frac_logits"],
         origin_frac_mask,
+        halt_logits,
+        combined_target_logits,
+        combined_target_mask,
     )
 
 
@@ -301,6 +310,9 @@ def compute_ppo_loss_torch(
         halt_lp,
         origin_frac_logits_3d,
         origin_frac_mask_3d,
+        halt_logits,
+        teacher_target_logits,
+        teacher_target_mask,
     ) = _compute_logp_value_entropy_torch(
         policy,
         entity_type,
@@ -534,6 +546,12 @@ def compute_ppo_loss_torch(
         "count": count,
         "rollout_logp_max_abs_diff": rollout_logp_max_abs_diff,
         "rollout_logp_mean_abs_diff": rollout_logp_mean_abs_diff,
+        "teacher_halt_logits": halt_logits.detach(),
+        "teacher_origin_frac_logits": origin_frac_logits_3d.detach(),
+        "teacher_origin_frac_mask": origin_frac_mask_3d.detach(),
+        "teacher_target_logits": teacher_target_logits.detach(),
+        "teacher_target_mask": teacher_target_mask.detach(),
+        "teacher_value": new_value.detach(),
     }
     if check_rollout_logp:
         stats["rollout_logp_new"] = new_logp.detach().float().cpu()

@@ -2,7 +2,8 @@
 
 The bundle is a directory (or ``.tar.gz``) with ``main.py`` at the root, a
 minimal ``orbit_wars_pt`` inference package, and two policy checkpoints (4-player
-FFA and 2-player endgame). Optional search-only checkpoints can also be included.
+FFA and 2-player endgame). Search can optionally use each checkpoint's embedded
+student model.
 
 Example::
 
@@ -86,7 +87,12 @@ def _write_main_py(
     )
 
 
-def _slim_checkpoint_payload(payload: Any, *, policy_key: str = "policy") -> dict[str, Any]:
+def _slim_checkpoint_payload(
+    payload: Any,
+    *,
+    policy_key: str = "policy",
+    include_student_policy: bool = False,
+) -> dict[str, Any]:
     """Drop optimizer / rollout state; keep only what ``load_policy`` needs."""
 
     if not isinstance(payload, dict) or policy_key not in payload:
@@ -98,6 +104,13 @@ def _slim_checkpoint_payload(payload: Any, *, policy_key: str = "policy") -> dic
         "policy": policy_state,
         "training_args": training_args,
     }
+    if include_student_policy:
+        student_state = payload.get("student_policy")
+        if student_state is None:
+            raise ValueError(
+                "Checkpoint is missing 'student_policy' but student search was requested"
+            )
+        slim["student_policy"] = student_state
     if "version" in payload:
         slim["version"] = payload["version"]
     return slim
@@ -156,12 +169,21 @@ def _write_checkpoint(
     slim: bool,
     keep_member: int | None = None,
     policy_key: str = "policy",
+    include_student_policy: bool = False,
 ) -> None:
     try:
         payload = torch.load(src, map_location="cpu", weights_only=False)
     except TypeError:
         payload = torch.load(src, map_location="cpu")
-    payload_out = _slim_checkpoint_payload(payload, policy_key=policy_key) if slim else payload
+    payload_out = (
+        _slim_checkpoint_payload(
+            payload,
+            policy_key=policy_key,
+            include_student_policy=include_student_policy,
+        )
+        if slim
+        else payload
+    )
     if not isinstance(payload_out, dict):
         raise ValueError("Expected checkpoint payload to be a dict after loading")
     payload_out = _collapse_population_members(payload_out, keep_member=keep_member)
@@ -201,8 +223,10 @@ def package_submission(
     checkpoint_2p: Path | None,
     out: Path,
     *,
-    search_checkpoint_4p: Path | None = None,
-    search_checkpoint_2p: Path | None = None,
+    use_student_for_search_4p: bool = False,
+    use_student_for_search_2p: bool = False,
+    search_main_policy_for_ego_steps_4p: int = 1,
+    search_main_policy_for_ego_steps_2p: int = 1,
     greedy: bool = False,
     greedy_4p: bool | None = None,
     greedy_2p: bool | None = None,
@@ -238,15 +262,6 @@ def package_submission(
         raise FileNotFoundError(checkpoint_4p)
     if not checkpoint_2p.is_file():
         raise FileNotFoundError(checkpoint_2p)
-    if search_checkpoint_4p is not None:
-        search_checkpoint_4p = search_checkpoint_4p.expanduser().resolve()
-        if not search_checkpoint_4p.is_file():
-            raise FileNotFoundError(search_checkpoint_4p)
-    if search_checkpoint_2p is not None:
-        search_checkpoint_2p = search_checkpoint_2p.expanduser().resolve()
-        if not search_checkpoint_2p.is_file():
-            raise FileNotFoundError(search_checkpoint_2p)
-
     source_pkg = (source_pkg or Path(__file__).resolve().parent).resolve()
     out = out.expanduser().resolve()
     bundle_dir, archive_path = _submission_paths(out)
@@ -270,6 +285,7 @@ def package_submission(
             slim=slim,
             keep_member=keep_member_4p,
             policy_key=policy_key_4p,
+            include_student_policy=bool(use_student_for_search_4p),
         )
         _write_checkpoint(
             checkpoint_2p,
@@ -277,20 +293,23 @@ def package_submission(
             slim=slim,
             keep_member=keep_member_2p,
             policy_key=policy_key_2p,
+            include_student_policy=bool(use_student_for_search_2p),
         )
     else:
         shutil.copy2(checkpoint_4p, bundle_dir / "checkpoint_4p.pt")
         shutil.copy2(checkpoint_2p, bundle_dir / "checkpoint_2p.pt")
-    if search_checkpoint_4p is not None:
-        shutil.copy2(search_checkpoint_4p, bundle_dir / "search_checkpoint_4p.pt")
-    if search_checkpoint_2p is not None:
-        shutil.copy2(search_checkpoint_2p, bundle_dir / "search_checkpoint_2p.pt")
     _copy_inference_package(bundle_dir / "orbit_wars_pt", source_pkg=source_pkg)
     submission_env = dict(extra_env or {})
-    if search_checkpoint_4p is not None:
-        submission_env["ORBIT_WARS_SEARCH_CHECKPOINT_4P"] = "search_checkpoint_4p.pt"
-    if search_checkpoint_2p is not None:
-        submission_env["ORBIT_WARS_SEARCH_CHECKPOINT_2P"] = "search_checkpoint_2p.pt"
+    if bool(use_student_for_search_4p):
+        submission_env["ORBIT_WARS_USE_STUDENT_FOR_SEARCH_4P"] = "1"
+    if bool(use_student_for_search_2p):
+        submission_env["ORBIT_WARS_USE_STUDENT_FOR_SEARCH_2P"] = "1"
+    submission_env["ORBIT_WARS_SEARCH_MAIN_POLICY_FOR_EGO_STEPS_4P"] = str(
+        max(0, int(search_main_policy_for_ego_steps_4p))
+    )
+    submission_env["ORBIT_WARS_SEARCH_MAIN_POLICY_FOR_EGO_STEPS_2P"] = str(
+        max(0, int(search_main_policy_for_ego_steps_2p))
+    )
     if sampling_mode is not None:
         submission_env["ORBIT_WARS_SAMPLING_MODE"] = str(sampling_mode)
     if sampling_mode_4p is not None:
@@ -350,8 +369,10 @@ def package_submission(
 
         4-player checkpoint: {checkpoint_4p.name} (copied to checkpoint_4p.pt)
         2-player checkpoint: {checkpoint_2p.name} (copied to checkpoint_2p.pt)
-        4-player search checkpoint: {search_checkpoint_4p.name if search_checkpoint_4p is not None else 'none'}
-        2-player search checkpoint: {search_checkpoint_2p.name if search_checkpoint_2p is not None else 'none'}
+        4-player search uses embedded student: {bool(use_student_for_search_4p)}
+        2-player search uses embedded student: {bool(use_student_for_search_2p)}
+        4-player search ego main-model steps: {max(0, int(search_main_policy_for_ego_steps_4p))}
+        2-player search ego main-model steps: {max(0, int(search_main_policy_for_ego_steps_2p))}
         Greedy (default): {greedy}
         Greedy 4p override: {greedy_4p if greedy_4p is not None else 'default'}
         Greedy 2p override: {greedy_2p if greedy_2p is not None else 'default'}
@@ -375,8 +396,10 @@ def package_submission(
 
         Policy selection: 4-player matches use checkpoint_4p.pt; 2-player matches
         use checkpoint_2p.pt. The first observation selects the mode for the full
-        episode; there is no mid-game policy switching. When present, search-only
-        checkpoints are used only for model-search rollouts.
+        episode; there is no mid-game policy switching. When enabled, search uses
+        the embedded student model from the corresponding checkpoint, optionally
+        keeping the main model on the ego seat for the first configured number of
+        simulated search env steps.
 
         Test locally (from this directory):
 
@@ -417,16 +440,46 @@ def main() -> None:
         help="2-player training checkpoint (.pt) shipped as checkpoint_2p.pt.",
     )
     parser.add_argument(
-        "--search-checkpoint-4p",
-        type=Path,
-        default=None,
-        help="Optional 4-player search-only checkpoint (.pt) shipped as search_checkpoint_4p.pt.",
+        "--search-use-student",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Default search-student setting for both packaged checkpoints. "
+            "Per-mode flags override this."
+        ),
     )
     parser.add_argument(
-        "--search-checkpoint-2p",
-        type=Path,
+        "--use-student-for-search-4p",
+        action=argparse.BooleanOptionalAction,
         default=None,
-        help="Optional 2-player search-only checkpoint (.pt) shipped as search_checkpoint_2p.pt.",
+        help="Use the packaged 4-player checkpoint's embedded student model for search rollouts.",
+    )
+    parser.add_argument(
+        "--use-student-for-search-2p",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use the packaged 2-player checkpoint's embedded student model for search rollouts.",
+    )
+    parser.add_argument(
+        "--search-main-model-ego-steps",
+        type=int,
+        default=1,
+        help=(
+            "Default number of simulated search env steps that keep the main model on the ego seat "
+            "for both packaged checkpoints. Per-mode flags override this."
+        ),
+    )
+    parser.add_argument(
+        "--search-main-model-ego-steps-4p",
+        type=int,
+        default=None,
+        help="How many simulated search env steps keep the packaged 4-player checkpoint's main model on the ego seat.",
+    )
+    parser.add_argument(
+        "--search-main-model-ego-steps-2p",
+        type=int,
+        default=None,
+        help="How many simulated search env steps keep the packaged 2-player checkpoint's main model on the ego seat.",
     )
     parser.add_argument(
         "--checkpoint-main",
@@ -671,8 +724,32 @@ def main() -> None:
         checkpoint_4p,
         checkpoint_2p,
         args.out,
-        search_checkpoint_4p=args.search_checkpoint_4p,
-        search_checkpoint_2p=args.search_checkpoint_2p,
+        use_student_for_search_4p=(
+            bool(args.search_use_student)
+            if args.use_student_for_search_4p is None
+            else bool(args.use_student_for_search_4p)
+        ),
+        use_student_for_search_2p=(
+            bool(args.search_use_student)
+            if args.use_student_for_search_2p is None
+            else bool(args.use_student_for_search_2p)
+        ),
+        search_main_policy_for_ego_steps_4p=max(
+            0,
+            int(
+                args.search_main_model_ego_steps
+                if args.search_main_model_ego_steps_4p is None
+                else args.search_main_model_ego_steps_4p
+            ),
+        ),
+        search_main_policy_for_ego_steps_2p=max(
+            0,
+            int(
+                args.search_main_model_ego_steps
+                if args.search_main_model_ego_steps_2p is None
+                else args.search_main_model_ego_steps_2p
+            ),
+        ),
         greedy=bool(args.greedy),
         greedy_4p=(None if args.greedy_4p is None else bool(args.greedy_4p)),
         greedy_2p=(None if args.greedy_2p is None else bool(args.greedy_2p)),

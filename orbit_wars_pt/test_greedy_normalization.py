@@ -146,14 +146,14 @@ class TestGreedyNormalization(unittest.TestCase):
         self.assertTrue(_launch_probability_meets_threshold(halt_logits, threshold=0.5))
         self.assertFalse(_launch_probability_meets_threshold(halt_logits, threshold=0.75))
 
-    def test_agent_can_load_distinct_search_checkpoint(self) -> None:
+    def test_agent_can_load_embedded_student_for_search(self) -> None:
         main_policy = torch.nn.Linear(1, 1)
         search_policy = torch.nn.Linear(1, 1)
-        load_calls: list[str] = []
+        load_calls: list[tuple[str, str]] = []
 
         def fake_load_policy(path, *, device=None, policy_key="policy"):
-            load_calls.append(str(path))
-            if str(path) == "/resolved/main.pt":
+            load_calls.append((str(path), str(policy_key)))
+            if str(path) == "/resolved/main.pt" and policy_key == "policy":
                 return (
                     main_policy,
                     torch.device("cpu"),
@@ -164,7 +164,7 @@ class TestGreedyNormalization(unittest.TestCase):
                         "max_micro_steps": 7,
                     },
                 )
-            if str(path) == "/resolved/search.pt":
+            if str(path) == "/resolved/main.pt" and policy_key == "student_policy":
                 return (
                     search_policy,
                     torch.device("cpu"),
@@ -186,27 +186,47 @@ class TestGreedyNormalization(unittest.TestCase):
         ):
             agent = KaggleOrbitWarsAgent(
                 "main.pt",
-                search_checkpoint_path="search.pt",
+                use_student_for_search=True,
                 device="cpu",
                 population_member=3,
             )
 
-        self.assertEqual(load_calls, ["/resolved/main.pt", "/resolved/search.pt"])
+        self.assertEqual(load_calls, [("/resolved/main.pt", "policy"), ("/resolved/main.pt", "student_policy")])
         self.assertIs(agent.policy, main_policy)
         self.assertIs(agent.search_policy, search_policy)
-        self.assertEqual(agent.search_checkpoint_path, "/resolved/search.pt")
+        self.assertTrue(agent.use_student_for_search)
         self.assertEqual(agent._population_member_for_player(0), 3)
         self.assertIsNone(agent._search_population_member_for_player(0))
         self.assertFalse(agent._search_compiled_forward_warmup_done)
         self.assertTrue(agent.search_normalize_obs_to_p0)
 
-    def test_dual_agent_threads_mode_specific_search_checkpoints(self) -> None:
+    def test_search_main_policy_for_ego_steps_respects_depth(self) -> None:
+        agent = object.__new__(KaggleOrbitWarsAgent)
+        agent.policy = object()
+        agent.search_policy = object()
+        agent.search_main_policy_for_ego_steps = 2
+
+        self.assertTrue(agent._search_uses_main_policy_for_player(2, 2, 0))
+        self.assertTrue(agent._search_uses_main_policy_for_player(2, 2, 1))
+        self.assertFalse(agent._search_uses_main_policy_for_player(2, 2, 2))
+        self.assertFalse(agent._search_uses_main_policy_for_player(1, 2, 0))
+
+        agent.search_main_policy_for_ego_steps = 0
+        self.assertFalse(agent._search_uses_main_policy_for_player(2, 2, 0))
+        self.assertFalse(agent._search_uses_main_policy_for_player(1, 2, 0))
+
+        agent.search_policy = agent.policy
+        self.assertTrue(agent._search_uses_main_policy_for_player(1, 2, 99))
+
+    def test_dual_agent_threads_mode_specific_student_search_flags(self) -> None:
         with patch("orbit_wars_pt.kaggle_adapter.resolve_checkpoint_path", side_effect=lambda path: f"/resolved/{path}"):
             agent = KaggleOrbitWarsDualPolicyAgent(
                 "main4.pt",
                 "main2.pt",
-                search_checkpoint_4p="search4.pt",
-                search_checkpoint_2p="search2.pt",
+                use_student_for_search_4p=True,
+                use_student_for_search_2p=False,
+                search_main_policy_for_ego_steps_4p=0,
+                search_main_policy_for_ego_steps_2p=2,
             )
 
         with patch("orbit_wars_pt.kaggle_adapter.KaggleOrbitWarsAgent") as delegate_cls:
@@ -215,8 +235,10 @@ class TestGreedyNormalization(unittest.TestCase):
 
         first_kwargs = delegate_cls.call_args_list[0].kwargs
         second_kwargs = delegate_cls.call_args_list[1].kwargs
-        self.assertEqual(first_kwargs["search_checkpoint_path"], "/resolved/search4.pt")
-        self.assertEqual(second_kwargs["search_checkpoint_path"], "/resolved/search2.pt")
+        self.assertTrue(first_kwargs["use_student_for_search"])
+        self.assertFalse(second_kwargs["use_student_for_search"])
+        self.assertEqual(first_kwargs["search_main_policy_for_ego_steps"], 0)
+        self.assertEqual(second_kwargs["search_main_policy_for_ego_steps"], 2)
 
     def test_search_active_keeps_root_sampling_mode_greedy_even_with_launch_threshold(self) -> None:
         agent = object.__new__(KaggleOrbitWarsAgent)

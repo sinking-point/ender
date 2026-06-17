@@ -99,37 +99,19 @@ def main() -> None:
         help="Checkpoint override for player 3 in 4-player mode. Default: same as --checkpoint.",
     )
     parser.add_argument(
-        "--search-checkpoint",
-        type=str,
-        default=None,
+        "--search-use-student",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use each seat checkpoint's embedded student model for search rollouts.",
+    )
+    parser.add_argument(
+        "--search-main-model-ego-steps",
+        type=int,
+        default=1,
         help=(
-            "Optional search-only checkpoint used for model-search rollouts by all seats unless overridden per seat. "
-            "Default: reuse each seat's acting checkpoint."
+            "How many simulated search env steps keep using each seat's main model for the ego/root player. "
+            "0 means always use the search student; 1 means only the current search root uses the main model."
         ),
-    )
-    parser.add_argument(
-        "--search-checkpoint-p0",
-        type=str,
-        default=None,
-        help="Search-only checkpoint override for player 0. Default: same as --search-checkpoint.",
-    )
-    parser.add_argument(
-        "--search-checkpoint-p1",
-        type=str,
-        default=None,
-        help="Search-only checkpoint override for player 1. Default: same as --search-checkpoint.",
-    )
-    parser.add_argument(
-        "--search-checkpoint-p2",
-        type=str,
-        default=None,
-        help="Search-only checkpoint override for player 2 in 4-player mode. Default: same as --search-checkpoint.",
-    )
-    parser.add_argument(
-        "--search-checkpoint-p3",
-        type=str,
-        default=None,
-        help="Search-only checkpoint override for player 3 in 4-player mode. Default: same as --search-checkpoint.",
     )
     parser.add_argument(
         "--num-agents",
@@ -494,14 +476,12 @@ def main() -> None:
         os.environ["ORBIT_WARS_CPU_THREADS"] = "0"
 
     os.environ["ORBIT_WARS_CHECKPOINT"] = str(Path(args.checkpoint).expanduser())
-    if args.search_checkpoint is not None:
-        os.environ["ORBIT_WARS_SEARCH_CHECKPOINT"] = str(Path(args.search_checkpoint).expanduser())
-    else:
-        os.environ.pop("ORBIT_WARS_SEARCH_CHECKPOINT", None)
+    os.environ["ORBIT_WARS_USE_STUDENT_FOR_SEARCH"] = "1" if bool(args.search_use_student) else "0"
+    os.environ["ORBIT_WARS_SEARCH_MAIN_POLICY_FOR_EGO_STEPS"] = str(
+        max(0, int(args.search_main_model_ego_steps))
+    )
     os.environ.pop("ORBIT_WARS_CHECKPOINT_4P", None)
     os.environ.pop("ORBIT_WARS_CHECKPOINT_2P", None)
-    os.environ.pop("ORBIT_WARS_SEARCH_CHECKPOINT_4P", None)
-    os.environ.pop("ORBIT_WARS_SEARCH_CHECKPOINT_2P", None)
     os.environ["ORBIT_WARS_DEVICE"] = str(args.device)
     if args.member is not None:
         os.environ["ORBIT_WARS_MEMBER"] = str(int(args.member))
@@ -702,13 +682,6 @@ def main() -> None:
         base_checkpoint if args.checkpoint_p2 is None else Path(args.checkpoint_p2).expanduser(),
         base_checkpoint if args.checkpoint_p3 is None else Path(args.checkpoint_p3).expanduser(),
     ]
-    base_search_checkpoint = None if args.search_checkpoint is None else Path(args.search_checkpoint).expanduser()
-    search_checkpoint_by_seat = [
-        base_search_checkpoint if args.search_checkpoint_p0 is None else Path(args.search_checkpoint_p0).expanduser(),
-        base_search_checkpoint if args.search_checkpoint_p1 is None else Path(args.search_checkpoint_p1).expanduser(),
-        base_search_checkpoint if args.search_checkpoint_p2 is None else Path(args.search_checkpoint_p2).expanduser(),
-        base_search_checkpoint if args.search_checkpoint_p3 is None else Path(args.search_checkpoint_p3).expanduser(),
-    ]
     member_by_seat = [
         member_p0,
         member_p1,
@@ -799,26 +772,16 @@ def main() -> None:
             f"p{seat}={checkpoint_by_seat[seat]}" for seat in range(int(args.num_agents))
         )
         print(f"[orbit_wars_pt] per-seat checkpoints: {checkpoint_summary}", flush=True)
-    unique_search_checkpoints = {
-        str(search_checkpoint_by_seat[seat])
-        for seat in range(int(args.num_agents))
-        if search_checkpoint_by_seat[seat] is not None
-    }
-    if unique_search_checkpoints:
-        if len(unique_search_checkpoints) > 1 or any(
-            search_checkpoint_by_seat[seat] != checkpoint_by_seat[seat]
-            for seat in range(int(args.num_agents))
-            if search_checkpoint_by_seat[seat] is not None
-        ):
-            search_checkpoint_summary = ", ".join(
-                (
-                    f"p{seat}={search_checkpoint_by_seat[seat]}"
-                    if search_checkpoint_by_seat[seat] is not None
-                    else f"p{seat}=acting"
-                )
-                for seat in range(int(args.num_agents))
-            )
-            print(f"[orbit_wars_pt] per-seat search checkpoints: {search_checkpoint_summary}", flush=True)
+    if bool(args.search_use_student):
+        print(
+            "[orbit_wars_pt] search rollouts will use each seat checkpoint's embedded student model",
+            flush=True,
+        )
+        print(
+            "[orbit_wars_pt] search ego main-model steps: "
+            f"{max(0, int(args.search_main_model_ego_steps))}",
+            flush=True,
+        )
     search_enabled_by_seat = [
         bool(model_search_adaptive_horizon_by_seat[seat]) or int(model_search_steps_by_seat[seat]) > 0
         for seat in range(int(args.num_agents))
@@ -861,7 +824,8 @@ def main() -> None:
             policy_key = "exploiter_policy"
         seat_agent = KaggleOrbitWarsAgent(
             checkpoint_by_seat[seat],
-            search_checkpoint_path=search_checkpoint_by_seat[seat],
+            use_student_for_search=bool(args.search_use_student),
+            search_main_policy_for_ego_steps=max(0, int(args.search_main_model_ego_steps)),
             device=str(args.device),
             policy_key=policy_key,
             greedy=bool(greedy_by_seat[seat]),
