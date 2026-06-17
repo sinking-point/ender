@@ -53,7 +53,7 @@ import os
 os.environ.setdefault("ORBIT_WARS_CHECKPOINT_4P", "checkpoint_4p.pt")
 os.environ.setdefault("ORBIT_WARS_CHECKPOINT_2P", "checkpoint_2p.pt")
 os.environ.setdefault("ORBIT_WARS_DEVICE", {device!r})
-os.environ.setdefault("ORBIT_WARS_CPU_THREADS", "2")
+os.environ.setdefault("ORBIT_WARS_CPU_THREADS", "1")
 os.environ.setdefault("ORBIT_WARS_GREEDY", {greedy!r})
 os.environ.setdefault("ORBIT_WARS_LOG_TIMING", "1")
 {extra_env}
@@ -380,7 +380,7 @@ def package_submission(
         Sampling mode 4p override: {sampling_mode_4p if sampling_mode_4p is not None else 'default'}
         Sampling mode 2p override: {sampling_mode_2p if sampling_mode_2p is not None else 'default'}
         Device: {device}
-        CPU threads: 2
+        CPU threads: 1
         Population member (fallback): {population_member if population_member is not None else 'member 0 / checkpoint default'}
         Population member 4p: {population_member_4p if population_member_4p is not None else (population_member if population_member is not None else 'member 0 / checkpoint default')}
         Population member 2p: {population_member_2p if population_member_2p is not None else (population_member if population_member is not None else 'member 0 / checkpoint default')}

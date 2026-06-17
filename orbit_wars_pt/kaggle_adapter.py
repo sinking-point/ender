@@ -56,7 +56,7 @@ DEFAULT_RAYCAST_RAYS = 256
 DEFAULT_INTERVAL_SAMPLES_PER_SPAN = 9
 DEFAULT_TARGET_METHOD = "rays"
 DEFAULT_MAX_ACTIONS = 64
-DEFAULT_CPU_THREADS = 0
+DEFAULT_CPU_THREADS = 1
 SAMPLING_MODE_STOCHASTIC = "stochastic"
 SAMPLING_MODE_GREEDY = "greedy"
 SAMPLING_MODE_MIXED = "mixed"
@@ -1506,7 +1506,7 @@ def _configure_cpu_threads() -> None:
     if n_threads < 1:
         return
     for name in CPU_THREAD_ENV_VARS:
-        os.environ.setdefault(name, str(n_threads))
+        os.environ[name] = str(n_threads)
     torch.set_num_threads(n_threads)
     try:
         torch.set_num_interop_threads(n_threads)
