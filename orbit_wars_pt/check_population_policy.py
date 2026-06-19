@@ -152,6 +152,8 @@ def _check_member_isolation(policy: OrbitWarsPolicy, batch: dict[str, torch.Tens
 
     target0 = policy.target_logits_for_origin_fraction(
         out0["planet_hidden"],
+        batch["owner_idx"],
+        batch["features"],
         torch.zeros(pop0.shape[0], dtype=torch.long),
         torch.zeros(pop0.shape[0], dtype=torch.long),
         fleet_size=torch.ones(pop0.shape[0], dtype=torch.float32),
@@ -161,6 +163,8 @@ def _check_member_isolation(policy: OrbitWarsPolicy, batch: dict[str, torch.Tens
     )
     target_mix = policy.target_logits_for_origin_fraction(
         out_mix["planet_hidden"],
+        batch["owner_idx"],
+        batch["features"],
         torch.zeros(pop_mix.shape[0], dtype=torch.long),
         torch.zeros(pop_mix.shape[0], dtype=torch.long),
         fleet_size=torch.ones(pop_mix.shape[0], dtype=torch.float32),

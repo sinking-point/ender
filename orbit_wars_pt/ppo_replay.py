@@ -128,6 +128,8 @@ def _compute_logp_value_entropy_torch(
         ph = out["planet_hidden"]
         target_logits = policy.target_logits_for_origin_fraction(
             ph,
+            owner_idx,
+            features,
             o_idx,
             frac_idx,
             fleet_size=fleet_size,

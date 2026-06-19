@@ -1337,6 +1337,8 @@ def _target_logits_by_controller(
     *,
     policies: list[OrbitWarsPolicy],
     planet_hidden: torch.Tensor,
+    owner_idx: torch.Tensor,
+    features: torch.Tensor,
     origin_idx: torch.Tensor,
     frac_idx: torch.Tensor,
     fleet_size: torch.Tensor,
@@ -1353,6 +1355,8 @@ def _target_logits_by_controller(
         policy = policies[int(controller_id)]
         logits = policy.target_logits_for_origin_fraction(
             planet_hidden.index_select(0, row_idx),
+            owner_idx.index_select(0, row_idx),
+            features.index_select(0, row_idx),
             origin_idx.index_select(0, row_idx),
             frac_idx.index_select(0, row_idx),
             fleet_size=fleet_size.index_select(0, row_idx),
@@ -1954,6 +1958,8 @@ def _run_async_micro_step_multi(
     target_logits = _target_logits_by_controller(
         policies=policies,
         planet_hidden=out["planet_hidden"],
+        owner_idx=active_obs["owner_idx"],
+        features=active_obs["features"],
         origin_idx=o_idx,
         frac_idx=frac_idx,
         fleet_size=fleet_size_for_logits,
@@ -2415,6 +2421,8 @@ def _run_async_micro_step_multi_grouped_population(
     fleet_size_for_logits = torch.floor(frac_values[frac_idx] * origin_ships)
     target_logits = policy.target_logits_for_origin_fraction_grouped_population(
         out["planet_hidden"],
+        full_obs["owner_idx"],
+        full_obs["features"],
         o_idx,
         frac_idx,
         fleet_size=fleet_size_for_logits,

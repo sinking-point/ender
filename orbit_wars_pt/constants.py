@@ -18,12 +18,14 @@ INCOMING_TA_BINS = 24
 
 # Owner ids after ego-remap (neutral, ego=0, ally unused in 2p, enemies) — also one-hot width for survivor plane.
 NUM_OWNER_SLOTS = 5
+FUTURE_PLANET_FEATURES_PER_TICK = NUM_OWNER_SLOTS + 1
 
 BASE_FEATURE_DIM = 8
 FEATURE_DIM = BASE_FEATURE_DIM + INCOMING_TA_BINS
 # After signed interfleet mass (``INCOMING_TA_BINS``), each TA bin uses a one-hot over ``NUM_OWNER_SLOTS``.
 INCOMING_SURVIVOR_FLAT = INCOMING_TA_BINS * NUM_OWNER_SLOTS
 FEATURE_DIM_MULTI = BASE_FEATURE_DIM + INCOMING_TA_BINS + INCOMING_SURVIVOR_FLAT
+FUTURE_PLANET_FEATURE_DIM = INCOMING_TA_BINS * FUTURE_PLANET_FEATURES_PER_TICK
 
 # Legacy cap retained for compatibility with older host/debug helpers.
 MAX_FLEET_TOKENS = 128

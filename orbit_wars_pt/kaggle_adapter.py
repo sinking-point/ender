@@ -3897,6 +3897,8 @@ def _build_turn_actions_torch_only(
             t0 = perf_counter()
             target_logits = policy.target_logits_for_origin_fraction(
                 out["planet_hidden"],
+                batch["owner_idx"],
+                batch["features"],
                 torch.tensor([o_idx], device=device, dtype=torch.long),
                 torch.tensor([frac_idx], device=device, dtype=torch.long),
                 fleet_size=torch.tensor(
@@ -4683,6 +4685,7 @@ def _infer_policy_kwargs(payload: Any, *, policy_key: str = "policy") -> dict[st
         ),
         "disjoint_actor_critic": bool(training_args.get("disjoint_actor_critic", False)),
         "target_abort_enabled": bool(training_args.get("target_abort_enabled", False)),
+        "future_feature_enabled": bool(training_args.get("future_feature_enabled", False)),
         "halt_init_prob": training_args.get("halt_init_prob"),
     }
     fraction_init_ratio = training_args.get("fraction_init_ratio")
@@ -4702,6 +4705,8 @@ def _infer_policy_kwargs(payload: Any, *, policy_key: str = "policy") -> dict[st
             key_s = str(key)
             if "abort_head." in key_s:
                 kwargs["target_abort_enabled"] = True
+            if key_s.startswith("future_feat_proj."):
+                kwargs["future_feature_enabled"] = True
             if key_s.startswith("critic_"):
                 kwargs["disjoint_actor_critic"] = True
             if key_s.startswith("blocks."):
@@ -6255,8 +6260,18 @@ class KaggleOrbitWarsAgent:
                         dtype=torch.long,
                     )
                 group_idx_t = torch.tensor(local_indices, device=self.device, dtype=torch.long)
+                obs_group = _obs_tensors_for_states(
+                    [continue_states[idx] for idx in local_indices],
+                    [int(continue_plans[idx].player) for idx in local_indices],
+                    self.device,
+                    policy_player_count=_ppc,
+                    target_abort_enabled=bool(getattr(policy, "target_abort_enabled", False)),
+                    normalize_obs_to_p0=_norm,
+                )
                 target_logits_group = policy.target_logits_for_origin_fraction(
                     hidden,
+                    obs_group["owner_idx"],
+                    obs_group["features"],
                     origin_idx_t.index_select(0, group_idx_t),
                     frac_idx_t.index_select(0, group_idx_t),
                     fleet_size=fleet_size_t.index_select(0, group_idx_t),

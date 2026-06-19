@@ -32,6 +32,7 @@ import orbit_wars_pt.xla_env  # noqa: F401
 import jax.numpy as jnp
 
 from orbit_wars_pt.batched_env import heal_terminal_env_slices, reset_env_at_index
+from orbit_wars_pt.compressed_observation import decode_observation
 from orbit_wars_pt.env_wrapper import OrbitWarsEnvConfig
 from orbit_wars_pt.reward_config import resolve_reward_mix as resolve_reward_mix_config
 from orbit_wars_pt.constants import FEATURE_DIM, FRACTIONS, INCOMING_TA_BINS, MAX_PLANETS, obs_feature_dim_for_num_agents
@@ -951,6 +952,7 @@ def _checkpoint_training_args(args: argparse.Namespace) -> Dict[str, Any]:
         "num_agents",
         "population_size",
         "target_abort_enabled",
+        "future_feature_enabled",
         "disjoint_actor_critic",
         "exploiter_mode",
         "activation_checkpointing",
@@ -2064,10 +2066,13 @@ def _distill_student_minibatch(
     target_hit_tick = actions["target_hit_tick"].to(device=device, dtype=torch.float32)
     target_reachable = actions["target_planet_reachable"].to(device=device, dtype=torch.bool)
     planet_ships = ships.to(torch.float32)
+    decoded_obs = decode_observation(comp_dev, feature_dim=int(student.feat_proj.in_features))
 
     with torch.no_grad():
         teacher_target_logits = teacher.target_logits_for_origin_fraction(
             teacher_out["planet_hidden"],
+            decoded_obs["owner_idx"],
+            decoded_obs["features"],
             origin_idx,
             frac_idx,
             fleet_size=fleet_size,
@@ -2077,6 +2082,8 @@ def _distill_student_minibatch(
         )
     student_target_logits = student.target_logits_for_origin_fraction(
         student_out["planet_hidden"],
+        decoded_obs["owner_idx"],
+        decoded_obs["features"],
         origin_idx,
         frac_idx,
         fleet_size=fleet_size,
@@ -2211,6 +2218,8 @@ def _student_outputs_for_obs(
     target_reachable = actions["target_planet_reachable"].to(device=device, dtype=torch.bool)
     student_target_logits = student.target_logits_for_origin_fraction(
         out["planet_hidden"],
+        owner_idx,
+        features,
         origin_idx,
         frac_idx,
         fleet_size=fleet_size,
@@ -2382,6 +2391,8 @@ def compute_student_distill_loss_torch(
     fleet_size = torch.floor(origin_ships * frac_values[frac_idx])
     student_target_logits = student.target_logits_for_origin_fraction(
         out["planet_hidden"],
+        owner_idx,
+        features,
         origin_idx,
         frac_idx,
         fleet_size=fleet_size,
@@ -5128,6 +5139,7 @@ def train(args: argparse.Namespace) -> None:
             population_size=args.population_size,
             rope_dims=policy_rope_dims,
             target_abort_enabled=bool(args.target_abort_enabled),
+            future_feature_enabled=bool(args.future_feature_enabled),
             disjoint_actor_critic=bool(args.disjoint_actor_critic),
             halt_init_prob=args.halt_init_prob,
             fraction_init_weights=fraction_init_weights,
@@ -5149,6 +5161,7 @@ def train(args: argparse.Namespace) -> None:
             population_size=args.population_size,
             rope_dims=policy_rope_dims,
             target_abort_enabled=bool(args.target_abort_enabled),
+            future_feature_enabled=bool(args.future_feature_enabled),
             disjoint_actor_critic=bool(args.disjoint_actor_critic),
             halt_init_prob=args.halt_init_prob,
             fraction_init_weights=fraction_init_weights,
@@ -7069,6 +7082,15 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Enable target-stage abort with per-turn origin/fraction blocking.",
+    )
+    p.add_argument(
+        "--future-feature-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable per-planet ceasefire future owner/garrison forecast features in the policy "
+            "trunk and target head."
+        ),
     )
     p.add_argument(
         "--disjoint-actor-critic",

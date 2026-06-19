@@ -23,7 +23,7 @@ if ROOT not in sys.path:
 import orbit_wars_pt.xla_env  # noqa: F401
 
 from orbit_wars_pt.batched_env import heal_terminal_env_slices
-from orbit_wars_pt.compressed_observation import CompressedObservationBuffer
+from orbit_wars_pt.compressed_observation import CompressedObservationBuffer, decode_observation
 from orbit_wars_pt.constants import FRACTIONS, MAX_PLANETS, obs_feature_dim_for_num_agents
 from orbit_wars_pt.env_wrapper import OrbitWarsEnvConfig
 from orbit_wars_pt.jax_setup import configure_jax_for_training
@@ -70,6 +70,7 @@ def _teacher_policy_from_checkpoint(path: Path, device: torch.device) -> tuple[O
         )
     train_args = _teacher_training_args(ckpt)
     target_abort_enabled = bool(train_args.get("target_abort_enabled", False))
+    future_feature_enabled = bool(train_args.get("future_feature_enabled", False))
     num_agents = int(train_args.get("num_agents", 2))
     exploiter_mode = bool(train_args.get("exploiter_mode", False))
     feature_agents = 4 if exploiter_mode else num_agents
@@ -91,6 +92,7 @@ def _teacher_policy_from_checkpoint(path: Path, device: torch.device) -> tuple[O
         value_head_count=value_head_count,
         disjoint_actor_critic=bool(train_args.get("disjoint_actor_critic", False)),
         target_abort_enabled=target_abort_enabled,
+        future_feature_enabled=future_feature_enabled,
         halt_init_prob=train_args.get("halt_init_prob"),
         fraction_init_weights=_parse_fraction_init_weights(train_args.get("fraction_init_ratio")),
     ).to(device)
@@ -105,6 +107,7 @@ def _teacher_policy_from_checkpoint(path: Path, device: torch.device) -> tuple[O
 
 def _student_policy_from_args(args: argparse.Namespace, teacher_args: dict[str, Any], device: torch.device) -> OrbitWarsPolicy:
     target_abort_enabled = bool(teacher_args.get("target_abort_enabled", False))
+    future_feature_enabled = bool(teacher_args.get("future_feature_enabled", False))
     num_agents = int(teacher_args.get("num_agents", 2))
     exploiter_mode = bool(teacher_args.get("exploiter_mode", False))
     feature_agents = 4 if exploiter_mode else num_agents
@@ -124,6 +127,7 @@ def _student_policy_from_args(args: argparse.Namespace, teacher_args: dict[str, 
         value_head_count=value_head_count,
         disjoint_actor_critic=bool(teacher_args.get("disjoint_actor_critic", False)),
         target_abort_enabled=target_abort_enabled,
+        future_feature_enabled=future_feature_enabled,
         halt_init_prob=(args.halt_init_prob if args.halt_init_prob is not None else teacher_args.get("halt_init_prob")),
         fraction_init_weights=_parse_fraction_init_weights(fraction_init_raw),
     ).to(device)
@@ -439,10 +443,13 @@ def _distill_minibatch(
     target_hit_tick = actions["target_hit_tick"].to(device=device, dtype=torch.float32)
     target_reachable = actions["target_planet_reachable"].to(device=device, dtype=torch.bool)
     planet_ships = ships.to(torch.float32)
+    decoded_obs = decode_observation(comp_dev, feature_dim=int(student.feat_proj.in_features))
 
     with torch.no_grad():
         teacher_target_logits = teacher.target_logits_for_origin_fraction(
             teacher_out["planet_hidden"],
+            decoded_obs["owner_idx"],
+            decoded_obs["features"],
             origin_idx,
             frac_idx,
             fleet_size=fleet_size,
@@ -452,6 +459,8 @@ def _distill_minibatch(
         )
     student_target_logits = student.target_logits_for_origin_fraction(
         student_out["planet_hidden"],
+        decoded_obs["owner_idx"],
+        decoded_obs["features"],
         origin_idx,
         frac_idx,
         fleet_size=fleet_size,

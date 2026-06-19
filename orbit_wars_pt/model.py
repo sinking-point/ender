@@ -17,8 +17,13 @@ from orbit_wars_pt.constants import (
     ENTITY_CLS,
     FEATURE_DIM,
     FEATURE_DIM_ABORT,
+    FEATURE_DIM_MULTI,
     FEATURE_DIM_MULTI_ABORT,
     FRACTIONS,
+    FUTURE_PLANET_FEATURE_DIM,
+    FUTURE_PLANET_FEATURES_PER_TICK,
+    INCOMING_SURVIVOR_FLAT,
+    INCOMING_TA_BINS,
     MAX_PLANETS,
     NUM_ENTITY_TYPES,
     NUM_FRACTIONS,
@@ -169,13 +174,130 @@ class TransformerBlock(nn.Module):
         return x
 
 
-def _make_target_pick_head(d_model: int) -> nn.Sequential:
+def _make_target_pick_head(d_model: int, *, extra_dim: int = 0) -> nn.Sequential:
     return nn.Sequential(
-        nn.Linear(d_model + 3, d_model),
+        nn.Linear(d_model + 3 + int(extra_dim), d_model),
         nn.GELU(),
         nn.Linear(d_model, d_model // 2),
         nn.GELU(),
         nn.Linear(d_model // 2, 1),
+    )
+
+
+def _extract_future_forecast_inputs(
+    owner_idx: torch.Tensor,
+    features: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    planet_owner = owner_idx[:, 1 : 1 + MAX_PLANETS].to(torch.long).clamp(0, NUM_OWNER_SLOTS - 1)
+    planet_features = features[:, 1 : 1 + MAX_PLANETS, :]
+    garrison = (planet_features[..., 1].float() * 1000.0).clamp_min(0.0)
+    production = torch.expm1(planet_features[..., 0].float()).clamp_min(0.0)
+    incoming_net = planet_features[..., 8 : 8 + INCOMING_TA_BINS].float() * 1000.0
+    arrival_ships = incoming_net.abs()
+
+    multi_min = 8 + INCOMING_TA_BINS + INCOMING_SURVIVOR_FLAT
+    if int(planet_features.shape[-1]) >= multi_min:
+        survivor = planet_features[..., 8 + INCOMING_TA_BINS : multi_min].reshape(
+            planet_features.shape[0], MAX_PLANETS, INCOMING_TA_BINS, NUM_OWNER_SLOTS
+        )
+        arrival_owner = survivor.argmax(dim=-1).to(torch.long)
+        no_survivor = arrival_ships <= 0.5
+        arrival_owner = torch.where(no_survivor, torch.zeros_like(arrival_owner), arrival_owner)
+    else:
+        arrival_owner = torch.where(
+            incoming_net > 0.5,
+            torch.ones_like(incoming_net, dtype=torch.long),
+            torch.where(
+                incoming_net < -0.5,
+                torch.full_like(incoming_net, 2, dtype=torch.long),
+                torch.zeros_like(incoming_net, dtype=torch.long),
+            ),
+        )
+    return planet_owner, garrison, production, arrival_owner, arrival_ships
+
+
+def _simulate_future_planet_features(
+    current_owner: torch.Tensor,
+    current_garrison: torch.Tensor,
+    production: torch.Tensor,
+    arrival_owner: torch.Tensor,
+    arrival_ships: torch.Tensor,
+    *,
+    active_mask: Optional[torch.Tensor] = None,
+    launch_ships: Optional[torch.Tensor] = None,
+    launch_eta: Optional[torch.Tensor] = None,
+    launch_owner: int = 1,
+) -> torch.Tensor:
+    owner = current_owner.to(torch.long).clamp(0, NUM_OWNER_SLOTS - 1)
+    garrison = current_garrison.float().clamp_min(0.0)
+    prod = production.float().clamp_min(0.0)
+    arr_owner = arrival_owner.to(torch.long).clamp(0, NUM_OWNER_SLOTS - 1)
+    arr_ships = arrival_ships.float().clamp_min(0.0)
+    active = None if active_mask is None else active_mask.to(dtype=torch.bool, device=garrison.device)
+    extra = None if launch_ships is None else launch_ships.to(device=garrison.device, dtype=garrison.dtype).clamp_min(0.0)
+    eta = None if launch_eta is None else launch_eta.to(device=garrison.device, dtype=torch.long)
+
+    out: list[torch.Tensor] = []
+    launch_owner_t = torch.full_like(owner, int(launch_owner))
+    for t in range(INCOMING_TA_BINS):
+        owner_non_neutral = owner > 0
+        garrison = torch.where(owner_non_neutral, garrison + prod, garrison)
+
+        arr_owner_t = arr_owner[..., t]
+        arr_ships_t = arr_ships[..., t]
+        if extra is not None and eta is not None:
+            hit = eta == t
+            same = arr_owner_t == launch_owner_t
+            none = arr_owner_t == 0
+            oppose = hit & (~same) & (~none)
+            bigger = extra > arr_ships_t
+            equal = extra == arr_ships_t
+            arr_owner_t = torch.where(hit & none, launch_owner_t, arr_owner_t)
+            arr_ships_t = torch.where(hit & none, extra, arr_ships_t)
+            arr_ships_t = torch.where(hit & same, arr_ships_t + extra, arr_ships_t)
+            arr_owner_t = torch.where(oppose & bigger, launch_owner_t, arr_owner_t)
+            arr_ships_t = torch.where(oppose & bigger, extra - arr_ships_t, arr_ships_t)
+            arr_owner_t = torch.where(oppose & equal, torch.zeros_like(arr_owner_t), arr_owner_t)
+            arr_ships_t = torch.where(oppose & equal, torch.zeros_like(arr_ships_t), arr_ships_t)
+            arr_ships_t = torch.where(oppose & (~bigger) & (~equal), arr_ships_t - extra, arr_ships_t)
+
+        has_arrival = (arr_owner_t > 0) & (arr_ships_t > 0.5)
+        same_owner = arr_owner_t == owner
+        add_mask = has_arrival & same_owner
+        garrison = torch.where(add_mask, garrison + arr_ships_t, garrison)
+
+        fight_mask = has_arrival & (~same_owner)
+        rem = garrison - arr_ships_t
+        captured = fight_mask & (rem < 0.0)
+        neutralized = fight_mask & (rem == 0.0)
+        held = fight_mask & (rem > 0.0)
+        owner = torch.where(captured, arr_owner_t, owner)
+        owner = torch.where(neutralized, torch.zeros_like(owner), owner)
+        garrison = torch.where(captured, -rem, garrison)
+        garrison = torch.where(neutralized, torch.zeros_like(garrison), garrison)
+        garrison = torch.where(held, rem, garrison)
+
+        owner_oh = torch.nn.functional.one_hot(owner, NUM_OWNER_SLOTS).to(dtype=garrison.dtype)
+        tick_feat = torch.cat([owner_oh, (garrison / 1000.0).unsqueeze(-1)], dim=-1)
+        if active is not None:
+            tick_feat = torch.where(active.unsqueeze(-1), tick_feat, torch.zeros_like(tick_feat))
+        out.append(tick_feat)
+
+    return torch.cat(out, dim=-1)
+
+
+def build_future_planet_features(owner_idx: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+    current_owner, current_garrison, production, arrival_owner, arrival_ships = _extract_future_forecast_inputs(
+        owner_idx, features
+    )
+    active = features[:, 1 : 1 + MAX_PLANETS, 4] > 0.5
+    return _simulate_future_planet_features(
+        current_owner,
+        current_garrison,
+        production,
+        arrival_owner,
+        arrival_ships,
+        active_mask=active,
     )
 
 
@@ -191,6 +313,7 @@ class OrbitWarsPopulationTail(nn.Module):
         dropout: float = 0.0,
         value_head_count: int = 1,
         target_abort_enabled: bool = False,
+        future_feature_enabled: bool = False,
         halt_init_prob: Optional[float] = None,
         fraction_init_weights: Optional[Tuple[float, ...]] = None,
     ):
@@ -198,7 +321,8 @@ class OrbitWarsPopulationTail(nn.Module):
         self.block = TransformerBlock(d_model, n_heads, rope_dims=rope_dims, dropout=dropout)
         self.norm_f = nn.LayerNorm(d_model)
         self.origin_frac_head = nn.Linear(d_model, NUM_FRACTIONS)
-        self.target_pick_head = _make_target_pick_head(d_model)
+        extra_dim = 2 * FUTURE_PLANET_FEATURE_DIM if future_feature_enabled else 0
+        self.target_pick_head = _make_target_pick_head(d_model, extra_dim=extra_dim)
         self.target_abort_enabled = bool(target_abort_enabled)
         if self.target_abort_enabled:
             self.abort_head = nn.Linear(d_model, NUM_FRACTIONS)
@@ -364,6 +488,7 @@ class OrbitWarsPolicy(nn.Module):
         value_head_count: int = 1,
         disjoint_actor_critic: bool = False,
         target_abort_enabled: bool = False,
+        future_feature_enabled: bool = False,
         halt_init_prob: Optional[float] = None,
         fraction_init_weights: Optional[Tuple[float, ...]] = None,
     ):
@@ -386,6 +511,7 @@ class OrbitWarsPolicy(nn.Module):
         self.value_head_count = int(value_head_count)
         self.disjoint_actor_critic = bool(disjoint_actor_critic)
         self.target_abort_enabled = bool(target_abort_enabled)
+        self.future_feature_enabled = bool(future_feature_enabled)
         self.halt_init_prob = None if halt_init_prob is None else float(halt_init_prob)
         self.fraction_init_weights = (
             None if fraction_init_weights is None else _normalize_fraction_init_weights(tuple(fraction_init_weights))
@@ -397,6 +523,8 @@ class OrbitWarsPolicy(nn.Module):
         self.type_emb = nn.Embedding(NUM_ENTITY_TYPES, d_model)
         self.owner_emb = nn.Embedding(NUM_OWNER_SLOTS, d_model)
         self.feat_proj = nn.Linear(feature_dim, d_model)
+        if self.future_feature_enabled:
+            self.future_feat_proj = nn.Linear(FUTURE_PLANET_FEATURE_DIM, d_model, bias=False)
         self.cls_type_idx = ENTITY_CLS
 
         if self.population_size == 1:
@@ -405,7 +533,8 @@ class OrbitWarsPolicy(nn.Module):
             )
             self.norm_f = nn.LayerNorm(d_model)
             self.origin_frac_head = nn.Linear(d_model, NUM_FRACTIONS)
-            self.target_pick_head = _make_target_pick_head(d_model)
+            extra_dim = 2 * FUTURE_PLANET_FEATURE_DIM if self.future_feature_enabled else 0
+            self.target_pick_head = _make_target_pick_head(d_model, extra_dim=extra_dim)
             if self.target_abort_enabled:
                 self.abort_head = nn.Linear(d_model, NUM_FRACTIONS)
             self.time_proj = nn.Linear(1, 32)
@@ -439,6 +568,7 @@ class OrbitWarsPolicy(nn.Module):
                         dropout=dropout,
                         value_head_count=self.value_head_count,
                         target_abort_enabled=self.target_abort_enabled,
+                        future_feature_enabled=self.future_feature_enabled,
                         halt_init_prob=self.halt_init_prob,
                         fraction_init_weights=self.fraction_init_weights,
                     )
@@ -476,10 +606,31 @@ class OrbitWarsPolicy(nn.Module):
     def critic_parameters(self) -> list[nn.Parameter]:
         return [param for _, param in self.critic_named_parameters()]
 
-    def embed(self, entity_type: torch.Tensor, owner_idx: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
+    def embed(
+        self,
+        entity_type: torch.Tensor,
+        owner_idx: torch.Tensor,
+        features: torch.Tensor,
+        future_planet_features: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         t_ok = entity_type.clamp(0, NUM_ENTITY_TYPES - 1)
         o_ok = owner_idx.clamp(0, NUM_OWNER_SLOTS - 1)
-        return self.type_emb(t_ok) + self.owner_emb(o_ok) + self.feat_proj(features)
+        x = self.type_emb(t_ok) + self.owner_emb(o_ok) + self.feat_proj(features)
+        if self.future_feature_enabled:
+            if future_planet_features is None:
+                future_planet_features = build_future_planet_features(owner_idx, features)
+            future_tokens = torch.zeros(
+                features.shape[0],
+                features.shape[1],
+                FUTURE_PLANET_FEATURE_DIM,
+                dtype=features.dtype,
+                device=features.device,
+            )
+            future_tokens[:, 1 : 1 + MAX_PLANETS, :] = future_planet_features.to(
+                device=features.device, dtype=features.dtype
+            )
+            x = x + self.future_feat_proj(future_tokens)
+        return x
 
     def _run_block(
         self,
@@ -664,6 +815,50 @@ class OrbitWarsPolicy(nn.Module):
     def _fp32_head_input(self, t: torch.Tensor) -> torch.Tensor:
         return t.float() if t.is_floating_point() else t
 
+    def _target_future_context(
+        self,
+        owner_idx: torch.Tensor,
+        features: torch.Tensor,
+        origin_idx: torch.Tensor,
+        fleet_size: torch.Tensor,
+        target_eta: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        current_owner, current_garrison, production, arrival_owner, arrival_ships = _extract_future_forecast_inputs(
+            owner_idx, features
+        )
+        active = features[:, 1 : 1 + MAX_PLANETS, 4] > 0.5
+        batch_idx = torch.arange(origin_idx.shape[0], device=features.device)
+        origin_long = origin_idx.to(device=features.device, dtype=torch.long)
+        fleet = fleet_size.to(device=features.device, dtype=torch.float32).clamp_min(0.0)
+
+        origin_owner = current_owner[batch_idx, origin_long].unsqueeze(1)
+        origin_garrison = (current_garrison[batch_idx, origin_long] - fleet).clamp_min(0.0).unsqueeze(1)
+        origin_prod = production[batch_idx, origin_long].unsqueeze(1)
+        origin_arr_owner = arrival_owner[batch_idx, origin_long].unsqueeze(1)
+        origin_arr_ships = arrival_ships[batch_idx, origin_long].unsqueeze(1)
+        origin_active = active[batch_idx, origin_long].unsqueeze(1)
+        origin_future = _simulate_future_planet_features(
+            origin_owner,
+            origin_garrison,
+            origin_prod,
+            origin_arr_owner,
+            origin_arr_ships,
+            active_mask=origin_active,
+        ).expand(-1, MAX_PLANETS, -1)
+
+        target_future = _simulate_future_planet_features(
+            current_owner,
+            current_garrison,
+            production,
+            arrival_owner,
+            arrival_ships,
+            active_mask=active,
+            launch_ships=fleet.unsqueeze(1),
+            launch_eta=target_eta.to(device=features.device, dtype=torch.long),
+            launch_owner=1,
+        )
+        return origin_future, target_future
+
     def _apply_encoder_sorted_population(
         self,
         x: torch.Tensor,
@@ -811,7 +1006,22 @@ class OrbitWarsPolicy(nn.Module):
             eta_feat = (target_eta.to(device=planet_hidden.device, dtype=planet_hidden.dtype) / 500.0).unsqueeze(-1)
             target_ships_t = target_ships.to(device=planet_hidden.device, dtype=planet_hidden.dtype)
             is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
-            target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
+            target_parts = [planet_hidden, fleet_feat, eta_feat, is_bigger]
+            if self.future_feature_enabled:
+                origin_future, target_future = self._target_future_context(
+                    owner_idx,
+                    features,
+                    origin_idx,
+                    fleet_size,
+                    target_eta,
+                )
+                target_parts.extend(
+                    [
+                        origin_future.to(device=planet_hidden.device, dtype=planet_hidden.dtype),
+                        target_future.to(device=planet_hidden.device, dtype=planet_hidden.dtype),
+                    ]
+                )
+            target_in = torch.cat(target_parts, dim=-1)
             target_logits = target_pick_head(target_in).squeeze(-1)
             out["target_logits"] = target_logits
             if self.target_abort_enabled and "abort_logits" in out:
@@ -1167,7 +1377,8 @@ class OrbitWarsPolicy(nn.Module):
         """
 
         b, l, _ = features.shape
-        x_dense = self.embed(entity_type, owner_idx, features)  # [B, L, d]
+        future_planet_features = build_future_planet_features(owner_idx, features) if self.future_feature_enabled else None
+        x_dense = self.embed(entity_type, owner_idx, features, future_planet_features)  # [B, L, d]
 
         # Stable sort (active first, original order preserved) — 0 for
         # active, 1 for inactive ⇒ stable argsort puts active before
@@ -1252,7 +1463,8 @@ class OrbitWarsPolicy(nn.Module):
     ) -> Dict[str, Any]:
         """Fixed-length dense path shared by rollout and PPO."""
 
-        x = self.embed(entity_type, owner_idx, features)
+        future_planet_features = build_future_planet_features(owner_idx, features) if self.future_feature_enabled else None
+        x = self.embed(entity_type, owner_idx, features, future_planet_features)
         padding_mask = ~entity_mask
 
         h, pop = self._apply_encoder(x, rope_pos, padding_mask, population_idx)
@@ -1327,7 +1539,8 @@ class OrbitWarsPolicy(nn.Module):
     ) -> Dict[str, Any]:
         """Fixed-length rollout forward path for contiguous per-member batch chunks."""
 
-        x = self.embed(entity_type, owner_idx, features)
+        future_planet_features = build_future_planet_features(owner_idx, features) if self.future_feature_enabled else None
+        x = self.embed(entity_type, owner_idx, features, future_planet_features)
         padding_mask = ~entity_mask
         h = self._apply_encoder_grouped_population(x, rope_pos, padding_mask)
         value_h = self._apply_critic_encoder_grouped_population(x, rope_pos, padding_mask) if self.disjoint_actor_critic else h
@@ -1423,7 +1636,10 @@ class OrbitWarsPolicy(nn.Module):
             else origin_frac_blocked.to(device=token_meta.device, dtype=torch.bool),
         )
         obs = decode_observation(comp, feature_dim=int(feature_dim))
-        x = self.embed(obs["entity_type"], obs["owner_idx"], obs["features"])
+        future_planet_features = (
+            build_future_planet_features(obs["owner_idx"], obs["features"]) if self.future_feature_enabled else None
+        )
+        x = self.embed(obs["entity_type"], obs["owner_idx"], obs["features"], future_planet_features)
         padding_mask = ~obs["entity_mask"]
         h = self._apply_encoder_grouped_population(x, obs["rope_pos"], padding_mask)
         value_h = self._apply_critic_encoder_grouped_population(x, obs["rope_pos"], padding_mask) if self.disjoint_actor_critic else h
@@ -1453,7 +1669,8 @@ class OrbitWarsPolicy(nn.Module):
         """Packed forward assuming rows are already contiguous by population member."""
 
         b, l, _ = features.shape
-        x_dense = self.embed(entity_type, owner_idx, features)
+        future_planet_features = build_future_planet_features(owner_idx, features) if self.future_feature_enabled else None
+        x_dense = self.embed(entity_type, owner_idx, features, future_planet_features)
         counts = entity_mask.sum(dim=-1).to(torch.int64)
         L_packed = int(counts.max().item())
         sort_keys = (~entity_mask).to(torch.int32)
@@ -1511,7 +1728,8 @@ class OrbitWarsPolicy(nn.Module):
         """PPO-specific sorted forward that computes all private outputs in one member loop."""
 
         b, l, _ = features.shape
-        x_dense = self.embed(entity_type, owner_idx, features)
+        future_planet_features = build_future_planet_features(owner_idx, features) if self.future_feature_enabled else None
+        x_dense = self.embed(entity_type, owner_idx, features, future_planet_features)
         counts = entity_mask.sum(dim=-1).to(torch.int64)
         L_packed = int(counts.max().item())
         sort_keys = (~entity_mask).to(torch.int32)
@@ -1589,6 +1807,8 @@ class OrbitWarsPolicy(nn.Module):
     def target_logits_for_origin_fraction(
         self,
         planet_hidden: torch.Tensor,
+        owner_idx: torch.Tensor,
+        features: torch.Tensor,
         origin_idx: torch.Tensor,
         frac_idx: torch.Tensor,
         fleet_size: Optional[torch.Tensor] = None,
@@ -1624,7 +1844,24 @@ class OrbitWarsPolicy(nn.Module):
             else:
                 target_ships_t = target_ships.to(device=device, dtype=planet_hidden.dtype)
                 is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
-            target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
+            target_parts = [planet_hidden, fleet_feat, eta_feat, is_bigger]
+            if self.future_feature_enabled:
+                if target_eta is None or fleet_size is None:
+                    raise ValueError("future_feature_enabled target head requires fleet_size and target_eta")
+                origin_future, target_future = self._target_future_context(
+                    owner_idx,
+                    features,
+                    origin_idx,
+                    fleet_size,
+                    target_eta,
+                )
+                target_parts.extend(
+                    [
+                        origin_future.to(device=device, dtype=planet_hidden.dtype),
+                        target_future.to(device=device, dtype=planet_hidden.dtype),
+                    ]
+                )
+            target_in = torch.cat(target_parts, dim=-1)
             if self.population_size == 1:
                 return self.target_pick_head(target_in).squeeze(-1)
 
@@ -1643,6 +1880,8 @@ class OrbitWarsPolicy(nn.Module):
     def target_logits_for_origin_fraction_grouped_population(
         self,
         planet_hidden: torch.Tensor,
+        owner_idx: torch.Tensor,
+        features: torch.Tensor,
         origin_idx: torch.Tensor,
         frac_idx: torch.Tensor,
         fleet_size: Optional[torch.Tensor] = None,
@@ -1672,7 +1911,24 @@ class OrbitWarsPolicy(nn.Module):
             else:
                 target_ships_t = target_ships.to(device=device, dtype=planet_hidden.dtype)
                 is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
-            target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
+            target_parts = [planet_hidden, fleet_feat, eta_feat, is_bigger]
+            if self.future_feature_enabled:
+                if target_eta is None or fleet_size is None:
+                    raise ValueError("future_feature_enabled target head requires fleet_size and target_eta")
+                origin_future, target_future = self._target_future_context(
+                    owner_idx,
+                    features,
+                    origin_idx,
+                    fleet_size,
+                    target_eta,
+                )
+                target_parts.extend(
+                    [
+                        origin_future.to(device=device, dtype=planet_hidden.dtype),
+                        target_future.to(device=device, dtype=planet_hidden.dtype),
+                    ]
+                )
+            target_in = torch.cat(target_parts, dim=-1)
             if self.population_size == 1:
                 return self.target_pick_head(target_in).squeeze(-1)
 
@@ -1686,6 +1942,8 @@ class OrbitWarsPolicy(nn.Module):
     def target_logits_for_origin_fraction_sorted_population(
         self,
         planet_hidden: torch.Tensor,
+        owner_idx: torch.Tensor,
+        features: torch.Tensor,
         origin_idx: torch.Tensor,
         frac_idx: torch.Tensor,
         population_idx: torch.Tensor,
@@ -1716,7 +1974,24 @@ class OrbitWarsPolicy(nn.Module):
             else:
                 target_ships_t = target_ships.to(device=device, dtype=planet_hidden.dtype)
                 is_bigger = (fleet_scalar > target_ships_t.unsqueeze(-1)).to(dtype=planet_hidden.dtype)
-            target_in = torch.cat([planet_hidden, fleet_feat, eta_feat, is_bigger], dim=-1)
+            target_parts = [planet_hidden, fleet_feat, eta_feat, is_bigger]
+            if self.future_feature_enabled:
+                if target_eta is None or fleet_size is None:
+                    raise ValueError("future_feature_enabled target head requires fleet_size and target_eta")
+                origin_future, target_future = self._target_future_context(
+                    owner_idx,
+                    features,
+                    origin_idx,
+                    fleet_size,
+                    target_eta,
+                )
+                target_parts.extend(
+                    [
+                        origin_future.to(device=device, dtype=planet_hidden.dtype),
+                        target_future.to(device=device, dtype=planet_hidden.dtype),
+                    ]
+                )
+            target_in = torch.cat(target_parts, dim=-1)
             if self.population_size == 1:
                 return self.target_pick_head(target_in).squeeze(-1)
 
