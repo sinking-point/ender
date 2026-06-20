@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from orbit_wars_pt.batched_env import stack_initial_states
+from orbit_wars_pt.constants import obs_feature_dim_for_num_agents
 from orbit_wars_pt.env_wrapper import OrbitWarsEnvConfig
 from orbit_wars_pt.parallel_rollout import RolloutCarry, collect_parallel_micro_rollouts
 from orbit_wars_pt.train_ppo import OrbitWarsPolicy
@@ -17,6 +18,7 @@ from orbit_wars_pt.train_ppo import OrbitWarsPolicy
 class TestRolloutCarryShapeRepair(unittest.TestCase):
     def test_stale_player_done_is_rebuilt_from_resized_controller_assignments(self) -> None:
         cfg = OrbitWarsEnvConfig(num_agents=2, max_fleets=32, episode_seed=7)
+        feature_dim = obs_feature_dim_for_num_agents(int(cfg.num_agents), target_abort_enabled=False)
         stale_envs = 3
         target_envs = 5
         state_b, _ = stack_initial_states(cfg, num_envs=target_envs, seed_base=11)
@@ -44,7 +46,7 @@ class TestRolloutCarryShapeRepair(unittest.TestCase):
             n_heads=4,
             n_layers=1,
             activation_checkpointing=False,
-            feature_dim=61,
+            feature_dim=feature_dim,
             population_size=1,
             rope_dims=2,
             target_abort_enabled=False,
@@ -74,6 +76,7 @@ class TestRolloutCarryShapeRepair(unittest.TestCase):
 
     def test_stale_state_batch_is_dropped_when_num_envs_changes(self) -> None:
         cfg = OrbitWarsEnvConfig(num_agents=2, max_fleets=32, episode_seed=7)
+        feature_dim = obs_feature_dim_for_num_agents(int(cfg.num_agents), target_abort_enabled=False)
         stale_envs = 3
         target_envs = 5
         stale_state_b, _ = stack_initial_states(cfg, num_envs=stale_envs, seed_base=11)
@@ -94,7 +97,7 @@ class TestRolloutCarryShapeRepair(unittest.TestCase):
             n_heads=4,
             n_layers=1,
             activation_checkpointing=False,
-            feature_dim=61,
+            feature_dim=feature_dim,
             population_size=1,
             rope_dims=2,
             target_abort_enabled=False,

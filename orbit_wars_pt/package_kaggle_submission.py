@@ -240,12 +240,16 @@ def package_submission(
     target_method: str | None = None,
     interval_geometry: str | None = None,
     model_search_steps: int | None = None,
+    model_search_mode: str | None = None,
     model_search_adaptive_horizon: bool | None = None,
     model_search_adaptive_horizon_offset: int | None = None,
     model_search_min_overage_s: float | None = None,
     model_search_gamma: float | None = None,
     model_search_launch_prob_threshold: float | None = None,
     model_search_greedy_launch_threshold: float | None = None,
+    model_search_branch_prob_threshold: float | None = None,
+    model_search_max_branching: int | None = None,
+    model_search_branch_after_first_env_step: bool | None = None,
     population_member: int | None = None,
     population_member_4p: int | None = None,
     population_member_2p: int | None = None,
@@ -332,6 +336,8 @@ def package_submission(
         submission_env["ORBIT_WARS_INTERVAL_GEOMETRY"] = str(interval_geometry)
     if model_search_steps is not None:
         submission_env["ORBIT_WARS_MODEL_SEARCH_STEPS"] = str(max(0, int(model_search_steps)))
+    if model_search_mode is not None:
+        submission_env["ORBIT_WARS_MODEL_SEARCH_MODE"] = str(model_search_mode)
     if model_search_adaptive_horizon is not None:
         submission_env["ORBIT_WARS_MODEL_SEARCH_ADAPTIVE_HORIZON"] = (
             "1" if bool(model_search_adaptive_horizon) else "0"
@@ -353,6 +359,16 @@ def package_submission(
     if model_search_greedy_launch_threshold is not None:
         submission_env["ORBIT_WARS_MODEL_SEARCH_GREEDY_LAUNCH_THRESHOLD"] = str(
             float(model_search_greedy_launch_threshold)
+        )
+    if model_search_branch_prob_threshold is not None:
+        submission_env["ORBIT_WARS_MODEL_SEARCH_BRANCH_PROB_THRESHOLD"] = str(
+            float(model_search_branch_prob_threshold)
+        )
+    if model_search_max_branching is not None:
+        submission_env["ORBIT_WARS_MODEL_SEARCH_MAX_BRANCHING"] = str(max(1, int(model_search_max_branching)))
+    if model_search_branch_after_first_env_step is not None:
+        submission_env["ORBIT_WARS_MODEL_SEARCH_BRANCH_AFTER_FIRST_ENV_STEP"] = (
+            "1" if bool(model_search_branch_after_first_env_step) else "0"
         )
 
     _write_main_py(
@@ -393,6 +409,7 @@ def package_submission(
         Model search gamma: {model_search_gamma if model_search_gamma is not None else 'checkpoint/default'}
         Model search launch probability threshold: {model_search_launch_prob_threshold if model_search_launch_prob_threshold is not None else 'env default'}
         Model search greedy launch threshold: {model_search_greedy_launch_threshold if model_search_greedy_launch_threshold is not None else 'env default'}
+        Model search branch after first env step: {model_search_branch_after_first_env_step if model_search_branch_after_first_env_step is not None else 'env default'}
 
         Policy selection: 4-player matches use checkpoint_4p.pt; 2-player matches
         use checkpoint_2p.pt. The first observation selects the mode for the full
@@ -611,6 +628,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--model-search-mode",
+        choices=("binary", "ego_bfs"),
+        default=None,
+        help=(
+            "Bake ORBIT_WARS_MODEL_SEARCH_MODE into main.py. "
+            "`binary` keeps the existing halt-vs-launch search; `ego_bfs` enables the breadth-first ego-only tree search."
+        ),
+    )
+    parser.add_argument(
         "--model-search-adaptive-horizon",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -662,6 +688,33 @@ def main() -> None:
         help=(
             "Bake ORBIT_WARS_MODEL_SEARCH_GREEDY_LAUNCH_THRESHOLD into main.py. "
             "Applies only inside greedy search continuations; for example 0.8 requires at least 80%% launch probability."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-branch-prob-threshold",
+        type=float,
+        default=None,
+        help=(
+            "Bake ORBIT_WARS_MODEL_SEARCH_BRANCH_PROB_THRESHOLD into main.py. "
+            "In ego_bfs mode, branch on ego choices whose probability is at least this threshold."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-max-branching",
+        type=int,
+        default=None,
+        help=(
+            "Bake ORBIT_WARS_MODEL_SEARCH_MAX_BRANCHING into main.py. "
+            "In ego_bfs mode, cap origin/fraction and target branching at this many choices per node."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-branch-after-first-env-step",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Bake ORBIT_WARS_MODEL_SEARCH_BRANCH_AFTER_FIRST_ENV_STEP into main.py. "
+            "Disable to branch only during the current turn and go greedy after the first simulated env step."
         ),
     )
     parser.add_argument(
@@ -719,6 +772,10 @@ def main() -> None:
         0.0 <= float(args.model_search_launch_prob_threshold) <= 1.0
     ):
         raise SystemExit("--model-search-launch-prob-threshold must be between 0 and 1")
+    if args.model_search_branch_prob_threshold is not None and not (
+        0.0 <= float(args.model_search_branch_prob_threshold) <= 1.0
+    ):
+        raise SystemExit("--model-search-branch-prob-threshold must be between 0 and 1")
 
     result = package_submission(
         checkpoint_4p,
@@ -761,6 +818,7 @@ def main() -> None:
         target_method=args.target_method,
         interval_geometry=args.interval_geometry,
         model_search_steps=args.model_search_steps,
+        model_search_mode=args.model_search_mode,
         model_search_adaptive_horizon=(
             None
             if args.model_search_adaptive_horizon is None
@@ -771,6 +829,9 @@ def main() -> None:
         model_search_gamma=args.model_search_gamma,
         model_search_launch_prob_threshold=args.model_search_launch_prob_threshold,
         model_search_greedy_launch_threshold=args.model_search_greedy_launch_threshold,
+        model_search_branch_prob_threshold=args.model_search_branch_prob_threshold,
+        model_search_max_branching=args.model_search_max_branching,
+        model_search_branch_after_first_env_step=args.model_search_branch_after_first_env_step,
         population_member=args.member,
         population_member_4p=args.member if args.member_4p is None else args.member_4p,
         population_member_2p=args.member if args.member_2p is None else args.member_2p,

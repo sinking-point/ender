@@ -314,6 +314,39 @@ def main() -> None:
         help="Optional search rollout discount override. Default: checkpoint gamma.",
     )
     parser.add_argument(
+        "--model-search-mode",
+        choices=("binary", "ego_bfs"),
+        default=None,
+        help=(
+            "Search mode for all seats. "
+            "`binary` keeps the old halt-vs-launch search; `ego_bfs` enables the breadth-first ego-only search."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-mode-p0",
+        choices=("binary", "ego_bfs"),
+        default=None,
+        help="Search mode for player 0. Default: same as --model-search-mode.",
+    )
+    parser.add_argument(
+        "--model-search-mode-p1",
+        choices=("binary", "ego_bfs"),
+        default=None,
+        help="Search mode for player 1. Default: same as --model-search-mode.",
+    )
+    parser.add_argument(
+        "--model-search-mode-p2",
+        choices=("binary", "ego_bfs"),
+        default=None,
+        help="Search mode for player 2 in 4-player mode. Default: same as --model-search-mode.",
+    )
+    parser.add_argument(
+        "--model-search-mode-p3",
+        choices=("binary", "ego_bfs"),
+        default=None,
+        help="Search mode for player 3 in 4-player mode. Default: same as --model-search-mode.",
+    )
+    parser.add_argument(
         "--model-search-launch-prob-threshold",
         type=float,
         default=None,
@@ -329,6 +362,33 @@ def main() -> None:
         help=(
             "Greedy launch threshold inside search continuations. "
             "Default: env ORBIT_WARS_MODEL_SEARCH_GREEDY_LAUNCH_THRESHOLD when set, otherwise disabled."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-branch-prob-threshold",
+        type=float,
+        default=None,
+        help=(
+            "In ego_bfs mode, branch on ego choices whose probability is at least this threshold. "
+            "Default: 0.2 unless overridden in the environment."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-max-branching",
+        type=int,
+        default=None,
+        help=(
+            "In ego_bfs mode, cap origin/fraction and target branching at this many choices per node. "
+            "Default: 4 unless overridden in the environment."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-branch-after-first-env-step",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "In ego_bfs mode, allow branching after the first simulated env step. "
+            "Disable to branch only in the current turn and go greedy after that."
         ),
     )
     parser.add_argument(
@@ -467,6 +527,12 @@ def main() -> None:
         0.0 <= float(args.model_search_launch_prob_threshold) <= 1.0
     ):
         raise SystemExit("--model-search-launch-prob-threshold must be between 0 and 1")
+    if args.model_search_branch_prob_threshold is not None and not (
+        0.0 <= float(args.model_search_branch_prob_threshold) <= 1.0
+    ):
+        raise SystemExit("--model-search-branch-prob-threshold must be between 0 and 1")
+    if args.model_search_max_branching is not None and int(args.model_search_max_branching) <= 0:
+        raise SystemExit("--model-search-max-branching must be positive")
 
     if args.cpu_threads > 0:
         for name in CPU_THREAD_ENV_VARS:
@@ -698,6 +764,16 @@ def main() -> None:
         model_search_steps_p2,
         model_search_steps_p3,
     ]
+    model_search_mode_p0 = args.model_search_mode if args.model_search_mode_p0 is None else args.model_search_mode_p0
+    model_search_mode_p1 = args.model_search_mode if args.model_search_mode_p1 is None else args.model_search_mode_p1
+    model_search_mode_p2 = args.model_search_mode if args.model_search_mode_p2 is None else args.model_search_mode_p2
+    model_search_mode_p3 = args.model_search_mode if args.model_search_mode_p3 is None else args.model_search_mode_p3
+    model_search_mode_by_seat = [
+        model_search_mode_p0,
+        model_search_mode_p1,
+        model_search_mode_p2,
+        model_search_mode_p3,
+    ]
     model_search_adaptive_horizon_p0 = (
         args.model_search_adaptive_horizon
         if args.model_search_adaptive_horizon_p0 is None
@@ -790,12 +866,15 @@ def main() -> None:
         search_summary = ", ".join(
             (
                 (
-                    f"p{seat}=adaptive+{int(model_search_adaptive_horizon_offset_by_seat[seat])}"
-                    if int(model_search_steps_by_seat[seat]) <= 0
-                    else f"p{seat}=adaptive+{int(model_search_adaptive_horizon_offset_by_seat[seat])}≤{int(model_search_steps_by_seat[seat])}"
+                    f"p{seat}:{model_search_mode_by_seat[seat]}="
+                    + (
+                        f"adaptive+{int(model_search_adaptive_horizon_offset_by_seat[seat])}"
+                        if int(model_search_steps_by_seat[seat]) <= 0
+                        else f"adaptive+{int(model_search_adaptive_horizon_offset_by_seat[seat])}≤{int(model_search_steps_by_seat[seat])}"
+                    )
                 )
                 if bool(model_search_adaptive_horizon_by_seat[seat])
-                else f"p{seat}={int(model_search_steps_by_seat[seat])}"
+                else f"p{seat}:{model_search_mode_by_seat[seat]}={int(model_search_steps_by_seat[seat])}"
             )
             for seat in range(int(args.num_agents))
             if search_enabled_by_seat[seat]
@@ -811,9 +890,19 @@ def main() -> None:
             if args.model_search_greedy_launch_threshold is None
             else f" greedy_launch≥{float(args.model_search_greedy_launch_threshold):g}"
         )
+        branch_prob_suffix = (
+            ""
+            if args.model_search_branch_prob_threshold is None
+            else f" branch_prob≥{float(args.model_search_branch_prob_threshold):g}"
+        )
+        branching_suffix = (
+            ""
+            if args.model_search_max_branching is None
+            else f" max_branch={int(args.model_search_max_branching)}"
+        )
         print(
             f"[orbit_wars_pt] per-seat model search: {search_summary}{gamma_suffix}"
-            f"{launch_prob_suffix}{greedy_launch_suffix}",
+            f"{launch_prob_suffix}{greedy_launch_suffix}{branch_prob_suffix}{branching_suffix}",
             flush=True,
         )
 
@@ -835,10 +924,14 @@ def main() -> None:
             seed=int(args.agent_seed) + seat + (1000 if policy_key != "policy" else 0),
             raycast_rays=(None if args.raycast_rays is None else int(args.raycast_rays)),
             model_search_steps=int(model_search_steps_by_seat[seat]),
+            model_search_mode=model_search_mode_by_seat[seat],
             model_search_gamma=args.model_search_gamma,
             model_search_adaptive_horizon=bool(model_search_adaptive_horizon_by_seat[seat]),
             model_search_adaptive_horizon_offset=int(model_search_adaptive_horizon_offset_by_seat[seat]),
             model_search_launch_prob_threshold=args.model_search_launch_prob_threshold,
+            model_search_branch_prob_threshold=args.model_search_branch_prob_threshold,
+            model_search_max_branching=args.model_search_max_branching,
+            model_search_branch_after_first_env_step=args.model_search_branch_after_first_env_step,
         )
         run_agent = seat_agent
         if args.swap_player_view:
