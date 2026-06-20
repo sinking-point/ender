@@ -8,9 +8,12 @@ This script never runs games.  It reconstructs pairwise match batches by
 differencing ``league_state`` between consecutive checkpoint saves, then fits
 Bradley-Terry strengths (reported as Elo with anchor 1500).
 
-Assumes every ``iter_XXXXXXXX.pt`` in the experiment checkpoint directory is
-present and evenly spaced in training iteration (``checkpoint_every``).  Game
-counts per interval still vary because league-opponent selection is stochastic.
+Assumes every saved main-training checkpoint ``iter_XXXXXXXX.pt`` in the
+experiment checkpoint directory is present and evenly spaced in training
+iteration (``checkpoint_every``). Imported league opponents may have arbitrary
+``.pt`` filenames; those are read from ``league_state`` metadata rather than
+from directory scans. Game counts per interval still vary because
+league-opponent selection is stochastic.
 
 Usage::
 
@@ -96,16 +99,17 @@ def _deserialize_league_state(obj: Any) -> dict[str, LeagueOpponentRecord]:
 
 @dataclass(frozen=True)
 class MatchBatch:
-    """Games where main at ``main_iter`` played opponent at ``opponent_iter``."""
+    """Games where main at one checkpoint played one league opponent."""
 
-    main_iter: int
-    opponent_iter: int
+    main_id: str
+    opponent_id: str
     main_wins: int
     games: int
 
 
 @dataclass(frozen=True)
 class PlayerRating:
+    player_id: str
     iteration: int
     checkpoint_name: str
     elo: float
@@ -159,23 +163,24 @@ def _verify_even_spacing(paths: list[Path]) -> int:
     return int(expected)
 
 
-def _extract_match_batches(paths: list[Path]) -> tuple[list[MatchBatch], dict[int, str]]:
+def _extract_match_batches(paths: list[Path]) -> tuple[list[MatchBatch], dict[str, tuple[int, str]]]:
     """Diff consecutive league_state snapshots to recover main-vs-opponent games."""
     batches: list[MatchBatch] = []
-    iter_to_name: dict[int, str] = {}
+    player_meta: dict[str, tuple[int, str]] = {}
 
-    prev_iter: Optional[int] = None
     prev_opponents: Optional[dict[str, LeagueOpponentRecord]] = None
 
     for path in paths:
         iteration, opponents, _ = _load_checkpoint(path)
-        iter_to_name[iteration] = path.name
-        if prev_iter is None or prev_opponents is None or opponents is None:
-            prev_iter = iteration
+        main_id = path.name
+        player_meta[main_id] = (int(iteration), path.name)
+        if prev_opponents is None or opponents is None:
             prev_opponents = opponents
             continue
 
         for key, rec in opponents.items():
+            opponent_id = str(key)
+            player_meta.setdefault(opponent_id, (int(rec.checkpoint_iteration), str(rec.checkpoint_name)))
             prev = prev_opponents.get(key)
             if prev is None:
                 continue
@@ -186,27 +191,26 @@ def _extract_match_batches(paths: list[Path]) -> tuple[list[MatchBatch], dict[in
             delta_wins = max(0, min(delta_wins, delta_games))
             batches.append(
                 MatchBatch(
-                    main_iter=int(iteration),
-                    opponent_iter=int(rec.checkpoint_iteration),
+                    main_id=main_id,
+                    opponent_id=opponent_id,
                     main_wins=int(delta_wins),
                     games=int(delta_games),
                 )
             )
 
-        prev_iter = iteration
         prev_opponents = opponents
 
-    return batches, iter_to_name
+    return batches, player_meta
 
 
 def _final_snapshot_stats(
     paths: list[Path],
-) -> tuple[dict[int, LeagueOpponentRecord], int, Mapping[str, Any]]:
+) -> tuple[dict[str, LeagueOpponentRecord], str, int, Mapping[str, Any]]:
     iteration, opponents, training_args = _load_checkpoint(paths[-1])
     if opponents is None:
         raise SystemExit("final checkpoint has no league_state opponents; is league enabled?")
-    by_iter = {int(rec.checkpoint_iteration): rec for rec in opponents.values()}
-    return by_iter, iteration, training_args
+    by_id = {str(key): rec for key, rec in opponents.items()}
+    return by_id, paths[-1].name, iteration, training_args
 
 
 def _winrate_to_elo_delta(winrate: float) -> float:
@@ -220,9 +224,9 @@ def _fit_bradley_terry(
     *,
     max_iter: int = 500,
     tol: float = 1e-8,
-) -> dict[int, float]:
-    """Return log-strength for each checkpoint iteration."""
-    players = sorted({b.main_iter for b in batches} | {b.opponent_iter for b in batches})
+) -> dict[str, float]:
+    """Return log-strength for each checkpoint/player id."""
+    players = sorted({b.main_id for b in batches} | {b.opponent_id for b in batches})
     if not players:
         return {}
 
@@ -232,8 +236,8 @@ def _fit_bradley_terry(
     n_ij = np.zeros((n, n), dtype=np.float64)
 
     for batch in batches:
-        i = index[batch.main_iter]
-        j = index[batch.opponent_iter]
+        i = index[batch.main_id]
+        j = index[batch.opponent_id]
         wins[i] += float(batch.main_wins)
         wins[j] += float(batch.games - batch.main_wins)
         n_ij[i, j] += float(batch.games)
@@ -261,41 +265,41 @@ def _fit_bradley_terry(
     return {players[i]: float(math.log(pi[i])) for i in range(n)}
 
 
-def _bt_to_elo(strengths: dict[int, float], *, anchor_iter: Optional[int]) -> dict[int, float]:
+def _bt_to_elo(strengths: dict[str, float], *, anchor_id: Optional[str]) -> dict[str, float]:
     if not strengths:
         return {}
-    if anchor_iter is not None and anchor_iter in strengths:
-        anchor_strength = strengths[anchor_iter]
+    if anchor_id is not None and anchor_id in strengths:
+        anchor_strength = strengths[anchor_id]
     else:
-        anchor_strength = strengths[max(strengths)]
-    out: dict[int, float] = {}
-    for iteration, strength in strengths.items():
+        anchor_strength = strengths[sorted(strengths)[-1]]
+    out: dict[str, float] = {}
+    for player_id, strength in strengths.items():
         # Elo difference ~= (s_i - s_j) * 400 / ln(10) when using 10-base logistic.
-        out[iteration] = 1500.0 + (strength - anchor_strength) * (400.0 / math.log(10.0))
+        out[player_id] = 1500.0 + (strength - anchor_strength) * (400.0 / math.log(10.0))
     return out
 
 
 def _build_ratings(
     batches: list[MatchBatch],
-    iter_to_name: dict[int, str],
-    final_by_iter: dict[int, LeagueOpponentRecord],
-    final_main_iter: int,
+    player_meta: dict[str, tuple[int, str]],
+    final_by_id: dict[str, LeagueOpponentRecord],
     *,
-    anchor_iter: Optional[int],
+    anchor_id: Optional[str],
 ) -> list[PlayerRating]:
     strengths = _fit_bradley_terry(batches)
-    elos = _bt_to_elo(strengths, anchor_iter=anchor_iter)
+    elos = _bt_to_elo(strengths, anchor_id=anchor_id)
 
-    games_as_main = {it: 0 for it in iter_to_name}
-    games_as_opponent = {it: 0 for it in iter_to_name}
+    games_as_main = {player_id: 0 for player_id in player_meta}
+    games_as_opponent = {player_id: 0 for player_id in player_meta}
     for batch in batches:
-        games_as_main[batch.main_iter] = games_as_main.get(batch.main_iter, 0) + batch.games
-        games_as_opponent[batch.opponent_iter] = games_as_opponent.get(batch.opponent_iter, 0) + batch.games
+        games_as_main[batch.main_id] = games_as_main.get(batch.main_id, 0) + batch.games
+        games_as_opponent[batch.opponent_id] = games_as_opponent.get(batch.opponent_id, 0) + batch.games
 
-    all_iters = sorted(set(iter_to_name) | set(final_by_iter) | set(strengths))
+    all_ids = sorted(set(player_meta) | set(final_by_id) | set(strengths))
     ratings: list[PlayerRating] = []
-    for iteration in all_iters:
-        rec = final_by_iter.get(iteration)
+    for player_id in all_ids:
+        iteration, checkpoint_name = player_meta.get(player_id, (-1, str(player_id)))
+        rec = final_by_id.get(player_id)
         cumulative_wr: Optional[float] = None
         ema_wr: Optional[float] = None
         if rec is not None and int(rec.games) > 0:
@@ -303,35 +307,36 @@ def _build_ratings(
             ema_wr = float(rec.main_winrate_ema)
         ratings.append(
             PlayerRating(
+                player_id=str(player_id),
                 iteration=int(iteration),
-                checkpoint_name=iter_to_name.get(iteration, f"iter_{iteration:08d}.pt"),
-                elo=float(elos.get(iteration, float("nan"))),
-                bt_strength=float(strengths.get(iteration, float("nan"))),
-                games_as_main=int(games_as_main.get(iteration, 0)),
-                games_as_opponent=int(games_as_opponent.get(iteration, 0)),
+                checkpoint_name=str(checkpoint_name),
+                elo=float(elos.get(player_id, float("nan"))),
+                bt_strength=float(strengths.get(player_id, float("nan"))),
+                games_as_main=int(games_as_main.get(player_id, 0)),
+                games_as_opponent=int(games_as_opponent.get(player_id, 0)),
                 ema_main_winrate=ema_wr,
                 cumulative_main_winrate=cumulative_wr,
             )
         )
-    ratings.sort(key=lambda row: row.iteration)
+    ratings.sort(key=lambda row: (row.iteration, row.checkpoint_name, row.player_id))
     return ratings
 
 
 def _ema_snapshot_elo(
-    final_main_iter: int,
-    final_by_iter: dict[int, LeagueOpponentRecord],
-) -> dict[int, float]:
+    final_main_id: str,
+    final_by_id: dict[str, LeagueOpponentRecord],
+) -> dict[str, float]:
     """Quick relative ratings from the final checkpoint's EMA vs latest main."""
-    out: dict[int, float] = {final_main_iter: 1500.0}
-    for iteration, rec in final_by_iter.items():
+    out: dict[str, float] = {final_main_id: 1500.0}
+    for player_id, rec in final_by_id.items():
         if int(rec.games) <= 0:
             continue
         # main_winrate_ema = P(latest main wins vs this opponent).
-        out[int(iteration)] = 1500.0 + _winrate_to_elo_delta(float(rec.main_winrate_ema))
+        out[str(player_id)] = 1500.0 + _winrate_to_elo_delta(float(rec.main_winrate_ema))
     return out
 
 
-def _print_table(ratings: list[PlayerRating], *, ema_elo: dict[int, float]) -> None:
+def _print_table(ratings: list[PlayerRating], *, ema_elo: dict[str, float]) -> None:
     print(
         f"{'iter':>8}  {'elo':>8}  {'ema_elo':>8}  "
         f"{'g_main':>8}  {'g_opp':>8}  {'cum_wr':>7}  {'ema_wr':>7}  checkpoint"
@@ -341,8 +346,8 @@ def _print_table(ratings: list[PlayerRating], *, ema_elo: dict[int, float]) -> N
         ema = "" if row.ema_main_winrate is None else f"{row.ema_main_winrate:.3f}"
         elo = "" if row.elo != row.elo else f"{row.elo:.1f}"
         ema_elo_text = ""
-        if row.iteration in ema_elo:
-            ema_elo_text = f"{ema_elo[row.iteration]:.1f}"
+        if row.player_id in ema_elo:
+            ema_elo_text = f"{ema_elo[row.player_id]:.1f}"
         print(
             f"{row.iteration:8d}  {elo:>8}  {ema_elo_text:>8}  "
             f"{row.games_as_main:8d}  {row.games_as_opponent:8d}  {cum:>7}  {ema:>7}  "
@@ -350,11 +355,12 @@ def _print_table(ratings: list[PlayerRating], *, ema_elo: dict[int, float]) -> N
         )
 
 
-def _write_csv(path: Path, ratings: list[PlayerRating], *, ema_elo: dict[int, float]) -> None:
+def _write_csv(path: Path, ratings: list[PlayerRating], *, ema_elo: dict[str, float]) -> None:
     with path.open("w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(
             [
+                "player_id",
                 "iteration",
                 "checkpoint_name",
                 "elo_bt",
@@ -368,10 +374,11 @@ def _write_csv(path: Path, ratings: list[PlayerRating], *, ema_elo: dict[int, fl
         for row in ratings:
             writer.writerow(
                 [
+                    row.player_id,
                     row.iteration,
                     row.checkpoint_name,
                     "" if row.elo != row.elo else f"{row.elo:.4f}",
-                    "" if row.iteration not in ema_elo else f"{ema_elo[row.iteration]:.4f}",
+                    "" if row.player_id not in ema_elo else f"{ema_elo[row.player_id]:.4f}",
                     row.games_as_main,
                     row.games_as_opponent,
                     "" if row.cumulative_main_winrate is None else f"{row.cumulative_main_winrate:.6f}",
@@ -393,7 +400,7 @@ def parse_args() -> argparse.Namespace:
         "--anchor-iter",
         type=int,
         default=None,
-        help="Anchor this checkpoint at Elo 1500 (default: latest checkpoint).",
+        help="Anchor this main-training iteration at Elo 1500 (default: latest main checkpoint).",
     )
     p.add_argument("--csv", type=str, default=None, help="Write ratings table to this CSV path.")
     p.add_argument("--json", type=str, default=None, help="Write ratings as JSON to this path.")
@@ -414,25 +421,33 @@ def main() -> None:
     if not args.skip_spacing_check:
         checkpoint_every = _verify_even_spacing(paths)
 
-    batches, iter_to_name = _extract_match_batches(paths)
+    batches, player_meta = _extract_match_batches(paths)
     if not batches:
         raise SystemExit(
             "no league match batches found; ensure league is enabled and checkpoints contain league_state"
         )
 
-    final_by_iter, final_main_iter, training_args = _final_snapshot_stats(paths)
+    final_by_id, final_main_id, final_main_iter, training_args = _final_snapshot_stats(paths)
     league_fraction = training_args.get("league_fraction")
     num_agents = training_args.get("num_agents")
 
-    anchor_iter = args.anchor_iter if args.anchor_iter is not None else final_main_iter
+    anchor_id = None
+    if args.anchor_iter is not None:
+        anchor_name = f"iter_{int(args.anchor_iter):08d}.pt"
+        if anchor_name not in player_meta:
+            raise SystemExit(
+                f"--anchor-iter={args.anchor_iter} does not correspond to a saved main checkpoint filename {anchor_name}"
+            )
+        anchor_id = anchor_name
+    else:
+        anchor_id = final_main_id
     ratings = _build_ratings(
         batches,
-        iter_to_name,
-        final_by_iter,
-        final_main_iter,
-        anchor_iter=anchor_iter,
+        player_meta,
+        final_by_id,
+        anchor_id=anchor_id,
     )
-    ema_elo = _ema_snapshot_elo(final_main_iter, final_by_iter)
+    ema_elo = _ema_snapshot_elo(final_main_id, final_by_id)
 
     total_games = sum(b.games for b in batches)
     print(f"experiment={args.experiment}")
@@ -441,7 +456,7 @@ def main() -> None:
         print(f"checkpoint_every={checkpoint_every}")
     if league_fraction is not None:
         print(f"league_fraction={league_fraction}  num_agents={num_agents}")
-    print(f"anchor_iter={anchor_iter} (Elo 1500)")
+    print(f"anchor_iter={args.anchor_iter if args.anchor_iter is not None else final_main_iter} (Elo 1500)")
     print()
     print("elo_bt: Bradley-Terry fit from checkpoint-to-checkpoint league deltas")
     print("ema_elo: final-checkpoint EMA vs latest main, anchored at 1500 for latest")
@@ -463,10 +478,11 @@ def main() -> None:
             "match_batches": len(batches),
             "ratings": [
                 {
+                    "player_id": r.player_id,
                     "iteration": r.iteration,
                     "checkpoint_name": r.checkpoint_name,
                     "elo_bt": None if r.elo != r.elo else r.elo,
-                    "elo_ema_snapshot": ema_elo.get(r.iteration),
+                    "elo_ema_snapshot": ema_elo.get(r.player_id),
                     "games_as_main": r.games_as_main,
                     "games_as_opponent": r.games_as_opponent,
                     "cumulative_main_winrate": r.cumulative_main_winrate,

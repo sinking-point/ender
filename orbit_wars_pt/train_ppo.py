@@ -246,6 +246,8 @@ class LeagueState:
 LEAGUE_ENV_MODE_SELFPLAY = 0
 LEAGUE_ENV_MODE_CHECKPOINT = 1
 
+_CHECKPOINT_ITERATION_CACHE: dict[Path, tuple[int, int, int]] = {}
+
 
 def _checkpoint_iteration_from_path(path: Path) -> int:
     stem = path.stem
@@ -253,6 +255,36 @@ def _checkpoint_iteration_from_path(path: Path) -> int:
         return int(stem.split("_", 1)[1])
     except (IndexError, ValueError):
         return -1
+
+
+def _checkpoint_iteration(path: Path) -> int:
+    it = _checkpoint_iteration_from_path(path)
+    if it >= 0:
+        return it
+    try:
+        stat = path.stat()
+    except OSError:
+        return -1
+    cached = _CHECKPOINT_ITERATION_CACHE.get(path)
+    cache_key = (int(stat.st_mtime_ns), int(stat.st_size))
+    if cached is not None and cached[:2] == cache_key:
+        return int(cached[2])
+    iteration = -1
+    try:
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(path, map_location="cpu")
+        if isinstance(payload, Mapping):
+            iteration = int(payload.get("iteration", -1))
+    except Exception:
+        iteration = -1
+    _CHECKPOINT_ITERATION_CACHE[path] = (cache_key[0], cache_key[1], int(iteration))
+    return int(iteration)
+
+
+def _checkpoint_has_iteration_filename(path: Path) -> bool:
+    return _checkpoint_iteration_from_path(path) >= 0
 
 
 def _serialize_league_state(state: Optional[LeagueState]) -> Optional[dict[str, Any]]:
@@ -302,10 +334,17 @@ def _league_candidate_paths(
 ) -> list[Path]:
     items = [
         p
-        for p in checkpoints_dir.glob("iter_*.pt")
-        if p.is_file() and 0 <= _checkpoint_iteration_from_path(p) < int(current_iteration)
+        for p in checkpoints_dir.glob("*.pt")
+        if p.is_file()
+        and (
+            (
+                _checkpoint_has_iteration_filename(p)
+                and 0 <= _checkpoint_iteration_from_path(p) < int(current_iteration)
+            )
+            or (not _checkpoint_has_iteration_filename(p))
+        )
     ]
-    items.sort(key=_checkpoint_iteration_from_path)
+    items.sort(key=_checkpoint_iteration)
     if int(max_pool_size) > 0:
         items = items[-int(max_pool_size) :]
     return items
@@ -332,12 +371,12 @@ def _sync_league_state(
             out.opponents[key] = LeagueOpponentRecord(
                 checkpoint_name=path.name,
                 checkpoint_path=str(path),
-                checkpoint_iteration=_checkpoint_iteration_from_path(path),
+                checkpoint_iteration=_checkpoint_iteration(path),
             )
         else:
             record.checkpoint_name = path.name
             record.checkpoint_path = str(path)
-            record.checkpoint_iteration = _checkpoint_iteration_from_path(path)
+            record.checkpoint_iteration = _checkpoint_iteration(path)
     stale = [key for key in out.opponents if key not in live_keys]
     for key in stale:
         del out.opponents[key]
@@ -885,10 +924,9 @@ def find_latest_checkpoint(checkpoints_dir: Path) -> Optional[Path]:
     best: Optional[Path] = None
     best_it = -1
     for p in checkpoints_dir.glob("iter_*.pt"):
-        try:
-            it = int(p.stem.split("_", 1)[1])
-        except (IndexError, ValueError):
+        if not p.is_file():
             continue
+        it = _checkpoint_iteration_from_path(p)
         if it > best_it:
             best_it = it
             best = p
