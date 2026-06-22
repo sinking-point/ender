@@ -19,8 +19,11 @@ from orbit_wars_pt.kaggle_adapter import (
     SearchPlannedLaunchAction,
     _SearchTreeNode,
     _search_branching_enabled_for_env_step,
+    _search_has_deadline,
+    _search_should_advance_closed_turn,
     _search_time_scale_from_overage,
     _search_single_root_turn_path,
+    _search_uses_turn_end_opponent_samples,
     _launch_geometry_from_obs,
     _refine_interval_launches_in_place,
     _search_branch_indices_from_probs,
@@ -100,6 +103,42 @@ class ModelSearchBfsHelperTests(unittest.TestCase):
         )
         self.assertTrue(_search_branching_enabled_for_env_step(settings_all, search_env_step_from_root=0))
         self.assertTrue(_search_branching_enabled_for_env_step(settings_all, search_env_step_from_root=1))
+
+    def test_search_can_stop_at_turn_end(self) -> None:
+        settings = ModelSearchSettings(
+            horizon_steps=4,
+            reward=RewardSettings(),
+            stop_at_turn_end=True,
+        )
+        self.assertFalse(_search_should_advance_closed_turn(settings, search_env_step_from_root=0))
+        self.assertFalse(_search_has_deadline(settings))
+        self.assertTrue(_search_should_advance_closed_turn(settings, search_env_step_from_root=1))
+
+        settings_rollout = ModelSearchSettings(
+            horizon_steps=4,
+            reward=RewardSettings(),
+            stop_at_turn_end=False,
+        )
+        self.assertTrue(_search_should_advance_closed_turn(settings_rollout, search_env_step_from_root=0))
+        self.assertTrue(_search_has_deadline(settings_rollout))
+
+    def test_turn_end_opponent_sampling_only_applies_at_root_turn_end(self) -> None:
+        settings = ModelSearchSettings(
+            horizon_steps=4,
+            reward=RewardSettings(),
+            stop_at_turn_end=True,
+            turn_end_opponent_samples=4,
+        )
+        self.assertTrue(_search_uses_turn_end_opponent_samples(settings, search_env_step_from_root=0))
+        self.assertFalse(_search_uses_turn_end_opponent_samples(settings, search_env_step_from_root=1))
+
+        settings_no_samples = ModelSearchSettings(
+            horizon_steps=4,
+            reward=RewardSettings(),
+            stop_at_turn_end=True,
+            turn_end_opponent_samples=0,
+        )
+        self.assertFalse(_search_uses_turn_end_opponent_samples(settings_no_samples, search_env_step_from_root=0))
 
     def test_single_root_turn_path_requires_closed_turn(self) -> None:
         state = np.array(False)

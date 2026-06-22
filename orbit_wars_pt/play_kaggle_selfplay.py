@@ -392,6 +392,25 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--model-search-stop-at-turn-end",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "In ego_bfs mode, stop search at the end of the current turn and score turn-end virtual states "
+            "without simulating any env steps."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-turn-end-opponent-samples",
+        type=int,
+        default=None,
+        help=(
+            "In ego_bfs + --model-search-stop-at-turn-end mode, evaluate each current-turn leaf by averaging "
+            "over this many shared sampled opponent joint-action sets and one simulated env step. "
+            "0 keeps pure turn-end virtual-state value scoring."
+        ),
+    )
+    parser.add_argument(
         "--model-search-adaptive-horizon",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -533,6 +552,8 @@ def main() -> None:
         raise SystemExit("--model-search-branch-prob-threshold must be between 0 and 1")
     if args.model_search_max_branching is not None and int(args.model_search_max_branching) <= 0:
         raise SystemExit("--model-search-max-branching must be positive")
+    if args.model_search_turn_end_opponent_samples is not None and int(args.model_search_turn_end_opponent_samples) < 0:
+        raise SystemExit("--model-search-turn-end-opponent-samples must be non-negative")
 
     if args.cpu_threads > 0:
         for name in CPU_THREAD_ENV_VARS:
@@ -932,6 +953,8 @@ def main() -> None:
             model_search_branch_prob_threshold=args.model_search_branch_prob_threshold,
             model_search_max_branching=args.model_search_max_branching,
             model_search_branch_after_first_env_step=args.model_search_branch_after_first_env_step,
+            model_search_stop_at_turn_end=args.model_search_stop_at_turn_end,
+            model_search_turn_end_opponent_samples=args.model_search_turn_end_opponent_samples,
         )
         run_agent = seat_agent
         if args.swap_player_view:

@@ -250,6 +250,8 @@ def package_submission(
     model_search_branch_prob_threshold: float | None = None,
     model_search_max_branching: int | None = None,
     model_search_branch_after_first_env_step: bool | None = None,
+    model_search_stop_at_turn_end: bool | None = None,
+    model_search_turn_end_opponent_samples: int | None = None,
     population_member: int | None = None,
     population_member_4p: int | None = None,
     population_member_2p: int | None = None,
@@ -370,6 +372,14 @@ def package_submission(
         submission_env["ORBIT_WARS_MODEL_SEARCH_BRANCH_AFTER_FIRST_ENV_STEP"] = (
             "1" if bool(model_search_branch_after_first_env_step) else "0"
         )
+    if model_search_stop_at_turn_end is not None:
+        submission_env["ORBIT_WARS_MODEL_SEARCH_STOP_AT_TURN_END"] = (
+            "1" if bool(model_search_stop_at_turn_end) else "0"
+        )
+    if model_search_turn_end_opponent_samples is not None:
+        submission_env["ORBIT_WARS_MODEL_SEARCH_TURN_END_OPPONENT_SAMPLES"] = str(
+            max(0, int(model_search_turn_end_opponent_samples))
+        )
 
     _write_main_py(
         bundle_dir / "main.py",
@@ -410,6 +420,8 @@ def package_submission(
         Model search launch probability threshold: {model_search_launch_prob_threshold if model_search_launch_prob_threshold is not None else 'env default'}
         Model search greedy launch threshold: {model_search_greedy_launch_threshold if model_search_greedy_launch_threshold is not None else 'env default'}
         Model search branch after first env step: {model_search_branch_after_first_env_step if model_search_branch_after_first_env_step is not None else 'env default'}
+        Model search stop at turn end: {model_search_stop_at_turn_end if model_search_stop_at_turn_end is not None else 'env default'}
+        Model search turn-end opponent samples: {model_search_turn_end_opponent_samples if model_search_turn_end_opponent_samples is not None else 'env default'}
 
         Policy selection: 4-player matches use checkpoint_4p.pt; 2-player matches
         use checkpoint_2p.pt. The first observation selects the mode for the full
@@ -718,6 +730,25 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--model-search-stop-at-turn-end",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Bake ORBIT_WARS_MODEL_SEARCH_STOP_AT_TURN_END into main.py. "
+            "In ego_bfs mode, stop at end of current turn and score virtual turn-end states without env-step rollout."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-turn-end-opponent-samples",
+        type=int,
+        default=None,
+        help=(
+            "Bake ORBIT_WARS_MODEL_SEARCH_TURN_END_OPPONENT_SAMPLES into main.py. "
+            "In ego_bfs + stop-at-turn-end mode, average each current-turn leaf over this many shared sampled "
+            "opponent joint-action sets and one env step; 0 keeps pure turn-end value scoring."
+        ),
+    )
+    parser.add_argument(
         "--keep-dir",
         action="store_true",
         help="When --out ends with .tar.gz, keep the extracted bundle directory beside the archive.",
@@ -776,6 +807,8 @@ def main() -> None:
         0.0 <= float(args.model_search_branch_prob_threshold) <= 1.0
     ):
         raise SystemExit("--model-search-branch-prob-threshold must be between 0 and 1")
+    if args.model_search_turn_end_opponent_samples is not None and int(args.model_search_turn_end_opponent_samples) < 0:
+        raise SystemExit("--model-search-turn-end-opponent-samples must be non-negative")
 
     result = package_submission(
         checkpoint_4p,
@@ -832,6 +865,8 @@ def main() -> None:
         model_search_branch_prob_threshold=args.model_search_branch_prob_threshold,
         model_search_max_branching=args.model_search_max_branching,
         model_search_branch_after_first_env_step=args.model_search_branch_after_first_env_step,
+        model_search_stop_at_turn_end=args.model_search_stop_at_turn_end,
+        model_search_turn_end_opponent_samples=args.model_search_turn_end_opponent_samples,
         population_member=args.member,
         population_member_4p=args.member if args.member_4p is None else args.member_4p,
         population_member_2p=args.member if args.member_2p is None else args.member_2p,

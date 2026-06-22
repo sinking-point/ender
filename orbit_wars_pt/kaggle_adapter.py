@@ -1055,6 +1055,10 @@ class ModelSearchTiming:
     bfs_advance_nodes: int = 0
     bfs_frontier_peak: int = 0
     bfs_single_path_early_exit: int = 0
+    turn_end_sample_batches: int = 0
+    turn_end_sample_joint_actions: int = 0
+    turn_end_sample_leaves: int = 0
+    turn_end_sample_s: float = 0.0
 
     def branch_setup_accounted_s(self) -> float:
         return (
@@ -1118,7 +1122,11 @@ class ModelSearchTiming:
             f" adv×{self.bfs_advance_batches}"
             f" adv_nodes={self.bfs_advance_nodes}"
             f" frontier_peak={self.bfs_frontier_peak}"
-            f" early_exit={self.bfs_single_path_early_exit}) "
+            f" early_exit={self.bfs_single_path_early_exit}"
+            f" turn_end×{self.turn_end_sample_batches}"
+            f" joint={self.turn_end_sample_joint_actions}"
+            f" leaves={self.turn_end_sample_leaves}"
+            f" eval={self.turn_end_sample_s:.4f}s) "
             f"setup={self.branch_setup_accounted_s():.4f}s"
             f"(geom={self.branch_setup_launch_geometry_s:.4f}"
             f" plans={self.branch_setup_seat_plans_s:.4f}"
@@ -1205,6 +1213,8 @@ class ModelSearchSettings:
     branch_probability_threshold: float = 0.2
     max_branching_factor: int = 4
     branch_after_first_env_step: bool = True
+    stop_at_turn_end: bool = False
+    turn_end_opponent_samples: int = 0
 
 
 def _model_search_enabled(settings: ModelSearchSettings) -> bool:
@@ -1237,6 +1247,32 @@ def _search_branching_enabled_for_env_step(
     search_env_step_from_root: int,
 ) -> bool:
     return bool(settings.branch_after_first_env_step or int(search_env_step_from_root) <= 0)
+
+
+def _search_should_advance_closed_turn(
+    settings: ModelSearchSettings,
+    *,
+    search_env_step_from_root: int,
+) -> bool:
+    if bool(settings.stop_at_turn_end) and int(search_env_step_from_root) == 0:
+        return False
+    return True
+
+
+def _search_has_deadline(settings: ModelSearchSettings) -> bool:
+    return not bool(settings.stop_at_turn_end)
+
+
+def _search_uses_turn_end_opponent_samples(
+    settings: ModelSearchSettings,
+    *,
+    search_env_step_from_root: int,
+) -> bool:
+    return bool(
+        int(search_env_step_from_root) == 0
+        and bool(settings.stop_at_turn_end)
+        and int(settings.turn_end_opponent_samples) > 0
+    )
 
 
 def _model_search_allowed_for_obs(obs: Mapping[str, Any], settings: ModelSearchSettings) -> bool:
@@ -3392,6 +3428,7 @@ class SearchRuntime:
     deadline_s: float | None = None
     planned_ego_actions: list[list[float]] | None = None
     planned_turn_complete: bool = False
+    turn_end_opponent_joint_action_samples: list[list[list[list[float]]]] | None = None
 
 
 @dataclass
@@ -4813,6 +4850,20 @@ def _model_search_branch_after_first_env_step_from_env() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _model_search_stop_at_turn_end_from_env() -> bool:
+    raw = os.environ.get("ORBIT_WARS_MODEL_SEARCH_STOP_AT_TURN_END", "").lower()
+    if not raw:
+        return False
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _model_search_turn_end_opponent_samples_from_env() -> int:
+    raw = _env_int("ORBIT_WARS_MODEL_SEARCH_TURN_END_OPPONENT_SAMPLES")
+    if raw is None:
+        return 0
+    return max(0, int(raw))
+
+
 def _launch_probability_from_halt_logits(halt_logits: torch.Tensor) -> float:
     return float(torch.softmax(halt_logits, dim=-1)[0].item())
 
@@ -5261,6 +5312,8 @@ class KaggleOrbitWarsAgent:
         model_search_branch_prob_threshold: Optional[float] = None,
         model_search_max_branching: Optional[int] = None,
         model_search_branch_after_first_env_step: Optional[bool] = None,
+        model_search_stop_at_turn_end: Optional[bool] = None,
+        model_search_turn_end_opponent_samples: Optional[int] = None,
     ):
         _configure_cpu_threads()
         self.checkpoint_path = resolve_checkpoint_path(checkpoint_path)
@@ -5352,6 +5405,16 @@ class KaggleOrbitWarsAgent:
                 bool(model_search_branch_after_first_env_step)
                 if model_search_branch_after_first_env_step is not None
                 else _model_search_branch_after_first_env_step_from_env()
+            ),
+            stop_at_turn_end=(
+                bool(model_search_stop_at_turn_end)
+                if model_search_stop_at_turn_end is not None
+                else _model_search_stop_at_turn_end_from_env()
+            ),
+            turn_end_opponent_samples=(
+                max(0, int(model_search_turn_end_opponent_samples))
+                if model_search_turn_end_opponent_samples is not None
+                else _model_search_turn_end_opponent_samples_from_env()
             ),
         )
         self.population_size = int(training_args.get("population_size", 1))
@@ -6345,6 +6408,7 @@ class KaggleOrbitWarsAgent:
         initial_policy_outputs: CachedSearchPolicyOutputs | None = None,
         timing: ModelSearchTiming | None = None,
         search_greedy_launch_threshold: float | None = None,
+        sampling_mode: str = SAMPLING_MODE_GREEDY,
     ) -> list[list[list[float]]]:
         t_plan = perf_counter() if timing is not None else 0.0
         active = [plan for plan in seat_plans if int(plan.micro_idx) < int(plan.max_micro_steps)]
@@ -6436,10 +6500,14 @@ class KaggleOrbitWarsAgent:
 
             for row, plan in enumerate(active):
                 halt_logits = out["halt_logits"][row]
-                halt_action = _greedy_halt_action_from_logits(
-                    halt_logits,
-                    launch_threshold=search_greedy_launch_threshold,
-                )
+                if sampling_mode == SAMPLING_MODE_GREEDY:
+                    halt_action = _greedy_halt_action_from_logits(
+                        halt_logits,
+                        launch_threshold=search_greedy_launch_threshold,
+                    )
+                else:
+                    halt_probs = torch.softmax(halt_logits, dim=-1)
+                    halt_action = int(torch.multinomial(halt_probs, 1, generator=self.rng).item())
                 if halt_action == 1:
                     continue
 
@@ -6448,7 +6516,13 @@ class KaggleOrbitWarsAgent:
                     continue
                 flat_logits = out["origin_frac_logits"].flatten(start_dim=1)[row]
                 masked_origin_frac = flat_logits.masked_fill(~flat_mask, -1e4)
-                origin_frac_flat = int(torch.argmax(masked_origin_frac).item())
+                if sampling_mode == SAMPLING_MODE_GREEDY:
+                    origin_frac_flat = int(torch.argmax(masked_origin_frac).item())
+                else:
+                    origin_frac_probs = torch.softmax(masked_origin_frac, dim=-1)
+                    origin_frac_flat = int(
+                        torch.multinomial(origin_frac_probs, 1, generator=self.rng).item()
+                    )
                 o_idx = origin_frac_flat // len(FRACTIONS)
                 frac_idx = origin_frac_flat % len(FRACTIONS)
                 ships_avail = float(plan.planets[o_idx, 5])
@@ -6594,7 +6668,13 @@ class KaggleOrbitWarsAgent:
                         [target_logits_b[idx].masked_fill(~target_mask, -1e4), abort_logit.reshape(1)],
                         dim=0,
                     )
-                    target_choice = int(torch.argmax(combined_target).item())
+                    if sampling_mode == SAMPLING_MODE_GREEDY:
+                        target_choice = int(torch.argmax(combined_target).item())
+                    else:
+                        target_probs = torch.softmax(combined_target, dim=-1)
+                        target_choice = int(
+                            torch.multinomial(target_probs, 1, generator=self.rng).item()
+                        )
                     if target_choice == MAX_PLANETS:
                         plan.origin_frac_blocked[o_idx, frac_idx] = True
                         plan.micro_idx += 1
@@ -6612,10 +6692,19 @@ class KaggleOrbitWarsAgent:
                 else:
                     if not bool(target_mask.any().item()):
                         continue
-                    sorted_choices = torch.argsort(
-                        target_logits_b[idx].masked_fill(~target_mask, -1e4),
-                        descending=True,
-                    ).tolist()
+                    masked_target = target_logits_b[idx].masked_fill(~target_mask, -1e4)
+                    if sampling_mode == SAMPLING_MODE_GREEDY:
+                        sorted_choices = torch.argsort(masked_target, descending=True).tolist()
+                    else:
+                        sampled_choice = int(
+                            torch.multinomial(torch.softmax(masked_target, dim=-1), 1, generator=self.rng).item()
+                        )
+                        sorted_choices = [sampled_choice]
+                        sorted_choices.extend(
+                            int(choice)
+                            for choice in torch.argsort(masked_target, descending=True).tolist()
+                            if int(choice) != sampled_choice
+                        )
 
                 d_idx = -1
                 true_target_slot = -1
@@ -7228,6 +7317,168 @@ class KaggleOrbitWarsAgent:
             )
         return advanced
 
+    def _search_turn_end_opponent_joint_action_samples(
+        self,
+        runtime: SearchRuntime,
+        *,
+        ego_player: int,
+        timing: ModelSearchTiming | None = None,
+    ) -> list[list[list[list[float]]]]:
+        cached = runtime.turn_end_opponent_joint_action_samples
+        if cached is not None:
+            return cached
+        sample_count = max(0, int(runtime.settings.turn_end_opponent_samples))
+        if sample_count <= 0:
+            runtime.turn_end_opponent_joint_action_samples = []
+            return []
+        root_state = runtime.public_state
+        if root_state is None:
+            root_state = observation_to_state(
+                runtime.public_obs,
+                runtime.kaggle_config,
+                max_fleets=self.max_fleets,
+                step_count_override=int(runtime.step_count),
+                num_agents_override=int(runtime.num_agents),
+                fleet_arrival_cache=runtime.fleet_arrival_cache,
+            )
+            runtime.public_state = root_state
+        branch_joint_actions: list[list[list[float]]] = [
+            [[] for _ in range(int(runtime.num_agents))]
+            for _ in range(sample_count)
+        ]
+        branch_launch_geometry = [
+            _launch_geometry_from_obs(runtime.public_obs, runtime.kaggle_config)
+            for _ in range(sample_count)
+        ]
+        seat_plans: list[_BatchedSearchSeatPlan] = []
+        for branch_idx in range(sample_count):
+            for player in range(int(runtime.num_agents)):
+                if int(player) == int(ego_player):
+                    continue
+                seat_plans.append(
+                    _BatchedSearchSeatPlan(
+                        branch_idx=int(branch_idx),
+                        player=int(player),
+                        state_template=root_state,
+                        planets=np.array(np.asarray(root_state.planets), copy=True),
+                        incoming_fleets=np.array(np.asarray(root_state.incoming_fleets), copy=True),
+                        origin_frac_blocked=np.zeros((MAX_PLANETS, len(FRACTIONS)), dtype=np.bool_),
+                        actions=[],
+                        micro_idx=0,
+                        max_micro_steps=int(self.max_micro_steps),
+                    )
+                )
+        if seat_plans:
+            branch_joint_actions = self._plan_joint_actions_batched_single_policy(
+                seat_plans=seat_plans,
+                branch_joint_actions=branch_joint_actions,
+                branch_launch_geometry=branch_launch_geometry,
+                sim_step=int(runtime.step_count),
+                ship_speed=float(_cfg_get(runtime.kaggle_config, "shipSpeed", 6.0)),
+                search_root_player=int(ego_player),
+                search_env_step_from_root=0,
+                timing=timing,
+                search_greedy_launch_threshold=runtime.settings.greedy_launch_threshold,
+                sampling_mode=SAMPLING_MODE_STOCHASTIC,
+            )
+        runtime.turn_end_opponent_joint_action_samples = branch_joint_actions
+        return branch_joint_actions
+
+    def _score_turn_end_leaves_with_opponent_samples(
+        self,
+        runtime: SearchRuntime,
+        *,
+        ego_player: int,
+        leaves: list[_SearchTreeNode],
+        timing: ModelSearchTiming | None = None,
+        stop_s: float | None = None,
+    ) -> list[float] | None:
+        if not leaves:
+            return []
+        if stop_s is not None and perf_counter() >= stop_s:
+            return None
+        t0 = perf_counter() if timing is not None else 0.0
+        joint_action_samples = self._search_turn_end_opponent_joint_action_samples(
+            runtime,
+            ego_player=int(ego_player),
+            timing=timing,
+        )
+        if not joint_action_samples:
+            return None
+        if runtime.public_state is None:
+            runtime.public_state = observation_to_state(
+                runtime.public_obs,
+                runtime.kaggle_config,
+                max_fleets=self.max_fleets,
+                step_count_override=int(runtime.step_count),
+                num_agents_override=int(runtime.num_agents),
+                fleet_arrival_cache=runtime.fleet_arrival_cache,
+            )
+        pre_state = runtime.public_state
+        ratios_pre = _reward_mix_ratios_np(pre_state, runtime.settings.reward)
+        gamma = float(runtime.settings.reward.gamma)
+        post_states: list[OrbitWarsState] = []
+        sample_meta: list[tuple[int, float, bool]] = []
+        leaf_totals = [0.0 for _ in leaves]
+        for leaf_idx, leaf in enumerate(leaves):
+            ego_actions = [copy.deepcopy(action.action) for action in leaf.current_turn_actions]
+            for sample_joint_actions in joint_action_samples:
+                if stop_s is not None and perf_counter() >= stop_s:
+                    return None
+                sim_state = _make_sim_state(
+                    runtime.public_obs,
+                    num_agents=int(runtime.num_agents),
+                    step_count=int(runtime.step_count),
+                )
+                joint_actions = copy.deepcopy(sample_joint_actions)
+                joint_actions[int(ego_player)] = ego_actions
+                _simulate_joint_step_with_kaggle_model(
+                    sim_state,
+                    joint_actions=joint_actions,
+                    config=runtime.kaggle_config,
+                )
+                next_step = int(runtime.step_count) + 1
+                next_public_obs = _public_obs_from_sim_state(sim_state, step_count=int(next_step))
+                next_state = observation_to_state(
+                    next_public_obs,
+                    runtime.kaggle_config,
+                    max_fleets=self.max_fleets,
+                    step_count_override=int(next_step),
+                    num_agents_override=int(runtime.num_agents),
+                    fleet_arrival_cache=runtime.fleet_arrival_cache,
+                )
+                step_reward = _reward_delta_np(pre_state, next_state, ratios_pre, runtime.settings.reward)
+                reward_value = float(step_reward[int(ego_player)])
+                done = bool(np.asarray(next_state.done))
+                sample_meta.append((leaf_idx, reward_value, done))
+                if done:
+                    leaf_totals[leaf_idx] += reward_value
+                else:
+                    post_states.append(next_state)
+        t_value = perf_counter() if timing is not None else 0.0
+        post_values = self._policy_values_for_states_batched(
+            post_states,
+            [int(ego_player)] * len(post_states),
+        )
+        value_idx = 0
+        for leaf_idx, reward_value, done in sample_meta:
+            if done:
+                continue
+            leaf_totals[leaf_idx] += reward_value + gamma * float(post_values[value_idx])
+            value_idx += 1
+        denom = float(len(joint_action_samples))
+        scores = [total / denom for total in leaf_totals]
+        if timing is not None:
+            timing.turn_end_sample_batches += 1
+            timing.turn_end_sample_joint_actions += len(joint_action_samples)
+            timing.turn_end_sample_leaves += len(leaves)
+            timing.turn_end_sample_s += perf_counter() - t0
+            timing.value_calls += len(post_values)
+            timing.value_eval_calls += len(post_values)
+            timing.value_s += perf_counter() - t_value
+            timing.value_eval_s += perf_counter() - t_value
+        return scores
+
     def _search_plan_turn_bfs(
         self,
         runtime: SearchRuntime,
@@ -7271,12 +7522,22 @@ class KaggleOrbitWarsAgent:
                 leaves.append(node)
                 continue
             if bool(node.turn_closed):
+                if not _search_should_advance_closed_turn(
+                    runtime.settings,
+                    search_env_step_from_root=int(node.search_env_step_from_root),
+                ):
+                    leaves.append(node)
+                    continue
                 batch_nodes = [node]
                 while (
                     frontier
                     and bool(frontier[0].turn_closed)
                     and not bool(frontier[0].done)
                     and int(frontier[0].search_env_step_from_root) == int(node.search_env_step_from_root)
+                    and _search_should_advance_closed_turn(
+                        runtime.settings,
+                        search_env_step_from_root=int(frontier[0].search_env_step_from_root),
+                    )
                 ):
                     batch_nodes.append(frontier.popleft())
                 for advanced_node in self._search_advance_tree_nodes_batched(
@@ -7340,21 +7601,53 @@ class KaggleOrbitWarsAgent:
         if not leaves:
             return SearchTurnPlanResult(actions=[], turn_complete=False)
 
-        unfinished = [leaf for leaf in leaves if not bool(leaf.done)]
-        if unfinished:
-            values = self._policy_values_for_states_batched(
-                [leaf.current_state for leaf in unfinished],
-                [int(ego_player)] * len(unfinished),
+        sampled_leaves: list[_SearchTreeNode] = []
+        plain_value_leaves: list[_SearchTreeNode] = []
+        for leaf in leaves:
+            if bool(leaf.done):
+                continue
+            if _search_uses_turn_end_opponent_samples(
+                runtime.settings,
+                search_env_step_from_root=int(leaf.search_env_step_from_root),
+            ):
+                sampled_leaves.append(leaf)
+            else:
+                plain_value_leaves.append(leaf)
+        sampled_scores: list[float] | None = None
+        if sampled_leaves:
+            sampled_scores = self._score_turn_end_leaves_with_opponent_samples(
+                runtime,
+                ego_player=int(ego_player),
+                leaves=sampled_leaves,
+                timing=timing,
+                stop_s=stop_s,
             )
-        else:
-            values = []
+        values = []
+        if plain_value_leaves or (sampled_leaves and sampled_scores is None):
+            value_leaves = plain_value_leaves + (sampled_leaves if sampled_scores is None else [])
+            t_value = perf_counter() if timing is not None else 0.0
+            values = self._policy_values_for_states_batched(
+                [leaf.current_state for leaf in value_leaves],
+                [int(ego_player)] * len(value_leaves),
+            )
+            if timing is not None:
+                dt = perf_counter() - t_value
+                timing.value_calls += len(values)
+                timing.value_eval_calls += len(values)
+                timing.value_s += dt
+                timing.value_eval_s += dt
         scored: list[tuple[float, _SearchTreeNode]] = []
+        sampled_idx = 0
         value_idx = 0
         for leaf in leaves:
             score = float(leaf.discounted_reward)
             if not bool(leaf.done):
-                score += float(leaf.discount) * float(values[value_idx])
-                value_idx += 1
+                if sampled_idx < len(sampled_leaves) and leaf is sampled_leaves[sampled_idx] and sampled_scores is not None:
+                    score += float(leaf.discount) * float(sampled_scores[sampled_idx])
+                    sampled_idx += 1
+                else:
+                    score += float(leaf.discount) * float(values[value_idx])
+                    value_idx += 1
             scored.append((score, leaf))
         best_leaf = max(scored, key=lambda item: item[0])[1]
         if timing is not None:
@@ -7776,7 +8069,7 @@ class KaggleOrbitWarsAgent:
             else None
         )
         search_deadline_s = None
-        if act_timeout is not None:
+        if act_timeout is not None and _search_has_deadline(self.model_search):
             search_scale = _search_time_scale_from_overage(obs)
             search_deadline_s = call_t0 + max(0.0, float(act_timeout)) * float(search_scale)
         if _model_search_enabled(self.model_search) and _model_search_allowed_for_obs(obs, self.model_search):
@@ -7973,6 +8266,9 @@ class KaggleOrbitWarsDualPolicyAgent:
         model_search_launch_prob_threshold: Optional[float] = None,
         model_search_branch_prob_threshold: Optional[float] = None,
         model_search_max_branching: Optional[int] = None,
+        model_search_branch_after_first_env_step: Optional[bool] = None,
+        model_search_stop_at_turn_end: Optional[bool] = None,
+        model_search_turn_end_opponent_samples: Optional[int] = None,
     ):
         self.checkpoint_4p = resolve_checkpoint_path(checkpoint_4p)
         self.checkpoint_2p = resolve_checkpoint_path(checkpoint_2p)
@@ -8004,6 +8300,9 @@ class KaggleOrbitWarsDualPolicyAgent:
         self.model_search_launch_prob_threshold = model_search_launch_prob_threshold
         self.model_search_branch_prob_threshold = model_search_branch_prob_threshold
         self.model_search_max_branching = model_search_max_branching
+        self.model_search_branch_after_first_env_step = model_search_branch_after_first_env_step
+        self.model_search_stop_at_turn_end = model_search_stop_at_turn_end
+        self.model_search_turn_end_opponent_samples = model_search_turn_end_opponent_samples
         self._delegate: Optional[KaggleOrbitWarsAgent] = None
         self._delegate_mode: Optional[str] = None
         self._game_key: Optional[str] = None
@@ -8066,6 +8365,9 @@ class KaggleOrbitWarsDualPolicyAgent:
             model_search_launch_prob_threshold=self.model_search_launch_prob_threshold,
             model_search_branch_prob_threshold=self.model_search_branch_prob_threshold,
             model_search_max_branching=self.model_search_max_branching,
+            model_search_branch_after_first_env_step=self.model_search_branch_after_first_env_step,
+            model_search_stop_at_turn_end=self.model_search_stop_at_turn_end,
+            model_search_turn_end_opponent_samples=self.model_search_turn_end_opponent_samples,
         )
 
     @torch.inference_mode()
