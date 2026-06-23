@@ -252,6 +252,7 @@ def package_submission(
     model_search_branch_after_first_env_step: bool | None = None,
     model_search_stop_at_turn_end: bool | None = None,
     model_search_turn_end_opponent_samples: int | None = None,
+    model_search_turn_sampling_max_samples: int | None = None,
     population_member: int | None = None,
     population_member_4p: int | None = None,
     population_member_2p: int | None = None,
@@ -380,6 +381,10 @@ def package_submission(
         submission_env["ORBIT_WARS_MODEL_SEARCH_TURN_END_OPPONENT_SAMPLES"] = str(
             max(0, int(model_search_turn_end_opponent_samples))
         )
+    if model_search_turn_sampling_max_samples is not None:
+        submission_env["ORBIT_WARS_MODEL_SEARCH_TURN_SAMPLING_MAX_SAMPLES"] = str(
+            max(0, int(model_search_turn_sampling_max_samples))
+        )
 
     _write_main_py(
         bundle_dir / "main.py",
@@ -422,6 +427,7 @@ def package_submission(
         Model search branch after first env step: {model_search_branch_after_first_env_step if model_search_branch_after_first_env_step is not None else 'env default'}
         Model search stop at turn end: {model_search_stop_at_turn_end if model_search_stop_at_turn_end is not None else 'env default'}
         Model search turn-end opponent samples: {model_search_turn_end_opponent_samples if model_search_turn_end_opponent_samples is not None else 'env default'}
+        Model search turn-sampling max samples: {model_search_turn_sampling_max_samples if model_search_turn_sampling_max_samples is not None else 'env default'}
 
         Policy selection: 4-player matches use checkpoint_4p.pt; 2-player matches
         use checkpoint_2p.pt. The first observation selects the mode for the full
@@ -641,11 +647,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--model-search-mode",
-        choices=("binary", "ego_bfs"),
+        choices=("binary", "ego_bfs", "turn_sampling"),
         default=None,
         help=(
             "Bake ORBIT_WARS_MODEL_SEARCH_MODE into main.py. "
-            "`binary` keeps the existing halt-vs-launch search; `ego_bfs` enables the breadth-first ego-only tree search."
+            "`binary` keeps the existing halt-vs-launch search; `ego_bfs` enables the breadth-first ego-only tree search; "
+            "`turn_sampling` stochastically samples distinct current-turn action sequences with prefix caching."
         ),
     )
     parser.add_argument(
@@ -749,6 +756,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--model-search-turn-sampling-max-samples",
+        type=int,
+        default=None,
+        help=(
+            "Bake ORBIT_WARS_MODEL_SEARCH_TURN_SAMPLING_MAX_SAMPLES into main.py. "
+            "In turn_sampling mode, stop after this many completed ego turn plans have been sampled pre-dedup."
+        ),
+    )
+    parser.add_argument(
         "--keep-dir",
         action="store_true",
         help="When --out ends with .tar.gz, keep the extracted bundle directory beside the archive.",
@@ -809,6 +825,8 @@ def main() -> None:
         raise SystemExit("--model-search-branch-prob-threshold must be between 0 and 1")
     if args.model_search_turn_end_opponent_samples is not None and int(args.model_search_turn_end_opponent_samples) < 0:
         raise SystemExit("--model-search-turn-end-opponent-samples must be non-negative")
+    if args.model_search_turn_sampling_max_samples is not None and int(args.model_search_turn_sampling_max_samples) < 0:
+        raise SystemExit("--model-search-turn-sampling-max-samples must be non-negative")
 
     result = package_submission(
         checkpoint_4p,
@@ -867,6 +885,7 @@ def main() -> None:
         model_search_branch_after_first_env_step=args.model_search_branch_after_first_env_step,
         model_search_stop_at_turn_end=args.model_search_stop_at_turn_end,
         model_search_turn_end_opponent_samples=args.model_search_turn_end_opponent_samples,
+        model_search_turn_sampling_max_samples=args.model_search_turn_sampling_max_samples,
         population_member=args.member,
         population_member_4p=args.member if args.member_4p is None else args.member_4p,
         population_member_2p=args.member if args.member_2p is None else args.member_2p,

@@ -315,34 +315,35 @@ def main() -> None:
     )
     parser.add_argument(
         "--model-search-mode",
-        choices=("binary", "ego_bfs"),
+        choices=("binary", "ego_bfs", "turn_sampling"),
         default=None,
         help=(
             "Search mode for all seats. "
-            "`binary` keeps the old halt-vs-launch search; `ego_bfs` enables the breadth-first ego-only search."
+            "`binary` keeps the old halt-vs-launch search; `ego_bfs` enables the breadth-first ego-only search; "
+            "`turn_sampling` stochastically samples distinct current-turn action sequences with prefix caching."
         ),
     )
     parser.add_argument(
         "--model-search-mode-p0",
-        choices=("binary", "ego_bfs"),
+        choices=("binary", "ego_bfs", "turn_sampling"),
         default=None,
         help="Search mode for player 0. Default: same as --model-search-mode.",
     )
     parser.add_argument(
         "--model-search-mode-p1",
-        choices=("binary", "ego_bfs"),
+        choices=("binary", "ego_bfs", "turn_sampling"),
         default=None,
         help="Search mode for player 1. Default: same as --model-search-mode.",
     )
     parser.add_argument(
         "--model-search-mode-p2",
-        choices=("binary", "ego_bfs"),
+        choices=("binary", "ego_bfs", "turn_sampling"),
         default=None,
         help="Search mode for player 2 in 4-player mode. Default: same as --model-search-mode.",
     )
     parser.add_argument(
         "--model-search-mode-p3",
-        choices=("binary", "ego_bfs"),
+        choices=("binary", "ego_bfs", "turn_sampling"),
         default=None,
         help="Search mode for player 3 in 4-player mode. Default: same as --model-search-mode.",
     )
@@ -392,6 +393,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--model-search-branch-micro-depth",
+        type=int,
+        default=None,
+        help=(
+            "In ego_bfs mode, branch only while current_micro_idx is below this limit within a turn. "
+            "For example, 4 branches in micros 0-3, then continues greedily to turn end."
+        ),
+    )
+    parser.add_argument(
         "--model-search-stop-at-turn-end",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -408,6 +418,15 @@ def main() -> None:
             "In ego_bfs + --model-search-stop-at-turn-end mode, evaluate each current-turn leaf by averaging "
             "over this many shared sampled opponent joint-action sets and one simulated env step. "
             "0 keeps pure turn-end virtual-state value scoring."
+        ),
+    )
+    parser.add_argument(
+        "--model-search-turn-sampling-max-samples",
+        type=int,
+        default=None,
+        help=(
+            "In turn_sampling mode, stop after this many completed ego turn plans have been sampled "
+            "before dedup. Default: unlimited until the time budget runs out."
         ),
     )
     parser.add_argument(
@@ -554,6 +573,8 @@ def main() -> None:
         raise SystemExit("--model-search-max-branching must be positive")
     if args.model_search_turn_end_opponent_samples is not None and int(args.model_search_turn_end_opponent_samples) < 0:
         raise SystemExit("--model-search-turn-end-opponent-samples must be non-negative")
+    if args.model_search_turn_sampling_max_samples is not None and int(args.model_search_turn_sampling_max_samples) < 0:
+        raise SystemExit("--model-search-turn-sampling-max-samples must be non-negative")
 
     if args.cpu_threads > 0:
         for name in CPU_THREAD_ENV_VARS:
@@ -953,8 +974,10 @@ def main() -> None:
             model_search_branch_prob_threshold=args.model_search_branch_prob_threshold,
             model_search_max_branching=args.model_search_max_branching,
             model_search_branch_after_first_env_step=args.model_search_branch_after_first_env_step,
+            model_search_branch_micro_depth=args.model_search_branch_micro_depth,
             model_search_stop_at_turn_end=args.model_search_stop_at_turn_end,
             model_search_turn_end_opponent_samples=args.model_search_turn_end_opponent_samples,
+            model_search_turn_sampling_max_samples=args.model_search_turn_sampling_max_samples,
         )
         run_agent = seat_agent
         if args.swap_player_view:

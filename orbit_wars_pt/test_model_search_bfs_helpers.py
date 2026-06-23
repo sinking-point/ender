@@ -104,6 +104,35 @@ class ModelSearchBfsHelperTests(unittest.TestCase):
         self.assertTrue(_search_branching_enabled_for_env_step(settings_all, search_env_step_from_root=0))
         self.assertTrue(_search_branching_enabled_for_env_step(settings_all, search_env_step_from_root=1))
 
+    def test_branching_can_be_capped_by_micro_depth(self) -> None:
+        settings = ModelSearchSettings(
+            horizon_steps=4,
+            reward=RewardSettings(),
+            branch_after_first_env_step=True,
+            branch_micro_depth=4,
+        )
+        self.assertTrue(
+            _search_branching_enabled_for_env_step(
+                settings,
+                search_env_step_from_root=0,
+                current_micro_idx=0,
+            )
+        )
+        self.assertTrue(
+            _search_branching_enabled_for_env_step(
+                settings,
+                search_env_step_from_root=0,
+                current_micro_idx=3,
+            )
+        )
+        self.assertFalse(
+            _search_branching_enabled_for_env_step(
+                settings,
+                search_env_step_from_root=0,
+                current_micro_idx=4,
+            )
+        )
+
     def test_search_can_stop_at_turn_end(self) -> None:
         settings = ModelSearchSettings(
             horizon_steps=4,
@@ -111,7 +140,7 @@ class ModelSearchBfsHelperTests(unittest.TestCase):
             stop_at_turn_end=True,
         )
         self.assertFalse(_search_should_advance_closed_turn(settings, search_env_step_from_root=0))
-        self.assertFalse(_search_has_deadline(settings))
+        self.assertTrue(_search_has_deadline(settings))
         self.assertTrue(_search_should_advance_closed_turn(settings, search_env_step_from_root=1))
 
         settings_rollout = ModelSearchSettings(
