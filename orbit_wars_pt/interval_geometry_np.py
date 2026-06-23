@@ -1493,6 +1493,7 @@ def _pick_planet_aim_from_visible_cells(
     cells: Sequence[tuple[float, float]],
     first_contact_angle: float,
     *,
+    allow_edge_aim: bool = True,
     refine_boundaries: bool,
     cache: "OcclusionWalkCache" | None,
     origin_xy: np.ndarray,
@@ -1561,42 +1562,47 @@ def _pick_planet_aim_from_visible_cells(
 
     edge_angles_by_label: dict[str, float | None] = {}
     edge_meta_by_label: dict[str, dict[str, float | None]] = {}
-    edge_angles_by_label["edge_same_side"], edge_meta_by_label["edge_same_side"] = _edge_angle_inside_furthest_on_side(
-            theta_fc,
-            cells,
-            side=primary_side,
-            refine_boundaries=refine_boundaries,
-            target_sig=target_sig,
-            cache=cache,
-            origin_xy=origin_xy,
-            origin_radius=origin_radius,
-            speed=speed,
-            p0_by_tick=p0_by_tick,
-            p1_by_tick=p1_by_tick,
-            radii=radii,
-            active_by_tick=active_by_tick,
-            object_order=object_order,
-            order_rank=order_rank,
-            return_meta=True,
-        )
-    edge_angles_by_label["edge_other_side"], edge_meta_by_label["edge_other_side"] = _edge_angle_inside_furthest_on_side(
-            theta_fc,
-            cells,
-            side=secondary_side,
-            refine_boundaries=refine_boundaries,
-            target_sig=target_sig,
-            cache=cache,
-            origin_xy=origin_xy,
-            origin_radius=origin_radius,
-            speed=speed,
-            p0_by_tick=p0_by_tick,
-            p1_by_tick=p1_by_tick,
-            radii=radii,
-            active_by_tick=active_by_tick,
-            object_order=object_order,
-            order_rank=order_rank,
-            return_meta=True,
-        )
+    if allow_edge_aim:
+        edge_angles_by_label["edge_same_side"], edge_meta_by_label["edge_same_side"] = _edge_angle_inside_furthest_on_side(
+                theta_fc,
+                cells,
+                side=primary_side,
+                refine_boundaries=refine_boundaries,
+                target_sig=target_sig,
+                cache=cache,
+                origin_xy=origin_xy,
+                origin_radius=origin_radius,
+                speed=speed,
+                p0_by_tick=p0_by_tick,
+                p1_by_tick=p1_by_tick,
+                radii=radii,
+                active_by_tick=active_by_tick,
+                object_order=object_order,
+                order_rank=order_rank,
+                return_meta=True,
+            )
+        edge_angles_by_label["edge_other_side"], edge_meta_by_label["edge_other_side"] = _edge_angle_inside_furthest_on_side(
+                theta_fc,
+                cells,
+                side=secondary_side,
+                refine_boundaries=refine_boundaries,
+                target_sig=target_sig,
+                cache=cache,
+                origin_xy=origin_xy,
+                origin_radius=origin_radius,
+                speed=speed,
+                p0_by_tick=p0_by_tick,
+                p1_by_tick=p1_by_tick,
+                radii=radii,
+                active_by_tick=active_by_tick,
+                object_order=object_order,
+                order_rank=order_rank,
+                return_meta=True,
+            )
+    else:
+        for label in ("edge_same_side", "edge_other_side"):
+            edge_angles_by_label[label] = None
+            edge_meta_by_label[label] = {}
 
     seen_angles: list[float] = []
     candidate_results: dict[str, tuple[float | None, int, str]] = {"primary": (primary_angle, tick_primary, reason_primary)}
@@ -2696,6 +2702,7 @@ def sweep_interval_best_targets_from_events(
     radii: np.ndarray | None = None,
     active_by_tick: np.ndarray | None = None,
     occlusion_cache: "OcclusionWalkCache" | None = None,
+    allow_edge_aim: bool = True,
     refine_boundaries: bool = True,
     debug_context: dict[str, Any] | None = None,
     selected_slots: set[int] | None = None,
@@ -2739,6 +2746,7 @@ def sweep_interval_best_targets_from_events(
                 picked = _pick_planet_aim_from_visible_cells(
                     cells,
                     _event_first_contact_angle(event),
+                    allow_edge_aim=allow_edge_aim,
                     refine_boundaries=refine_boundaries,
                     cache=occlusion_cache,
                     origin_xy=origin,

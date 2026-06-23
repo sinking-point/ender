@@ -2871,6 +2871,7 @@ def _sweep_interval_from_geometry(
     num_planets: int,
     *,
     target_timing: Optional[MicroTargetTiming],
+    allow_edge_aim: bool,
     refine_boundaries: bool,
     game_step: int = -1,
     micro_idx: int = -1,
@@ -2901,6 +2902,7 @@ def _sweep_interval_from_geometry(
                 radii=geom.radii,
                 active_by_tick=geom.active_by_tick,
                 occlusion_cache=geom.occlusion_cache,
+                allow_edge_aim=allow_edge_aim,
                 refine_boundaries=refine_boundaries,
                 debug_context={
                     "phase": phase,
@@ -3136,6 +3138,7 @@ def _interval_targets_np(
         geom,
         int(planets.shape[0]),
         target_timing=target_timing,
+        allow_edge_aim=int(np.asarray(state.incoming_fleets).shape[0]) <= 2,
         refine_boundaries=refine_boundaries,
         game_step=game_step,
         micro_idx=micro_idx,

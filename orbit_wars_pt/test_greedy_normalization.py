@@ -18,6 +18,7 @@ from orbit_wars_pt.kaggle_adapter import (
     _dual_greedy_from_env,
     _greedy_from_env,
     _greedy_halt_action_from_logits,
+    _interval_targets_np,
     _launch_probability_meets_threshold,
     _model_search_greedy_launch_threshold_from_env,
     _model_search_launch_probability_threshold_from_env,
@@ -311,6 +312,50 @@ class TestGreedyNormalization(unittest.TestCase):
 
         self.assertEqual(build_actions.call_args.kwargs["sampling_mode"], SAMPLING_MODE_GREEDY)
         self.assertEqual(build_actions.call_args.kwargs["search_launch_probability_threshold"], 0.9)
+
+    def test_interval_targets_disable_edge_aim_in_four_player_states(self) -> None:
+        fake_geom = SimpleNamespace(
+            p0_by_tick=np.zeros((1, 1, 2), dtype=np.float64),
+            p1_by_tick=np.zeros((1, 1, 2), dtype=np.float64),
+            active_by_tick=np.ones((1, 1), dtype=np.bool_),
+            origin_idx=0,
+            geometry="orthogonal",
+            object_order=[0],
+            origin_xy=np.zeros((2,), dtype=np.float64),
+            origin_radius=1.0,
+            speed=6.0,
+            horizon=24,
+            radii=np.ones((1,), dtype=np.float64),
+            occlusion_cache=None,
+            events=[],
+            precomputed_hits=None,
+            samples_per_span=4,
+        )
+        fake_result = (
+            np.zeros((1,), dtype=np.float64),
+            np.ones((1,), dtype=np.bool_),
+            np.zeros((1,), dtype=np.int32),
+        )
+        state_4p = SimpleNamespace(
+            planets=np.zeros((1, 7), dtype=np.float32),
+            planet_active=np.ones((1,), dtype=np.bool_),
+            incoming_fleets=np.zeros((4, 1, 24), dtype=np.uint16),
+        )
+        state_2p = SimpleNamespace(
+            planets=np.zeros((1, 7), dtype=np.float32),
+            planet_active=np.ones((1,), dtype=np.bool_),
+            incoming_fleets=np.zeros((2, 1, 24), dtype=np.uint16),
+        )
+
+        with patch("orbit_wars_pt.kaggle_adapter._build_interval_micro_geometry", return_value=fake_geom), patch(
+            "orbit_wars_pt.kaggle_adapter._sweep_interval_from_geometry",
+            return_value=fake_result,
+        ) as sweep:
+            _interval_targets_np(state_4p, 0, 0)
+            self.assertFalse(sweep.call_args.kwargs["allow_edge_aim"])
+
+            _interval_targets_np(state_2p, 0, 0)
+            self.assertTrue(sweep.call_args.kwargs["allow_edge_aim"])
 
 
 if __name__ == "__main__":
