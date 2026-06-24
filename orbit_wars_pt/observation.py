@@ -265,30 +265,3 @@ def jax_state_to_numpy(state: Any) -> Any:
             overflow=_to_np(state.overflow),
         )
     return state
-
-
-def total_ship_ratio_scores(state_np: Any) -> Tuple[float, float, float]:
-    """Returns (ratio_ego0, ratio_ego1, total_ships) for 2 agents (ego ids 0 and 1)."""
-
-    planets = np.asarray(state_np.planets)
-    planet_active = np.asarray(state_np.planet_active)
-    incoming_fleets = np.asarray(state_np.incoming_fleets)
-
-    scores = np.zeros((4,), dtype=np.float64)
-    total = 1e-6
-    for i in range(planets.shape[0]):
-        if not planet_active[i]:
-            continue
-        owner = int(planets[i, 1])
-        if owner < 0:
-            continue
-        sh = float(planets[i, 5])
-        scores[owner] += sh
-        total += sh
-    fleet_scores = incoming_fleets.astype(np.float64).sum(axis=(1, 2))
-    scores[: fleet_scores.shape[0]] += fleet_scores
-    total += float(fleet_scores.sum())
-
-    r0 = float(scores[0] / total)
-    r1 = float(scores[1] / total)
-    return r0, r1, float(total)

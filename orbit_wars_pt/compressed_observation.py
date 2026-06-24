@@ -200,29 +200,6 @@ def decode_observation(
 
 
 @torch.no_grad()
-def store_compressed_observation_rows(
-    dst: CompressedObservationBuffer,
-    row: torch.Tensor,
-    env: torch.Tensor,
-    obs: dict[str, torch.Tensor],
-) -> CompressedObservationBuffer:
-    comp = compress_observation(obs)
-    r = row.to(device=dst.token_meta.device, dtype=torch.long)
-    e = env.to(device=dst.token_meta.device, dtype=torch.long)
-    dst.token_meta[r, e, :] = comp.token_meta.to(dst.token_meta.device)
-    dst.owner_idx[r, e, :] = comp.owner_idx.to(dst.owner_idx.device)
-    dst.production[r, e, :] = comp.production.to(dst.production.device)
-    dst.ships[r, e, :] = comp.ships.to(dst.ships.device)
-    dst.velocity[r, e, :, :] = comp.velocity.to(dst.velocity.device)
-    dst.xy[r, e, :, :] = comp.xy.to(dst.xy.device)
-    dst.turn_progress[r, e] = comp.turn_progress.to(dst.turn_progress.device)
-    dst.incoming_net[r, e, :, :] = comp.incoming_net.to(dst.incoming_net.device)
-    dst.incoming_survivor[r, e, :, :] = comp.incoming_survivor.to(dst.incoming_survivor.device)
-    dst.origin_frac_blocked[r, e, :, :] = comp.origin_frac_blocked.to(dst.origin_frac_blocked.device)
-    return dst
-
-
-@torch.no_grad()
 def store_precompressed_observation_rows(
     dst: CompressedObservationBuffer,
     row: torch.Tensor,
@@ -261,30 +238,6 @@ def index_compressed_observation_rows(
         incoming_survivor=comp.incoming_survivor.index_select(0, ii),
         origin_frac_blocked=comp.origin_frac_blocked.index_select(0, ii),
     )
-
-
-def select_compressed_observation(
-    src: CompressedObservationBuffer,
-    t: torch.Tensor,
-    n: torch.Tensor,
-    *,
-    device: torch.device,
-) -> CompressedObservationBuffer:
-    tt = t.to(device=src.token_meta.device, dtype=torch.long)
-    nn = n.to(device=src.token_meta.device, dtype=torch.long)
-    return CompressedObservationBuffer(
-        token_meta=src.token_meta[tt, nn].to(device),
-        owner_idx=src.owner_idx[tt, nn].to(device),
-        production=src.production[tt, nn].to(device),
-        ships=src.ships[tt, nn].to(device),
-        velocity=src.velocity[tt, nn].to(device),
-        xy=src.xy[tt, nn].to(device),
-        turn_progress=src.turn_progress[tt, nn].to(device),
-        incoming_net=src.incoming_net[tt, nn].to(device),
-        incoming_survivor=src.incoming_survivor[tt, nn].to(device),
-        origin_frac_blocked=src.origin_frac_blocked[tt, nn].to(device),
-    )
-
 
 def compressed_observation_to_host(obs: CompressedObservationBuffer) -> CompressedObservationBuffer:
     return CompressedObservationBuffer(
