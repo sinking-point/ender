@@ -4811,6 +4811,15 @@ def _model_search_steps_from_env() -> int:
     return max(0, int(raw))
 
 
+def _dual_model_search_steps_from_env() -> tuple[int | None, int | None]:
+    steps_4p = _env_int("ORBIT_WARS_MODEL_SEARCH_STEPS_4P")
+    steps_2p = _env_int("ORBIT_WARS_MODEL_SEARCH_STEPS_2P")
+    return (
+        max(0, int(steps_4p)) if steps_4p is not None else None,
+        max(0, int(steps_2p)) if steps_2p is not None else None,
+    )
+
+
 def _validate_model_search_mode(value: str) -> str:
     mode = str(value).strip().lower()
     if mode not in _VALID_MODEL_SEARCH_MODES:
@@ -5369,6 +5378,8 @@ class KaggleOrbitWarsAgent:
         target_method: Optional[str] = None,
         interval_samples_per_span: Optional[int] = None,
         model_search_steps: Optional[int] = None,
+        model_search_steps_4p: Optional[int] = None,
+        model_search_steps_2p: Optional[int] = None,
         model_search_mode: Optional[str] = None,
         model_search_gamma: Optional[float] = None,
         model_search_adaptive_horizon: Optional[bool] = None,
@@ -8887,6 +8898,8 @@ class KaggleOrbitWarsDualPolicyAgent:
         target_method: Optional[str] = None,
         interval_samples_per_span: Optional[int] = None,
         model_search_steps: Optional[int] = None,
+        model_search_steps_4p: Optional[int] = None,
+        model_search_steps_2p: Optional[int] = None,
         model_search_mode: Optional[str] = None,
         model_search_gamma: Optional[float] = None,
         model_search_adaptive_horizon: Optional[bool] = None,
@@ -8923,6 +8936,8 @@ class KaggleOrbitWarsDualPolicyAgent:
         self.target_method = target_method
         self.interval_samples_per_span = interval_samples_per_span
         self.model_search_steps = model_search_steps
+        self.model_search_steps_4p = model_search_steps if model_search_steps_4p is None else model_search_steps_4p
+        self.model_search_steps_2p = model_search_steps if model_search_steps_2p is None else model_search_steps_2p
         self.model_search_mode = model_search_mode
         self.model_search_gamma = model_search_gamma
         self.model_search_adaptive_horizon = model_search_adaptive_horizon
@@ -8989,7 +9004,7 @@ class KaggleOrbitWarsDualPolicyAgent:
             raycast_rays=self.raycast_rays,
             target_method=self.target_method,
             interval_samples_per_span=self.interval_samples_per_span,
-            model_search_steps=self.model_search_steps,
+            model_search_steps=self.model_search_steps_4p if use_4p else self.model_search_steps_2p,
             model_search_mode=self.model_search_mode,
             model_search_gamma=self.model_search_gamma,
             model_search_adaptive_horizon=self.model_search_adaptive_horizon,
@@ -9316,6 +9331,7 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
         greedy_4p, greedy_2p = _dual_greedy_from_env()
         sampling_mode = _sampling_mode_from_env()
         sampling_mode_4p, sampling_mode_2p = _dual_sampling_mode_from_env()
+        model_search_steps_4p, model_search_steps_2p = _dual_model_search_steps_from_env()
         population_members = _population_members_single_from_env()
         population_member_4p, population_member_2p = _population_members_dual_from_env()
         seed_raw = os.environ.get("ORBIT_WARS_AGENT_SEED")
@@ -9377,6 +9393,8 @@ def agent(obs: Mapping[str, Any], config: Any = None) -> list[list[float]]:
                     raycast_rays=rays,
                     target_method=target_method,
                     interval_samples_per_span=interval_samples,
+                    model_search_steps_4p=model_search_steps_4p,
+                    model_search_steps_2p=model_search_steps_2p,
                 )
             else:
                 ckpt = resolve_checkpoint_path(

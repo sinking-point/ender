@@ -240,6 +240,8 @@ def package_submission(
     target_method: str | None = None,
     interval_geometry: str | None = None,
     model_search_steps: int | None = None,
+    model_search_steps_4p: int | None = None,
+    model_search_steps_2p: int | None = None,
     model_search_mode: str | None = None,
     model_search_adaptive_horizon: bool | None = None,
     model_search_adaptive_horizon_offset: int | None = None,
@@ -339,6 +341,10 @@ def package_submission(
         submission_env["ORBIT_WARS_INTERVAL_GEOMETRY"] = str(interval_geometry)
     if model_search_steps is not None:
         submission_env["ORBIT_WARS_MODEL_SEARCH_STEPS"] = str(max(0, int(model_search_steps)))
+    if model_search_steps_4p is not None:
+        submission_env["ORBIT_WARS_MODEL_SEARCH_STEPS_4P"] = str(max(0, int(model_search_steps_4p)))
+    if model_search_steps_2p is not None:
+        submission_env["ORBIT_WARS_MODEL_SEARCH_STEPS_2P"] = str(max(0, int(model_search_steps_2p)))
     if model_search_mode is not None:
         submission_env["ORBIT_WARS_MODEL_SEARCH_MODE"] = str(model_search_mode)
     if model_search_adaptive_horizon is not None:
@@ -418,6 +424,8 @@ def package_submission(
         Target method: {target_method or 'checkpoint/default'}
         Interval geometry: {interval_geometry or 'checkpoint/default'}
         Model search steps: {model_search_steps if model_search_steps is not None else 'disabled / env default'}
+        Model search steps 4p override: {model_search_steps_4p if model_search_steps_4p is not None else 'default'}
+        Model search steps 2p override: {model_search_steps_2p if model_search_steps_2p is not None else 'default'}
         Model search adaptive horizon: {model_search_adaptive_horizon if model_search_adaptive_horizon is not None else 'env default'}
         Model search adaptive horizon offset: {model_search_adaptive_horizon_offset if model_search_adaptive_horizon_offset is not None else 'env default'}
         Model search min overage seconds: {model_search_min_overage_s if model_search_min_overage_s is not None else 'env default'}
@@ -646,6 +654,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--model-search-steps-4p",
+        type=int,
+        default=None,
+        help="Override ORBIT_WARS_MODEL_SEARCH_STEPS_4P in main.py. Defaults to --model-search-steps when omitted.",
+    )
+    parser.add_argument(
+        "--model-search-steps-2p",
+        type=int,
+        default=None,
+        help="Override ORBIT_WARS_MODEL_SEARCH_STEPS_2P in main.py. Defaults to --model-search-steps when omitted.",
+    )
+    parser.add_argument(
         "--model-search-mode",
         choices=("binary", "ego_bfs", "turn_sampling"),
         default=None,
@@ -869,6 +889,12 @@ def main() -> None:
         target_method=args.target_method,
         interval_geometry=args.interval_geometry,
         model_search_steps=args.model_search_steps,
+        model_search_steps_4p=(
+            args.model_search_steps if args.model_search_steps_4p is None else args.model_search_steps_4p
+        ),
+        model_search_steps_2p=(
+            args.model_search_steps if args.model_search_steps_2p is None else args.model_search_steps_2p
+        ),
         model_search_mode=args.model_search_mode,
         model_search_adaptive_horizon=(
             None
