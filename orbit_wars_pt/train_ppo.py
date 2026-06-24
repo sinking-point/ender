@@ -6759,7 +6759,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--iterations", type=int, default=100000)
-    p.add_argument("--num-envs", type=int, default=256, help="Parallel env rollouts per iteration.")
+    p.add_argument("--num-envs", type=int, default=2048, help="Parallel env rollouts per iteration.")
     p.add_argument(
         "--num-agents",
         type=int,
@@ -6799,7 +6799,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--league-fraction",
         type=float,
-        default=0.0,
+        default=0.25,
         help=(
             "Fraction of rollout envs reserved for main-vs-past-checkpoint league games. "
             "0 keeps pure self-play."
@@ -6841,7 +6841,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--rollout-micro-horizon",
         type=int,
-        default=128,
+        default=256,
         help=(
             "Stop a rollout segment after a full env-step when any env's any player's "
             "micro-step count in this segment reaches this value (end-of-turn cut). "
@@ -6899,12 +6899,12 @@ def parse_args() -> argparse.Namespace:
         "resolving launch angles in the consistency replay.",
     )
     p.add_argument("--lr", type=float, default=3e-5)
-    p.add_argument("--gamma", type=float, default=1.0)
+    p.add_argument("--gamma", type=float, default=0.998)
     p.add_argument("--lam", type=float, default=0.95)
     p.add_argument("--vf-coef", type=float, default=0.5)
     p.add_argument("--entropy-coef", type=float, default=0.01)
     p.add_argument("--clip-eps", type=float, default=0.2, help="PPO ratio + value clipping ε.")
-    p.add_argument("--ppo-epochs", type=int, default=4, help="Passes over rollout data per iteration.")
+    p.add_argument("--ppo-epochs", type=int, default=2, help="Passes over rollout data per iteration.")
     p.add_argument(
         "--ppo-epochs-main",
         type=int,
@@ -6920,7 +6920,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--minibatch-size",
         type=int,
-        default=512,
+        default=2048,
         help="Transitions per minibatch (capped automatically if buffer smaller).",
     )
     p.add_argument("--student-d-model", type=int, default=64)
@@ -6976,7 +6976,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--micro-step-penalty",
         type=float,
-        default=1e-4,
+        default=0.0,
         help=(
             "Small reward penalty per dispatched micro-action/fleet launch. Halt-only "
             "micro-steps are not charged. Set 0 to disable."
@@ -6985,7 +6985,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--reward-mode",
         type=str,
-        default="ship-mass-share",
+        default="terminal-win-loss",
         choices=("ship-mass-share", "production-share", "terminal-win-loss"),
         help=(
             "Legacy preset for the reward mix. 'ship-mass-share' initializes to "
@@ -7053,20 +7053,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--reward-terminal-loss",
         type=float,
-        default=-1.0,
-        help="Raw terminal reward assigned to losing players. Default: -1.",
+        default=0.0,
+        help="Raw terminal reward assigned to losing players. Default: 0.",
     )
     p.add_argument(
         "--reward-terminal-draw",
         type=float,
-        default=0.0,
-        help="Raw terminal reward assigned to tied winners in a draw. Default: 0.",
+        default=1.0,
+        help="Raw terminal reward assigned to tied winners in a draw. Default: 1.",
     )
     p.add_argument(
         "--reward-terminal-win",
         type=float,
-        default=1.0,
-        help="Raw terminal reward assigned to sole winners. Default: 1.",
+        default=2.0,
+        help="Raw terminal reward assigned to sole winners. Default: 2.",
     )
     p.add_argument(
         "--reward-time-bonus-coef",
@@ -7089,7 +7089,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--normalize-obs-to-p0",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
             "Rotate non-player-0 observations into player 0's board frame in the live JAX "
             "rollout path. In 4-player mode this also rotates opponent owner slots so every "
@@ -7103,13 +7103,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--halt-init-prob",
         type=float,
-        default=None,
+        default=0.9,
         help="Optional fresh-init prior for action=halt. For example 0.9 initializes halt logits to about 90%% halt.",
     )
     p.add_argument(
         "--fraction-init-ratio",
         type=str,
-        default=None,
+        default="1:1:1:1:10",
         help=(
             "Optional fresh-init origin/fraction prior as colon- or comma-separated positive weights, "
             "one per fraction in order. Example: '1:1:1:1:15'."
@@ -7118,13 +7118,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--target-abort-enabled",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Enable target-stage abort with per-turn origin/fraction blocking.",
     )
     p.add_argument(
         "--future-feature-enabled",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
             "Enable per-planet ceasefire future owner/garrison forecast features in the policy "
             "trunk and target head."
@@ -7143,7 +7143,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--activation-checkpointing",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Recompute transformer block activations during backward to reduce GPU memory usage.",
     )
     p.add_argument("--max-fleets", type=int, default=128)
