@@ -1,4 +1,4 @@
-# Orbit Wars
+# Ender - Provisional Top 10 Orbit Wars Agent
 
 PyTorch training and inference code for a Kaggle Orbit Wars agent, backed by a JAX environment for high-throughput self-play.
 
@@ -10,6 +10,13 @@ This repository contains:
 - Tournament and debugging scripts for comparing packaged agents
 
 The approach is described in more detail in [writeup.md](/home/billy/orbit-wars/writeup.md).
+
+## License
+
+This Orbit Wars solution is released under the Creative Commons Attribution 4.0
+International License (CC BY 4.0), as required by the Kaggle Orbit Wars rules.
+
+See `LICENSE`.
 
 ## Repository Layout
 
@@ -57,8 +64,7 @@ python -m orbit_wars_pt.cli.run_train_ppo \
 ```bash
 python -m orbit_wars_pt.cli.run_train_ppo \
   --experiment ppo-4p-baseline \
-  --num-agents 4 \
-  --num-envs 384
+  --num-agents 4
 ```
 
 Artifacts are written under `experiments/<experiment>/`, with TensorBoard logs grouped under `experiments/tensorboard/`.
