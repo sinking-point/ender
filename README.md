@@ -1,4 +1,4 @@
-# Ender - Provisional 8th Place Orbit Wars Agent
+# Ender - 8th Place Orbit Wars Agent
 
 PyTorch training and inference code for a Kaggle Orbit Wars agent, backed by a JAX environment for high-throughput self-play.
 
